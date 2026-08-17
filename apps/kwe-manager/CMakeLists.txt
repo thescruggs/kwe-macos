@@ -27,6 +27,10 @@ qt_add_qml_module(kwe-manager
     NO_IMPORT_SCAN
     QML_FILES
         qml/Main.qml
+        qml/GalleryPage.qml
+        qml/WallpaperCard.qml
+        qml/WallpaperDetail.qml
+        qml/WallpaperSelection.qml
 )
 
 target_link_libraries(kwe-manager PRIVATE

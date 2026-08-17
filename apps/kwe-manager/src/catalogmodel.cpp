@@ -199,16 +199,29 @@ void WallpaperFilterModel::setFavoritesOnly(bool value) {
     emit favoritesOnlyChanged();
 }
 
+void WallpaperFilterModel::setWorkshopView(bool value) {
+    if (m_workshopView == value) return;
+    beginFilterChange();
+    m_workshopView = value;
+    endFilterChange(Direction::Rows);
+    emit workshopViewChanged();
+}
+
 bool WallpaperFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const {
     const auto index = sourceModel()->index(sourceRow, 0, sourceParent);
     const auto title = sourceModel()->data(index, CatalogModel::TitleRole).toString();
     const auto id = sourceModel()->data(index, CatalogModel::WorkshopIdRole).toString();
     const auto kind = sourceModel()->data(index, CatalogModel::KindRole).toString();
+    const auto workshopState = sourceModel()->data(index, CatalogModel::WorkshopStateRole).toString();
     const bool favorite = sourceModel()->data(index, CatalogModel::FavoriteRole).toBool();
     const bool kindMatches = m_kindFilter == QStringLiteral("all") || kind == m_kindFilter;
     const bool favoriteMatches = !m_favoritesOnly || favorite;
     const bool searchMatches = m_searchText.trimmed().isEmpty()
         || title.contains(m_searchText.trimmed(), Qt::CaseInsensitive)
         || id.contains(m_searchText.trimmed(), Qt::CaseInsensitive);
-    return kindMatches && favoriteMatches && searchMatches;
+    // The Workshop view shows only subscribed content (installed,
+    // downloading, or awaiting download); local-only items stay on the
+    // Installed page.
+    const bool workshopMatches = !m_workshopView || workshopState != QStringLiteral("local");
+    return kindMatches && favoriteMatches && searchMatches && workshopMatches;
 }

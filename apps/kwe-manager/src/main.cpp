@@ -93,10 +93,14 @@ int main(int argc, char *argv[]) {
     CatalogClient client(socketPath);
     WallpaperFilterModel filtered;
     filtered.setSourceModel(client.sourceModel());
+    WallpaperFilterModel workshopFiltered;
+    workshopFiltered.setSourceModel(client.sourceModel());
+    workshopFiltered.setWorkshopView(true);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("catalogClient"), &client);
     engine.rootContext()->setContextProperty(QStringLiteral("wallpaperModel"), &filtered);
+    engine.rootContext()->setContextProperty(QStringLiteral("workshopModel"), &workshopFiltered);
     engine.rootContext()->setContextProperty(QStringLiteral("catalogStats"), client.sourceModel());
     engine.rootContext()->setContextProperty(QStringLiteral("packageInstaller"), &packageInstaller);
     engine.rootContext()->setContextProperty(QStringLiteral("packageSource"), packageSource);

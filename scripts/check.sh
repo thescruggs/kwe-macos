@@ -12,7 +12,10 @@ cargo build --workspace
 cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/cmake --parallel
 if command -v qmllint >/dev/null 2>&1; then
-    qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/Main.qml
+    qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager \
+        apps/kwe-manager/qml/Main.qml apps/kwe-manager/qml/GalleryPage.qml \
+        apps/kwe-manager/qml/WallpaperCard.qml apps/kwe-manager/qml/WallpaperDetail.qml \
+        apps/kwe-manager/qml/WallpaperSelection.qml
     qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-frame-preview apps/kwe-frame-preview/qml/Preview.qml
 fi
 target/debug/kwe diagnose

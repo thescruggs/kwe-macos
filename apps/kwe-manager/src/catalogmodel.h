@@ -98,6 +98,7 @@ class WallpaperFilterModel final : public QSortFilterProxyModel {
     Q_PROPERTY(QString kindFilter READ kindFilter WRITE setKindFilter NOTIFY kindFilterChanged)
     Q_PROPERTY(QString sortMode READ sortMode WRITE setSortMode NOTIFY sortModeChanged)
     Q_PROPERTY(bool favoritesOnly READ favoritesOnly WRITE setFavoritesOnly NOTIFY favoritesOnlyChanged)
+    Q_PROPERTY(bool workshopView READ workshopView WRITE setWorkshopView NOTIFY workshopViewChanged)
 
 public:
     explicit WallpaperFilterModel(QObject *parent = nullptr);
@@ -108,8 +109,10 @@ public:
     void setKindFilter(const QString &value);
     QString sortMode() const { return m_sortMode; }
     bool favoritesOnly() const { return m_favoritesOnly; }
+    bool workshopView() const { return m_workshopView; }
     void setSortMode(const QString &value);
     void setFavoritesOnly(bool value);
+    void setWorkshopView(bool value);
 
 signals:
     void searchTextChanged();
@@ -117,6 +120,7 @@ signals:
     void countChanged();
     void sortModeChanged();
     void favoritesOnlyChanged();
+    void workshopViewChanged();
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
@@ -126,4 +130,5 @@ private:
     QString m_kindFilter = QStringLiteral("all");
     QString m_sortMode = QStringLiteral("title");
     bool m_favoritesOnly = false;
+    bool m_workshopView = false;
 };
