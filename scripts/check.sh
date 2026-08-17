@@ -36,3 +36,6 @@ fi
 if [[ "${KWE_RUN_PLAYLIST_SMOKE:-0}" == "1" ]]; then
     scripts/smoke-playlist-restart.sh
 fi
+if [[ "${KWE_RUN_WORKSHOP_CACHE_SMOKE:-0}" == "1" ]]; then
+    scripts/smoke-workshop-cache.sh
+fi
