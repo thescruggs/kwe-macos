@@ -17,6 +17,8 @@ qt_add_executable(kwe-manager
     src/webpreview.h
     src/playlistcontroller.cpp
     src/playlistcontroller.h
+    src/playlistclient.cpp
+    src/playlistclient.h
 )
 
 qt_add_qml_module(kwe-manager

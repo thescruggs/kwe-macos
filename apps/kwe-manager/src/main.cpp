@@ -77,7 +77,7 @@ int main(int argc, char *argv[]) {
     VideoPreview videoPreview;
     RendererStatus rendererStatus(socketPath);
     WebPreview webPreview;
-    PlaylistController playlistController;
+    PlaylistController playlistController(socketPath);
     QString packageSource = parser.value(packageSourceOption);
     if (packageSource.isEmpty()) {
         packageSource = QStandardPaths::locate(

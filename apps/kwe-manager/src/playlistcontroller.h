@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+
+#include "playlistclient.h"
+
+#include <QHash>
+#include <QJsonArray>
 #include <QObject>
 #include <QStringList>
-#include <QHash>
 
+// Playlist model for the manager UI. The daemon owns the playlist store;
+// this controller applies edits optimistically and persists them through
+// PlaylistClient, so the QML surface stays unchanged. The pre-M5k QSettings
+// blob is only a one-time migration source and is never written again.
 class PlaylistController final : public QObject {
     Q_OBJECT
     Q_PROPERTY(QStringList names READ names NOTIFY changed)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY changed)
 public:
-    explicit PlaylistController(QObject *parent = nullptr);
+    explicit PlaylistController(QString socketPath, QObject *parent = nullptr);
     QStringList names() const { return m_names; }
     QString errorMessage() const { return m_error; }
     Q_INVOKABLE void create(const QString &name);
@@ -27,11 +35,19 @@ public:
     Q_INVOKABLE void setDurationSeconds(const QString &name, int value);
     Q_INVOKABLE void setTransition(const QString &name, const QString &value);
     Q_INVOKABLE void setTransitionSeconds(const QString &name, int value);
-signals: void changed();
+signals:
+    void changed();
+
 private:
-    void load();
-    void save();
+    QJsonArray legacyBlob();
+    void onPlaylistsReceived(const QJsonArray &playlists);
+    void applyList(const QJsonArray &playlists);
+    QJsonObject playlistObject(const QString &name) const;
+    void refresh();
+
+    PlaylistClient m_client;
     QStringList m_names;
+    QHash<QString, QString> m_ids; // title -> daemon id
     QHash<QString, QStringList> m_entries;
     QHash<QString, bool> m_shuffle;
     QHash<QString, bool> m_repeat;
@@ -39,4 +55,5 @@ private:
     QHash<QString, QString> m_transition;
     QHash<QString, int> m_transitionSeconds;
     QString m_error;
+    int m_pendingEdits = 0;
 };

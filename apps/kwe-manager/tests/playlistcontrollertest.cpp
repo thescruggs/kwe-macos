@@ -9,6 +9,10 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+// The daemon owns playlist persistence (exercised by the daemon smoke
+// suites); these tests cover the controller's local, synchronous behavior:
+// validation, optimistic state, and legacy-blob migration wiring. The
+// socket path below never exists, so persistence attempts queue offline.
 class PlaylistControllerTest final : public QObject {
     Q_OBJECT
 
@@ -19,6 +23,7 @@ private slots:
         QCoreApplication::setApplicationName(QStringLiteral("PlaylistController"));
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, m_settingsRoot.path());
+        m_socketPath = m_settingsRoot.path() + QStringLiteral("/missing-daemon.sock");
     }
 
     void init() {
@@ -28,9 +33,10 @@ private slots:
         QCOMPARE(settings.status(), QSettings::NoError);
     }
 
-    void defaultsAndTimingRoundTrip() {
-        PlaylistController controller;
+    void createAndEditLocalState() {
+        PlaylistController controller(m_socketPath);
         controller.create(QStringLiteral("Morning"));
+        QCOMPARE(controller.names(), QStringList{QStringLiteral("Morning")});
         QCOMPARE(controller.durationSeconds(QStringLiteral("Morning")), 300);
         QCOMPARE(controller.transition(QStringLiteral("Morning")), QStringLiteral("none"));
         QCOMPARE(controller.transitionSeconds(QStringLiteral("Morning")), 0);
@@ -38,36 +44,26 @@ private slots:
         controller.setDurationSeconds(QStringLiteral("Morning"), 900);
         controller.setTransition(QStringLiteral("Morning"), QStringLiteral("crossfade"));
         controller.setTransitionSeconds(QStringLiteral("Morning"), 4);
-        QVERIFY(controller.errorMessage().isEmpty());
+        controller.setShuffle(QStringLiteral("Morning"), true);
+        controller.setRepeat(QStringLiteral("Morning"), false);
+        controller.add(QStringLiteral("Morning"), QStringLiteral("123"));
+        controller.add(QStringLiteral("Morning"), QStringLiteral("123")); // dedup
+        QCOMPARE(controller.entries(QStringLiteral("Morning")), QStringList{QStringLiteral("123")});
+        QCOMPARE(controller.durationSeconds(QStringLiteral("Morning")), 900);
+        QCOMPARE(controller.transition(QStringLiteral("Morning")), QStringLiteral("crossfade"));
+        QCOMPARE(controller.transitionSeconds(QStringLiteral("Morning")), 4);
 
-        PlaylistController reloaded;
-        QCOMPARE(reloaded.names(), QStringList{QStringLiteral("Morning")});
-        QCOMPARE(reloaded.durationSeconds(QStringLiteral("Morning")), 900);
-        QCOMPARE(reloaded.transition(QStringLiteral("Morning")), QStringLiteral("crossfade"));
-        QCOMPARE(reloaded.transitionSeconds(QStringLiteral("Morning")), 4);
+        controller.removeEntry(QStringLiteral("Morning"), QStringLiteral("123"));
+        QVERIFY(controller.entries(QStringLiteral("Morning")).isEmpty());
     }
 
-    void migratesM5fSettingsWithSafeDefaults() {
-        const QJsonArray stored{QJsonObject{
-            {QStringLiteral("title"), QStringLiteral("Legacy")},
-            {QStringLiteral("entries"), QJsonArray{QStringLiteral("123")}},
-            {QStringLiteral("shuffle"), true},
-            {QStringLiteral("repeat"), false},
-        }};
-        QSettings settings;
-        settings.setValue(QStringLiteral("playlists/data"), QJsonDocument(stored).toJson(QJsonDocument::Compact));
-        settings.sync();
-
-        PlaylistController controller;
-        QCOMPARE(controller.names(), QStringList{QStringLiteral("Legacy")});
-        QCOMPARE(controller.durationSeconds(QStringLiteral("Legacy")), 300);
-        QCOMPARE(controller.transition(QStringLiteral("Legacy")), QStringLiteral("none"));
-        QCOMPARE(controller.transitionSeconds(QStringLiteral("Legacy")), 0);
-    }
-
-    void rejectsInvalidTimingWithoutChangingValidState() {
-        PlaylistController controller;
+    void rejectsInvalidInputWithoutChangingState() {
+        PlaylistController controller(m_socketPath);
         controller.create(QStringLiteral("Evening"));
+        controller.create(QStringLiteral("Evening"));
+        QCOMPARE(controller.names(), QStringList{QStringLiteral("Evening")});
+        QVERIFY(!controller.errorMessage().isEmpty());
+
         controller.setDurationSeconds(QStringLiteral("Evening"), 9);
         QCOMPARE(controller.durationSeconds(QStringLiteral("Evening")), 300);
         QVERIFY(!controller.errorMessage().isEmpty());
@@ -76,33 +72,34 @@ private slots:
         controller.setTransitionSeconds(QStringLiteral("Evening"), 11);
         QCOMPARE(controller.transitionSeconds(QStringLiteral("Evening")), 0);
         QVERIFY(!controller.errorMessage().isEmpty());
+
+        controller.add(QStringLiteral("Evening"), QString{});
+        QVERIFY(!controller.errorMessage().isEmpty());
     }
 
-    void malformedOrDuplicateSettingsFailClosed() {
+    void removeDropsLocalState() {
+        PlaylistController controller(m_socketPath);
+        controller.create(QStringLiteral("Morning"));
+        controller.create(QStringLiteral("Night"));
+        controller.remove(QStringLiteral("Morning"));
+        QCOMPARE(controller.names(), QStringList{QStringLiteral("Night")});
+        controller.remove(QStringLiteral("Morning"));
+        QCOMPARE(controller.names(), QStringList{QStringLiteral("Night")});
+    }
+
+    void malformedLegacyBlobIsNotReadIntoLocalState() {
         QSettings settings;
         settings.setValue(QStringLiteral("playlists/data"), QByteArrayLiteral("not-json"));
         settings.sync();
-        PlaylistController malformed;
-        QVERIFY(malformed.names().isEmpty());
-        QVERIFY(!malformed.errorMessage().isEmpty());
-
-        const QJsonArray duplicateEntries{QStringLiteral("123"), QStringLiteral("123")};
-        const QJsonArray stored{QJsonObject{
-            {QStringLiteral("title"), QStringLiteral("Broken")},
-            {QStringLiteral("entries"), duplicateEntries},
-            {QStringLiteral("duration_seconds"), 300},
-            {QStringLiteral("transition"), QStringLiteral("none")},
-            {QStringLiteral("transition_seconds"), 0},
-        }};
-        settings.setValue(QStringLiteral("playlists/data"), QJsonDocument(stored).toJson(QJsonDocument::Compact));
-        settings.sync();
-        PlaylistController duplicate;
-        QVERIFY(duplicate.names().isEmpty());
-        QVERIFY(!duplicate.errorMessage().isEmpty());
+        PlaylistController controller(m_socketPath);
+        // The legacy blob is only a migration source; nothing may appear
+        // locally without a successful daemon round trip.
+        QVERIFY(controller.names().isEmpty());
     }
 
 private:
     QTemporaryDir m_settingsRoot;
+    QString m_socketPath;
 };
 
 QTEST_GUILESS_MAIN(PlaylistControllerTest)

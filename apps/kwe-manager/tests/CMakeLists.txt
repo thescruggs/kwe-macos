@@ -19,6 +19,8 @@ qt_add_executable(kwe-playlist-controller-test
     playlistcontrollertest.cpp
     ../src/playlistcontroller.cpp
     ../src/playlistcontroller.h
+    ../src/playlistclient.cpp
+    ../src/playlistclient.h
 )
-target_link_libraries(kwe-playlist-controller-test PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(kwe-playlist-controller-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 add_test(NAME kwe-playlist-controller-test COMMAND kwe-playlist-controller-test)
