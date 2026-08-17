@@ -257,6 +257,11 @@ Plasma; disabling audio tears down capture immediately.
   battery, power, and focused-application signals.
 - M5j adds deterministic time/day policy windows, including cross-midnight
   matching and fail-closed caller-provided local clock snapshots.
+- M5k adds the daemon-owned playlist session: transactional runtime-state
+  persistence with re-anchored remaining durations, catalog- and
+  quarantine-derived unavailable sets, a fixed-cadence monotonic tick,
+  one-time manager migration, and the restart/hotplug/suspend/
+  missing-library recovery matrix.
 - Add ordered and shuffled playlists, duration, transition, history, and
   per-output/group assignment.
 - Add time/day, battery, fullscreen, session-lock, and idle policies.
@@ -266,7 +271,9 @@ Plasma; disabling audio tears down capture immediately.
 - Store desired state transactionally in SQLite WAL mode.
 
 Exit gate: daemon restart, monitor hotplug, sleep/resume, and missing removable
-Steam libraries recover without losing playlist state.
+Steam libraries recover without losing playlist state. Demonstrated as of M5k
+by `scripts/smoke-playlist-restart.sh`, which also covers quarantine skipping
+and corrupt-store containment.
 
 ### M6 — Integrated Steam Workshop
 

@@ -61,13 +61,18 @@ scripts/smoke-plasma-display.sh
 
 Playlist work through Alpha M5j provides bounded persistent membership,
 shuffle/repeat, duration and transition settings, a monotonic pause-aware
-runtime, and deterministic playback/time policy decisions. It does not yet
-assign or start wallpapers; see [Alpha M5g](docs/ALPHA_M5G.md),
-[M5h](docs/ALPHA_M5H.md), [M5i](docs/ALPHA_M5I.md), and
-[M5j](docs/ALPHA_M5J.md).
+runtime, and deterministic playback/time policy decisions. Alpha M5k moves
+playlist state into the daemon: definitions and per-playlist runtime
+snapshots survive daemon restarts, monitor hotplug, suspend/resume, and
+missing removable Steam libraries, and the manager edits them through the
+daemon after a one-time migration. It still does not assign or start
+wallpapers; see [Alpha M5g](docs/ALPHA_M5G.md),
+[M5h](docs/ALPHA_M5H.md), [M5i](docs/ALPHA_M5I.md),
+[M5j](docs/ALPHA_M5J.md), and [M5k](docs/ALPHA_M5K.md).
 
 ```sh
 ./scripts/dev-run.sh
+scripts/smoke-playlist-restart.sh
 ```
 
 See [Alpha 0.1](docs/ALPHA_0_1.md) for requirements, manual commands, known
