@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+[Desktop Entry]
+Type=Application
+Name=KDE Wallpaper Engine
+Comment=Browse and safely run Wallpaper Engine wallpapers
+Exec=kwe-manager
+Icon=preferences-desktop-wallpaper
+Categories=Qt;KDE;Settings;DesktopSettings;
+StartupNotify=true
+Terminal=false
+

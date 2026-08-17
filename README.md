@@ -1,0 +1,108 @@
+# KDE Wallpaper Engine
+
+KDE Wallpaper Engine is an experimental KDE Plasma 6 application for browsing,
+installing, configuring, and safely running wallpapers owned through Wallpaper
+Engine's Steam Workshop.
+
+The project is aimed first at Arch Linux and CachyOS on Plasma Wayland. It is
+not affiliated with Valve or Wallpaper Engine/Wallpaper Engine's publisher.
+Users must own Wallpaper Engine and obtain Workshop content through Steam; this
+project will not redistribute Wallpaper Engine assets or Workshop items.
+
+Alpha 0.1 is now runnable. It safely indexes installed Wallpaper Engine
+Workshop content and presents it in a native Kirigami gallery. It also includes
+an isolated Vulkan hardware preflight. Applying remains deliberately disabled
+until package enablement, per-output assignment, and safe-mode restoration are
+manager-controlled.
+
+Alpha M1a also includes the first safe-display harness: an external generated
+frame producer and a standalone native preview using the bounded shared-memory
+fallback. Try it without changing Plasma:
+
+```sh
+./scripts/dev-frame-demo.sh
+KWE_FRAME_FAULT=hang ./scripts/dev-frame-demo.sh
+```
+
+Alpha M1b adds daemon-owned process supervision, frame deadlines, bounded
+restart/quarantine, forced kill and reap, a persistent static fallback, and
+parent-death cleanup. Run its isolated fault matrix with:
+
+```sh
+scripts/smoke-supervisor.sh
+```
+
+Alpha M1c makes replacement transactional: a candidate cannot displace the
+active renderer until it passes a bounded canary, and the previous mapping is
+retained until display-generation acknowledgement or timeout.
+
+Alpha M1d-A adds per-renderer Linux resource ceilings, aggregate systemd
+budgets, resource-limit diagnostics, and an active-preserving memory-pressure
+recovery test. It does not install or load the Plasma bridge.
+
+Alpha M1d-B adds generation-bound normalized pointer position, nonblocking
+active-worker routing, bounded renderer acknowledgements, and passive Qt hover
+observation that accepts no mouse buttons or touch events.
+
+```sh
+scripts/smoke-input-preview.sh
+```
+
+Alpha M1e extracts the validated frame and input code into the installable
+`org.kde.kwe.display` QML module and adds the original Plasma 6
+`org.kde.kwe.wallpaper` package. The package polls and acknowledges the daemon
+through bounded IPC, preserves the last copied frame on failure, and presents
+a native text-and-icon fallback. Its smoke test stages everything in a
+temporary prefix and does not load or change the live desktop:
+
+```sh
+scripts/smoke-plasma-display.sh
+```
+
+Playlist work through Alpha M5j provides bounded persistent membership,
+shuffle/repeat, duration and transition settings, a monotonic pause-aware
+runtime, and deterministic playback/time policy decisions. It does not yet
+assign or start wallpapers; see [Alpha M5g](docs/ALPHA_M5G.md),
+[M5h](docs/ALPHA_M5H.md), [M5i](docs/ALPHA_M5I.md), and
+[M5j](docs/ALPHA_M5J.md).
+
+```sh
+./scripts/dev-run.sh
+```
+
+See [Alpha 0.1](docs/ALPHA_0_1.md) for requirements, manual commands, known
+limits, and cleanup, [Alpha M1a](docs/ALPHA_M1A.md) for the safe-display fault
+harness, [Alpha M1b](docs/ALPHA_M1B.md) for supervised recovery, and
+[Alpha M1c](docs/ALPHA_M1C.md) for transactional replacement.
+[Alpha M1d-A](docs/ALPHA_M1D.md) documents resource containment and its safe
+fault-injection procedure, and [Alpha M1d-B](docs/ALPHA_M1D_INPUT.md) documents
+the pointer-position slice. [Alpha M1e](docs/ALPHA_M1E.md) documents the
+reusable QML module, staged Plasma package, and acknowledged offscreen handoff.
+Design references:
+
+- [Project plan](docs/PROJECT_PLAN.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [User experience design](docs/UX_DESIGN.md)
+- [Wallpaper Engine feature compatibility](docs/FEATURE_COMPATIBILITY.md)
+- [Provenance policy](docs/PROVENANCE.md)
+- [AI contributor workflow](AGENTS.md)
+- [Alpha protocol](docs/PROTOCOL_V1.md)
+- [Original Vulkan renderer decision](docs/adr/0001-original-vulkan-renderer.md)
+- [Shared frame protocol](docs/FRAME_PROTOCOL_V1.md)
+- [Shared frame fallback decision](docs/adr/0002-shared-frame-fallback.md)
+- [Renderer supervisor API](docs/SUPERVISOR_API_V1.md)
+- [Normalized input protocol](docs/INPUT_PROTOCOL_V1.md)
+- [Deferred renderer optimization backlog](docs/backlog/POST_RELEASE_RENDERER_OPTIMIZATION.md)
+- [Layered resource containment decision](docs/adr/0003-renderer-resource-containment.md)
+- [Thin Plasma display bridge decision](docs/adr/0004-thin-plasma-display-bridge.md)
+
+The defining reliability rule is simple: untrusted wallpaper parsing,
+rendering, web content, audio processing, and Steam integration must never run
+inside `plasmashell`.
+
+The product standard is equally important: the application should feel like a
+first-class KDE app while making Wallpaper Engine compatibility visible and
+understandable instead of hiding unsupported behavior.
+
+This repository contains no Workshop payloads or Wallpaper Engine runtime
+assets. Users must own Wallpaper Engine and obtain content through Steam.

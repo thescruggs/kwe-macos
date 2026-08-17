@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kwe-core",
+    "crates/kwe-cli",
+    "crates/kwe-daemon",
+    "crates/kwe-frame-protocol",
+    "crates/kwe-input-protocol",
+    "crates/kwe-test-renderer",
+    "crates/kwe-vulkan",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/kde-wallpaper-engine/kde-wallpaper-engine"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0"
+ash = "0.38"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+libc = "0.2"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"

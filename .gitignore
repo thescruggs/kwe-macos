@@ -1,0 +1,8 @@
+/build/
+/target/
+/.cache/
+/catalog.json
+/graphify-out/
+*.log
+*.sock
+

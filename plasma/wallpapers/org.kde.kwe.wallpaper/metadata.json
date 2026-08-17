@@ -1,0 +1,20 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "KDE Wallpaper Engine contributors"
+            }
+        ],
+        "Category": "Appearance",
+        "Description": "Crash-contained animated wallpapers rendered outside Plasma",
+        "Icon": "preferences-desktop-wallpaper",
+        "Id": "org.kde.kwe.wallpaper",
+        "License": "Apache-2.0",
+        "Name": "KDE Wallpaper Engine",
+        "Version": "0.1.0"
+    },
+    "Keywords": "wallpaper;animated;steam;workshop;",
+    "X-KDE-ParentApp": "org.kde.plasmashell",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

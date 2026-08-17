@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=KDE Wallpaper Engine user service
+Documentation=man:kwe-daemon(1)
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kwe-daemon --state-dir=${STATE_DIRECTORY}
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=kwe
+RuntimeDirectoryMode=0700
+StateDirectory=kwe
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=1024
+LimitCORE=0
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=256M
+OOMPolicy=continue
+CPUQuota=300%
+TasksMax=64
+TimeoutStopSec=5s
+
+# Do not add PrivateDevices= or MemoryDenyWriteExecute=: Vulkan renderers need
+# DRM render nodes and graphics drivers may need executable shader mappings.
+
+[Install]
+WantedBy=default.target

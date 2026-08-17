@@ -1,0 +1,135 @@
+# Planning ledger. A non-null revision and completed license review are required
+# before code is copied or adapted from an entry.
+schema_version: 1
+entries:
+  - id: rust-ash
+    project: ash
+    url: https://crates.io/crates/ash
+    revision: 0.38.0+1.3.281
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Vulkan FFI bindings used only by the external preflight/renderer worker.
+
+  - id: rust-cli-errors
+    project: clap, anyhow, thiserror
+    url: https://crates.io/
+    revision: clap@4.6.6; anyhow@1.0.104; thiserror@2.0.20
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: CLI parsing and bounded error propagation; exact transitive set is pinned in Cargo.lock.
+
+  - id: rust-data
+    project: serde, serde_json, sha2, hex
+    url: https://crates.io/
+    revision: serde@1.0.229; serde_json@1.0.151; sha2@0.10.9; hex@0.4.3
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Protocol/metadata serialization and non-secret metadata fingerprints.
+
+  - id: rust-libc
+    project: libc
+    url: https://crates.io/crates/libc
+    revision: 0.2.189
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Linux O_NOFOLLOW/O_CLOEXEC flags, process groups, parent-death signal, bounded worker termination, and per-renderer setrlimit controls.
+
+  - id: rust-memmap2
+    project: memmap2
+    url: https://crates.io/crates/memmap2
+    revision: 0.9.11
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Safe ownership wrappers around mmap for the original fallback frame protocol.
+
+  - id: qt-kirigami
+    project: Qt 6 and KDE Kirigami
+    url: https://invent.kde.org/frameworks/kirigami
+    revision: Qt@6.11.1; Kirigami@6.28.0
+    license_observed: LGPL/GPL/commercial multi-license; LGPL-compatible dynamic use intended
+    use: dependency
+    approved_for_code_use: true
+    notes: Native manager UI, reusable QML module build/deployment, wallpaper fallback UI, and local socket clients; release packaging must retain upstream notices.
+
+  - id: kde-plasma-wallpaper-api
+    project: KDE Plasma WallpaperItem and Plasma/Wallpaper package interface
+    url: https://api.kde.org/qml-org-kde-plasma-plasmoid-wallpaperitem.html
+    revision: Plasma@6.7.4; CachyOS plasma-workspace 6.7.4 package inspected 2026-08-16
+    license_observed: GPL-2.0-or-later implementation; GFDL-1.3 documentation
+    use: idea
+    approved_for_code_use: false
+    local_files:
+      - plasma/wallpapers/org.kde.kwe.wallpaper/metadata.json
+      - plasma/wallpapers/org.kde.kwe.wallpaper/contents/ui/main.qml
+      - docs/adr/0004-thin-plasma-display-bridge.md
+    reviewer: Codex implementation; human release review pending
+    review_date: 2026-08-16
+    notes: Public package shape, import name, and WallpaperItem interface only; the package QML and C++ module are original and no KDE implementation code was copied or adapted.
+
+  - id: waywallen-display
+    project: waywallen/waywallen-display
+    url: https://github.com/waywallen/waywallen-display
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: External daemon, DMA-BUF protocol, and thin Plasma surface reference.
+
+  - id: waywallen
+    project: waywallen/waywallen
+    url: https://github.com/waywallen/waywallen
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: Manager, daemon, plugin, input, and auto-pause UX reference.
+
+  - id: jagrat7-linux-wallpaper-engine
+    project: jagrat7/linux-wallpaper-engine
+    url: https://github.com/jagrat7/linux-wallpaper-engine
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: Gallery, playlist, compatibility scanner, and Steamworks.js workflow reference.
+
+  - id: rainy-pixel-kde-plugin
+    project: RainyPixel/wallpaper-engine-kde-plugin
+    url: https://github.com/RainyPixel/wallpaper-engine-kde-plugin
+    revision: null
+    license_observed: GPL-2.0
+    use: idea
+    approved_for_code_use: false
+    notes: Plasma integration, format support, and documented crash behavior reference.
+
+  - id: open-wallpaper-engine
+    project: waywallen/open-wallpaper-engine
+    url: https://github.com/waywallen/open-wallpaper-engine
+    revision: null
+    license_observed: GPL-2.0
+    use: idea
+    approved_for_code_use: false
+    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend.
+
+  - id: almamu-linux-wallpaperengine
+    project: Almamu/linux-wallpaperengine
+    url: https://github.com/Almamu/linux-wallpaperengine
+    revision: null
+    license_observed: GPL-3.0
+    use: idea
+    approved_for_code_use: false
+    notes: Behavior, format, and compatibility concepts only; no code copied and not a runtime backend.
+
+  - id: valve-steamworks
+    project: Valve Steamworks SDK / ISteamUGC
+    url: https://partner.steamgames.com/doc/features/workshop/implementation
+    revision: null
+    license_observed: proprietary-sdk-terms
+    use: separate-process-backend
+    approved_for_code_use: false
+    notes: Optional isolated Workshop bridge after distribution review.
