@@ -1,0 +1,81 @@
+# Maintainer: KDE Wallpaper Engine developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# AUR package for KDE Wallpaper Engine.
+#
+# NOTE (pre-release): the GitHub repository below does not exist yet and the
+# pinned commit is the tip of the project's main branch. Before this package
+# can build from the AUR, the repository must be pushed to GitHub. To build
+# and test the PKGBUILD against a local checkout before that, replace the
+# source line with:
+#
+#   source=("kde-wallpaper-engine::git+file:///path/to/checkout#commit=ad3ddbf")
+#
+# and run `makepkg -f` (the commit ref must exist in that checkout).
+
+pkgname=kde-wallpaper-engine
+pkgver=0.1.0.alpha.1
+pkgrel=1
+pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon"
+arch=('x86_64')
+url="https://github.com/kde-wallpaper-engine/kde-wallpaper-engine"
+license=('Apache-2.0')
+# Package names reflect the 2026 KDE split renames: Kirigami ships as
+# `kirigami`, and Qt Quick Controls 2 is part of `qt6-declarative`.
+depends=(
+    'qt6-base'
+    'qt6-declarative'
+    'kirigami'
+    'vulkan-icd-loader'
+    'vulkan-driver'
+)
+makedepends=(
+    'rust'
+    'cmake'
+    'ninja'
+    'git'
+    'qt6-base'
+    'qt6-declarative'
+    'kirigami'
+)
+source=("kde-wallpaper-engine::git+https://github.com/kde-wallpaper-engine/kde-wallpaper-engine.git#commit=ad3ddbf")
+sha256sums=('SKIP')
+
+build() {
+    cd "${srcdir}/kde-wallpaper-engine"
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    cargo build --release --workspace
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DBUILD_TESTING=OFF
+    cmake --build build
+}
+
+check() {
+    cd "${srcdir}/kde-wallpaper-engine"
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    # kwe-vulkan exercises real Vulkan instances and is excluded so the test
+    # run also works in GPU-less build environments.
+    cargo test --release --workspace --exclude kwe-vulkan
+}
+
+package() {
+    cd "${srcdir}/kde-wallpaper-engine"
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+
+    # Rust binaries. The daemon resolves its default renderer as
+    # `kwe-test-renderer` next to its own executable, so both must land in
+    # /usr/bin. kwe-vulkan is the original ash-based renderer; kwe is the CLI.
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-daemon" "${pkgdir}/usr/bin/kwe-daemon"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-test-renderer" "${pkgdir}/usr/bin/kwe-test-renderer"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-vulkan" "${pkgdir}/usr/bin/kwe-vulkan"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe" "${pkgdir}/usr/bin/kwe"
+
+    # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and
+    # the staged org.kde.kwe.wallpaper Plasma wallpaper package.
+    DESTDIR="${pkgdir}" cmake --install build
+
+    install -Dm644 packaging/org.kde.kwe.desktop "${pkgdir}/usr/share/applications/org.kde.kwe.desktop"
+    install -Dm644 packaging/systemd/kwe-daemon.service "${pkgdir}/usr/lib/systemd/user/kwe-daemon.service"
+}

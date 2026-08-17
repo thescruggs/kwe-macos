@@ -9,6 +9,30 @@ not affiliated with Valve or Wallpaper Engine/Wallpaper Engine's publisher.
 Users must own Wallpaper Engine and obtain Workshop content through Steam; this
 project will not redistribute Wallpaper Engine assets or Workshop items.
 
+## Installing
+
+Arch Linux and CachyOS. An AUR recipe lives in `packaging/PKGBUILD`; the
+`kde-wallpaper-engine` package is installed once it is published, or built
+locally from this repository:
+
+```sh
+cd packaging
+makepkg -si
+```
+
+The package installs `kwe-daemon` (supervised renderer daemon), `kwe-manager`
+(the Kirigami app), the `kwe` CLI, the `kwe-test-renderer` and `kwe-vulkan`
+renderers, the staged `org.kde.kwe.wallpaper` Plasma wallpaper package, and a
+user systemd unit. After installing, enable the daemon user service:
+
+```sh
+systemctl --user enable --now kwe-daemon.service
+```
+
+On CachyOS the AUR helper `yay` is already in the `cachyos` repository
+(`sudo pacman -S yay`); AUR packages are then installed with `yay -S <name>`.
+There is no repository to "add" — `yay` queries the AUR API directly.
+
 Alpha 0.1 is now runnable. It safely indexes installed Wallpaper Engine
 Workshop content and presents it in a native Kirigami gallery. It also includes
 an isolated Vulkan hardware preflight. Applying remains deliberately disabled

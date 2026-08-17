@@ -5,4 +5,9 @@
 /graphify-out/
 *.log
 *.sock
+# makepkg artifacts (packaging/)
+/packaging/pkg/
+/packaging/src/
+/packaging/*.pkg.tar
+/packaging/*.pkg.tar.zst
 
