@@ -5,21 +5,24 @@
 //! but this state machine, persistence format, and implementation are original.
 
 use std::{
-    collections::BTreeMap,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
+    io::{self, Read},
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::OpenOptionsExt,
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use crate::persist::unix_nanos;
+use crate::persist::{atomic_write, ensure_private_dir};
 use anyhow::{Context, Result, anyhow, bail};
 use kwe_core::preflight_scene;
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
@@ -357,10 +360,11 @@ enum ControlCommand {
         y: f64,
         reply: mpsc::Sender<Result<WorkerStatus>>,
     },
+    QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SupervisorHandle {
     sender: SyncSender<ControlCommand>,
 }
@@ -400,6 +404,22 @@ impl SupervisorHandle {
             y,
             reply,
         })
+    }
+
+    /// Returns the wallpaper IDs with at least one quarantined failure record.
+    /// Used by the playlist session to skip quarantined content. The caller
+    /// chooses the deadline so frequent pollers can fall back to a cached
+    /// value on timeout.
+    pub fn try_quarantined_ids(&self, timeout: Duration) -> Result<BTreeSet<String>> {
+        let (sender, receiver) = mpsc::channel();
+        match self.sender.try_send(ControlCommand::QuarantinedIds(sender)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => bail!("supervisor command queue is full"),
+            Err(TrySendError::Disconnected(_)) => bail!("supervisor is unavailable"),
+        }
+        receiver
+            .recv_timeout(timeout)
+            .map_err(|_| anyhow!("supervisor command timed out"))
     }
 
     fn request(
@@ -551,6 +571,16 @@ impl SupervisorRuntime {
                 }) => {
                     let result = self.forward_pointer_input(generation, phase, x, y);
                     let _ = reply.send(result);
+                }
+                Ok(ControlCommand::QuarantinedIds(reply)) => {
+                    let ids = self
+                        .persisted
+                        .records
+                        .values()
+                        .filter(|record| record.quarantined)
+                        .map(|record| record.wallpaper_id.clone())
+                        .collect();
+                    let _ = reply.send(ids);
                 }
                 Ok(ControlCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.stop_all(false);
@@ -1452,47 +1482,6 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn ensure_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("private path must be a real directory: {}", path.display());
-    }
-    // SAFETY: geteuid has no preconditions.
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "private path is not owned by the current user: {}",
-            path.display()
-        );
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let parent = path.parent().context("atomic-write path has no parent")?;
-    ensure_private_dir(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        std::process::id(),
-        unix_nanos()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&temporary)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
 fn encode_ppm(snapshot: &FrameSnapshot) -> Result<Vec<u8>> {
     let expected = snapshot.spec.pixel_bytes();
     if snapshot.pixels.len() != expected {
@@ -1535,13 +1524,6 @@ fn unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ pub enum PlaylistTransition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Playlist {
     pub id: String,
     pub title: String,
@@ -296,6 +297,15 @@ mod tests {
         assert_eq!(playlist.transition, PlaylistTransition::None);
         assert_eq!(playlist.transition_seconds, 0);
         playlist.validate().unwrap();
+    }
+
+    #[test]
+    fn playlist_data_rejects_unknown_fields() {
+        // A typo'd field must not silently disappear.
+        let result: Result<Playlist, _> = serde_json::from_str(
+            r#"{"id":"main","title":"Main","entries":[],"shuffle":false,"repeat":true,"entrirs":["one"]}"#,
+        );
+        assert!(result.is_err());
     }
 
     #[test]

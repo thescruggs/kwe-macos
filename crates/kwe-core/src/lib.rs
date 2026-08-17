@@ -24,7 +24,7 @@ pub use mpris::{MprisStatus, probe_mpris};
 pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
-pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime};
+pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};
 pub use policy::{
     PlaybackAction, PlaybackPolicy, PolicyDecision, PolicyRule, PolicySnapshot, PolicyTrigger,
 };

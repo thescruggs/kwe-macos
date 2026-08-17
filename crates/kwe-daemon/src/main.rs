@@ -2,9 +2,12 @@
 //! Small Alpha control service. The newline-delimited protocol is deliberately
 //! bounded and versioned so the UI never parses Workshop content itself.
 
+mod persist;
+mod playlist_session;
 mod supervisor;
 
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::fs::{FileTypeExt, PermissionsExt},
@@ -16,8 +19,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use kwe_core::{Catalog, ScanLimits, default_steam_roots, scan_installed};
+use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
 use kwe_input_protocol::PointerPhase;
+use playlist_session::{
+    ImportPlaylist, PlaylistSessionConfig, PlaylistSessionHandle, PlaylistSessionService,
+    SessionError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supervisor::{
@@ -27,6 +34,9 @@ use supervisor::{
 
 const API_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// `playlist.import` carries a whole legacy playlist blob (up to 4 MiB, the
+/// manager's historical store bound) and is capped separately.
+const MAX_IMPORT_REQUEST_BYTES: usize = 4 * 1024 * 1024 + 1024;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Crash-contained KDE Wallpaper Engine user service")]
@@ -77,6 +87,9 @@ struct Arguments {
     /// Enable synthetic hang/corruption/exit requests for development tests.
     #[arg(long)]
     allow_test_faults: bool,
+    /// Playlist session tick interval.
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(50..=5000))]
+    playlist_tick_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +141,7 @@ fn main() -> Result<()> {
         Some(path) => path,
         None => default_state_dir()?,
     };
+    let playlist_state_dir = state_dir.clone();
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_path,
         runtime_dir: renderer_runtime_dir,
@@ -149,6 +163,13 @@ fn main() -> Result<()> {
     })?;
     let supervisor = supervisor_service.handle();
     let catalog = Arc::new(RwLock::new(scan_installed(&roots, &ScanLimits::default())));
+    let playlist_service = PlaylistSessionService::start(PlaylistSessionConfig {
+        state_dir: playlist_state_dir,
+        tick_ms: arguments.playlist_tick_ms,
+        supervisor: Some(supervisor.clone()),
+        valid_ids: compute_valid_ids(&catalog),
+    });
+    let playlist = playlist_service.handle();
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -172,6 +193,7 @@ fn main() -> Result<()> {
                     &catalog,
                     &roots,
                     &supervisor,
+                    &playlist,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -193,21 +215,26 @@ fn handle_client(
     catalog: &Arc<RwLock<Catalog>>,
     roots: &[PathBuf],
     supervisor: &SupervisorHandle,
+    playlist: &PlaylistSessionHandle,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
-    let mut reader = BufReader::new(cloned).take((MAX_REQUEST_BYTES + 1) as u64);
+    let mut reader = BufReader::new(cloned).take((MAX_IMPORT_REQUEST_BYTES + 1) as u64);
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line)?;
-    if line.len() > MAX_REQUEST_BYTES {
-        bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+    if line.len() > MAX_IMPORT_REQUEST_BYTES {
+        bail!("request exceeded {MAX_IMPORT_REQUEST_BYTES} bytes");
     }
     let request: Request = serde_json::from_slice(&line).context("invalid request JSON")?;
+    if line.len() > MAX_REQUEST_BYTES && request.method != "playlist.import" {
+        bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+    }
     let (ok, result) = process_request(
         &request,
         catalog,
         roots,
         Some(supervisor),
+        Some(playlist),
         allow_test_faults,
     )?;
     let response = Response {
@@ -227,6 +254,7 @@ fn process_request(
     catalog: &Arc<RwLock<Catalog>>,
     roots: &[PathBuf],
     supervisor: Option<&SupervisorHandle>,
+    playlist: Option<&PlaylistSessionHandle>,
     allow_test_faults: bool,
 ) -> Result<(bool, Value)> {
     let result = if request.version != API_VERSION {
@@ -253,7 +281,66 @@ fn process_request(
                 *catalog
                     .write()
                     .map_err(|_| anyhow!("catalog lock poisoned"))? = updated;
+                if let Some(playlist) = playlist
+                    && !playlist.update_availability(compute_valid_ids(catalog))
+                {
+                    eprintln!("event=playlist.availability_dropped detail=command queue full");
+                }
                 json!({"catalog_items": count})
+            }
+            "playlist.list" => playlist_call(playlist, |handle| {
+                handle
+                    .list()
+                    .map(|playlists| json!({"playlists": playlists}))
+            }),
+            "playlist.put" => {
+                match serde_json::from_value::<PlaylistPutParams>(request.params.clone()) {
+                    Ok(params) => playlist_call(playlist, |handle| handle.put(params.playlist)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "playlist.remove" => {
+                match serde_json::from_value::<PlaylistRemoveParams>(request.params.clone()) {
+                    Ok(params) => playlist_call(playlist, |handle| handle.remove(params.id)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "playlist.activate" => {
+                match serde_json::from_value::<PlaylistActivateParams>(request.params.clone()) {
+                    Ok(params) => playlist_call(playlist, |handle| handle.activate(params.id)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "playlist.status" => playlist_call(playlist, |handle| handle.status()),
+            "playlist.import" => {
+                match serde_json::from_value::<PlaylistImportParams>(request.params.clone()) {
+                    Ok(params) => playlist_call(playlist, |handle| handle.import(params.playlists)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "playlist.debug-clock-skip" => {
+                if !allow_test_faults {
+                    json!({"error": "test_faults_disabled"})
+                } else {
+                    match serde_json::from_value::<PlaylistDebugClockSkipParams>(
+                        request.params.clone(),
+                    ) {
+                        Ok(params) => {
+                            playlist_call(playlist, |handle| handle.debug_clock_skip(params.ms))
+                        }
+                        Err(error) => {
+                            json!({"error": "invalid_params", "detail": error.to_string()})
+                        }
+                    }
+                }
             }
             "renderer.status" => supervisor_call(supervisor, |handle| handle.status()),
             "renderer.stop" => supervisor_call(supervisor, |handle| handle.stop()),
@@ -343,6 +430,36 @@ struct RendererInputParams {
     y: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistPutParams {
+    playlist: kwe_core::Playlist,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistRemoveParams {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistActivateParams {
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistImportParams {
+    playlists: Vec<ImportPlaylist>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaylistDebugClockSkipParams {
+    ms: u64,
+}
+
 impl TryFrom<RendererStartParams> for StartSpec {
     type Error = anyhow::Error;
 
@@ -389,6 +506,53 @@ fn supervisor_call(
         ),
         Err(error) => json!({"error": "supervisor_failed", "detail": error.to_string()}),
     }
+}
+
+fn playlist_call<T: Serialize>(
+    playlist: Option<&PlaylistSessionHandle>,
+    call: impl FnOnce(&PlaylistSessionHandle) -> Result<T, SessionError>,
+) -> Value {
+    let Some(playlist) = playlist else {
+        return json!({"error": "playlist_unavailable"});
+    };
+    match call(playlist) {
+        Ok(value) => serde_json::to_value(value).unwrap_or_else(
+            |error| json!({"error": "serialization_failed", "detail": error.to_string()}),
+        ),
+        Err(error) => {
+            let name = match &error {
+                SessionError::NotFound(_) => "playlist_not_found",
+                SessionError::ImportBlocked => "playlist_import_blocked",
+                SessionError::StoreUnavailable(_) => "playlist_store_unavailable",
+                SessionError::Invalid(_) => "invalid_playlist",
+                SessionError::Busy(_) => "playlist_busy",
+            };
+            json!({"error": name, "detail": error.to_string()})
+        }
+    }
+}
+
+/// Installed, playable workshop ids: local or subscribed-and-present content
+/// with valid project metadata. Everything else (absent, subscribed_missing,
+/// downloading, invalid) is treated as unavailable by the playlist session.
+fn compute_valid_ids(catalog: &Arc<RwLock<Catalog>>) -> Arc<BTreeSet<String>> {
+    let Ok(guard) = catalog.read() else {
+        eprintln!("event=playlist.availability_error detail=catalog lock poisoned");
+        return Arc::new(BTreeSet::new());
+    };
+    Arc::new(
+        guard
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.workshop_state.as_str(),
+                    "local" | "subscribed_installed"
+                ) && item.kind != ProjectKind::Invalid
+            })
+            .map(|item| item.workshop_id.clone())
+            .collect(),
+    )
 }
 
 const fn default_width() -> u32 {
@@ -439,12 +603,33 @@ fn validate_socket_parent(socket: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn empty_catalog() -> Arc<RwLock<Catalog>> {
+        Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())))
+    }
+
+    fn session_service() -> PlaylistSessionService {
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-daemon-api-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        PlaylistSessionService::start(PlaylistSessionConfig {
+            state_dir: dir,
+            tick_ms: 50,
+            supervisor: None,
+            valid_ids: Arc::new(BTreeSet::new()),
+        })
+    }
+
     #[test]
     fn health_round_trip_preserves_request_id() {
-        let catalog = Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())));
+        let catalog = empty_catalog();
         let request: Request =
             serde_json::from_str(r#"{"version":1,"id":"test-7","method":"health"}"#).unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, false).unwrap();
+        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
         assert_eq!(request.id, "test-7");
         assert!(ok);
         assert_eq!(result["status"], "ready");
@@ -452,23 +637,155 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_protocol_version() {
-        let catalog = Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())));
+        let catalog = empty_catalog();
         let request: Request =
             serde_json::from_str(r#"{"version":99,"id":1,"method":"health"}"#).unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, false).unwrap();
+        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "unsupported_api_version");
     }
 
     #[test]
     fn rejects_test_faults_unless_explicitly_enabled() {
-        let catalog = Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())));
+        let catalog = empty_catalog();
         let request: Request = serde_json::from_str(
             r#"{"version":1,"id":3,"method":"renderer.start","params":{"wallpaper_id":"synthetic","content_hash":"abc","test_fault":{"kind":"hang","after":2}}}"#,
         )
         .unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, false).unwrap();
+        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "test_faults_disabled");
+    }
+
+    fn process(
+        request_json: &str,
+        catalog: &Arc<RwLock<Catalog>>,
+        playlist: Option<&PlaylistSessionHandle>,
+    ) -> (bool, Value) {
+        let request: Request = serde_json::from_str(request_json).unwrap();
+        process_request(&request, catalog, &[], None, playlist, true).unwrap()
+    }
+
+    const DAILY_JSON: &str = r#"{"id":"daily","title":"Daily","entries":[],"shuffle":false,"repeat":true,"duration_seconds":300,"transition":"none","transition_seconds":0}"#;
+
+    #[test]
+    fn playlist_put_list_and_status_round_trip() {
+        let catalog = empty_catalog();
+        let service = session_service();
+        let handle = service.handle();
+        let (ok, result) = process(
+            &format!(
+                r#"{{"version":1,"method":"playlist.put","params":{{"playlist":{DAILY_JSON}}}}}"#
+            ),
+            &catalog,
+            Some(&handle),
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["id"], "daily");
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.list"}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(ok);
+        assert_eq!(result["playlists"].as_array().unwrap().len(), 1);
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.status"}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(ok);
+        assert_eq!(result["definitions"]["count"], 1);
+        assert_eq!(result["definitions"]["store_health"], "ok");
+        assert!(!result["active"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn playlist_put_rejects_unknown_params_and_invalid_playlists() {
+        let catalog = empty_catalog();
+        let service = session_service();
+        let handle = service.handle();
+        // Unknown params field.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.put","params":{"playlist":{"id":"x","title":"X","entries":[]},"bogus":1}}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Unknown playlist field (deny_unknown_fields on Playlist).
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.put","params":{"playlist":{"id":"x","title":"X","entries":[],"shuffle":false,"repeat":true,"duration_seconds":300,"transition":"none","transition_seconds":0,"entrirs":[]}}}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Semantically invalid timing.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.put","params":{"playlist":{"id":"x","title":"X","entries":[],"shuffle":false,"repeat":true,"duration_seconds":5,"transition":"none","transition_seconds":0}}}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_playlist");
+    }
+
+    #[test]
+    fn playlist_activate_rejects_unknown_playlist() {
+        let catalog = empty_catalog();
+        let service = session_service();
+        let handle = service.handle();
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.activate","params":{"id":"nope"}}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "playlist_not_found");
+    }
+
+    #[test]
+    fn playlist_import_blocked_when_store_non_empty() {
+        let catalog = empty_catalog();
+        let service = session_service();
+        let handle = service.handle();
+        process(
+            &format!(
+                r#"{{"version":1,"method":"playlist.put","params":{{"playlist":{DAILY_JSON}}}}}"#
+            ),
+            &catalog,
+            Some(&handle),
+        );
+        let (ok, result) = process(
+            r#"{"version":1,"method":"playlist.import","params":{"playlists":[{"title":"Legacy","entries":[]}]}}"#,
+            &catalog,
+            Some(&handle),
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "playlist_import_blocked");
+    }
+
+    #[test]
+    fn playlist_debug_clock_skip_rejected_without_test_faults() {
+        let catalog = empty_catalog();
+        let service = session_service();
+        let handle = service.handle();
+        let request: Request = serde_json::from_str(
+            r#"{"version":1,"method":"playlist.debug-clock-skip","params":{"ms":1000}}"#,
+        )
+        .unwrap();
+        let (ok, result) =
+            process_request(&request, &catalog, &[], None, Some(&handle), false).unwrap();
+        assert!(!ok);
+        assert_eq!(result["error"], "test_faults_disabled");
+    }
+
+    #[test]
+    fn playlist_methods_fail_closed_without_session() {
+        let catalog = empty_catalog();
+        let (ok, result) = process(r#"{"version":1,"method":"playlist.list"}"#, &catalog, None);
+        assert!(!ok);
+        assert_eq!(result["error"], "playlist_unavailable");
     }
 }
