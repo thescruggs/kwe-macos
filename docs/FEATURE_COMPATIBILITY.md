@@ -36,10 +36,10 @@ performance policies:
 | `content.scene3d` | 3D models, cameras, lights, shaders | P1, backend-dependent | Report model/effect/shader support individually. |
 | `content.web` | HTML/JS/WebGL wallpapers | P1 | Sandboxed external browser process; permissions are explicit. |
 | `content.application` | Downloaded executable wallpapers | Unsupported | Never execute arbitrary Workshop programs as wallpapers. |
-| `workshop.browse` | Search/filter Workshop | P0 | Integrated paginated browser with Steam-client fallback. |
-| `workshop.subscribe` | Subscribe/unsubscribe/install/update | P0 | Optional Steam bridge plus local VDF status monitoring. |
+| `workshop.browse` | Search/filter Workshop | P0 | `partial` (M6a): a Workshop destination lists subscribed items (installed/downloading/awaiting download) with the same card/detail model as Installed; remote paginated browsing remains SDK work. Steam-client fallback per M1g. |
+| `workshop.subscribe` | Subscribe/unsubscribe/install/update | P0 | `partial` (M1h/M6a): local VDF subscription-state monitoring with honest Steam-managed subscription actions; the optional Steam bridge remains a separate dependency decision. |
 | `library.local` | Local projects/files | P0 | Add without copying where safe; track missing/removable paths. |
-| `library.metadata` | Title, author, tags, preview, rating/favorites | P1 | Cache metadata offline and retain Steam canonical links. |
+| `library.metadata` | Title, author, tags, preview, rating/favorites | P1 | `partial` (M6a): bounded offline metadata cache (daemon `workshop-metadata-v1.json`) keeps title/kind/tags across unmounts and restarts; Steam canonical links via the open-in-Steam affordance; author/rating fields remain SDK work. |
 
 ## Wallpaper customization
 

@@ -20,6 +20,11 @@ cd packaging
 makepkg -si
 ```
 
+When run inside this repository the PKGBUILD sources from the local git
+checkout (its committed state — commit first if you have uncommitted changes),
+so no GitHub access or credentials are needed. Only outside the checkout (AUR
+builders) does it fetch the published GitHub repository.
+
 The package installs `kwe-daemon` (supervised renderer daemon), `kwe-manager`
 (the Kirigami app), the `kwe` CLI, the `kwe-test-renderer` and `kwe-vulkan`
 renderers, the staged `org.kde.kwe.wallpaper` Plasma wallpaper package, and a
@@ -94,9 +99,17 @@ wallpapers; see [Alpha M5g](docs/ALPHA_M5G.md),
 [M5h](docs/ALPHA_M5H.md), [M5i](docs/ALPHA_M5I.md),
 [M5j](docs/ALPHA_M5J.md), and [M5k](docs/ALPHA_M5K.md).
 
+Alpha M6a adds the Steam-SDK-free Workshop half: a Workshop destination in
+the manager sharing the Installed card and details components (subscribed
+items only, with download states and an Installed badge), and a bounded
+daemon-side offline metadata cache so subscriptions keep their titles,
+tags, and kind when Steam libraries are unmounted or the daemon restarts.
+Subscription management stays in Steam; see [Alpha M6a](docs/ALPHA_M6A.md).
+
 ```sh
 ./scripts/dev-run.sh
 scripts/smoke-playlist-restart.sh
+scripts/smoke-workshop-cache.sh
 ```
 
 See [Alpha 0.1](docs/ALPHA_0_1.md) for requirements, manual commands, known

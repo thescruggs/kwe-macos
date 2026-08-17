@@ -277,6 +277,13 @@ and corrupt-store containment.
 
 ### M6 — Integrated Steam Workshop
 
+- M6a adds the SDK-free Workshop visibility half: a Workshop destination in
+  the manager sharing the Installed card/detail components, a subscribed-only
+  filter with an Installed badge, and a bounded daemon-side offline metadata
+  cache (`workshop-metadata-v1.json`) that fills placeholder
+  `subscribed_missing` entries and restores vanished subscriptions with a
+  `workshop.offline_metadata` diagnostic; entries absent from every scan for
+  30 days age out.
 - M1g now ships the reliable fallback that opens an item in the Steam client and
   watches Steam's local Workshop manifests for progress.
 - M1h now joins those manifest states with the defensive local project scan,
