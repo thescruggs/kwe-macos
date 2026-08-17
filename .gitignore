@@ -8,6 +8,7 @@
 # makepkg artifacts (packaging/)
 /packaging/pkg/
 /packaging/src/
+/packaging/kde-wallpaper-engine/
 /packaging/*.pkg.tar
 /packaging/*.pkg.tar.zst
 

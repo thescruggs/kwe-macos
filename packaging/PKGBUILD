@@ -3,15 +3,29 @@
 #
 # AUR package for KDE Wallpaper Engine.
 #
-# NOTE (pre-release): the GitHub repository below does not exist yet and the
-# pinned commit is the tip of the project's main branch. Before this package
-# can build from the AUR, the repository must be pushed to GitHub. To build
-# and test the PKGBUILD against a local checkout before that, replace the
-# source line with:
+# Source selection: when this PKGBUILD is built from inside the project
+# checkout (packaging/ lives in the repository root), the source is the local
+# git repository at its current committed HEAD, so `makepkg -si` needs no
+# network access and never prompts for credentials. Anywhere else (AUR
+# builders, CI) the published GitHub repository is used instead.
 #
-#   source=("kde-wallpaper-engine::git+file:///path/to/checkout#commit=ad3ddbf")
-#
-# and run `makepkg -f` (the commit ref must exist in that checkout).
+# Notes:
+#  - Uncommitted changes in the checkout are not part of the package (a git
+#    clone only sees committed state). Commit first if you want them included.
+#  - The GitHub repository does not exist yet: push it before relying on the
+#    AUR path, and keep the pinned commit below in sync with what is pushed.
+#  - To force the GitHub source while building inside the checkout (for
+#    example, to regenerate .SRCINFO for AUR submission):
+#        KWE_FORCE_AUR_SOURCE=1 makepkg --printsrcinfo
+#  - namcap may note the file:// branch; it is intentional for local builds.
+
+if [[ -z "${KWE_FORCE_AUR_SOURCE:-}" && -f "../Cargo.toml" ]]; then
+    _source="git+file://$(cd .. && pwd -P)#commit=$(git -C .. rev-parse --short HEAD)"
+else
+    _source="git+https://github.com/kde-wallpaper-engine/kde-wallpaper-engine.git#commit=4477783"
+fi
+source=("kde-wallpaper-engine::${_source}")
+sha256sums=('SKIP')
 
 pkgname=kde-wallpaper-engine
 pkgver=0.1.0.alpha.1
@@ -38,8 +52,6 @@ makedepends=(
     'qt6-declarative'
     'kirigami'
 )
-source=("kde-wallpaper-engine::git+https://github.com/kde-wallpaper-engine/kde-wallpaper-engine.git#commit=ad3ddbf")
-sha256sums=('SKIP')
 
 build() {
     cd "${srcdir}/kde-wallpaper-engine"
