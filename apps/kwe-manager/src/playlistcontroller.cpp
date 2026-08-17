@@ -28,30 +28,35 @@ bool isTransition(const QString &value) {
 PlaylistController::PlaylistController(QString socketPath, QObject *parent)
     : QObject(parent), m_client(std::move(socketPath)) {
     connect(&m_client, &PlaylistClient::playlistsReceived, this, &PlaylistController::onPlaylistsReceived);
-    connect(&m_client, &PlaylistClient::importFinished, this, [this](bool ok, int, const QString &error) {
-        if (ok) {
-            QSettings settings;
-            settings.setValue(MigrationFlag, true);
-            settings.sync();
-        } else if (error.contains(QStringLiteral("playlist_import_blocked"))) {
-            // The daemon store filled up concurrently; the list refresh
-            // below is authoritative and nothing is lost.
-            QSettings settings;
-            settings.setValue(MigrationFlag, true);
-            settings.sync();
-        } else {
-            m_error = error;
-            emit changed();
-            return;
-        }
-        refresh();
-    });
+    connect(&m_client, &PlaylistClient::importFinished, this,
+            [this](bool ok, int, int rejected, const QString &error) {
+                if (ok) {
+                    QSettings settings;
+                    settings.setValue(MigrationFlag, true);
+                    settings.sync();
+                    if (rejected > 0)
+                        m_error = tr("%1 stored playlist(s) could not be migrated and remain in the settings backup.").arg(rejected);
+                } else if (error.contains(QStringLiteral("playlist_import_blocked"))) {
+                    // The daemon store filled up concurrently; the list
+                    // refresh below is authoritative and nothing is lost.
+                    QSettings settings;
+                    settings.setValue(MigrationFlag, true);
+                    settings.sync();
+                } else {
+                    m_error = error;
+                    emit changed();
+                    return;
+                }
+                refresh();
+            });
     connect(&m_client, &PlaylistClient::putFinished, this, [this](bool ok, const QString &error) {
         --m_pendingEdits;
         if (ok)
             m_error.clear();
         else
             m_error = error;
+        if (m_pendingEdits == 0)
+            refresh(); // re-sync after the queue drained
         emit changed();
     });
     connect(&m_client, &PlaylistClient::removeFinished, this, [this](bool ok, const QString &error) {
@@ -60,11 +65,15 @@ PlaylistController::PlaylistController(QString socketPath, QObject *parent)
             m_error.clear();
         else
             m_error = error;
+        if (m_pendingEdits == 0)
+            refresh(); // re-sync after the queue drained
         emit changed();
     });
     connect(&m_client, &PlaylistClient::stateChanged, this, [this] {
-        if (m_client.state() == PlaylistClient::Error && m_pendingEdits > 0)
-            m_error = tr("The wallpaper service is not running; playlist changes will be saved when it returns.");
+        if (m_client.state() == PlaylistClient::Error)
+            m_error = m_pendingEdits > 0
+                ? tr("The wallpaper service is not running; playlist changes will be saved when it returns.")
+                : m_client.errorMessage();
         else if (m_client.state() == PlaylistClient::Ready && m_pendingEdits == 0)
             m_error.clear();
         emit changed();
@@ -140,6 +149,10 @@ void PlaylistController::onPlaylistsReceived(const QJsonArray &playlists) {
         settings.setValue(MigrationFlag, true);
         settings.sync();
     }
+    // A stale list response must not wipe optimistic edits that are queued
+    // behind it; the drain-triggered refresh applies the authoritative list.
+    if (m_pendingEdits > 0)
+        return;
     applyList(playlists);
 }
 
@@ -193,12 +206,16 @@ void PlaylistController::applyList(const QJsonArray &playlists) {
     m_durationSeconds = allDurations;
     m_transition = allTransitions;
     m_transitionSeconds = allTransitionSeconds;
+    m_loaded = true;
     if (hadInvalid)
         m_error = tr("Some playlists could not be shown because they are invalid.");
     emit changed();
 }
 
 QJsonObject PlaylistController::playlistObject(const QString &name) const {
+    // m_names and m_ids move in lockstep (applyList, create, remove); a
+    // missing id would mean a bookkeeping bug, not a legitimate fallback.
+    Q_ASSERT(m_ids.contains(name));
     QJsonArray entries;
     for (const auto &entry : m_entries.value(name))
         entries.push_back(entry);
@@ -215,6 +232,14 @@ QJsonObject PlaylistController::playlistObject(const QString &name) const {
 }
 
 void PlaylistController::create(const QString &name) {
+    if (!m_loaded) {
+        // Until the first list round trip the daemon store may already
+        // contain playlists this controller has not seen; a blind upsert
+        // could overwrite them.
+        m_error = tr("Playlists are still loading; try again in a moment.");
+        emit changed();
+        return;
+    }
     const auto clean = name.trimmed().left(MaxNameLength);
     if (clean.isEmpty() || m_names.contains(clean)) {
         m_error = tr("Playlist name is empty or already exists.");

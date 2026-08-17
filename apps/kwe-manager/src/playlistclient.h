@@ -35,7 +35,7 @@ signals:
     void stateChanged();
     void errorMessageChanged();
     void playlistsReceived(const QJsonArray &playlists);
-    void importFinished(bool ok, int imported, const QString &error);
+    void importFinished(bool ok, int imported, int rejected, const QString &error);
     void putFinished(bool ok, const QString &error);
     void removeFinished(bool ok, const QString &error);
 

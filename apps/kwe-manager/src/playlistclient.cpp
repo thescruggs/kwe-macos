@@ -21,6 +21,10 @@ PlaylistClient::PlaylistClient(QString socketPath, QObject *parent)
     });
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, [this] {
+        // Never clobber an in-flight operation: its own failure path
+        // re-arms this timer.
+        if (m_state == Loading)
+            return;
         if (!m_queue.isEmpty())
             begin(m_queue.takeFirst());
     });
@@ -41,7 +45,8 @@ void PlaylistClient::importLegacy(const QJsonArray &playlists) {
         QStringLiteral("playlist.import"),
         QJsonObject{{QStringLiteral("playlists"), playlists}},
         [this](bool ok, const QJsonObject &result, const QString &error) {
-            emit importFinished(ok, ok ? result.value(QStringLiteral("imported")).toInt() : 0, error);
+            emit importFinished(ok, ok ? result.value(QStringLiteral("imported")).toInt() : 0,
+                                ok ? result.value(QStringLiteral("rejected")).toInt() : 0, error);
         }});
 }
 

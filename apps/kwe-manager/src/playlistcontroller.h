@@ -56,4 +56,5 @@ private:
     QHash<QString, int> m_transitionSeconds;
     QString m_error;
     int m_pendingEdits = 0;
+    bool m_loaded = false;
 };

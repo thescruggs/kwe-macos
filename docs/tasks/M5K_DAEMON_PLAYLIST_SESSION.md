@@ -40,7 +40,9 @@ Out of scope:
   policy adapter;
 - live Plasma modification;
 - a SIGTERM handler for final-state capture (last transition is persisted
-  before SIGTERM, so at most one in-flight decision is re-derived).
+  before SIGTERM, so at most one in-flight decision is re-derived; a waiting
+  snapshot is refreshed at most every 30 s, so a hard crash can restore a
+  remaining time stale by up to that interval by design).
 
 ## Files and modules
 

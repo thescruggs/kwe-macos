@@ -9,12 +9,12 @@ mod supervisor;
 use std::{
     collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufReader, Read, Write},
     os::unix::fs::{FileTypeExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -220,10 +220,37 @@ fn handle_client(
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
     let mut reader = BufReader::new(cloned).take((MAX_IMPORT_REQUEST_BYTES + 1) as u64);
+    // One request per connection, but the per-read 5s timeout alone lets a
+    // trickling peer hold the single-threaded accept loop open indefinitely.
+    // Enforce an overall deadline for collecting the request line.
+    let request_deadline = Instant::now() + Duration::from_secs(10);
     let mut line = Vec::new();
-    reader.read_until(b'\n', &mut line)?;
-    if line.len() > MAX_IMPORT_REQUEST_BYTES {
-        bail!("request exceeded {MAX_IMPORT_REQUEST_BYTES} bytes");
+    loop {
+        if line.contains(&b'\n') {
+            break;
+        }
+        if Instant::now() >= request_deadline {
+            bail!("request deadline exceeded");
+        }
+        let mut chunk = [0u8; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                line.extend_from_slice(&chunk[..count]);
+                if line.len() > MAX_IMPORT_REQUEST_BYTES {
+                    bail!("request exceeded {MAX_IMPORT_REQUEST_BYTES} bytes");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !line.contains(&b'\n') {
+        bail!("request ended without a newline");
     }
     let request: Request = serde_json::from_slice(&line).context("invalid request JSON")?;
     if line.len() > MAX_REQUEST_BYTES && request.method != "playlist.import" {
@@ -303,7 +330,11 @@ fn process_request(
             }
             "playlist.remove" => {
                 match serde_json::from_value::<PlaylistRemoveParams>(request.params.clone()) {
-                    Ok(params) => playlist_call(playlist, |handle| handle.remove(params.id)),
+                    Ok(params) => playlist_call(playlist, |handle| {
+                        handle
+                            .remove(params.id)
+                            .map(|removed| json!({"removed": removed}))
+                    }),
                     Err(error) => {
                         json!({"error": "invalid_params", "detail": error.to_string()})
                     }

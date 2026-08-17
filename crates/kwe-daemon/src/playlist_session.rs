@@ -172,7 +172,8 @@ enum SessionCommand {
     Availability {
         valid_ids: Arc<BTreeSet<String>>,
     },
-    Shutdown,
+    /// Persists final state and acknowledges so a caller can bound its join.
+    Shutdown(mpsc::Sender<()>),
 }
 
 #[derive(Clone)]
@@ -483,8 +484,12 @@ impl SessionRuntime {
     }
 
     fn run(mut self, receiver: Receiver<SessionCommand>) {
+        // Tick on a fixed cadence even while commands stream in: a bare
+        // recv_timeout would let continuous polling starve the tick.
+        let mut last_tick = Instant::now();
         loop {
-            match receiver.recv_timeout(self.tick_duration) {
+            let wait = self.tick_duration.saturating_sub(last_tick.elapsed());
+            match receiver.recv_timeout(wait) {
                 Ok(SessionCommand::List(reply)) => {
                     let _ = reply.send(self.store_list());
                 }
@@ -509,7 +514,7 @@ impl SessionRuntime {
                 Ok(SessionCommand::Availability { valid_ids }) => {
                     self.valid_ids = valid_ids;
                 }
-                Ok(SessionCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Ok(SessionCommand::Shutdown(ack)) => {
                     // Capture the final position before the daemon exits.
                     if let Some(active) = self.active.clone() {
                         let now_ms = self.now_ms();
@@ -527,9 +532,14 @@ impl SessionRuntime {
                         }
                     }
                     self.persist_state();
+                    let _ = ack.send(());
                     return;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => self.tick_session(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.tick_session();
+                    last_tick = Instant::now();
+                }
             }
         }
     }
@@ -656,15 +666,25 @@ impl SessionRuntime {
         let mut rejected = 0;
         let mut used_ids: BTreeSet<String> = BTreeSet::new();
         for entry in legacy {
-            let base: String = entry.title.trim().chars().take(128).collect();
+            // 124 chars leaves room for a "-NNN" collision suffix within the
+            // 128-byte playlist id bound.
+            let base: String = entry.title.trim().chars().take(124).collect();
             let mut id = base.clone();
             let mut suffix = 2;
             while id.is_empty() || used_ids.contains(&id) {
-                id = format!("{base}-{suffix}");
-                suffix += 1;
                 if suffix > 256 {
+                    eprintln!(
+                        "event=playlist.import_rejected detail=identity collision limit reached"
+                    );
+                    rejected += 1;
+                    id.clear();
                     break;
                 }
+                id = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            if id.is_empty() {
+                continue;
             }
             match entry.into_playlist(id.clone()) {
                 Ok(playlist) => {
@@ -758,11 +778,28 @@ fn decision_signature(decision: &PlaylistDecision) -> (u8, String, usize) {
 fn load_runtime_state(
     path: &std::path::Path,
 ) -> (Option<String>, BTreeMap<String, PlaylistRuntimeSnapshot>) {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    // Bound the read before allocating: a huge accidental file must not
+    // balloon the daemon at startup.
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return (None, BTreeMap::new());
         }
+        Err(error) => {
+            eprintln!("event=playlist.state_read_error detail={error}");
+            return (None, BTreeMap::new());
+        }
+    };
+    if metadata.len() > MAX_RUNTIME_STATE_BYTES {
+        eprintln!(
+            "event=playlist.state_invalid detail=runtime state exceeds {} bytes",
+            MAX_RUNTIME_STATE_BYTES
+        );
+        quarantine_invalid_state(path);
+        return (None, BTreeMap::new());
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("event=playlist.state_read_error detail={error}");
             quarantine_invalid_state(path);
@@ -853,9 +890,20 @@ impl PlaylistSessionService {
 
 impl Drop for PlaylistSessionService {
     fn drop(&mut self) {
-        let _ = self.handle.sender.send(SessionCommand::Shutdown);
+        // Bound the shutdown wait: a wedged filesystem must not hang daemon
+        // exit. The ack bounds the final persist; the join polls with a
+        // deadline in case the thread is wedged before it can ack.
+        let (ack_sender, ack_receiver) = mpsc::channel();
+        let _ = self
+            .handle
+            .sender
+            .send(SessionCommand::Shutdown(ack_sender));
+        let _ = ack_receiver.recv_timeout(Duration::from_secs(5));
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -1034,6 +1082,47 @@ mod tests {
             handle.import(Vec::new()),
             Err(SessionError::ImportBlocked)
         ));
+    }
+
+    #[test]
+    fn import_ids_never_exceed_the_identity_bound() {
+        // Titles longer than the 128-byte id bound must still import: the
+        // derived base leaves room for a collision suffix, and every id must
+        // round-trip the daemon's own validate().
+        let dir = temporary_state_dir("import-bound");
+        let service = PlaylistSessionService::start(config(dir, &[]));
+        let handle = service.handle();
+        let long = "L".repeat(200);
+        let legacy = vec![
+            ImportPlaylist {
+                title: long.clone(),
+                entries: vec!["one".into()],
+                shuffle: false,
+                repeat: true,
+                duration_seconds: 300,
+                transition: "none".into(),
+                transition_seconds: 0,
+            },
+            ImportPlaylist {
+                title: long,
+                entries: vec!["two".into()],
+                shuffle: false,
+                repeat: true,
+                duration_seconds: 300,
+                transition: "none".into(),
+                transition_seconds: 0,
+            },
+        ];
+        let summary = handle.import(legacy).unwrap();
+        assert_eq!(
+            summary.imported, 2,
+            "long-titled duplicates must not be dropped"
+        );
+        assert_eq!(summary.rejected, 0);
+        let ids: Vec<String> = handle.list().unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id.len() <= 128 && !id.is_empty()));
+        assert_ne!(ids[0], ids[1], "collision suffix must keep ids distinct");
     }
 
     #[test]
