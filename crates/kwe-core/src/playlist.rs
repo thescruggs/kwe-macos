@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const MAX_ENTRIES: usize = 1024;
 const MAX_PLAYLISTS: usize = 256;
@@ -90,8 +90,47 @@ impl PlaylistStore {
         let temporary = self
             .path
             .with_extension(format!("tmp-{}", std::process::id()));
-        fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-        fs::rename(temporary, &self.path).map_err(|error| error.to_string())
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        // Sync the contents before the rename so a crash cannot leave a
+        // zero-length store under the real name.
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
+        if let Some(parent) = self.path.parent()
+            && let Ok(directory) = fs::File::open(parent)
+        {
+            // Best-effort: make the rename itself durable.
+            let _ = directory.sync_all();
+        }
+        self.remove_stale_temporaries();
+        Ok(())
+    }
+
+    /// Removes leftovers of interrupted saves (single-writer assumption:
+    /// the store is owned by one daemon process at a time).
+    fn remove_stale_temporaries(&self) {
+        let Some(stem) = self.path.file_stem().and_then(|name| name.to_str()) else {
+            return;
+        };
+        let prefix = format!("{stem}.tmp-");
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) && entry.path() != self.path
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -285,6 +324,24 @@ mod tests {
         ));
         let store = PlaylistStore::new(path.clone());
         assert!(store.save(&[original, duplicate]).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn store_save_cleans_stale_temporary_files() {
+        let path =
+            std::env::temp_dir().join(format!("kwe-playlists-stale-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let store = PlaylistStore::new(path.clone());
+        let playlist = Playlist::new("main".into(), "Main".into()).unwrap();
+
+        // Simulate a crash mid-save: a stale temp from another pid lingers.
+        let stale = path.with_extension(format!("tmp-{}", std::process::id() + 1));
+        fs::write(&stale, b"partial").unwrap();
+
+        store.save(&[playlist]).unwrap();
+        assert!(!stale.exists(), "stale temporary must be removed");
+        assert_eq!(store.load().unwrap().len(), 1);
         let _ = fs::remove_file(path);
     }
 

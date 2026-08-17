@@ -1,11 +1,79 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::VecDeque;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Playlist;
 
 const MAX_RUNTIME_ENTRIES: usize = 1024;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Longest legal remaining time: the maximum playlist duration in
+/// milliseconds. Anything larger is a corrupt or hostile snapshot.
+const MAX_SNAPSHOT_REMAINING_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Persistent form of [`PlaylistRuntime`] state. Only durations are stored —
+/// never absolute deadlines — so a snapshot restored after a daemon restart
+/// (or any monotonic-clock re-anchor) resumes with the same remaining time.
+/// The wall-clock position itself is never serialized.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaylistRuntimeSnapshot {
+    pub schema_version: u32,
+    pub playlist_id: String,
+    pub seed: u64,
+    pub current_index: Option<usize>,
+    pub current_wallpaper_id: Option<String>,
+    /// Remaining milliseconds on the current entry while playing.
+    pub remaining_ms: Option<u64>,
+    /// Remaining milliseconds while paused; mutually exclusive with
+    /// `remaining_ms`.
+    pub paused_remaining_ms: Option<u64>,
+    pub history: Vec<String>,
+}
+
+impl PlaylistRuntimeSnapshot {
+    /// Fails closed on any malformed, oversized, or inconsistent state.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != SNAPSHOT_SCHEMA_VERSION {
+            return Err("playlist runtime snapshot has an unsupported schema".into());
+        }
+        if self.playlist_id.is_empty() || self.playlist_id.len() > 128 {
+            return Err("playlist runtime snapshot identity is invalid".into());
+        }
+        if self.history.len() > MAX_RUNTIME_ENTRIES
+            || self
+                .history
+                .iter()
+                .any(|entry| entry.is_empty() || entry.len() > 128)
+        {
+            return Err("playlist runtime snapshot history exceeds safety bounds".into());
+        }
+        match (self.current_index, self.current_wallpaper_id.as_ref()) {
+            (None, None) => {}
+            (Some(index), Some(id)) => {
+                if index >= MAX_RUNTIME_ENTRIES || id.is_empty() || id.len() > 128 {
+                    return Err("playlist runtime snapshot position is invalid".into());
+                }
+            }
+            _ => return Err("playlist runtime snapshot position is inconsistent".into()),
+        }
+        let has_timing = self.remaining_ms.is_some() || self.paused_remaining_ms.is_some();
+        if (self.current_index.is_some()
+            && self.remaining_ms.is_some() == self.paused_remaining_ms.is_some())
+            || (self.current_index.is_none() && has_timing)
+        {
+            return Err("playlist runtime snapshot timing is inconsistent".into());
+        }
+        if self
+            .remaining_ms
+            .into_iter()
+            .chain(self.paused_remaining_ms)
+            .any(|remaining| remaining > MAX_SNAPSHOT_REMAINING_MS)
+        {
+            return Err("playlist runtime snapshot timing exceeds safety bounds".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -155,6 +223,70 @@ impl PlaylistRuntime {
 
     pub fn history(&self) -> Vec<String> {
         self.history.iter().cloned().collect()
+    }
+
+    /// Captures restorable state. `now_ms` must not regress against the last
+    /// observed time; only durations are stored, never absolute deadlines.
+    pub fn snapshot(
+        &self,
+        playlist: &Playlist,
+        now_ms: u64,
+    ) -> Result<PlaylistRuntimeSnapshot, String> {
+        playlist.validate()?;
+        if self.last_now_ms.is_some_and(|previous| now_ms < previous) {
+            return Err("playlist monotonic time regressed".into());
+        }
+        let (remaining_ms, paused_remaining_ms) = if self.paused_remaining_ms.is_some() {
+            (None, self.paused_remaining_ms)
+        } else if self.current_index.is_some() {
+            (
+                self.deadline_ms
+                    .map(|deadline| deadline.saturating_sub(now_ms)),
+                None,
+            )
+        } else {
+            (None, None)
+        };
+        let snapshot = PlaylistRuntimeSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            playlist_id: playlist.id.clone(),
+            seed: self.seed,
+            current_index: self.current_index,
+            current_wallpaper_id: self.current_wallpaper_id.clone(),
+            remaining_ms,
+            paused_remaining_ms,
+            history: self.history.iter().cloned().collect(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Restores a previously captured snapshot and re-anchors any remaining
+    /// duration against `now_ms`. The restored position is reconciled against
+    /// the supplied playlist, so an entry that no longer exists is cleared
+    /// exactly as it would be after an in-process playlist mutation.
+    pub fn restore(
+        &mut self,
+        snapshot: &PlaylistRuntimeSnapshot,
+        playlist: &Playlist,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        snapshot.validate()?;
+        playlist.validate()?;
+        if snapshot.playlist_id != playlist.id {
+            return Err("playlist runtime snapshot belongs to another playlist".into());
+        }
+        self.seed = snapshot.seed;
+        self.history = snapshot.history.iter().cloned().collect();
+        self.current_index = snapshot.current_index;
+        self.current_wallpaper_id = snapshot.current_wallpaper_id.clone();
+        self.deadline_ms = snapshot
+            .remaining_ms
+            .map(|remaining| now_ms.saturating_add(remaining));
+        self.paused_remaining_ms = snapshot.paused_remaining_ms;
+        self.last_now_ms = Some(now_ms);
+        self.reconcile_current(playlist);
+        Ok(())
     }
 
     fn select(
@@ -397,6 +529,178 @@ mod tests {
         playlist.entries.remove(2);
         assert!(matches!(
             runtime.tick(&playlist, 2, &[]).unwrap(),
+            PlaylistDecision::Advanced { .. }
+        ));
+    }
+
+    #[test]
+    fn snapshot_round_trip_reanchors_remaining_time_after_restart() {
+        let playlist = playlist(true, false);
+        let mut original = PlaylistRuntime::new(7);
+        original.start(&playlist, 1_000, &[]).unwrap();
+        let snapshot = original.snapshot(&playlist, 4_000).unwrap();
+
+        // "Restart" happens at a different monotonic origin (e.g. 1_000_000).
+        let mut restored = PlaylistRuntime::new(0);
+        restored.restore(&snapshot, &playlist, 1_000_000).unwrap();
+        assert_eq!(restored.current_index(), Some(0));
+        assert_eq!(
+            restored.tick(&playlist, 1_003_000, &[]).unwrap(),
+            PlaylistDecision::Waiting {
+                wallpaper_id: "one".into(),
+                index: 0,
+                remaining_ms: 4_000,
+            }
+        );
+        assert!(matches!(
+            restored.tick(&playlist, 1_008_000, &[]).unwrap(),
+            PlaylistDecision::Advanced { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn paused_snapshot_round_trip_freezes_remaining_time() {
+        let playlist = playlist(true, false);
+        let mut original = PlaylistRuntime::new(3);
+        original.start(&playlist, 0, &[]).unwrap();
+        original.pause(&playlist, 2_000).unwrap();
+        let snapshot = original.snapshot(&playlist, 9_000).unwrap();
+        assert_eq!(snapshot.paused_remaining_ms, Some(8_000));
+        assert_eq!(snapshot.remaining_ms, None);
+
+        let mut restored = PlaylistRuntime::new(0);
+        restored.restore(&snapshot, &playlist, 50_000).unwrap();
+        assert_eq!(
+            restored.tick(&playlist, 60_000, &[]).unwrap(),
+            PlaylistDecision::Paused {
+                wallpaper_id: "one".into(),
+                index: 0,
+                remaining_ms: 8_000,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_seed_history_and_exhaustion() {
+        let playlist = playlist(false, true);
+        let mut original = PlaylistRuntime::new(42);
+        original.start(&playlist, 0, &[]).unwrap();
+        original.tick(&playlist, 10_000, &[]).unwrap();
+        original.tick(&playlist, 20_000, &[]).unwrap();
+        assert_eq!(
+            original.tick(&playlist, 30_000, &[]).unwrap(),
+            PlaylistDecision::Exhausted
+        );
+        let snapshot = original.snapshot(&playlist, 30_000).unwrap();
+        assert_eq!(snapshot.current_index, None);
+        assert_eq!(snapshot.history.len(), 3);
+
+        let mut restored = PlaylistRuntime::new(0);
+        restored.restore(&snapshot, &playlist, 100_000).unwrap();
+        // Exhausted (not NoEligible) must survive: history came back intact.
+        assert_eq!(
+            restored.tick(&playlist, 100_000, &[]).unwrap(),
+            PlaylistDecision::Exhausted
+        );
+
+        // Shuffle determinism depends on the persisted seed: after a restore,
+        // the next selection must match what the un-restarted runtime picks.
+        let repeat_playlist = self::playlist(true, true);
+        let mut original = PlaylistRuntime::new(42);
+        original.start(&repeat_playlist, 0, &[]).unwrap();
+        let snapshot = original.snapshot(&repeat_playlist, 1_000).unwrap();
+        let mut restored = PlaylistRuntime::new(0);
+        restored
+            .restore(&snapshot, &repeat_playlist, 100_000)
+            .unwrap();
+        // Deadlines differ across a restart (different monotonic origins),
+        // so compare the selection only.
+        let restored_decision = restored.tick(&repeat_playlist, 110_000, &[]).unwrap();
+        let original_decision = original.tick(&repeat_playlist, 10_000, &[]).unwrap();
+        match (&restored_decision, &original_decision) {
+            (
+                PlaylistDecision::Advanced {
+                    wallpaper_id: restored_id,
+                    index: restored_index,
+                    ..
+                },
+                PlaylistDecision::Advanced {
+                    wallpaper_id: original_id,
+                    index: original_index,
+                    ..
+                },
+            ) => assert_eq!((restored_id, restored_index), (original_id, original_index)),
+            other => panic!("expected Advanced decisions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_rejects_malformed_snapshots() {
+        let playlist = playlist(true, false);
+        let mut runtime = PlaylistRuntime::new(1);
+        runtime.start(&playlist, 0, &[]).unwrap();
+        let mut snapshot = runtime.snapshot(&playlist, 1_000).unwrap();
+
+        snapshot.schema_version = 2;
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.schema_version = 1;
+
+        snapshot.playlist_id = "other".into();
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.playlist_id = "daily".into();
+
+        snapshot.remaining_ms = Some(1);
+        snapshot.paused_remaining_ms = Some(1);
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.remaining_ms = Some(10_000);
+        snapshot.paused_remaining_ms = None;
+
+        snapshot.current_index = None;
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.current_index = Some(0);
+
+        snapshot.remaining_ms = Some(24 * 60 * 60 * 1000 + 1);
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.remaining_ms = Some(10_000);
+
+        snapshot.history = vec!["oversized".repeat(129)];
+        assert!(runtime.restore(&snapshot, &playlist, 0).is_err());
+        snapshot.history.clear();
+
+        runtime.restore(&snapshot, &playlist, 0).unwrap();
+    }
+
+    #[test]
+    fn forward_clock_jump_advances_deterministically() {
+        // Sleep/resume: the monotonic clock jumps far forward; the stale
+        // deadline must simply expire and advance, never error or loop.
+        let playlist = playlist(true, false);
+        let mut runtime = PlaylistRuntime::new(0);
+        runtime.start(&playlist, 0, &[]).unwrap();
+        assert!(matches!(
+            runtime.tick(&playlist, 1_000_000_000, &[]).unwrap(),
+            PlaylistDecision::Advanced { index: 1, .. }
+        ));
+        assert!(matches!(
+            runtime.tick(&playlist, 1_000_001_000, &[]).unwrap(),
+            PlaylistDecision::Waiting { index: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn restore_reconciles_against_mutated_playlist() {
+        let mut playlist = playlist(true, false);
+        let mut original = PlaylistRuntime::new(5);
+        original.start(&playlist, 0, &[]).unwrap();
+        let snapshot = original.snapshot(&playlist, 1_000).unwrap();
+
+        // The snapshot's entry vanished while the daemon was down.
+        playlist.entries.remove(0);
+        let mut restored = PlaylistRuntime::new(0);
+        restored.restore(&snapshot, &playlist, 10_000).unwrap();
+        assert_eq!(restored.current_index(), None);
+        assert!(matches!(
+            restored.tick(&playlist, 10_000, &[]).unwrap(),
             PlaylistDecision::Advanced { .. }
         ));
     }
