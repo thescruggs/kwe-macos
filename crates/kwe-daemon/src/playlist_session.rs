@@ -30,7 +30,10 @@ use kwe_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{persist::atomic_write, supervisor::SupervisorHandle};
+use crate::{
+    persist::{atomic_write, quarantine_invalid_state},
+    supervisor::SupervisorHandle,
+};
 
 const COMMAND_CAPACITY: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -837,31 +840,6 @@ fn load_runtime_state(
             (None, BTreeMap::new())
         }
     }
-}
-
-fn quarantine_invalid_state(path: &std::path::Path) {
-    let quarantined = path.with_file_name(format!(
-        "{}.invalid-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        unix_seconds()
-    ));
-    if let Err(error) = std::fs::rename(path, &quarantined) {
-        eprintln!("event=playlist.state_quarantine_error detail={error}");
-    } else {
-        eprintln!(
-            "event=playlist.state_quarantined path={}",
-            quarantined.display()
-        );
-    }
-}
-
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 pub struct PlaylistSessionService {

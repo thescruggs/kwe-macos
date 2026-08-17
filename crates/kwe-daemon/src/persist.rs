@@ -65,3 +65,30 @@ pub(crate) fn unix_nanos() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
+
+pub(crate) fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Moves an invalid state file to a `.invalid-<unix>` sibling so the data is
+/// preserved for diagnosis while the service restarts fresh. Best-effort.
+pub(crate) fn quarantine_invalid_state(path: &Path) {
+    let quarantined = path.with_file_name(format!(
+        "{}.invalid-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
+        unix_seconds()
+    ));
+    if let Err(error) = fs::rename(path, &quarantined) {
+        eprintln!(
+            "event=state.quarantine_error path={} detail={error}",
+            path.display()
+        );
+    } else {
+        eprintln!("event=state.quarantined path={}", quarantined.display());
+    }
+}

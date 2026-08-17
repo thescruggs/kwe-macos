@@ -5,6 +5,7 @@
 mod persist;
 mod playlist_session;
 mod supervisor;
+mod workshop_cache;
 
 use std::{
     collections::BTreeSet,
@@ -31,6 +32,7 @@ use supervisor::{
     RendererResourceLimits, StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService,
     TestFault, WorkerStatus,
 };
+use workshop_cache::WorkshopCache;
 
 const API_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -162,7 +164,18 @@ fn main() -> Result<()> {
         },
     })?;
     let supervisor = supervisor_service.handle();
-    let catalog = Arc::new(RwLock::new(scan_installed(&roots, &ScanLimits::default())));
+    let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
+        &playlist_state_dir,
+    )));
+    let catalog = {
+        let mut cache = workshop_cache
+            .lock()
+            .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
+        let mut initial_catalog = scan_installed(&roots, &ScanLimits::default());
+        cache.merge_and_update(&mut initial_catalog, unix_ms());
+        cache.save();
+        Arc::new(RwLock::new(initial_catalog))
+    };
     let playlist_service = PlaylistSessionService::start(PlaylistSessionConfig {
         state_dir: playlist_state_dir,
         tick_ms: arguments.playlist_tick_ms,
@@ -194,6 +207,7 @@ fn main() -> Result<()> {
                     &roots,
                     &supervisor,
                     &playlist,
+                    &workshop_cache,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -216,6 +230,7 @@ fn handle_client(
     roots: &[PathBuf],
     supervisor: &SupervisorHandle,
     playlist: &PlaylistSessionHandle,
+    workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
@@ -262,6 +277,7 @@ fn handle_client(
         roots,
         Some(supervisor),
         Some(playlist),
+        workshop_cache,
         allow_test_faults,
     )?;
     let response = Response {
@@ -282,6 +298,7 @@ fn process_request(
     roots: &[PathBuf],
     supervisor: Option<&SupervisorHandle>,
     playlist: Option<&PlaylistSessionHandle>,
+    workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     allow_test_faults: bool,
 ) -> Result<(bool, Value)> {
     let result = if request.version != API_VERSION {
@@ -303,7 +320,12 @@ fn process_request(
                 serde_json::to_value(&*guard)?
             }
             "rescan" => {
-                let updated = scan_installed(roots, &ScanLimits::default());
+                let mut cache = workshop_cache
+                    .lock()
+                    .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
+                let mut updated = scan_installed(roots, &ScanLimits::default());
+                cache.merge_and_update(&mut updated, unix_ms());
+                cache.save();
                 let count = updated.stats.total;
                 *catalog
                     .write()
@@ -620,6 +642,13 @@ fn default_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/kwe"))
 }
 
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn validate_socket_parent(socket: &Path) -> Result<()> {
     let parent = socket.parent().context("socket path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -636,6 +665,19 @@ mod tests {
 
     fn empty_catalog() -> Arc<RwLock<Catalog>> {
         Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())))
+    }
+
+    fn cache_for_tests() -> Arc<std::sync::Mutex<WorkshopCache>> {
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-daemon-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(std::sync::Mutex::new(WorkshopCache::open(&dir)))
     }
 
     fn session_service() -> PlaylistSessionService {
@@ -660,7 +702,16 @@ mod tests {
         let catalog = empty_catalog();
         let request: Request =
             serde_json::from_str(r#"{"version":1,"id":"test-7","method":"health"}"#).unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            false,
+        )
+        .unwrap();
         assert_eq!(request.id, "test-7");
         assert!(ok);
         assert_eq!(result["status"], "ready");
@@ -671,7 +722,16 @@ mod tests {
         let catalog = empty_catalog();
         let request: Request =
             serde_json::from_str(r#"{"version":99,"id":1,"method":"health"}"#).unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            false,
+        )
+        .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "unsupported_api_version");
     }
@@ -683,7 +743,16 @@ mod tests {
             r#"{"version":1,"id":3,"method":"renderer.start","params":{"wallpaper_id":"synthetic","content_hash":"abc","test_fault":{"kind":"hang","after":2}}}"#,
         )
         .unwrap();
-        let (ok, result) = process_request(&request, &catalog, &[], None, None, false).unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            false,
+        )
+        .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "test_faults_disabled");
     }
@@ -694,7 +763,16 @@ mod tests {
         playlist: Option<&PlaylistSessionHandle>,
     ) -> (bool, Value) {
         let request: Request = serde_json::from_str(request_json).unwrap();
-        process_request(&request, catalog, &[], None, playlist, true).unwrap()
+        process_request(
+            &request,
+            catalog,
+            &[],
+            None,
+            playlist,
+            &cache_for_tests(),
+            true,
+        )
+        .unwrap()
     }
 
     const DAILY_JSON: &str = r#"{"id":"daily","title":"Daily","entries":[],"shuffle":false,"repeat":true,"duration_seconds":300,"transition":"none","transition_seconds":0}"#;
@@ -806,8 +884,16 @@ mod tests {
             r#"{"version":1,"method":"playlist.debug-clock-skip","params":{"ms":1000}}"#,
         )
         .unwrap();
-        let (ok, result) =
-            process_request(&request, &catalog, &[], None, Some(&handle), false).unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            Some(&handle),
+            &cache_for_tests(),
+            false,
+        )
+        .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "test_faults_disabled");
     }
