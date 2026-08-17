@@ -33,3 +33,6 @@ fi
 if [[ "${KWE_RUN_PLASMA_DISPLAY_SMOKE:-0}" == "1" ]]; then
     scripts/smoke-plasma-display.sh
 fi
+if [[ "${KWE_RUN_PLAYLIST_SMOKE:-0}" == "1" ]]; then
+    scripts/smoke-playlist-restart.sh
+fi
