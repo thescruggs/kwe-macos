@@ -45,7 +45,7 @@ Kirigami.ScrollablePage {
         Controls.Label {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== ""
-            text: qsTr("Workshop %1 · %2").arg(WallpaperSelection.selectedId, WallpaperSelection.selectedKind)
+            text: qsTr("Workshop %1 · %2").arg(WallpaperSelection.selectedId).arg(WallpaperSelection.selectedKind)
             opacity: 0.75
             wrapMode: Text.Wrap
         }
@@ -85,7 +85,7 @@ Kirigami.ScrollablePage {
             visible: WallpaperSelection.selectedId !== ""
             type: WallpaperSelection.selectedCompatibility === "invalid" || WallpaperSelection.selectedCompatibility === "unsupported"
                 ? Kirigami.MessageType.Warning : Kirigami.MessageType.Information
-            text: qsTr("%1: %2").arg(WallpaperSelection.compatibilityLabel(WallpaperSelection.selectedCompatibility), WallpaperSelection.selectedDetail)
+            text: qsTr("%1: %2").arg(WallpaperSelection.compatibilityLabel(WallpaperSelection.selectedCompatibility)).arg(WallpaperSelection.selectedDetail)
         }
         Controls.Label {
             Layout.fillWidth: true

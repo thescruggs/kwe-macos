@@ -38,7 +38,10 @@ Item {
         anchors.margins: Kirigami.Units.smallSpacing
         hoverEnabled: true
         activeFocusOnTab: true
-        Accessible.name: qsTr("%1, %2 wallpaper, %3").arg(cardRoot.title, cardRoot.kind, WallpaperSelection.compatibilityLabel(cardRoot.compatibility))
+        // Qt 6.11: multi-argument String.arg() throws; chain single-arg calls.
+        Accessible.name: qsTr("%1, %2 wallpaper, %3")
+            .arg(cardRoot.title).arg(cardRoot.kind)
+            .arg(WallpaperSelection.compatibilityLabel(cardRoot.compatibility))
         onClicked: WallpaperSelection.select(cardRoot.title, cardRoot.workshopId, cardRoot.kind, cardRoot.compatibility, cardRoot.compatibilityDetail, cardRoot.previewUrl, cardRoot.tags, cardRoot.entryUrl, cardRoot.diagnosticSummary, cardRoot.requestedPermissions)
 
         background: Rectangle {
@@ -47,7 +50,11 @@ Item {
                  : card.hovered ? Kirigami.Theme.hoverColor
                  : Kirigami.Theme.backgroundColor
             border.width: card.activeFocus ? 2 : 1
-            border.color: card.activeFocus ? Kirigami.Theme.focusColor : Kirigami.Theme.separatorColor
+            // Kirigami 6.28 no longer provides Theme.separatorColor; tint the
+            // text color instead for the idle 1px card border.
+            border.color: card.activeFocus ? Kirigami.Theme.focusColor
+                : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
+                          Kirigami.Theme.textColor.b, 0.2)
         }
 
         contentItem: ColumnLayout {

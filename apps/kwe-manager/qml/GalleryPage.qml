@@ -2,6 +2,7 @@
 import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import org.kde.kirigami as Kirigami
 
 // One gallery destination: the Installed view shows every indexed item, the
@@ -219,7 +220,9 @@ Kirigami.Page {
             Layout.fillWidth: true
             visible: rendererStatus.quarantined
             type: Kirigami.MessageType.Error
-            text: qsTr("Renderer quarantined wallpaper %1. %2").arg(rendererStatus.wallpaperId, rendererStatus.detail !== "" ? rendererStatus.detail : qsTr("The last-known-good frame remains active."))
+            text: qsTr("Renderer quarantined wallpaper %1. %2")
+                .arg(rendererStatus.wallpaperId)
+                .arg(rendererStatus.detail !== "" ? rendererStatus.detail : qsTr("The last-known-good frame remains active."))
         }
 
         Kirigami.InlineMessage {
@@ -327,20 +330,11 @@ Kirigami.Page {
                     activeFocusOnTab: true
 
                     delegate: WallpaperCard {
-                        required property string title
-                        required property string workshopId
-                        required property string kind
-                        required property string compatibility
-                        required property string compatibilityDetail
-                        required property url previewUrl
-                        required property int diagnosticCount
-                        required property string workshopState
-                        required property int workshopProgress
-                        required property bool favorite
-                        required property var tags
-                        required property url entryUrl
-                        required property string diagnosticSummary
-                        required property var requestedPermissions
+                        // The view initializes the card's required properties
+                        // from the model roles directly. On Qt 6.11
+                        // re-declaring them here shadows the component's own
+                        // properties, leaving them unset, so every card
+                        // failed to instantiate and the gallery stayed empty.
                         cellWidth: grid.cellWidth
                         cellHeight: grid.cellHeight
                         workshopView: galleryPage.workshopView
@@ -361,7 +355,10 @@ Kirigami.Page {
                 id: detailsPane
                 Controls.SplitView.preferredWidth: Kirigami.Units.gridUnit * 20
                 Controls.SplitView.minimumWidth: Kirigami.Units.gridUnit * 16
-                detailsVisible: window.width >= Kirigami.Units.gridUnit * 48
+                // Qt 6.11 dropped the bare `window` identifier; use the
+                // Window attached property (null until the page is attached).
+                detailsVisible: Window.window !== null
+                    && Window.window.width >= Kirigami.Units.gridUnit * 48
                 activePlaylistName: playlistSelector.currentText
             }
         }

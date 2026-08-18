@@ -21,6 +21,14 @@ qt_add_executable(kwe-manager
     src/playlistclient.h
 )
 
+# WallpaperSelection is a pragma Singleton; the generated qmldir must
+# register it as such, otherwise QML resolves the type object instead of the
+# instance and every WallpaperSelection.* read is undefined. The property
+# must be set before qt_add_qml_module, which reads it at call time.
+set_source_files_properties(qml/WallpaperSelection.qml PROPERTIES
+    QT_QML_SINGLETON_TYPE TRUE
+)
+
 qt_add_qml_module(kwe-manager
     URI org.kde.kwe
     VERSION 1.0
