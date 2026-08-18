@@ -121,7 +121,8 @@ impl WorkshopCache {
     /// Fills placeholder metadata on scanned items, snapshots fresh metadata
     /// from subscribed items, synthesizes vanished subscriptions, and drops
     /// aged-out entries. `now_unix_ms` is the caller's wall-clock epoch.
-    pub fn merge_and_update(&mut self, catalog: &mut Catalog, now_unix_ms: u128) {
+    /// Returns true when the cache changed and a `save()` is worthwhile.
+    pub fn merge_and_update(&mut self, catalog: &mut Catalog, now_unix_ms: u128) -> bool {
         let mut updates: Vec<(String, CachedItem)> = Vec::new();
         for item in catalog.items.iter_mut() {
             let cached = self.items.get(&item.workshop_id).cloned();
@@ -157,15 +158,38 @@ impl WorkshopCache {
                     },
                 ));
             } else if is_subscribed_state(&item.workshop_state) {
-                // Fresh files on disk: snapshot the current metadata.
+                // Files are on disk, but a re-download can leave placeholders
+                // where real metadata used to be. Never overwrite cached real
+                // metadata with placeholder or Invalid values.
                 updates.push((
                     item.workshop_id.clone(),
                     CachedItem {
-                        title: item.title.clone(),
-                        kind: item.kind,
-                        tags: item.tags.clone(),
-                        preview_present: item.preview_file.is_some(),
-                        metadata_hash: item.metadata_hash.clone(),
+                        title: if placeholder_title(item) {
+                            cached
+                                .as_ref()
+                                .map_or_else(|| item.title.clone(), |cached| cached.title.clone())
+                        } else {
+                            item.title.clone()
+                        },
+                        kind: if item.kind == ProjectKind::Invalid {
+                            cached.as_ref().map_or(item.kind, |cached| cached.kind)
+                        } else {
+                            item.kind
+                        },
+                        tags: if item.tags.is_empty() {
+                            cached
+                                .as_ref()
+                                .map_or_else(Vec::new, |cached| cached.tags.clone())
+                        } else {
+                            item.tags.clone()
+                        },
+                        preview_present: item.preview_file.is_some()
+                            || cached.as_ref().is_some_and(|cached| cached.preview_present),
+                        metadata_hash: item.metadata_hash.clone().or_else(|| {
+                            cached
+                                .as_ref()
+                                .and_then(|cached| cached.metadata_hash.clone())
+                        }),
                         workshop_state: item.workshop_state.clone(),
                         workshop_progress: item.workshop_progress,
                         last_seen_unix_ms: now_unix_ms,
@@ -173,17 +197,21 @@ impl WorkshopCache {
                 ));
             }
         }
+        let mut changed = !updates.is_empty();
         for (id, entry) in updates {
             self.items.insert(id, entry);
         }
 
         // Synthesize entries for subscriptions whose library vanished; drop
-        // entries that have not appeared in any scan for too long.
+        // entries that have not appeared in any scan for too long. Aging and
+        // synthesis are separate passes so the synthesis cap never skips
+        // aging for later entries.
         let present_ids: std::collections::BTreeSet<String> = catalog
             .items
             .iter()
             .map(|item| item.workshop_id.clone())
             .collect();
+        let mut to_synthesize = Vec::new();
         let mut aged_out = Vec::new();
         for (id, entry) in &self.items {
             if present_ids.contains(id) {
@@ -191,26 +219,49 @@ impl WorkshopCache {
             }
             if entry.last_seen_unix_ms.saturating_add(STALE_ENTRY_MS) < now_unix_ms {
                 aged_out.push(id.clone());
+                changed = true;
                 continue;
             }
-            if catalog.items.len() >= MAX_CATALOG_ITEMS {
-                break;
+            if catalog.items.len() < MAX_CATALOG_ITEMS {
+                to_synthesize.push((id.clone(), entry.clone()));
             }
-            catalog.items.push(synthesized_item(id, entry));
-            catalog.stats.total = catalog.stats.total.saturating_add(1);
-            catalog.stats.subscribed = catalog.stats.subscribed.saturating_add(1);
-            catalog.stats.missing = catalog.stats.missing.saturating_add(1);
-            catalog.stats.invalid = catalog.stats.invalid.saturating_add(1);
         }
         for id in aged_out {
             self.items.remove(&id);
         }
+        for (id, entry) in to_synthesize {
+            catalog.items.push(synthesized_item(&id, &entry));
+            // Mirror `CatalogStats::from_items` semantics: missing items are
+            // never counted as subscribed (that bucket counts installed
+            // subscriptions only); the kind counter follows the cached kind.
+            catalog.stats.total = catalog.stats.total.saturating_add(1);
+            catalog.stats.missing = catalog.stats.missing.saturating_add(1);
+            match entry.kind {
+                ProjectKind::Scene => catalog.stats.scene = catalog.stats.scene.saturating_add(1),
+                ProjectKind::Video => catalog.stats.video = catalog.stats.video.saturating_add(1),
+                ProjectKind::Web => catalog.stats.web = catalog.stats.web.saturating_add(1),
+                ProjectKind::Unknown => {
+                    catalog.stats.unknown = catalog.stats.unknown.saturating_add(1)
+                }
+                ProjectKind::Invalid => {
+                    catalog.stats.invalid = catalog.stats.invalid.saturating_add(1)
+                }
+            }
+            // A synthesized item is still a live subscription: touching it
+            // means only ids absent from every scan ever age out.
+            if let Some(updated) = self.items.get_mut(&id) {
+                updated.last_seen_unix_ms = now_unix_ms;
+            }
+            changed = true;
+        }
+        changed
     }
 
     /// Persists the cache atomically; evicts the oldest entries when the
     /// bounded file size would be exceeded.
     pub fn save(&mut self) {
         let mut bytes = self.encode_state();
+        let mut evicted = 0;
         while bytes.len() as u64 > MAX_CACHE_BYTES && !self.items.is_empty() {
             let oldest = self
                 .items
@@ -219,8 +270,11 @@ impl WorkshopCache {
                 .map(|(id, _)| id.clone());
             let Some(oldest) = oldest else { break };
             self.items.remove(&oldest);
-            eprintln!("event=workshop.cache_evict workshop_id={oldest}");
+            evicted += 1;
             bytes = self.encode_state();
+        }
+        if evicted > 0 {
+            eprintln!("event=workshop.cache_evict count={evicted}");
         }
         if bytes.len() as u64 > MAX_CACHE_BYTES {
             eprintln!("event=workshop.cache_oversize bytes={}", bytes.len());

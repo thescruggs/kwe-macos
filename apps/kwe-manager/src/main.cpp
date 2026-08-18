@@ -72,12 +72,10 @@ int main(int argc, char *argv[]) {
         packageRoot = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
             + QStringLiteral("/plasma/wallpapers");
     }
-    PackageInstaller packageInstaller(packageRoot + QStringLiteral("/org.kde.kwe.wallpaper"));
-    WorkshopClient workshopClient;
-    VideoPreview videoPreview;
-    RendererStatus rendererStatus(socketPath);
-    WebPreview webPreview;
-    PlaylistController playlistController(socketPath);
+    // The package shipped system-wide by the distro package (or, in dev runs,
+    // the --package-source directory) counts as an installed display package.
+    // QStandardPaths::locate prefers the user-local copy, so this only names
+    // the system copy when no user-local package exists.
     QString packageSource = parser.value(packageSourceOption);
     if (packageSource.isEmpty()) {
         packageSource = QStandardPaths::locate(
@@ -85,6 +83,13 @@ int main(int argc, char *argv[]) {
             QStringLiteral("plasma/wallpapers/org.kde.kwe.wallpaper"),
             QStandardPaths::LocateDirectory);
     }
+    PackageInstaller packageInstaller(packageRoot + QStringLiteral("/org.kde.kwe.wallpaper"),
+                                      packageSource);
+    WorkshopClient workshopClient;
+    VideoPreview videoPreview;
+    RendererStatus rendererStatus(socketPath);
+    WebPreview webPreview;
+    PlaylistController playlistController(socketPath);
     if (parser.isSet(safeModeOption))
         packageInstaller.enterSafeMode();
     if (parser.isSet(leaveSafeModeOption))

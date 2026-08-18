@@ -172,8 +172,9 @@ fn main() -> Result<()> {
             .lock()
             .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
         let mut initial_catalog = scan_installed(&roots, &ScanLimits::default());
-        cache.merge_and_update(&mut initial_catalog, unix_ms());
-        cache.save();
+        if cache.merge_and_update(&mut initial_catalog, unix_ms()) {
+            cache.save();
+        }
         Arc::new(RwLock::new(initial_catalog))
     };
     let playlist_service = PlaylistSessionService::start(PlaylistSessionConfig {
@@ -324,8 +325,9 @@ fn process_request(
                     .lock()
                     .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
                 let mut updated = scan_installed(roots, &ScanLimits::default());
-                cache.merge_and_update(&mut updated, unix_ms());
-                cache.save();
+                if cache.merge_and_update(&mut updated, unix_ms()) {
+                    cache.save();
+                }
                 let count = updated.stats.total;
                 *catalog
                     .write()

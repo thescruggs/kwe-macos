@@ -26,6 +26,7 @@ else
 fi
 source=("kde-wallpaper-engine::${_source}")
 sha256sums=('SKIP')
+install=kde-wallpaper-engine.install
 
 pkgname=kde-wallpaper-engine
 pkgver=0.1.0.alpha.1

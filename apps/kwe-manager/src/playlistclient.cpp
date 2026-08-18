@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "playlistclient.h"
 
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonParseError>
 
@@ -16,8 +17,11 @@ PlaylistClient::PlaylistClient(QString socketPath, QObject *parent)
     connect(&m_socket, &QLocalSocket::connected, this, &PlaylistClient::writeRequest);
     connect(&m_socket, &QLocalSocket::readyRead, this, &PlaylistClient::consumeResponse);
     connect(&m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
-        failCurrent(tr("Could not connect to the wallpaper service at %1: %2")
-                        .arg(m_socketPath, m_socket.errorString()));
+        const QString message = tr("Could not connect to the wallpaper service at %1: %2")
+                                    .arg(m_socketPath, m_socket.errorString());
+        const QString hint = QFileInfo::exists(m_socketPath) ? QString()
+            : tr(". Start the service with: systemctl --user enable --now kwe-daemon.service");
+        failCurrent(message + hint);
     });
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, [this] {

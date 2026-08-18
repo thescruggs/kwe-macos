@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "catalogclient.h"
 
+#include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -19,7 +20,11 @@ CatalogClient::CatalogClient(QString socketPath, QObject *parent)
     connect(&m_socket, &QLocalSocket::connected, this, &CatalogClient::sendRequest);
     connect(&m_socket, &QLocalSocket::readyRead, this, &CatalogClient::consumeResponse);
     connect(&m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
-        setState(Error, tr("Could not connect to the wallpaper service at %1: %2").arg(m_socketPath, m_socket.errorString()));
+        const QString message = tr("Could not connect to the wallpaper service at %1: %2")
+                                    .arg(m_socketPath, m_socket.errorString());
+        const QString hint = QFileInfo::exists(m_socketPath) ? QString()
+            : tr(". Start the service with: systemctl --user enable --now kwe-daemon.service");
+        setState(Error, message + hint);
     });
     m_autoRefreshTimer.setInterval(AutomaticRefreshMilliseconds);
     m_autoRefreshTimer.setTimerType(Qt::CoarseTimer);

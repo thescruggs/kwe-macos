@@ -15,14 +15,25 @@ constexpr auto MainQml = "contents/ui/main.qml";
 constexpr auto DisabledSuffix = ".disabled";
 }
 
-PackageInstaller::PackageInstaller(QString packagePath, QObject *parent)
-    : QObject(parent), m_packagePath(std::move(packagePath)) {
+PackageInstaller::PackageInstaller(QString packagePath, QString systemPackagePath,
+                                   QObject *parent)
+    : QObject(parent), m_packagePath(std::move(packagePath)),
+      m_systemPackagePath(std::move(systemPackagePath)) {
   if (QFileInfo::exists(m_packagePath + DisabledSuffix))
     setState(SafeMode, tr("The Plasma package is disabled in safe mode."));
   else if (QFileInfo::exists(m_packagePath))
     setState(Installed, tr("The Plasma display package is installed."));
+  else if (!m_systemPackagePath.isEmpty() &&
+           QFileInfo::exists(m_systemPackagePath))
+    setState(Installed,
+             tr("The Plasma display package is installed system-wide."));
   else
     setState(Unavailable, tr("The Plasma display package is not installed."));
+}
+
+bool PackageInstaller::userPackagePresent() const {
+  return QFileInfo::exists(m_packagePath) ||
+         QFileInfo::exists(m_packagePath + DisabledSuffix);
 }
 
 bool PackageInstaller::validatePackage(const QString &sourcePath,
@@ -53,8 +64,13 @@ bool PackageInstaller::validatePackage(const QString &sourcePath,
     *error = tr("Package metadata is invalid or is not a Plasma wallpaper.");
     return false;
   }
-  if (document.object().value(QStringLiteral("Id")).toString() !=
-      QString::fromLatin1(PackageId)) {
+  // KPackage metadata nests the plugin id under KPlugin (the shipped package
+  // does); accept a top-level Id for hand-authored dev fixtures.
+  const QJsonObject root = document.object();
+  const QJsonObject plugin = root.value(QStringLiteral("KPlugin")).toObject();
+  const QString id = plugin.value(QStringLiteral("Id"))
+                         .toString(root.value(QStringLiteral("Id")).toString());
+  if (id != QString::fromLatin1(PackageId)) {
     *error = tr("Package ID does not match the KDE Wallpaper Engine package.");
     return false;
   }
@@ -122,12 +138,18 @@ bool PackageInstaller::installFrom(const QString &sourcePath) {
     return false;
   }
   setState(Installed, tr("The Plasma display package was installed safely."));
+  emit userPackagePresentChanged();
   return true;
 }
 
 bool PackageInstaller::enterSafeMode() {
   if (m_state == SafeMode)
     return true;
+  if (!userPackagePresent()) {
+    setState(Failed, tr("Safe mode requires a user-local Plasma package; only "
+                        "the system-wide package is present."));
+    return false;
+  }
   const QString disabledPath = m_packagePath + QLatin1String(DisabledSuffix);
   if (!QFileInfo::exists(m_packagePath) ||
       !QDir(QFileInfo(m_packagePath).dir()).rename(m_packagePath, disabledPath)) {
@@ -147,6 +169,7 @@ bool PackageInstaller::leaveSafeMode() {
     return false;
   }
   setState(Installed, tr("The Plasma display package is enabled again."));
+  emit userPackagePresentChanged();
   return true;
 }
 

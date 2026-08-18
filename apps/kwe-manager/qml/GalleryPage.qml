@@ -96,7 +96,8 @@ Kirigami.Page {
                 icon.name: packageInstaller.state === packageInstaller.SafeMode
                     ? "dialog-ok-apply-symbolic" : "security-high-symbolic"
                 display: Controls.AbstractButton.TextBesideIcon
-                enabled: packageInstaller.state === packageInstaller.Installed
+                enabled: (packageInstaller.state === packageInstaller.Installed
+                        && packageInstaller.userPackagePresent)
                     || packageInstaller.state === packageInstaller.SafeMode
                 Accessible.name: text
                 onClicked: packageInstaller.state === packageInstaller.SafeMode
