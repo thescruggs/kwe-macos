@@ -84,6 +84,12 @@ package() {
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-test-renderer" "${pkgdir}/usr/bin/kwe-test-renderer"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-vulkan" "${pkgdir}/usr/bin/kwe-vulkan"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe" "${pkgdir}/usr/bin/kwe"
+    # Beta renderer workers (packaged ahead of the release milestone so test
+    # builds can drive video/web wallpapers; the daemon resolves them next to
+    # its own executable).
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-video-renderer" "${pkgdir}/usr/bin/kwe-video-renderer"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-web-renderer" "${pkgdir}/usr/bin/kwe-web-renderer"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-audio-worker" "${pkgdir}/usr/bin/kwe-audio-worker"
 
     # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and
     # the staged org.kde.kwe.wallpaper Plasma wallpaper package.
