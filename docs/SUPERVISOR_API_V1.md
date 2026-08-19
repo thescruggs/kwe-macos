@@ -18,6 +18,7 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `renderer.input`
 - `audio.forward` *(BETA_M1a)*
 - `media.state` *(BETA_M1a)*
+- `audio.status` *(BETA_M1d)*
 
 ## Start and retry
 
@@ -188,6 +189,53 @@ only after re-reading `renderer.status` for the current `display_generation`.
 Each stream is latest-wins: one pending frame per stream, replaced — not
 queued — when the worker pipe is under backpressure, counting into
 `audio_coalesced` / `media_coalesced`.
+
+### BETA_M1d: the daemon's audio capture producer
+
+`kwe-daemon --audio-capture` spawns `kwe-audio-worker` (default
+`kwe-audio-worker` beside the daemon executable; `--audio-worker <path>` and
+`--audio-capture-node <id>` override the binary and the PipeWire capture
+target). The worker is managed like a renderer child — own process group,
+`no_new_privs`, parent-death signal, bounded SIGTERM-then-SIGKILL stop — but
+with two differences: it is restarted on *any* unexpected exit (at most 3
+restarts within a rolling 10-minute window; beyond that it is disabled for the
+daemon's lifetime with a one-time log), and it inherits the daemon environment
+because PipeWire capture needs the session's `XDG_RUNTIME_DIR`.
+
+`audio.status` (no params) reports:
+
+```json
+{"enabled": true, "pid": 1234, "restarts": 0, "disabled_reason": null}
+```
+
+`enabled` mirrors the `--audio-capture` flag; `pid` is the live worker (or
+`null`); `restarts` counts bounded respawns; `disabled_reason` is
+`"too_many_restarts"` once the budget is exhausted. Without
+`--audio-capture`, `enabled` is `false` and the daemon never spawns the
+worker.
+
+Producer contract (`kwe-audio-worker`):
+
+- It pushes at most `--max-fps` frames per second (default 30), one request
+  per connection, each envelope `{"version":1,"id":N,"method":"audio.forward",
+  "params":{"generation":G,"frame":{"left":[...],"right":[...]}}}`.
+- The `generation` is learned from `renderer.status` and refreshed whenever a
+  push is rejected with `supervisor_failed` (stale generation). While no
+  renderer has ever been promoted (`display_generation` 0) the worker holds a
+  single latest frame and re-polls `renderer.status` on a bounded interval;
+  it does not spam rejections at the daemon.
+- While the daemon runs with `--audio-capture` and no renderer is promoted,
+  the daemon converts its own worker's
+  `{"error": "supervisor_failed", "detail": "no promoted renderer is
+  available for audio forwarding"}` responses into `{"ok": true,
+  "result": {"status": "dropped"}}` — a silent latest-wins drop with
+  rate-limited daemon logging. Every other caller (and every other failure
+  detail, including stale generations) keeps the `supervisor_failed` error
+  shape unchanged.
+- Worker exit codes: 0 graceful SIGTERM, 74 capture-node resolution failure
+  (pw-dump missing/unparsable/no sink), 75 capture failure (pw-record missing,
+  failed to start, or died). The daemon's restart policy treats every exit
+  while running as unexpected except its own shutdown SIGTERM.
 
 ## Lifecycle and recovery
 

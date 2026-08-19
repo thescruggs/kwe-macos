@@ -64,7 +64,9 @@ and cannot enter this control stream.
 
 ## Audio and media control
 
-*(BETA_M1a: daemon-side producers/forwarders on the same control pipe.)*
+*(BETA_M1a: daemon-side producers/forwarders on the same control pipe;
+BETA_M1d: `audio_bands` gains a real producer — the bounded PipeWire capture
+worker.)*
 
 The supervisor writes the versioned `audio_bands` and `media_state` wire types
 (see `docs/SUPERVISOR_API_V1.md` for the daemon API that feeds them) through
@@ -85,6 +87,25 @@ for monotonicity or ordering (a later capture can legitimately carry a lower
 `sequence` after a rollback), and must not reject an `audio_bands` /
 `media_state` message whose `sequence` is lower than the previous one:
 staleness is enforced daemon-side before writing, exactly like pointer input.
+
+### BETA_M1d producer: `kwe-audio-worker`
+
+With `kwe-daemon --audio-capture`, the daemon's `kwe-audio-worker` captures
+the PipeWire default sink (`pw-record --raw --format f32 --rate <rate>
+--channels 2 --target <node> -`; `<node>` from `--capture-node` or resolved
+once from `pw-dump`) and analyzes each bounded window with
+`kwe_core::audio::analyze_stereo`, producing the 16/32/64-band frames above at
+most `--max-fps` times per second. Defaults: 48000 Hz, 64 bands, 2048-sample
+windows, 30 fps. The worker holds only the latest window (a bounded queue of
+1), pushes over one fresh RPC connection per frame (`audio.forward`), and
+pauses pushing while the daemon has no promoted display generation (polling
+`renderer.status` on a bounded interval instead). The bands are normalized
+energies in `0..=1` per band per channel; the worker is bounded end to end —
+capture reads, window buffers, pw-dump output (4 MiB), response lines
+(16 KiB), reconnect backoff (max 1 s), and stderr diagnostics — and stops
+gracefully on SIGTERM (it first stops `pw-record`). Capture requires the
+user's PipeWire session (inherited `XDG_RUNTIME_DIR`); per-wallpaper audio
+grants are a later milestone.
 
 ## Display behavior
 

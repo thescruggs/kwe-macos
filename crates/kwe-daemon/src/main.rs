@@ -2,6 +2,7 @@
 //! Small Alpha control service. The newline-delimited protocol is deliberately
 //! bounded and versioned so the UI never parses Workshop content itself.
 
+mod audio;
 mod persist;
 mod playlist_session;
 mod supervisor;
@@ -11,14 +12,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufReader, Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use audio::{AudioCaptureConfig, AudioCaptureHandle, AudioCaptureService};
 use clap::Parser;
 use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
 use kwe_input_protocol::{AudioFrame, MediaState, PointerButton, PointerPhase};
@@ -117,6 +123,18 @@ struct Arguments {
     /// Playlist session tick interval.
     #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(50..=5000))]
     playlist_tick_ms: u64,
+    /// Spawn the bounded PipeWire audio capture worker (default: off).
+    #[arg(long)]
+    audio_capture: bool,
+    /// Audio capture worker executable (default: kwe-audio-worker beside the
+    /// daemon).
+    #[arg(long)]
+    audio_worker: Option<PathBuf>,
+    /// PipeWire capture node passed through to the worker as --capture-node;
+    /// lets tests direct the worker at a null sink instead of the user's
+    /// real default sink.
+    #[arg(long)]
+    audio_capture_node: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +276,21 @@ fn main() -> Result<()> {
         valid_ids: compute_valid_ids(&catalog),
     });
     let playlist = playlist_service.handle();
+    // The audio capture service always runs so `audio.status` stays
+    // answerable; without --audio-capture it stays idle and reports
+    // enabled: false.
+    let audio_worker_path = match arguments.audio_worker {
+        Some(path) => path,
+        None => default_audio_worker_path()?,
+    };
+    let audio_service = AudioCaptureService::start(AudioCaptureConfig {
+        enabled: arguments.audio_capture,
+        worker_path: audio_worker_path,
+        socket: socket.clone(),
+        capture_node: arguments.audio_capture_node,
+    })?;
+    let audio = audio_service.handle();
+    let worker_pid = audio_service.worker_pid();
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -283,6 +316,8 @@ fn main() -> Result<()> {
                     &supervisor,
                     &playlist,
                     &workshop_cache,
+                    &audio,
+                    &worker_pid,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -359,6 +394,10 @@ fn read_request_line<R: Read>(reader: &mut R, deadline: Instant) -> Result<Vec<u
     Ok(line)
 }
 
+// The API layer intentionally takes its context explicitly so unit tests can
+// drive process_request directly; a context struct would only re-bundle what
+// the boundary already names.
+#[allow(clippy::too_many_arguments)]
 fn handle_client(
     mut stream: UnixStream,
     catalog: &Arc<RwLock<Catalog>>,
@@ -366,6 +405,8 @@ fn handle_client(
     supervisor: &SupervisorHandle,
     playlist: &PlaylistSessionHandle,
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
+    audio: &AudioCaptureHandle,
+    worker_pid: &Arc<AtomicU32>,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
@@ -379,6 +420,11 @@ fn handle_client(
     if line.len() > MAX_REQUEST_BYTES && request.method != "playlist.import" {
         bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
     }
+    // Peer credential identification: the daemon's own audio worker is
+    // recognized by pid so its no-active-renderer rejections can be dropped
+    // silently instead of erroring the caller's connection. SO_PEERCRED is
+    // read directly because std's peer_cred() is still feature-gated.
+    let peer_pid = peer_pid(&stream);
     let (ok, result) = process_request(
         &request,
         catalog,
@@ -386,6 +432,9 @@ fn handle_client(
         Some(supervisor),
         Some(playlist),
         workshop_cache,
+        Some(audio),
+        peer_pid,
+        worker_pid,
         allow_test_faults,
     )?;
     let response = Response {
@@ -400,6 +449,9 @@ fn handle_client(
     Ok(())
 }
 
+// See the note on handle_client: explicit context keeps the API layer
+// directly testable.
+#[allow(clippy::too_many_arguments)]
 fn process_request(
     request: &Request,
     catalog: &Arc<RwLock<Catalog>>,
@@ -407,6 +459,9 @@ fn process_request(
     supervisor: Option<&SupervisorHandle>,
     playlist: Option<&PlaylistSessionHandle>,
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
+    audio: Option<&AudioCaptureHandle>,
+    peer_pid: u32,
+    worker_pid: &Arc<AtomicU32>,
     allow_test_faults: bool,
 ) -> Result<(bool, Value)> {
     let result = if request.version != API_VERSION {
@@ -542,9 +597,18 @@ fn process_request(
                             params.frame.left,
                             params.frame.right,
                         ) {
-                            Ok(frame) => supervisor_call(supervisor, |handle| {
-                                handle.audio_frame(params.generation, frame)
-                            }),
+                            Ok(frame) => {
+                                let result = supervisor_call(supervisor, |handle| {
+                                    handle.audio_frame(params.generation, frame)
+                                });
+                                // The daemon's own worker drops its frames
+                                // latest-wins while no renderer is active;
+                                // external callers still see the error.
+                                match classify_audio_error(peer_pid, worker_pid, &result) {
+                                    Some(dropped) => dropped,
+                                    None => result,
+                                }
+                            }
                             Err(error) => {
                                 json!({"error": "invalid_params", "detail": error.to_string()})
                             }
@@ -555,6 +619,7 @@ fn process_request(
                     }
                 }
             }
+            "audio.status" => audio_call(audio, |handle| handle.status()),
             "media.state" => {
                 match serde_json::from_value::<MediaStateParams>(request.params.clone()) {
                     Ok(params) => match MediaState::new(
@@ -757,6 +822,69 @@ impl TryFrom<RendererStartParams> for StartSpec {
     }
 }
 
+/// The daemon's own worker is expected to keep capturing while no renderer is
+/// promoted: its `audio.forward` calls are rejected with
+/// `supervisor_failed` / "no promoted renderer is available for audio
+/// forwarding" every window until a renderer appears. For the daemon's own
+/// worker that is a silent latest-wins drop (the worker holds one frame and
+/// keeps the generation refreshed); for every other caller the error shape is
+/// preserved unchanged.
+const NO_PROMOTED_RENDERER_DETAIL: &str = "no promoted renderer is available for audio forwarding";
+
+/// Counter for the rate-limited silent-drop diagnostic (first 5, then every
+/// thousandth) so a renderer-less session cannot flood the daemon log.
+static AUDIO_DROP_LOGS: AtomicU64 = AtomicU64::new(0);
+
+fn log_audio_drop() {
+    let calls = AUDIO_DROP_LOGS.fetch_add(1, Ordering::Relaxed);
+    if calls < 5 || calls.is_multiple_of(1000) {
+        eprintln!(
+            "event=audio.forward.dropped detail=no promoted renderer, daemon worker frames dropped latest-wins"
+        );
+    }
+}
+
+/// `Some({"status": "dropped"})` exactly when the request came from the
+/// daemon's own audio worker (identified by pid) and the supervisor rejected
+/// it only because no renderer is currently promoted. Everything else
+/// (stale generations, other callers, unknown errors) returns `None` and the
+/// original error result is surfaced.
+fn classify_audio_error(
+    peer_pid: u32,
+    worker_pid: &Arc<AtomicU32>,
+    result: &Value,
+) -> Option<Value> {
+    let is_managed_worker = worker_pid.load(Ordering::Acquire) != 0
+        && peer_pid != 0
+        && peer_pid == worker_pid.load(Ordering::Acquire);
+    if !is_managed_worker {
+        return None;
+    }
+    if result.get("error").and_then(Value::as_str) != Some("supervisor_failed") {
+        return None;
+    }
+    if result.get("detail").and_then(Value::as_str) != Some(NO_PROMOTED_RENDERER_DETAIL) {
+        return None;
+    }
+    log_audio_drop();
+    Some(json!({"status": "dropped"}))
+}
+
+fn audio_call(
+    audio: Option<&AudioCaptureHandle>,
+    call: impl FnOnce(&AudioCaptureHandle) -> Result<audio::AudioCaptureStatus>,
+) -> Value {
+    let Some(audio) = audio else {
+        return json!({"error": "audio_unavailable"});
+    };
+    match call(audio) {
+        Ok(status) => serde_json::to_value(status).unwrap_or_else(
+            |error| json!({"error": "serialization_failed", "detail": error.to_string()}),
+        ),
+        Err(error) => json!({"error": "audio_failed", "detail": error.to_string()}),
+    }
+}
+
 fn supervisor_call(
     supervisor: Option<&SupervisorHandle>,
     call: impl FnOnce(&SupervisorHandle) -> Result<WorkerStatus>,
@@ -857,6 +985,15 @@ fn default_renderer_paths() -> Result<BTreeMap<RendererKind, PathBuf>> {
     ]))
 }
 
+/// Default audio capture worker binary beside the daemon executable.
+fn default_audio_worker_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("resolve daemon executable")?;
+    let directory = executable
+        .parent()
+        .context("daemon executable has no parent")?;
+    Ok(directory.join("kwe-audio-worker"))
+}
+
 fn default_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path).join("kwe"));
@@ -870,6 +1007,25 @@ fn unix_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Peer process id of a Unix stream connection, or 0 when the credential
+/// query fails (which also makes the no-renderer drop never apply).
+fn peer_pid(stream: &UnixStream) -> u32 {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` is a valid mutable ucred buffer and `len` its bound;
+    // getsockopt fills it with the peer credentials of our own descriptor.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 { cred.pid as u32 } else { 0 }
 }
 
 fn validate_socket_parent(socket: &Path) -> Result<()> {
@@ -932,6 +1088,9 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
             false,
         )
         .unwrap();
@@ -952,6 +1111,9 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
             false,
         )
         .unwrap();
@@ -973,6 +1135,9 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
             false,
         )
         .unwrap();
@@ -993,9 +1158,16 @@ mod tests {
             None,
             playlist,
             &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
             true,
         )
         .unwrap()
+    }
+
+    fn empty_worker_pid() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(0))
     }
 
     const DAILY_JSON: &str = r#"{"id":"daily","title":"Daily","entries":[],"shuffle":false,"repeat":true,"duration_seconds":300,"transition":"none","transition_seconds":0}"#;
@@ -1114,6 +1286,9 @@ mod tests {
             None,
             Some(&handle),
             &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
             false,
         )
         .unwrap();
@@ -1296,5 +1471,85 @@ mod tests {
             .unwrap(),
             state
         );
+    }
+
+    #[test]
+    fn only_the_daemons_own_worker_no_renderer_rejection_is_dropped_silently() {
+        let worker_pid = Arc::new(AtomicU32::new(4321));
+        let no_renderer = json!({
+            "error": "supervisor_failed",
+            "detail": "no promoted renderer is available for audio forwarding"
+        });
+        // The daemon's own worker with the no-promoted-renderer rejection:
+        // silent latest-wins drop.
+        let dropped = classify_audio_error(4321, &worker_pid, &no_renderer);
+        assert_eq!(dropped, Some(json!({"status": "dropped"})));
+        // Stale-generation rejections still surface unchanged: the worker
+        // refreshes its display generation on them.
+        let stale = json!({
+            "error": "supervisor_failed",
+            "detail": "audio frame display generation is stale or invalid"
+        });
+        assert_eq!(classify_audio_error(4321, &worker_pid, &stale), None);
+        // Other callers, unknown credentials, and a worker that never
+        // spawned keep the original error.
+        assert_eq!(classify_audio_error(9999, &worker_pid, &no_renderer), None);
+        assert_eq!(classify_audio_error(0, &worker_pid, &no_renderer), None);
+        assert_eq!(
+            classify_audio_error(4321, &Arc::new(AtomicU32::new(0)), &no_renderer),
+            None
+        );
+        // Non-supervisor failures are never dropped.
+        let invalid = json!({"error": "invalid_params", "detail": "x"});
+        assert_eq!(classify_audio_error(4321, &worker_pid, &invalid), None);
+    }
+
+    #[test]
+    fn audio_status_reports_the_capture_service_state_and_fails_closed() {
+        let catalog = empty_catalog();
+        let service = AudioCaptureService::start(AudioCaptureConfig {
+            enabled: false,
+            worker_path: PathBuf::from("/bin/sleep"),
+            socket: PathBuf::from("/nonexistent/kwe.sock"),
+            capture_node: None,
+        })
+        .unwrap();
+        let handle = service.handle();
+        let request: Request =
+            serde_json::from_str(r#"{"version":1,"method":"audio.status"}"#).unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            Some(&handle),
+            0,
+            &empty_worker_pid(),
+            false,
+        )
+        .unwrap();
+        assert!(ok, "{result}");
+        assert_eq!(result["enabled"], false);
+        assert!(result["pid"].is_null());
+        assert_eq!(result["restarts"], 0);
+        assert!(result["disabled_reason"].is_null());
+        // Without a running service the method fails closed.
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            None,
+            0,
+            &empty_worker_pid(),
+            false,
+        )
+        .unwrap();
+        assert!(!ok);
+        assert_eq!(result["error"], "audio_unavailable");
     }
 }

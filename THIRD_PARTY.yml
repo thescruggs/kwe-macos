@@ -143,6 +143,15 @@ entries:
     approved_for_code_use: false
     notes: Behavior, format, and compatibility concepts only; no code copied and not a runtime backend.
 
+  - id: pipewire-tools
+    project: PipeWire tools (pw-record, pw-dump)
+    url: https://gitlab.freedesktop.org/pipewire/pipewire
+    revision: 1.6.8 (installed package 1:1.6.8-1.1 on the development machine)
+    license_observed: MIT (PipeWire)
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-audio-worker spawns pw-record --raw and pw-dump as separate processes and parses their bounded raw f32 output and JSON dump only; it never links libpipewire and no upstream code is copied. Revision pinned to the installed pipewire package; flag/property shapes verified empirically on 1.6.8 (--target accepts a node serial or name; monitor nodes are created on demand and do not appear in pw-dump).
+
   - id: valve-steamworks
     project: Valve Steamworks SDK / ISteamUGC
     url: https://partner.steamgames.com/doc/features/workshop/implementation

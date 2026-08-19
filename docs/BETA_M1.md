@@ -4,7 +4,10 @@ M1 proves the wallpaper contract end to end: a supervised, kind-specific
 renderer that decodes real video in its own process and publishes validated
 frames through the shared frame protocol. M1a generalized the renderer
 contract (per-kind spawn, env allowlist, resource limits, bounded stderr
-ring, audio/media plumbing); M1b adds the libmpv video renderer itself.
+ring, audio/media plumbing); M1b adds the libmpv video renderer itself; M1d
+adds the bounded PipeWire audio capture worker (`kwe-audio-worker`), the
+daemon-side capture management (`--audio-capture`, `audio.status`), and the
+real producer behind the `audio_bands` wire type.
 
 ## Goal
 
@@ -22,12 +25,16 @@ Nothing is loaded into plasmashell.
 ```sh
 scripts/smoke-video.sh        # M1b: video renderer through the daemon
 scripts/smoke-supervisor.sh   # M1a: supervisor fault/recovery contract
+scripts/smoke-audio.sh        # M1d: bounded audio capture through the daemon
 ```
 
-Both scripts build the workspace, use a private temporary socket/runtime/
+All three scripts build the workspace, use a private temporary socket/runtime/
 state tree, generate synthetic fixtures with ffmpeg (never committed), and
 remove everything on exit. They do not install a wallpaper or touch the
-running Plasma session.
+running Plasma session. `smoke-audio.sh` additionally creates an isolated
+null sink (pactl module-null-sink or pw-cli adapter node) and directs the
+capture worker at it, so the user's real default sink is never touched; it
+prints `SKIPPED` and exits 0 when no PipeWire control tool is available.
 
 ## Acceptance evidence
 
@@ -89,6 +96,25 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, and `cargo test --workspace
 --all-targets` are clean (119 tests); `smoke-video.sh` (10 cases) and
 `smoke-supervisor.sh` (15 cases) both pass.
+
+### M1d — bounded audio capture
+
+Validated on 2026-08-19 (PipeWire 1:1.6.8-1.1, CachyOS; capture directed at
+a null sink, never the user's default).
+
+| Case | Expected | Result |
+|---|---|---|
+| worker start | `--audio-capture` spawns the worker | `audio.status` `enabled: true`, live `pid`, `restarts` 0; the null sink name is passed through as `--audio-capture-node` (pw-dump resolution skipped) |
+| renderer active | frames flow through the daemon | `input_ack_sequence` follows the promoted `display_generation` (advances across a stop/start generation bump); `input_protocol_errors` stays 0 |
+| renderer stopped | silent latest-wins drop | `renderer.stop` produces no `event=api.client_error` storm; the daemon log carries only the rate-limited `event=audio.forward.dropped` note (1–10 lines over a 2 s window) |
+| kill -9 worker | bounded restart | `restarts` 1, a new live `pid` replaces the killed one |
+| SIGTERM daemon | graceful stop | worker logs `event=audio.worker.stopped` and its pid vanishes; no `forced_kill` line (exit-0 evidence — a non-child's exit code is not directly observable) |
+| unit tests | 13 in-crate | parameter bounds, emission cadence, pw-dump sink resolution, response/refresh decisions, queue-of-1 latest-wins, stderr-ring budgets, restart-window pruning, restart-budget disable, shutdown reap, status shape |
+
+M1d gates: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, and `cargo test --workspace --all-targets`
+are clean (132 tests); `smoke-audio.sh` (5 cases) passes, and
+`smoke-video.sh` / `smoke-supervisor.sh` still pass.
 
 ## Failure and recovery cases
 
@@ -176,3 +202,21 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 | 72 | memory-pressure allocation unexpectedly succeeded | `process_exit` failure |
 | 73 | backend rejection (decode/render unusable, incl. after `--hwdec=no` retry, or a known duration over 24 h) | `exit_code_73` in `last_failure_detail` |
 | signal | killed (e.g. kill -9) | `process_exit` with `signal_9` |
+
+## Audio worker exit codes
+
+The daemon restarts `kwe-audio-worker` on any unexpected exit (own process
+group, `no_new_privs`, parent-death **SIGTERM** — deliberately not SIGKILL,
+so a crashed daemon cannot orphan `pw-record`), at most 3 times within a
+rolling 10-minute window; beyond that the worker is disabled for the daemon's
+lifetime (`audio.status.disabled_reason` = `"too_many_restarts"`, logged
+once). The worker pushes at most `--max-fps` frames per second and holds
+only the latest window internally, so restarts are cheap and lossless by
+design (latest-wins).
+
+| Code | Meaning | Daemon mapping |
+|---|---|---|
+| 0 | graceful stop (SIGTERM; pw-record stopped first) | normal stop |
+| 74 | capture-node resolution failure (pw-dump missing, unparsable, or no default sink / monitor node found) | restart (bounded), then disable |
+| 75 | capture failure (pw-record missing, failed to start, or died) | restart (bounded), then disable |
+| signal | killed (e.g. kill -9) | restart (bounded), then disable |
