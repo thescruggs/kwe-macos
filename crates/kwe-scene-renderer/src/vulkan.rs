@@ -53,7 +53,7 @@ use std::fmt;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
-use crate::layers::{BlendMode, LayerDraw, MAX_LAYERS};
+use crate::layers::{BlendMode, DrawKind, LayerDraw, MAX_LAYERS};
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
 /// backend failure by the caller.
@@ -153,6 +153,15 @@ struct LayerTexture {
     view: vk::ImageView,
 }
 
+/// One text layer's quad vertex buffer (M3e): host-visible, grown in
+/// place (create-or-grow on resize), index-aligned with the layer table.
+/// The byte capacity is tracked so a shorter text reuses the buffer.
+struct LayerVertexBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    bytes: usize,
+}
+
 pub struct LayerRenderer {
     instance: Instance,
     device: Device,
@@ -187,6 +196,11 @@ pub struct LayerRenderer {
     /// Bounded pool: at most MAX_LAYERS sets of one combined image sampler.
     descriptor_pool: vk::DescriptorPool,
     /// One descriptor set per layer index; None until the layer uploaded.
+    ///
+    /// M3e: one host-visible vertex buffer per text layer (the quad
+    /// geometry rebuilt on text change), index-aligned with the layer
+    /// table; None until the layer's text synced.
+    text_vertex_buffers: Vec<Option<LayerVertexBuffer>>,
     descriptor_sets: Vec<Option<vk::DescriptorSet>>,
     /// Uploaded textures per layer index; None = skipped at load or failed
     /// upload.
@@ -611,6 +625,7 @@ impl LayerRenderer {
             descriptor_pool,
             descriptor_sets: Vec::new(),
             textures: Vec::new(),
+            text_vertex_buffers: Vec::new(),
             command_pool,
             command_buffer,
             upload_buffer,
@@ -915,6 +930,56 @@ impl LayerRenderer {
         Ok(())
     }
 
+    /// Upload one text layer's quad vertex data (M3e): 6 verts per glyph
+    /// of {pos.xy, uv.xy} — the same stride and layout as the unit quad.
+    /// The buffer is host-visible and grown in place (create-or-grow), so
+    /// per-change uploads never allocate from the device; `bytes` is
+    /// bounded by the caller (text::MAX_TEXT_VERTEX_BYTES). A failed
+    /// allocation returns an error the caller treats like a failed texture
+    /// upload (layer skipped, renderer healthy).
+    pub fn upload_text_vertices(&mut self, index: usize, bytes: &[u8]) -> Result<(), RenderError> {
+        while self.text_vertex_buffers.len() <= index {
+            self.text_vertex_buffers.push(None);
+        }
+        let entry = self.text_vertex_buffers[index].get_or_insert_with(|| LayerVertexBuffer {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            bytes: 0,
+        });
+        if entry.bytes < bytes.len() {
+            if entry.buffer != vk::Buffer::null() {
+                unsafe { self.device.destroy_buffer(entry.buffer, None) };
+                unsafe { self.device.free_memory(entry.memory, None) };
+            }
+            let size = bytes.len().max(64) as vk::DeviceSize;
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.device.create_buffer(&info, None) }?;
+            let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+            let memory =
+                allocate_host_visible(&self.instance, &self.device, self.physical, &requirements)?;
+            unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
+            entry.buffer = buffer;
+            entry.memory = memory;
+            entry.bytes = size as usize;
+        }
+        let mapped = unsafe {
+            self.device.map_memory(
+                entry.memory,
+                0,
+                bytes.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            self.device.unmap_memory(entry.memory);
+        }
+        Ok(())
+    }
+
     /// Clear the attachment with `color` (straight RGBA), draw the given
     /// layers in order (scene.json order, src-over blending), read the
     /// pixels back, and return them premultiplied BGRA. In-flight 1: a
@@ -927,15 +992,6 @@ impl LayerRenderer {
             self.device
                 .begin_command_buffer(self.command_buffer, &begin_info)
         }?;
-
-        unsafe {
-            self.device.cmd_bind_vertex_buffers(
-                self.command_buffer,
-                0,
-                std::slice::from_ref(&self.vertex_buffer),
-                &[0],
-            );
-        }
 
         // ClearValue is a union in ash 0.38; only the color member is set.
         let clear_value = vk::ClearValue {
@@ -1026,15 +1082,52 @@ impl LayerRenderer {
                     std::slice::from_ref(&set),
                     &[],
                 );
-                // The quad is two fan-ordered triangles in the vertex
-                // buffer ([v0,v1,v2, v0,v2,v3]); one 6-vertex TRIANGLE_LIST
-                // draw emits both. The original half-quad bug was NOT the
-                // draw shape — it was the vertex-buffer size: an
-                // element/byte mix-up sized the buffer at 16 bytes (one
-                // vertex), so the GPU's reads of vertices 2..5 ran out of
-                // bounds and the second triangle rasterized garbage
-                // (found via the isolated_draw probe; see `new`).
-                self.device.cmd_draw(self.command_buffer, 6, 1, 0, 0);
+                // M3e: the vertex source depends on the draw kind — image
+                // draws use the shared unit quad, text draws bind the
+                // layer's own quad buffer (geometry rebuilt on change,
+                // never per frame). Binding inside the pass per draw is
+                // what makes the per-layer vertex data work.
+                let vertex_count = match draw.kind {
+                    DrawKind::Image => {
+                        self.device.cmd_bind_vertex_buffers(
+                            self.command_buffer,
+                            0,
+                            std::slice::from_ref(&self.vertex_buffer),
+                            &[0],
+                        );
+                        // The quad is two fan-ordered triangles in the
+                        // vertex buffer ([v0,v1,v2, v0,v2,v3]); one
+                        // 6-vertex TRIANGLE_LIST draw emits both. The
+                        // original half-quad bug was NOT the draw shape —
+                        // it was the vertex-buffer size: an element/byte
+                        // mix-up sized the buffer at 16 bytes (one
+                        // vertex), so the GPU's reads of vertices 2..5 ran
+                        // out of bounds and the second triangle rasterized
+                        // garbage (found via the isolated_draw probe; see
+                        // `new`).
+                        6
+                    }
+                    DrawKind::Text { vertex_count } => {
+                        let Some(buffer) = self
+                            .text_vertex_buffers
+                            .get(draw.layer_index)
+                            .and_then(|slot| slot.as_ref())
+                        else {
+                            // Defense: the draw list builder already skips
+                            // text layers without vertex data.
+                            continue;
+                        };
+                        self.device.cmd_bind_vertex_buffers(
+                            self.command_buffer,
+                            0,
+                            std::slice::from_ref(&buffer.buffer),
+                            &[0],
+                        );
+                        vertex_count
+                    }
+                };
+                self.device
+                    .cmd_draw(self.command_buffer, vertex_count, 1, 0, 0);
             }
         }
         unsafe {
@@ -1246,6 +1339,11 @@ impl Drop for LayerRenderer {
                 self.device.destroy_image_view(texture.view, None);
                 self.device.destroy_image(texture.image, None);
                 self.device.free_memory(texture.memory, None);
+            }
+            // M3e: per-layer text vertex buffers.
+            for buffer in self.text_vertex_buffers.iter().flatten() {
+                self.device.destroy_buffer(buffer.buffer, None);
+                self.device.free_memory(buffer.memory, None);
             }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -1613,6 +1711,7 @@ mod tests {
             .upload_layer(0, &[255, 0, 0, 255], 1, 1)
             .expect("upload layer");
         let draws = [LayerDraw {
+            kind: DrawKind::Image,
             layer_index: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
@@ -1669,6 +1768,7 @@ mod tests {
             .upload_layer(0, &texture, 2, 2)
             .expect("upload layer");
         let draws = [LayerDraw {
+            kind: DrawKind::Image,
             layer_index: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
@@ -1718,6 +1818,7 @@ mod tests {
             .upload_layer(0, &[64, 103, 142, 255], 1, 1)
             .expect("upload layer");
         let draws = [LayerDraw {
+            kind: DrawKind::Image,
             layer_index: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
@@ -1898,6 +1999,7 @@ mod tests {
         ];
         for (mode, expected) in cases {
             let draws = [LayerDraw {
+                kind: DrawKind::Image,
                 layer_index: 0,
                 m: [[64.0, 0.0], [0.0, 48.0]],
                 t: [0.0, 0.0],
@@ -1933,6 +2035,7 @@ mod tests {
             .upload_layer(0, &[64, 103, 142, 255], 1, 1)
             .expect("upload layer");
         let draws = [LayerDraw {
+            kind: DrawKind::Image,
             layer_index: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
@@ -1978,6 +2081,7 @@ mod tests {
             .upload_layer(0, &[64, 103, 142, 255], 1, 1)
             .expect("upload layer");
         let draws = [LayerDraw {
+            kind: DrawKind::Image,
             layer_index: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],

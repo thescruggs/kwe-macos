@@ -21,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
+use crate::text::{HorizontalAlign, VerticalAlign};
 use crate::textures::DecodedTexture;
 
 /// Cap on the raw scene.json bytes. Single source of truth in kwe-core
@@ -105,11 +106,21 @@ pub struct SceneConfig {
     /// Optional `general.fps` hint (unused by the worker in M3a; the daemon
     /// owns the pacing).
     pub fps: Option<f32>,
-    /// The `objects` array interpreted as image layers, in scene.json
-    /// order (M3c). Every other object kind (models, particles, audio,
-    /// text — M3d+) is ignored. The loader resolves and decodes each
-    /// layer's `image` and fills `texture`.
+    /// The `objects` array interpreted as image and text layers, in
+    /// scene.json order (M3c image, M3e text). Every other object kind
+    /// (models, particles, audio — M3d+) is ignored. The loader resolves
+    /// and decodes each layer's `image` and fills `texture`.
     pub layers: Vec<LayerSpec>,
+    /// Text objects skipped because the scene declares more than
+    /// text::MAX_TEXT_LAYERS of them. Never a rejection — the extra layers
+    /// just do not register; counted for the worker's one-time diagnostic.
+    pub text_layer_skips: usize,
+    /// Objects carrying both `image` and `text` (image wins per the M3c
+    /// rule; counted for the worker's one-time diagnostic).
+    pub text_on_image_objects: usize,
+    /// Text layers that also wrote a `size` field (ignored — text size is
+    /// automatic; counted for the worker's one-time diagnostic).
+    pub text_size_ignored: usize,
 }
 
 /// One `objects` entry interpreted as an image layer (M3c). Parsed fields
@@ -163,6 +174,46 @@ pub struct LayerSpec {
     /// is missing, unreadable, over budget, or not a decodable format. The
     /// layer then stays registered (script-visible) but draws nothing.
     pub texture: Option<DecodedTexture>,
+    /// Text-layer content (M3e), `Some` exactly when the object was a text
+    /// layer (has `text`, no `image`). The layer then draws through the
+    /// text path: a per-layer glyph atlas + a quad whose vertex data the
+    /// worker rebuilds on change (text.rs).
+    pub text: Option<TextSpec>,
+}
+
+/// One `objects` entry interpreted as a text layer (M3e). Field names
+/// follow the researched WE/OEW text-object schema (docs/SCENE_FORMAT_V1.md,
+/// M3e section): the file key is `pointsize` (points; the engine multiplies
+/// by 4), alignment is `horizontalalign`/`verticalalign` (both default
+/// "center"), and the color is `color` (a vec3; alpha implied 1.0) —
+/// `fontsize` is not a WE key. Text layers render at their automatic size
+/// (a `size` field is ignored, see `text_size_ignored`); `scale` still
+/// scales the layer, `origin` positions it.
+#[derive(Debug, Clone)]
+pub struct TextSpec {
+    /// The string to render. Capped at text::MAX_TEXT_CHARS chars when the
+    /// layout runs (text.rs); the parser keeps the raw value so the
+    /// worker's one-time truncation diagnostic reports the truth. Defaults
+    /// to "" when the field is absent or not a string (renders nothing).
+    pub text: String,
+    /// Requested font family (WE `font`, optionally `systemfont_`-prefixed
+    /// or an absolute/basename path). None = the resolver's default.
+    pub font: Option<String>,
+    /// Effective pixel em size, clamped to text::MIN_FONT_PX..=MAX_FONT_PX.
+    pub pointsize: f32,
+    pub horizontal_align: HorizontalAlign,
+    pub vertical_align: VerticalAlign,
+    /// RGBA multiplier, 0..=1 each, default opaque white (WE `color` is a
+    /// vec3; the 4th component is accepted and defaults to 1). The color
+    /// drives the pipeline's tint slot; alpha composes with `alpha` per
+    /// the M3d alpha policy.
+    pub color: [f32; 4],
+    /// Whether the scene wrote a `size` for this text layer (ignored).
+    pub has_size: bool,
+    // NOTE: the `objects` common props (origin/angles/scale/alpha/visible/
+    // blend/brightness) live on the LayerSpec for every layer kind, text
+    // included; TextSpec deliberately does not duplicate them (the worker
+    // reads them off LayerState, which mirrors LayerSpec — see layers.rs).
 }
 
 impl SceneConfig {
@@ -237,7 +288,7 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
     let clear_color = parse_clear_color(general)?;
     let resolution = parse_resolution(general)?;
     let fps = parse_fps(general)?;
-    let layers = parse_objects(root_obj)?;
+    let (layers, counts) = parse_objects(root_obj)?;
 
     let script_reference = match general.get("script") {
         None | Some(Value::Null) => None,
@@ -258,22 +309,42 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
         resolution,
         fps,
         layers,
+        text_layer_skips: counts.text_layer_skips,
+        text_on_image_objects: counts.text_on_image_objects,
+        text_size_ignored: counts.text_size_ignored,
     })
 }
 
-/// The `objects` array, interpreted as image layers in scene.json order
-/// (the compositor's draw order — the layer on top is drawn last, over the
-/// others). An object is an image layer exactly when it carries an `image`
-/// field; everything else (models, particles, audio, text — M3d+) is
-/// ignored. A reference that ends in `.json` is a model instance under the
-/// WE solid-model architecture (620 of the 685 corpus image references
-/// point at model files; the other 65 carry a null image value) — skipped
-/// BEFORE any validation, so a malformed model layer (no name, out-of-range
-/// alpha, ...) can never reject the scene, and it is not counted toward the
-/// layer cap, until models arrive (M3h).
-fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerSpec>, SceneError> {
+/// Bounded counts the parser collects while interpreting `objects` (M3e):
+/// never rejections, only one-time worker diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectCounts {
+    pub text_layer_skips: usize,
+    pub text_on_image_objects: usize,
+    pub text_size_ignored: usize,
+}
+
+/// The `objects` array, interpreted as image (M3c) and text (M3e) layers
+/// in scene.json order (the compositor's draw order — the layer on top is
+/// drawn last, over the others). An object is an image layer exactly when
+/// it carries an `image` field; a text layer exactly when it carries a
+/// `text` field without `image` (an object with both counts as image —
+/// `text_on_image_objects` — and an object with neither is ignored:
+/// models, particles, audio — M3d+). A reference that ends in `.json` is a
+/// model instance under the WE solid-model architecture (620 of the 685
+/// corpus image references point at model files; the other 65 carry a null
+/// image value) — skipped BEFORE any validation, so a malformed model
+/// layer (no name, out-of-range alpha, ...) can never reject the scene,
+/// and it is not counted toward the layer cap, until models arrive (M3h).
+///
+/// Text layers beyond text::MAX_TEXT_LAYERS are skipped (counted, never a
+/// rejection); both caps (MAX_TEXT_LAYERS and MAX_LAYERS) apply to the
+/// layers that register.
+fn parse_objects(
+    root_obj: &serde_json::Map<String, Value>,
+) -> Result<(Vec<LayerSpec>, ObjectCounts), SceneError> {
     let Some(value) = root_obj.get("objects") else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), ObjectCounts::default()));
     };
     let array = value.as_array().ok_or_else(|| {
         SceneError::new(
@@ -282,6 +353,8 @@ fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerS
         )
     })?;
     let mut layers = Vec::new();
+    let mut text_layers = 0usize;
+    let mut counts = ObjectCounts::default();
     for (index, entry) in array.iter().enumerate() {
         let object = entry.as_object().ok_or_else(|| {
             SceneError::new(
@@ -289,22 +362,37 @@ fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerS
                 format!("scene.json \"objects[{index}]\" must be an object"),
             )
         })?;
-        if !object.contains_key("image") {
-            continue; // particles, audio, text, ... — M3d+
+        if object.contains_key("image") {
+            if object.contains_key("text") {
+                counts.text_on_image_objects += 1;
+            }
+            // A model instance: WE stores every visual (2D included) as a
+            // model; model layers are M3h. The scene renders without it.
+            // The check runs on the raw (property-unwrapped) reference
+            // BEFORE parse_image_layer, so a malformed model layer skips
+            // like any model layer instead of rejecting the whole scene.
+            if property_value(object.get("image").expect("caller checked"))
+                .as_str()
+                .is_some_and(|image| image.to_ascii_lowercase().ends_with(".json"))
+            {
+                continue;
+            }
+            let layer = parse_image_layer(object, index)?;
+            layers.push(layer);
+        } else if object.contains_key("text") {
+            if text_layers >= crate::text::MAX_TEXT_LAYERS {
+                counts.text_layer_skips += 1;
+                continue;
+            }
+            text_layers += 1;
+            let layer = parse_text_layer(object, index)?;
+            if layer.text.as_ref().is_some_and(|spec| spec.has_size) {
+                counts.text_size_ignored += 1;
+            }
+            layers.push(layer);
+        } else {
+            continue; // particles, audio, ... — M3d+
         }
-        // A model instance: WE stores every visual (2D included) as a
-        // model; model layers are M3h. The scene renders without it. The
-        // check runs on the raw (property-unwrapped) reference BEFORE
-        // parse_image_layer, so a malformed model layer skips like any
-        // model layer instead of rejecting the whole scene.
-        if property_value(object.get("image").expect("caller checked"))
-            .as_str()
-            .is_some_and(|image| image.to_ascii_lowercase().ends_with(".json"))
-        {
-            continue;
-        }
-        let layer = parse_image_layer(object, index)?;
-        layers.push(layer);
     }
     if layers.len() > MAX_LAYERS {
         return Err(SceneError::new(
@@ -315,22 +403,37 @@ fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerS
             ),
         ));
     }
-    Ok(layers)
+    Ok((layers, counts))
 }
 
-/// One image layer entry. Numeric out-of-range values reject the whole
-/// scene (like clearcolor); an unresolvable image never does (the task's
-/// policy — a missing image skips the layer, not the scene).
-fn parse_image_layer(
+/// The layer properties image (M3c) and text (M3e) layers share: name,
+/// origin, angles (file radians → API degrees), scale, alpha, visible,
+/// blend mode, brightness. Defaults, clamps, and error messages mirror the
+/// original parse_image_layer code exactly; `kind` only labels the name
+/// error ("image layers" / "text layers").
+#[derive(Debug, Clone)]
+struct CommonProps {
+    name: String,
+    origin: [f32; 2],
+    angles: [f32; 3],
+    scale: [f32; 2],
+    alpha: f32,
+    visible: bool,
+    blend_mode: u32,
+    brightness: f32,
+}
+
+fn parse_common_props(
     object: &serde_json::Map<String, Value>,
     index: usize,
-) -> Result<LayerSpec, SceneError> {
+    kind: &str,
+) -> Result<CommonProps, SceneError> {
     let name = match object.get("name") {
         Some(Value::String(name)) => name.clone(),
         None | Some(Value::Null) => {
             return Err(SceneError::new(
                 SceneErrorKind::Shape,
-                format!("scene.json \"objects[{index}].name\" is required for image layers"),
+                format!("scene.json \"objects[{index}].name\" is required for {kind} layers"),
             ));
         }
         Some(_) => {
@@ -348,11 +451,6 @@ fn parse_image_layer(
     // until user properties arrive (M3j); the wrapper is unwrapped here,
     // and a wrapped scalar without a value rejects like any malformed
     // scalar.
-    let image = match property_value(object.get("image").expect("caller checked")) {
-        Value::String(reference) => Some(reference.clone()),
-        _ => None,
-    };
-
     let origin = match object.get("origin") {
         None => [0.0, 0.0],
         Some(value) => {
@@ -397,14 +495,6 @@ fn parse_image_layer(
                 &[2, 3],
                 false,
             )?;
-            [vector[0], vector[1]]
-        }
-    };
-
-    let size = match object.get("size") {
-        None => [0.0, 0.0],
-        Some(value) => {
-            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
             [vector[0], vector[1]]
         }
     };
@@ -501,6 +591,47 @@ fn parse_image_layer(
         }
     };
 
+    Ok(CommonProps {
+        name,
+        origin,
+        angles,
+        scale,
+        alpha,
+        visible,
+        blend_mode,
+        brightness,
+    })
+}
+
+/// One image layer entry. Numeric out-of-range values reject the whole
+/// scene (like clearcolor); an unresolvable image never does (the task's
+/// policy — a missing image skips the layer, not the scene).
+fn parse_image_layer(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<LayerSpec, SceneError> {
+    let common = parse_common_props(object, index, "image")?;
+
+    // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
+    // editor serializes user-bindable fields — corpus re-scan: 70%
+    // (315/447) of image layers carrying alpha and 49% (276/568) of those
+    // carrying visible are wrapped. The initial `value` is the behavior
+    // until user properties arrive (M3j); the wrapper is unwrapped here,
+    // and a wrapped scalar without a value rejects like any malformed
+    // scalar.
+    let image = match property_value(object.get("image").expect("caller checked")) {
+        Value::String(reference) => Some(reference.clone()),
+        _ => None,
+    };
+
+    let size = match object.get("size") {
+        None => [0.0, 0.0],
+        Some(value) => {
+            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
+            [vector[0], vector[1]]
+        }
+    };
+
     // `tint` (the brief's key, 3 or 4 components) takes precedence over
     // `color` (the WE file key, a vec3 — its alpha is implied 1.0, the
     // g_Color4 semantics of WE's shader library). Components clamp 0..=1.
@@ -518,19 +649,184 @@ fn parse_image_layer(
     };
 
     Ok(LayerSpec {
-        name,
+        name: common.name,
         image,
-        origin,
-        angles,
-        scale,
+        origin: common.origin,
+        angles: common.angles,
+        scale: common.scale,
         size,
-        alpha,
-        visible,
-        blend_mode,
-        brightness,
+        alpha: common.alpha,
+        visible: common.visible,
+        blend_mode: common.blend_mode,
+        brightness: common.brightness,
         tint,
         texture: None,
+        text: None,
     })
+}
+
+/// One text layer entry (M3e). Shared props come from parse_common_props;
+/// text-only keys follow the OWE text-object schema: `text` (plain string
+/// or property-wrapped), `font` (family / systemfont_ alias / path),
+/// `pointsize` (points, ×4 to pixels — the WE key; `fontsize` is not a WE
+/// key), `horizontalalign` / `verticalalign` (falling back to `alignment`
+/// like OWE's align_or_default, default "center"), and `color` (vec3/vec4
+/// multiplier). A `size` field is tolerated and ignored (counted via
+/// `text_size_ignored`); a missing/blank `text` renders nothing.
+fn parse_text_layer(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<LayerSpec, SceneError> {
+    let common = parse_common_props(object, index, "text")?;
+
+    let text = match property_value(object.get("text").expect("caller checked")) {
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    };
+    let font = match object.get("font").map(property_value) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+
+    // OWE TextPointSizeToPx: px = round(pointsize * 4.0), clamped to our
+    // bounded range (4..=512 px; OWE clamps 1..=1024 — documented
+    // deviation). Non-finite or ≤ 0 sizes use the default (12 pt -> 48 px).
+    let pointsize = match object.get("pointsize") {
+        None => crate::text::DEFAULT_POINT_SIZE * crate::text::POINT_TO_PX,
+        Some(value) => {
+            let value = property_value(value);
+            let pointsize = if let Some(number) = value.as_f64() {
+                number
+            } else if let Some(text) = value.as_str() {
+                text.parse::<f64>().map_err(|_| {
+                    SceneError::new(
+                        SceneErrorKind::Shape,
+                        format!(
+                            "scene.json \"{}\" must be a float or a numeric string",
+                            field(index, "pointsize")
+                        ),
+                    )
+                })?
+            } else {
+                return Err(SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be a float or a numeric string",
+                        field(index, "pointsize")
+                    ),
+                ));
+            };
+            crate::text::pointsize_to_px(pointsize)
+        }
+    };
+
+    // OWE align_or_default: the horizontal/vertical keys win when
+    // non-empty; otherwise `alignment` is consulted for the polarity word;
+    // final default "center" on both axes (researched OWE parser).
+    let horizontal_align = parse_text_align(object, "horizontalalign", "left", "right");
+    let vertical_align = parse_text_align_v(object, "verticalalign");
+
+    // WE `color` for text is a vec3 (alpha implied 1.0); a 4th component
+    // is accepted. Components clamp 0..=1; default opaque white.
+    let color = match object.get("color") {
+        None => [1.0, 1.0, 1.0, 1.0],
+        Some(value) => {
+            let vector = parse_vector(
+                property_value(value),
+                &field(index, "color"),
+                &[3, 4],
+                false,
+            )?;
+            let mut color = [1.0, 1.0, 1.0, 1.0];
+            for (slot, component) in color.iter_mut().zip(vector.iter()) {
+                *slot = crate::layers::clamp_layer_tint(f64::from(*component));
+            }
+            color
+        }
+    };
+
+    let has_size = object.contains_key("size");
+
+    Ok(LayerSpec {
+        name: common.name.clone(),
+        image: None,
+        origin: common.origin,
+        angles: common.angles,
+        scale: common.scale,
+        size: [1.0, 1.0], // text renders at layout size; scale does the resizing
+        alpha: common.alpha,
+        visible: common.visible,
+        blend_mode: common.blend_mode,
+        brightness: common.brightness,
+        tint: color,
+        texture: None,
+        text: Some(TextSpec {
+            text,
+            font,
+            pointsize,
+            horizontal_align,
+            vertical_align,
+            color,
+            has_size,
+        }),
+    })
+}
+
+/// OWE align_or_default for one axis: the `key` value (property-wrapped
+/// allowed) wins when non-empty; otherwise the `alignment` field is
+/// consulted for the polarity words; default "center". The returned
+/// HorizontalAlign doubles as the vertical polarity (Top/Bottom) through
+/// `parse_text_align_v`.
+fn parse_text_align(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    negative: &str,
+    positive: &str,
+) -> HorizontalAlign {
+    // Exact words go through the enum parser; combined alignment strings
+    // ("top-left") fall back to polarity containment.
+    let polarity = |s: &str| -> HorizontalAlign {
+        let s = s.to_ascii_lowercase();
+        if s.contains(negative) {
+            HorizontalAlign::Left
+        } else if s.contains(positive) {
+            HorizontalAlign::Right
+        } else {
+            HorizontalAlign::Center
+        }
+    };
+    let resolve =
+        |s: &str| -> HorizontalAlign { HorizontalAlign::parse(s).unwrap_or_else(|| polarity(s)) };
+    if let Some(Some(value)) = object.get(key).map(property_value).map(Value::as_str)
+        && !value.is_empty()
+    {
+        return resolve(value);
+    }
+    if let Some(Some(alignment)) = object
+        .get("alignment")
+        .map(property_value)
+        .map(Value::as_str)
+    {
+        return resolve(alignment);
+    }
+    HorizontalAlign::Center
+}
+
+/// Vertical counterpart of parse_text_align (`top`/`bottom` polarity).
+fn parse_text_align_v(object: &serde_json::Map<String, Value>, key: &str) -> VerticalAlign {
+    // Exact vertical words first; combined strings ("top-left") fall
+    // through to the shared polarity parser (top -> Left -> Top).
+    if let Some(Some(value)) = object.get(key).map(property_value).map(Value::as_str)
+        && !value.is_empty()
+        && let Some(align) = VerticalAlign::parse(value)
+    {
+        return align;
+    }
+    match parse_text_align(object, key, "top", "bottom") {
+        HorizontalAlign::Left => VerticalAlign::Top,
+        HorizontalAlign::Right => VerticalAlign::Bottom,
+        HorizontalAlign::Center => VerticalAlign::Center,
+    }
 }
 
 fn field(index: usize, name: &str) -> String {
@@ -1338,7 +1634,7 @@ mod tests {
     fn parse_objects_of(json: &str) -> Result<Vec<LayerSpec>, SceneError> {
         let value: Value = serde_json::from_str(json).unwrap();
         let root = value.as_object().unwrap();
-        parse_objects(root)
+        parse_objects(root).map(|(layers, _)| layers)
     }
 
     #[test]
@@ -1644,6 +1940,220 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    // ---- M3e: text layers ----
+
+    #[test]
+    fn text_layers_parsed_with_defaults() {
+        // A bare text object: defaults are the researched OWE ones —
+        // pointsize 12 pt -> 48 px, alignment center/center, opaque white,
+        // brightness 1.0, alpha 1.0, visible true.
+        let layers = parse_objects_of(r#"{"objects": [{"name": "t", "text": "Hello"}]}"#).unwrap();
+        assert_eq!(layers.len(), 1);
+        let text = layers[0].text.as_ref().unwrap();
+        assert_eq!(text.text, "Hello");
+        assert_eq!(text.font, None);
+        assert_eq!(text.pointsize, 48.0);
+        assert_eq!(text.horizontal_align, HorizontalAlign::Center);
+        assert_eq!(text.vertical_align, VerticalAlign::Center);
+        assert_eq!(text.color, [1.0, 1.0, 1.0, 1.0]);
+        assert!(!text.has_size);
+        // The shared fields (common props) live on the layer; defaults are
+        // the researched OWE ones — brightness 1.0, alpha 1.0, visible
+        // true, no image.
+        assert_eq!(layers[0].name, "t");
+        assert_eq!(layers[0].alpha, 1.0);
+        assert!(layers[0].visible);
+        assert_eq!(layers[0].brightness, 1.0);
+        assert_eq!(layers[0].blend_mode, 0);
+        assert_eq!(layers[0].image, None);
+        assert!(layers[0].texture.is_none());
+        assert_eq!(layers[0].size, [1.0, 1.0]); // text size is automatic
+    }
+
+    #[test]
+    fn text_layer_fields_parsed() {
+        let layers = parse_objects_of(
+            r#"{"objects": [{
+                "name": "t",
+                "text": {"user": "txt", "value": "Hi"},
+                "font": "systemfont_Noto Sans",
+                "pointsize": 13,
+                "horizontalalign": "right",
+                "verticalalign": "top",
+                "color": [1.0, 0.0, 0.0],
+                "alpha": 0.5,
+                "brightness": 2.0,
+                "size": [100, 100]
+            }]}"#,
+        )
+        .unwrap();
+        let text = layers[0].text.as_ref().unwrap();
+        // Property-wrapped text is unwrapped like every other field.
+        assert_eq!(text.text, "Hi");
+        assert_eq!(text.font.as_deref(), Some("systemfont_Noto Sans"));
+        // pointsize 13 pt -> round(13 * 4) = 52 px.
+        assert_eq!(text.pointsize, 52.0);
+        assert_eq!(text.horizontal_align, HorizontalAlign::Right);
+        assert_eq!(text.vertical_align, VerticalAlign::Top);
+        assert_eq!(text.color, [1.0, 0.0, 0.0, 1.0]);
+        assert!(text.has_size);
+        // The common props (alpha, brightness) land on the layer.
+        assert_eq!(layers[0].alpha, 0.5);
+        assert_eq!(layers[0].brightness, 2.0);
+    }
+
+    #[test]
+    fn text_pointsize_clamped_and_tolerant() {
+        // OWE: px = round(pointsize * 4), clamp 1..=1024; ours 4..=512
+        // (documented deviation). Non-finite or ≤ 0 falls back to the
+        // default 48 px; numeric strings are accepted like brightness.
+        for (input, want) in [
+            ("100", 400.0),
+            ("200", 512.0), // clamped
+            ("0.5", 4.0),   // clamped up
+            ("-3", 48.0),   // invalid -> default
+            ("\"nan\"", 48.0),
+            ("\"inf\"", 48.0),
+        ] {
+            let layers = parse_objects_of(&format!(
+                r#"{{"objects": [{{"name": "t", "text": "x", "pointsize": {input}}}]}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                layers[0].text.as_ref().unwrap().pointsize,
+                want,
+                "pointsize {input}"
+            );
+        }
+        // A non-numeric pointsize rejects like brightness.
+        let error =
+            parse_objects_of(r#"{"objects": [{"name": "t", "text": "x", "pointsize": "big"}]}"#)
+                .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    #[test]
+    fn text_alignment_falls_back_like_owe() {
+        // horizontalalign/verticalalign win; `alignment` is consulted when
+        // they are empty; default "center" (the researched OWE
+        // align_or_default chain).
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "a", "text": "x", "horizontalalign": "left"},
+                {"name": "b", "text": "x", "alignment": "right"},
+                {"name": "c", "text": "x", "alignment": "top"},
+                {"name": "d", "text": "x", "horizontalalign": "", "verticalalign": ""},
+                {"name": "e", "text": "x", "alignment": {"user": "u", "value": "left"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            layers[0].text.as_ref().unwrap().horizontal_align,
+            HorizontalAlign::Left
+        );
+        assert_eq!(
+            layers[0].text.as_ref().unwrap().vertical_align,
+            VerticalAlign::Center
+        );
+        assert_eq!(
+            layers[1].text.as_ref().unwrap().horizontal_align,
+            HorizontalAlign::Right
+        );
+        assert_eq!(
+            layers[2].text.as_ref().unwrap().vertical_align,
+            VerticalAlign::Top
+        );
+        // Empty explicit values fall back to the alignment field too, and
+        // empty everywhere means center (the OWE default).
+        assert_eq!(
+            layers[3].text.as_ref().unwrap().horizontal_align,
+            HorizontalAlign::Center
+        );
+        assert_eq!(
+            layers[3].text.as_ref().unwrap().vertical_align,
+            VerticalAlign::Center
+        );
+        // Property-wrapped alignment is unwrapped.
+        assert_eq!(
+            layers[4].text.as_ref().unwrap().horizontal_align,
+            HorizontalAlign::Left
+        );
+    }
+
+    #[test]
+    fn text_common_props_match_image_layers() {
+        // The shared parse path must behave identically for text layers:
+        // radians->degrees, wrappers, clamps, rejections.
+        let layers = parse_objects_of(
+            r#"{"objects": [{
+                "name": "t", "text": "x",
+                "origin": "100 200 0", "angles": [3.14159265, 0, 0],
+                "scale": [2, 3], "alpha": 0.25, "visible": false,
+                "colorBlendMode": 7, "brightness": "4"
+            }]}"#,
+        )
+        .unwrap();
+        // The common props land on the LayerSpec exactly like image layers
+        // (TextSpec does not duplicate them — the worker reads LayerState,
+        // which mirrors LayerSpec).
+        assert_eq!(layers[0].origin, [100.0, 200.0]);
+        assert!((layers[0].angles[0] - 180.0).abs() < 0.001);
+        assert_eq!(layers[0].scale, [2.0, 3.0]);
+        assert_eq!(layers[0].alpha, 0.25);
+        assert!(!layers[0].visible);
+        assert_eq!(layers[0].blend_mode, 7);
+        assert_eq!(layers[0].brightness, 4.0);
+        assert_eq!(layers[0].size, [1.0, 1.0], "text layers pin size");
+        // Text layers reject bad shared scalars like image layers.
+        let error = parse_objects_of(r#"{"objects": [{"name": "t", "text": "x", "alpha": 2.0}]}"#)
+            .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        let error = parse_objects_of(r#"{"objects": [{"text": "x"}]}"#).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        assert!(error.message.contains("name"));
+    }
+
+    #[test]
+    fn text_layer_caps_and_counts() {
+        // Objects with both image and text count as image layers (and are
+        // counted for the diag); text layers past MAX_TEXT_LAYERS are
+        // skipped, not a rejection.
+        use crate::text::MAX_TEXT_LAYERS;
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..MAX_TEXT_LAYERS {
+            objects.push_str(&format!(r#"{{"name": "t{i}", "text": "x"}},"#));
+        }
+        objects.push_str(r#"{"name": "extra", "text": "y"}"#);
+        objects.push_str(r#",{"name": "both", "image": "a.png", "text": "z"}"#);
+        objects.push_str("]}");
+        let value: Value = serde_json::from_str(&objects).unwrap();
+        let root = value.as_object().unwrap();
+        let (layers, counts) = parse_objects(root).unwrap();
+        assert_eq!(layers.len(), MAX_TEXT_LAYERS + 1); // 16 text + 1 image
+        assert!(layers[MAX_TEXT_LAYERS].text.is_none()); // "both" is an image layer
+        assert_eq!(layers[MAX_TEXT_LAYERS].image.as_deref(), Some("a.png"));
+        assert_eq!(counts.text_layer_skips, 1);
+        assert_eq!(counts.text_on_image_objects, 1);
+        assert_eq!(counts.text_size_ignored, 0);
+        // Text layers count toward the MAX_LAYERS cap like image layers
+        // (the text cap only limits text layers — the bulk here is image
+        // layers so the 257th registered layer triggers the rejection:
+        // 241 images + 16 text = 257 registrations; the 17th text object
+        // is skipped by the text cap and never registers).
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..MAX_LAYERS - MAX_TEXT_LAYERS + 1 {
+            objects.push_str(&format!(r#"{{"name": "i{i}", "image": "i.png"}},"#));
+        }
+        for i in 0..MAX_TEXT_LAYERS + 1 {
+            objects.push_str(&format!(r#"{{"name": "t{i}", "text": "x"}},"#));
+        }
+        objects.pop();
+        objects.push_str("]}");
+        let error = parse_objects_of(&objects).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        assert!(error.message.contains("layer cap"));
     }
 
     #[test]

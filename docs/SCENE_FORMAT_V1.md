@@ -238,6 +238,126 @@ clear — the hard multiply stores (14,26,26) and the src-over alpha
 0.5 + (128/255)·0.5 = 191.5 rounds to 192 — delivered (11,20,20,192): the
 layer's own opacity survives, and the readback premultiplies exactly once.
 
+## Text layers (M3e)
+
+Text is a WE scene object family on par with images (the WE `Text`
+objects; the OWE reference renders them through a dynamic glyph atlas of
+quads — the architecture mirrored here). **Corpus reality**: the corpus
+carries zero textures and zero known text layers — no real wallpaper
+exercises text — so the implementation is validated with synthetic
+fixtures (the `scripts/smoke-scene.sh` M3e lanes) and unit tests over
+synthetic font directories via `--font-dir` / `KWE_FONT_DIRS`, never with
+byte-pinned real-content renders.
+
+### Researched reference facts
+
+- `pointsize` is the WE file key for the font size, in points; **`fontsize`
+  is not a WE key** (tolerated as an unknown key, never parsed). OWE's
+  `TextPointSizeToPx` multiplies by `kPointsizeToPx = 4.0` and clamps to
+  1..=1024 px. We multiply by the same 4.0 and clamp to **4..=512 px**
+  (documented deviation: `MIN_FONT_PX`/`MAX_FONT_PX` — stricter bounds keep
+  a single glyph comfortably inside the atlas).
+- Alignment defaults to **center/center** in the original (OWE resolves
+  `horizontalalign` → `alignment` → center); our parse mirrors the
+  defaults.
+- WE system fonts are addressed as `systemfont_<Family>` in scenes; the
+  prefix is stripped before resolution.
+- `text` and `font` are property-wrapped in the corpus editor form
+  (`{user, value}`).
+- WE text objects carry a `color` (vec3 or vec4), `alpha` and `brightness`
+  like image objects; the color tints the glyphs.
+- `font` accepts a family name, a `systemfont_` alias, or a path
+  (absolute, or a basename matched against the scanned files).
+
+### Font resolution order
+
+One resolver per worker, cached per normalized family (alphanumerics
+lowercased). Font sources: explicit `--font-dir` / `KWE_FONT_DIRS`
+entries first, then `/usr/share/fonts`, `/usr/local/share/fonts`,
+`~/.local/share/fonts`, `~/.fonts` — bounded (16 dirs, depth 4, 4096
+files per dir, 16384 resolved files, 64 MiB per file) and sorted for
+determinism. Resolution:
+
+1. **Exact** — among basename candidates, the first whose name-table
+   family matches. Verified via the vendored stb_truetype name records
+   (decoded by the C shim: Windows/Unicode records are UTF-16BE, Mac
+   records single-byte), bounded to 32 opens (`MAX_FAMILY_VERIFY`).
+2. **Basename** — the first unverified basename-prefix candidate in
+   sorted order (WE-style basename matching; may be a CJK or condensed
+   variant).
+3. **Fallback chain** — ["Noto Sans", "DejaVu Sans", "Liberation Sans",
+   "FreeSans"], each through steps 1–2; the resolution is reported as a
+   fallback so the load-time diagnostic records the order.
+4. **Any** — the first file that parses, in scan order.
+5. **None** — the layer renders nothing; one bounded diagnostic per layer
+   (`event=renderer.scene.text_font_none layer=... requested=...`).
+
+A `font` written as a path resolves directly when it exists, else by
+basename against the scanned files. Daemon-spawned workers carry fixed
+args, so daemon lanes resolve real system fonts only; the synthetic-font
+lanes (`--font-dir`, unit tests) drive the order above end-to-end.
+
+### Implemented subset (M3e)
+
+- **scene.json keys**: `text` (required to classify the object as a text
+  layer; an object with `image` is an image layer — a `.json` image ref
+  stays a model, M3h — and one with `text` *and* `image` is an image
+  layer with the text counted), `font`, `pointsize`, `horizontalalign` /
+  `verticalalign` (with `alignment` accepted for the horizontal, like the
+  OWE chain), `color` (RGB/RGBA, property-wrapped or plain). Missing or
+  blank `text` renders nothing. A scene-written `size` on a text layer is
+  **ignored** (counted, one-time diagnostic): text renders at its
+  automatic layout size with `size` pinned to (1,1), so layout pixels map
+  1:1 to scene units; resizing happens through `scale` like every other
+  layer.
+- **Common properties** (origin, angles, scale, alpha, visible,
+  blendMode, brightness, tint) inherit the M3c/M3d path unchanged,
+  including the M3d alpha policy: the text color's alpha is folded into
+  the layer alpha (`m1.w`) exactly like a tint.
+- **Rendering**: one 2048×2048 RGBA8 glyph atlas per text layer
+  (16 MiB), shelf-packed, white glyphs (RGB=255, coverage in alpha) with
+  the text color riding the draw's tint slot — **zero shader changes**:
+  the M3d fragment shader multiplies the sampled RGB by the tint and the
+  alpha by the layer alpha, so glyph interiors land exactly in the text
+  color and antialiased edges blend toward the background. An overflow
+  triggers a clear+repack, rate-limited to 2/s
+  (`event=renderer.scene.text_atlas_rebuild_rate_limited`); a glyph
+  larger than 520 px is skipped
+  (`event=renderer.scene.text_glyph_too_large`). Each text layer draws as
+  one `DrawKind::Text` — `vertex_count` vertices (6 per glyph quad), one
+  TRIANGLE_LIST draw — through a per-layer host-visible vertex buffer
+  (created or grown, max 393 216 bytes). The atlas uploads through the
+  existing image upload path; dirty state is synced before the initial
+  render and each NewFrame, regenerating geometry only on text /
+  alignment / font-size change.
+- **JS surface** (`Scene.getLayer` on a text layer): read/write `text`
+  (string; a write truncates to 4096 chars with
+  `event=renderer.scene.text_truncated` and rebuilds the geometry),
+  `pointsize` (clamped 4..=512 px; non-finite/≤0 → the default 12 pt →
+  48 px), `horizontalAlign` / `verticalAlign` (0/1/2 = left|top /
+  center / right|bottom, clamped), `color` (read-only `{r,g,b,a}` 0..=1
+  per component — the scene.json color; script color writes are not
+  exposed in M3e), plus all common layer properties. Text-only properties
+  are only defined on text layers: on image layers they read `undefined`
+  and writes reach no renderer state — never shared state.
+- **Diagnostics** (one per layer, bounded): `text_font_fallback`,
+  `text_font_none`, `text_truncated`, `text_atlas_rebuild_rate_limited`,
+  `text_glyph_too_large`.
+
+### Bounds
+
+| Bound | Value | Behavior |
+|---|---|---|
+| text layers per scene | 16 (`MAX_TEXT_LAYERS`) | further text objects are skipped (counted), never a rejection |
+| text length | 4096 chars (`MAX_TEXT_CHARS`) | script writes truncate; scene.json longer strings truncate with the same diagnostic |
+| font size | 4..=512 px (`MIN_FONT_PX`..`MAX_FONT_PX`), default 12 pt × 4 = 48 px | out-of-range and non-finite clamp to the default at the parse |
+| point→px | × 4.0 (`POINT_TO_PX`, the researched WE multiplier) | rounded, then clamped |
+| atlas | 2048² RGBA8 per layer, shelf-packed | clear+repack rate-limited to 2/s on overflow |
+| glyph bitmap | ≤ 520×520 px | larger glyphs are skipped per layer, never fatal |
+| font file | 64 MiB | over-budget files are skipped by the resolver |
+| font scan | 16 dirs, depth 4, 4096 files/dir, 16384 files | deterministic (sorted) |
+| family verify | 32 opens (`MAX_FAMILY_VERIFY`) | the Exact step never walks the whole corpus |
+
 ## Image sources (M3c)
 
 - **File scenes**: the reference is resolved against the canonicalized
@@ -445,11 +565,25 @@ image compositing in M3a.
 
 | API | Status | Notes |
 |---|---|---|
-| `Scene.getLayer(name \| index)` | **implemented (M3c)** | returns the `Layer` proxy for a registered image layer, or `null` for an unknown name/index (never throws); layers are registered in `objects` order |
-| `Scene.getLayerCount()` | **implemented (M3c)** | the number of registered image layers |
+| `Scene.getLayer(name \| index)` | **implemented (M3c)** | returns the `Layer` proxy for a registered layer (image or text), or `null` for an unknown name/index (never throws); layers are registered in `objects` order |
+| `Scene.getLayerCount()` | **implemented (M3c)** | the number of registered layers (image and text) |
 | `SceneLayer` (`Layer`) | **implemented (M3c, M3d)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). M3d adds `blendMode` (0/1/6/7/9 select the researched modes; 11/12/24/30 clamp to Normal with a bounded diagnostic; anything else clamps silently), `brightness` (0..=10), and `tint` `{r, g, b, a}` (0..=1 each). Writes are clamped like `Engine.clearcolor`: non-finite → 0 (effects → their default 1.0), alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
 | color effects (`brightness`, `tint`) | **implemented (M3d)** | the effects apply to the sampled texel before blending; clamps absorb any out-of-range write |
-| text, particles, 3D models, properties | *planned* (M3e–M3k) | the parse tolerates extra keys but renders none of them |
+| text layers | **implemented (M3e)** | see the Text layers table below |
+| particles, 3D models, properties | *planned* (M3f–M3k) | the parse tolerates extra keys but renders none of them |
+
+### Text layers (M3e)
+
+| API | Status | Notes |
+|---|---|---|
+| `Layer.text` | **implemented (M3e)** | read/write string; a write truncates to 4096 chars (one bounded `text_truncated` diagnostic per layer) and rebuilds the geometry |
+| `Layer.pointsize` | **implemented (M3e)** | points ×4 → px (the researched WE multiplier), clamped 4..=512; non-finite/≤0 → the default 12 pt (48 px) |
+| `Layer.horizontalAlign` / `verticalAlign` | **implemented (M3e)** | 0/1/2 = left\|top / center / right\|bottom, clamped; the parse defaults to center/center (the OWE `horizontalalign` → `alignment` → center chain) |
+| `Layer.color` | **implemented (M3e)** | read-only `{r, g, b, a}` 0..=1 per component (clamped at the parse); RGB implies alpha 1; the alpha folds into the layer alpha (M3d policy), the RGB rides the draw's tint slot |
+| font resolution | **implemented (M3e)** | the Exact → Basename → fallback chain → Any → None order documented in "Text layers (M3e)" above; fallback/none reported once per layer (`text_font_fallback`, `text_font_none`) |
+| glyph atlas | **implemented (M3e)** | 2048² per layer, white glyphs with coverage in alpha — zero shader changes; overflow clear+repack rate-limited to 2/s |
+| `Layer.size` on a text layer | ignored | text size is automatic (layout pixels map 1:1 to scene units); the write is counted (`text_size_ignored`), resizing goes through `scale` |
+| text-bearing wallpapers | *planned* | the corpus carries **zero** text layers and zero textures — nothing real to validate against; M3e is exercised with synthetic fixtures only |
 | `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
 | image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
 | audio/pointer/media input in script | *planned* | the worker receives and acks the wire inputs (M1a plumbing, unchanged) but exposes none of them to the script in M3a |

@@ -20,13 +20,19 @@
 // (relative to the content root, or through the package entry table for
 // scene.pkg), decoded with bounded limits (src/textures.rs), and uploaded
 // before the first render; a missing or over-budget image skips its layer
-// with a bounded one-time diagnostic, never the scene. Script exceptions
-// never kill the renderer; a soft-timeout frame is skipped by re-publishing
-// the last pixels (the supervisor only watches sequence progression).
+// with a bounded one-time diagnostic, never the scene. M3e added text
+// layers: fonts are resolved from the standard system directories (plus
+// --font-dir / KWE_FONT_DIRS for standalone lanes), glyphs rasterized into
+// one bounded 2048x2048 atlas per text layer (src/text.rs), and each text
+// layer draws as a textured quad over the same compositor path. Script
+// exceptions never kill the renderer; a soft-timeout frame is skipped by
+// re-publishing the last pixels (the supervisor only watches sequence
+// progression).
 
 mod js;
 mod layers;
 mod scene;
+mod text;
 mod textures;
 mod vulkan;
 
@@ -51,6 +57,7 @@ use kwe_input_protocol::{
 use js::{EngineStartError, ScriptEngine, StepResult};
 use layers::{LayerState, frame_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
+use text::{MAX_TEXT_LAYERS, TextRenderer};
 use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
 use vulkan::{LayerRenderer, RenderError};
 
@@ -147,6 +154,12 @@ struct Arguments {
     /// exit 0. `kwe diagnose` runs this lane.
     #[arg(long)]
     probe: bool,
+    /// Extra font directories consulted before the standard system font
+    /// locations (repeatable). The daemon spawns workers with a fixed
+    /// environment, so this is also read from KWE_FONT_DIRS (colon-
+    /// separated) for standalone lanes.
+    #[arg(long)]
+    font_dir: Vec<PathBuf>,
 }
 
 fn try_memory_pressure(mib: Option<u64>) -> Result<(), ()> {
@@ -346,6 +359,8 @@ struct SceneWorker {
     input: InputChannel,
     engine: ScriptEngine,
     renderer: LayerRenderer,
+    /// M3e: font resolution, glyph atlas, and per-layer text quad geometry.
+    text: TextRenderer,
     /// The script-visible layer states, index-aligned with the scene's
     /// `objects` array and with `texture_ok`.
     layers: Vec<Rc<RefCell<LayerState>>>,
@@ -408,6 +423,9 @@ impl SceneWorker {
         // canary must pass regardless of script health. An initial render
         // failure means the compositor cannot produce frames at all: that
         // is a backend rejection (exit 73), not an internal error.
+        // M3e: text layers are synced before every frame's draw list, so
+        // the first published frame carries any static scene text too.
+        self.sync_text();
         let draws = frame_draws(&self.layers, &self.texture_ok);
         let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
             Ok(pixels) => pixels,
@@ -444,7 +462,11 @@ impl SceneWorker {
                     };
                     // The draw list is rebuilt per frame: the script may
                     // have mutated layer alpha, position, size, visibility,
-                    // or rotation since the last step.
+                    // or rotation since the last step. M3e: dirty text
+                    // layers (text/pointsize/alignment/color changed by the
+                    // script) are re-rasterized here — geometry is rebuilt
+                    // on change only, never per frame.
+                    self.sync_text();
                     let draws = frame_draws(&self.layers, &self.texture_ok);
                     match self.renderer.render(color, &draws) {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
@@ -510,6 +532,23 @@ impl SceneWorker {
             self.published = self.writer.publish(pixels)?;
         }
         Ok(())
+    }
+
+    /// M3e: re-sync every dirty text layer — resolve its font, relayout,
+    /// rasterize missing glyphs into the layer's bounded atlas, and upload
+    /// atlas + quad geometry. A failed upload marks the layer as not
+    /// drawable this frame, exactly like an image layer; a hostile text can
+    /// only degrade rendering, never the scene. All diagnostics are bounded
+    /// one-time eprintlns (text.rs).
+    fn sync_text(&mut self) {
+        let failed = self.text.sync_and_upload(&mut self.renderer, &self.layers);
+        for index in failed {
+            self.texture_ok[index] = false;
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={} detail=text-upload-failed",
+                self.layers[index].borrow().name
+            );
+        }
     }
 }
 
@@ -629,6 +668,43 @@ fn main() -> Result<()> {
     let layers = engine.layers();
     let texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
 
+    // 6. M3e text subsystem: font directories come from --font-dir (the
+    //    daemon spawns workers with a fixed environment, so standalone
+    //    lanes use the flag) plus KWE_FONT_DIRS (colon-separated, for
+    //    integration tests). Load-time diagnostics are bounded one-time
+    //    eprintlns; a hostile scene only degrades text rendering.
+    let mut font_dirs = arguments.font_dir.clone();
+    if let Some(dirs) = std::env::var_os("KWE_FONT_DIRS") {
+        font_dirs.extend(std::env::split_paths(&dirs));
+    }
+    let text = TextRenderer::new(&font_dirs);
+    eprintln!(
+        "event=renderer.scene.text fonts={} layers={}",
+        text.font_file_count(),
+        layers
+            .iter()
+            .filter(|layer| layer.borrow().text.is_some())
+            .count()
+    );
+    if config.text_layer_skips > 0 {
+        eprintln!(
+            "event=renderer.scene.text_layer_skip count={} (cap is {MAX_TEXT_LAYERS})",
+            config.text_layer_skips
+        );
+    }
+    if config.text_on_image_objects > 0 {
+        eprintln!(
+            "event=renderer.scene.text_on_image_objects count={} (text on image objects is ignored)",
+            config.text_on_image_objects
+        );
+    }
+    if config.text_size_ignored > 0 {
+        eprintln!(
+            "event=renderer.scene.text_size_ignored count={} (text layers pin size=1x1)",
+            config.text_size_ignored
+        );
+    }
+
     let mut worker = SceneWorker {
         arguments,
         spec,
@@ -636,6 +712,7 @@ fn main() -> Result<()> {
         input,
         engine,
         renderer,
+        text,
         layers,
         texture_ok,
         published: 0,
@@ -1109,6 +1186,7 @@ mod tests {
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
             texture: None,
+            text: None,
         }
     }
 

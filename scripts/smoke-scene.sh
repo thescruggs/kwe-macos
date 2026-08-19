@@ -833,7 +833,95 @@ open(sys.argv[12], "w").write(
 )
 PY
 echo "scene smoke: M3d fixtures generated"
-echo "scene smoke: M3c fixtures generated"
+
+# ---------------------------------------------------------------------------
+# M3e fixtures: text layers (BETA_M3e). Every text scene is one text layer
+# over a fullscreen opaque blue background (the M3c blue texel), centered
+# on the frame (scene (0,0) = frame (80,45)); text layers pin size (1,1)
+# and render glyphs at pointsize*4 px per em (default 12pt -> 48 px), so a
+# pointsize 10 -> 40 px em, well inside the sampled region below. The
+# region oracles are STRUCTURAL (foreground-pixel count, differing-pixel
+# count, mean color) — never byte-pins: the exact glyph pixels depend on
+# which font the resolver lands on, which varies per machine (the M3e
+# acceptance records the actual values observed). Case (a) requests the
+# Noto Sans family (the resolver's first fallback candidate); if the
+# machine lacks it the resolver falls back to another system font and the
+# structural oracle still holds.
+m3e_a_scene="$smoke_root/m3e-a.json"
+m3e_b_scene="$smoke_root/m3e-b.json"
+m3e_b_script="$smoke_root/m3e-b.js"
+m3e_c_scene="$smoke_root/m3e-c.json"
+m3e_c_script="$smoke_root/m3e-c.js"
+m3e_d_scene="$smoke_root/m3e-d.json"
+python3 - "$m3e_a_scene" "$m3e_b_scene" "$m3e_b_script" "$m3e_c_scene" "$m3e_c_script" "$m3e_d_scene" <<'PY'
+import json
+import sys
+
+
+def scene(objects, script=None):
+    general = {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30}
+    if script is not None:
+        general["script"] = script
+    return {"general": general, "objects": objects}
+
+
+bg = {"name": "bg", "image": "m3c-blue.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 1.0, "visible": True}
+
+
+def text_layer(name, string, **extra):
+    layer = {
+        "name": name,
+        "text": string,
+        "font": "Noto Sans",
+        "pointsize": 10.0,  # 40 px em
+        "color": [1.0, 0.0, 0.0, 1.0],
+        "origin": [0.0, 0.0],
+        "alpha": 1.0,
+        "visible": True,
+    }
+    layer.update(extra)
+    return layer
+
+
+# (a): fixed string + known family, red on blue — the structural region
+# oracle (count + mean color, no byte-pins).
+json.dump(scene([bg, text_layer("txt", "SMOKE")]), open(sys.argv[1], "w"))
+# (b): the script swaps layer.text from 4 wide glyphs to 1 at t=3s — the
+# foreground count drops ~4x and the two frames differ.
+json.dump(scene([bg, text_layer("txt", "WWWW")], script="m3e-b.js"), open(sys.argv[2], "w"))
+open(sys.argv[3], "w").write(
+    "var t = 0;\n"
+    "function update(dt) {\n"
+    "  t += dt;\n"
+    "  var l = Scene.getLayer(\"txt\");\n"
+    "  if (l === null) throw new Error(\"layer not registered\");\n"
+    "  if (t >= 3.0) l.text = \"W\";\n"
+    "}\n"
+)
+# (c): the pointsize clamp — JSON 9999 clamps to 512 px, script writes
+# clamp the same way (9999 -> 512, -5 -> 4); the script probes the clamped
+# values through console.log (captured in the daemon's stderr tail).
+json.dump(scene([bg, text_layer("txt", "CLAMP", pointsize=9999.0)], script="m3e-c.js"), open(sys.argv[4], "w"))
+open(sys.argv[5], "w").write(
+    "function init() {\n"
+    "  var l = Scene.getLayer(\"txt\");\n"
+    "  if (l === null) throw new Error(\"layer not registered\");\n"
+    "  console.log(\"M3E-POINTSIZE-JSON \" + l.pointsize);\n"
+    "  l.pointsize = 9999;\n"
+    "  console.log(\"M3E-POINTSIZE-SET \" + l.pointsize);\n"
+    "  l.pointsize = -5;\n"
+    "  console.log(\"M3E-POINTSIZE-NEG \" + l.pointsize);\n"
+    "}\n"
+)
+# (d): an unknown family — the resolver falls back (the chain, then any
+# font) and the layer still renders; the one-time diagnostic names the
+# requested family and the resolution. White default color.
+json.dump(
+    scene([bg, text_layer("txt", "FALLBACK", font="DefinitelyNotAFontFamily_M3E", color=[1.0, 1.0, 1.0, 1.0])]),
+    open(sys.argv[6], "w"),
+)
+PY
+echo "scene smoke: M3e fixtures generated"
 
 # Frame pixel oracle for the shared frame file: like scene_oracle, but for
 # one arbitrary pixel against an expected BGRA value with a tolerance
@@ -899,6 +987,275 @@ if max(abs(g - e) for g, e in zip(got, expected)) > tol:
         % (x, y, ",".join(map(str, got)), ",".join(map(str, expected)), tol)
     )
 print("ORACLE-OK pixel (%d,%d) = %s" % (x, y, ",".join(map(str, got))))
+PY
+}
+
+# M3e region oracles: structural assertions over a rectangle of the shared
+# frame file — never byte-pins, because the exact glyph pixels depend on
+# which font the resolver lands on (machine-dependent). Each embeds the
+# stable even-generation snapshot of the pixel oracle. Arguments are
+# "B,G,R,A" colors in memory order, like scene_pixel_oracle.
+#
+# scene_region_oracle: counts the region pixels within tol_text of the
+# text color ("foreground"), counts the pixels differing from the
+# background by more than tol_bg ("differing"), and requires the mean
+# color of the differing pixels to sit inside per-channel bounds (glyph
+# interiors are the exact text color; antialiased edges lean toward the
+# background). Prints the actual counts and mean for the acceptance
+# record. Args: frame x0 y0 w h bg text_color tol_bg tol_text min_foreground
+# min_differing mean_r_min mean_r_max mean_g_min mean_g_max mean_b_min
+# mean_b_max.
+scene_region_oracle() {
+    local frame_file="$1"
+    python3 - "$@" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+x0, y0, w, h = (int(sys.argv[i]) for i in (2, 3, 4, 5))
+bg = tuple(int(v) for v in sys.argv[6].split(","))
+text_color = tuple(int(v) for v in sys.argv[7].split(","))
+tol_bg, tol_text = int(sys.argv[8]), int(sys.argv[9])
+min_fg, min_diff = int(sys.argv[10]), int(sys.argv[11])
+mean_r_min, mean_r_max = float(sys.argv[12]), float(sys.argv[13])
+mean_g_min, mean_g_max = float(sys.argv[14]), float(sys.argv[15])
+mean_b_min, mean_b_max = float(sys.argv[16]), float(sys.argv[17])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    # The region's BGRA bytes at a stable even generation.
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue  # publish in progress; retry
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue  # writer advanced mid-read; retry
+        region = bytearray()
+        for yy in range(y0, y0 + h):
+            i = yy * header["stride"] + x0 * 4
+            region += pixels[i : i + w * 4]
+        return bytes(region)
+    sys.exit("frame generation never stabilized")
+
+
+region = snapshot()
+foreground = 0
+differing = 0
+mean_r = mean_g = mean_b = 0.0
+for p in range(0, len(region), 4):
+    b, g, r, a = region[p], region[p + 1], region[p + 2], region[p + 3]
+    if max(abs(r - text_color[2]), abs(g - text_color[1]), abs(b - text_color[0])) <= tol_text:
+        foreground += 1
+    if max(abs(r - bg[2]), abs(g - bg[1]), abs(b - bg[0])) > tol_bg:
+        differing += 1
+        mean_r += r
+        mean_g += g
+        mean_b += b
+if differing == 0:
+    sys.exit("region has no pixels differing from the background")
+mean_r /= differing
+mean_g /= differing
+mean_b /= differing
+if foreground < min_fg:
+    sys.exit("foreground %d < %d" % (foreground, min_fg))
+if differing < min_diff:
+    sys.exit("differing %d < %d" % (differing, min_diff))
+if not (
+    mean_r_min <= mean_r <= mean_r_max
+    and mean_g_min <= mean_g <= mean_g_max
+    and mean_b_min <= mean_b <= mean_b_max
+):
+    sys.exit("mean (R %.1f G %.1f B %.1f) outside bounds" % (mean_r, mean_g, mean_b))
+print(
+    "ORACLE-OK region foreground=%d differing=%d mean=(R %.1f G %.1f B %.1f)"
+    % (foreground, differing, mean_r, mean_g, mean_b)
+)
+PY
+}
+
+# scene_region_probe: prints the foreground count only (no assertions) —
+# the poll primitive for the runtime-change case. Exits 1 when the frame
+# never stabilizes. Args: frame x0 y0 w h text_color tol_text.
+scene_region_probe() {
+    local frame_file="$1"
+    python3 - "$@" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+x0, y0, w, h = (int(sys.argv[i]) for i in (2, 3, 4, 5))
+text_color = tuple(int(v) for v in sys.argv[6].split(","))
+tol_text = int(sys.argv[7])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue
+        region = bytearray()
+        for yy in range(y0, y0 + h):
+            i = yy * header["stride"] + x0 * 4
+            region += pixels[i : i + w * 4]
+        return bytes(region)
+    sys.exit("frame generation never stabilized")
+
+
+region = snapshot()
+foreground = 0
+for p in range(0, len(region), 4):
+    b, g, r, a = region[p], region[p + 1], region[p + 2], region[p + 3]
+    if max(abs(r - text_color[2]), abs(g - text_color[1]), abs(b - text_color[0])) <= tol_text:
+        foreground += 1
+print("foreground=%d" % foreground)
+PY
+}
+
+# scene_region_diff: two stable snapshots `interval` seconds apart; counts
+# the region pixels that changed (any channel, tolerance 1 for driver
+# float rounding) and both foreground counts. Requires the difference >=
+# min_differing and the second foreground <= half the first (the
+# runtime text swap shrinks the drawn text ~4x). Prints the actuals.
+# Args: frame x0 y0 w h interval min_differing min_foreground_a
+# text_color tol_text.
+scene_region_diff() {
+    local frame_file="$1"
+    python3 - "$@" <<'PY'
+import struct
+import sys
+import time
+
+path = sys.argv[1]
+x0, y0, w, h = (int(sys.argv[i]) for i in (2, 3, 4, 5))
+interval = float(sys.argv[6])
+min_diff, min_fg_a = int(sys.argv[7]), int(sys.argv[8])
+text_color = tuple(int(v) for v in sys.argv[9].split(","))
+tol_text = int(sys.argv[10])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue
+        region = bytearray()
+        for yy in range(y0, y0 + h):
+            i = yy * header["stride"] + x0 * 4
+            region += pixels[i : i + w * 4]
+        return bytes(region)
+    sys.exit("frame generation never stabilized")
+
+
+def foreground(region):
+    count = 0
+    for p in range(0, len(region), 4):
+        b, g, r, a = region[p], region[p + 1], region[p + 2], region[p + 3]
+        if max(abs(r - text_color[2]), abs(g - text_color[1]), abs(b - text_color[0])) <= tol_text:
+            count += 1
+    return count
+
+
+a = snapshot()
+fg_a = foreground(a)
+time.sleep(interval)
+b = snapshot()
+fg_b = foreground(b)
+changed = 0
+for p in range(0, len(a), 4):
+    if any(abs(a[p + i] - b[p + i]) > 1 for i in range(3)):
+        changed += 1
+if fg_a < min_fg_a:
+    sys.exit("foreground_a %d < %d" % (fg_a, min_fg_a))
+if changed < min_diff:
+    sys.exit("changed %d < %d" % (changed, min_diff))
+if fg_b > fg_a / 2:
+    sys.exit("foreground_b %d did not drop below half of foreground_a %d" % (fg_b, fg_a))
+print(
+    "ORACLE-OK diff changed=%d foreground_a=%d foreground_b=%d"
+    % (changed, fg_a, fg_b)
+)
 PY
 }
 
@@ -1115,6 +1472,75 @@ sleep 3.5
 scene_pixel_oracle "$m3d_js_frame" 80 45 "14,26,26,255" 1
 echo "scene smoke passed (M3d 9): scripted blendMode switch — add at t<3, multiply at t>3"
 
+# ---------------------------------------------------------------------------
+# M3e cases (BETA_M3e): text layers. The daemon lanes cannot receive
+# --font-dir (the daemon spawns workers with fixed args), so every M3e lane
+# resolves REAL system fonts; on a machine with none the lanes are skipped
+# with a message. The worker's own "text_font_none" diagnostic is the
+# authoritative fallback signal when a lane still finds nothing usable.
+# The resolver scans exactly these paths (skipping missing ones); a missing
+# start point makes find exit 1, so `|| true` keeps the probe non-fatal.
+m3e_any_font="$(find /usr/share/fonts /usr/local/share/fonts -maxdepth 4 -type f \( -iname '*.ttf' -o -iname '*.otf' -o -iname '*.ttc' \) -print -quit 2>/dev/null || true)"
+if [[ -n "$m3e_any_font" ]]; then
+
+# Case M3e-b: the script swaps layer.text from "WWWW" to "W" at t=3s — the
+# two frames differ (the region changes over the switch) and the drawn
+# glyph area drops ~4x. The first probe POLLS until the 4-glyph text is
+# observed (foreground >= 450), then waits 1s so snapshot A is taken well
+# before t=3 even on a slow lane; scene_region_diff's 2.5s span crosses
+# the switch, so snapshot B shows the single glyph.
+call_daemon renderer.start "$(jq -cn --arg content "$m3e_b_scene" \
+    '{wallpaper_id:"scene-m3e-b",content_hash:"hash-m3e-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3e_b_status="$(wait_phase live)"
+m3e_b_frame="$(jq -r '.result.frame_file' <<<"$m3e_b_status")"
+m3e_b_c1=0
+for _attempt in {1..120}; do
+    if m3e_b_probe="$(scene_region_probe "$m3e_b_frame" 30 18 100 54 "0,0,255,255" 30 2>/dev/null)"; then
+        m3e_b_fg="${m3e_b_probe#foreground=}"
+        if (( m3e_b_fg >= 450 )); then
+            m3e_b_c1="$m3e_b_fg"
+            break
+        fi
+    fi
+    sleep 0.25
+done
+[[ "$m3e_b_c1" -ge 450 ]]
+sleep 1
+scene_region_diff "$m3e_b_frame" 30 18 100 54 2.5 150 450 "0,0,255,255" 30
+echo "scene smoke passed (M3e b): scripted text swap — frames differ, foreground $m3e_b_c1 -> ~/4"
+
+# Case M3e-c: the pointsize clamp — scene.json 9999 (-> 512 px), script
+# writes 9999 (-> 512) and -5 (-> 4). The script probes the clamped values
+# through console.log, captured in the daemon's stderr tail.
+call_daemon renderer.start "$(jq -cn --arg content "$m3e_c_scene" \
+    '{wallpaper_id:"scene-m3e-c",content_hash:"hash-m3e-c",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3e_c_status="$(wait_phase live)"
+m3e_c_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$m3e_c_status")"
+[[ "$m3e_c_tail" == *"M3E-POINTSIZE-JSON 512"* ]]
+[[ "$m3e_c_tail" == *"M3E-POINTSIZE-SET 512"* ]]
+[[ "$m3e_c_tail" == *"M3E-POINTSIZE-NEG 4"* ]]
+echo "scene smoke passed (M3e c): pointsize clamped — JSON 9999 -> 512, script 9999 -> 512, -5 -> 4"
+
+# Case M3e-d: an unknown font family — the resolver falls back (the
+# documented chain, then any font) and the layer still renders; the
+# one-time diagnostic names the requested family and the resolution.
+call_daemon renderer.start "$(jq -cn --arg content "$m3e_d_scene" \
+    '{wallpaper_id:"scene-m3e-d",content_hash:"hash-m3e-d",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3e_d_status="$(wait_phase live)"
+m3e_d_frame="$(jq -r '.result.frame_file' <<<"$m3e_d_status")"
+m3e_d_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$m3e_d_status")"
+if [[ "$m3e_d_tail" == *"event=renderer.scene.text_font_none"* ]]; then
+    echo "scene smoke SKIP (M3e d): no usable system fonts for the fallback — text lane needs real fonts"
+else
+    [[ "$m3e_d_tail" == *"event=renderer.scene.text_font_fallback layer=txt requested=DefinitelyNotAFontFamily_M3E"* ]]
+    scene_region_oracle "$m3e_d_frame" 30 18 100 54 "255,0,0,255" "255,255,255,255" 20 30 300 400 180 255 180 255 180 255
+    echo "scene smoke passed (M3e d): unknown family -> fallback font, layer renders, diagnostic names the request"
+fi
+
+else
+    echo "scene smoke SKIP (M3e b/c/d): no system fonts under /usr/share/fonts — text lanes need real fonts"
+fi
+
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
 stopped_status="$(wait_phase stopped)"
@@ -1317,5 +1743,49 @@ sleep 3.5
 scene_pixel_oracle "$smoke_root/standalone-m3d-js.bin" 80 45 "14,26,26,255" 0
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d scripted blendMode switch (exact)"
+
+# The M3e text oracle on the llvmpipe lane: a fixed string ("SMOKE") in a
+# known family (Noto Sans, the resolver's first fallback candidate — if
+# the machine lacks it, the fallback chain resolves and the structural
+# oracle still holds), red on opaque blue. Structural assertions, not
+# byte-pins: the region must hold >= 300 pixels matching the text color
+# and >= 400 pixels differing from the background, and the mean color of
+# the differing pixels must be the text color within per-channel bounds.
+# The actual counts and mean are printed for the acceptance record. A
+# fontless machine skips with a message (the resolver's text_font_none
+# diagnostic is the signal).
+if [[ -n "$m3e_any_font" ]]; then
+    standalone_m3e_a="$smoke_root/standalone-m3e-a.bin"
+    VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+        --output "$standalone_m3e_a" --width 160 --height 90 --fps 30 \
+        --content "$m3e_a_scene" --device llvmpipe >"$smoke_root/standalone-m3e-a.log" 2>&1 &
+    standalone_m3e_a_pid=$!
+    for _attempt in {1..400}; do
+        [[ -f "$standalone_m3e_a" ]] && head -c 8 "$standalone_m3e_a" | grep -q KWEFRM1 && break
+        kill -0 "$standalone_m3e_a_pid" 2>/dev/null || {
+            echo "standalone M3e renderer exited early" >&2
+            sed -n '1,120p' "$smoke_root/standalone-m3e-a.log" >&2
+            exit 1
+        }
+        sleep 0.05
+    done
+    head -c 8 "$standalone_m3e_a" | grep -q KWEFRM1
+    if grep -q "event=renderer.scene.text_font_none" "$smoke_root/standalone-m3e-a.log"; then
+        echo "scene smoke SKIP (M3e a): no usable system fonts — text lane needs real fonts"
+        kill -TERM "$standalone_m3e_a_pid"
+        wait "$standalone_m3e_a_pid" || true
+    else
+        # Mean bounds are RED-DOMINANCE, not tight per-channel: glyph
+        # interiors are pure text color, but the antialiased edges lean
+        # toward the blue background, so the differing-pixel mean carries
+        # a blue cast (measured on this lane: R 234.0, G 0.0, B 128.9).
+        scene_region_oracle "$standalone_m3e_a" 30 18 100 54 "255,0,0,255" "0,0,255,255" 20 30 300 400 150 255 0 80 0 210
+        kill -TERM "$standalone_m3e_a_pid"
+        wait "$standalone_m3e_a_pid"
+        echo "scene smoke passed: standalone llvmpipe lane — M3e text region oracle (fixed string, known family)"
+    fi
+else
+    echo "scene smoke SKIP (M3e a): no system fonts under /usr/share/fonts — text lane needs real fonts"
+fi
 
 echo "all scene smoke cases passed"

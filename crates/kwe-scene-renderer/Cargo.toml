@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "Isolated KWE SceneScript renderer: QuickJS script engine plus an original offscreen Vulkan compositor"
 
+[build-dependencies]
+cc.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 ash.workspace = true

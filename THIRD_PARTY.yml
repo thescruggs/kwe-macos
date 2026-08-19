@@ -196,3 +196,12 @@ entries:
     use: dependency
     approved_for_code_use: true
     notes: JS engine for the original SceneScript implementation (ADR 0001; docs/SCENE_FORMAT_V1.md). Used only by the separate-process kwe-scene-renderer worker; never in plasmashell. Bounded execution is enforced with Runtime::set_memory_limit (64 MiB heap) and set_interrupt_handler (per-update wall-clock soft/hard budget, M3a) — no WE code is copied or linked; the engine just evaluates the wallpaper's script. Exact transitive set pinned in Cargo.lock (rquickjs-core, rquickjs-sys, cc build of vendored QuickJS C).
+
+  - id: stb-truetype
+    project: stb_truetype (nothings/stb single-file library)
+    url: https://github.com/nothings/stb
+    revision: vendored header at commit 6e9f34d5429cf16790ec43c9bac3f1ee4ad1f760 (2024-12-08); redox-os/stb_truetype crate 0.3.1 researched but NOT used (its surface is C API re-exports only — it has no pixel rasterizer of its own, so it was dropped in favor of the vendored header)
+    license_observed: public domain (stb_truetype.h license header: "This library is in the public domain"); crate MIT OR Apache-2.0 (research only)
+    use: vendored-source
+    approved_for_code_use: true
+    notes: M3e text-layer glyph rasterization (crates/kwe-scene-renderer/vendor/stb/stb_truetype.h, unmodified, STB_TRUETYPE_IMPLEMENTATION compiled once in the original C shim vendor/stb/stb_shim.c via a cc build.rs; never linked into plasmashell — separate-process kwe-scene-renderer worker only). The shim bounds everything the Rust side sees: ttc collection offset lookup, GetGlyphBitmapBoxSubpixel (no subpixel shift), shape vertex count capped at 65536 before rasterization, flatness 0.35. Public domain per upstream license header; vendored file is bit-exact with the pinned upstream commit. One ledger entry covers the vendored header and the researched-but-unused crate.

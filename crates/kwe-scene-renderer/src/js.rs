@@ -55,6 +55,45 @@ use crate::layers::{
     clamp_layer_size, clamp_layer_tint,
 };
 use crate::scene::SceneConfig;
+use crate::text::{
+    HorizontalAlign, MAX_FONT_PX, MAX_TEXT_CHARS, MIN_FONT_PX, VerticalAlign, truncate_chars,
+};
+
+/// Clamp a script-written pointsize (M3e): non-finite → the default size
+/// (48 px), otherwise the bounded range MIN_FONT_PX..=MAX_FONT_PX.
+fn clamp_pointsize_px(value: f64) -> f32 {
+    if value.is_finite() {
+        (value as f32).clamp(MIN_FONT_PX, MAX_FONT_PX)
+    } else {
+        crate::text::DEFAULT_POINT_SIZE * crate::text::POINT_TO_PX
+    }
+}
+
+/// Clamp a script-written horizontal alignment (M3e): 0 = left, 1 =
+/// center, 2 = right; non-finite → center.
+fn clamp_align_h(value: f64) -> HorizontalAlign {
+    let index = if value.is_finite() {
+        value.round()
+    } else {
+        1.0
+    }
+    .clamp(0.0, 2.0) as u32;
+    match index {
+        0 => HorizontalAlign::Left,
+        2 => HorizontalAlign::Right,
+        _ => HorizontalAlign::Center,
+    }
+}
+
+/// Clamp a script-written vertical alignment (M3e): 0 = top, 1 = center,
+/// 2 = bottom; non-finite → center.
+fn clamp_align_v(value: f64) -> VerticalAlign {
+    match clamp_align_h(value) {
+        HorizontalAlign::Left => VerticalAlign::Top,
+        HorizontalAlign::Right => VerticalAlign::Bottom,
+        HorizontalAlign::Center => VerticalAlign::Center,
+    }
+}
 
 /// Heap cap for the per-worker QuickJS runtime.
 pub const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -347,6 +386,9 @@ pub struct ScriptEngine {
     /// Bounded one-time diagnostic for script writes of an unimplemented
     /// blendMode (the flag lives here so the bridge closure can share it).
     blend_mode_diag: Rc<Cell<bool>>,
+    /// Bounded one-time diagnostic for script writes of an over-long text
+    /// (M3e): the string is truncated to MAX_TEXT_CHARS chars.
+    text_truncate_diag: Rc<Cell<bool>>,
     script_ok: bool,
     last_update: Option<Instant>,
     frames: u64,
@@ -436,6 +478,7 @@ impl ScriptEngine {
             clear_color: config.clear_color,
             layers,
             blend_mode_diag: Rc::new(Cell::new(false)),
+            text_truncate_diag: Rc::new(Cell::new(false)),
             script_ok: false,
             last_update: None,
             frames: 0,
@@ -584,6 +627,23 @@ impl ScriptEngine {
                     "visible" => f64::from(u8::from(layer.visible)),
                     "blendMode" => f64::from(layer.blend_mode.as_u32()),
                     "brightness" => f64::from(layer.brightness),
+                    // M3e text scalars: 0/1/2 for left|top / center /
+                    // right|bottom; pointsize in pixels (already clamped).
+                    "pointsize" => layer.text.as_ref().map_or(0.0, |t| f64::from(t.pointsize_px)),
+                    "horizontalAlign" => layer.text.as_ref().map_or(0.0, |t| {
+                        f64::from(match t.horizontal_align {
+                            HorizontalAlign::Left => 0,
+                            HorizontalAlign::Center => 1,
+                            HorizontalAlign::Right => 2,
+                        })
+                    }),
+                    "verticalAlign" => layer.text.as_ref().map_or(0.0, |t| {
+                        f64::from(match t.vertical_align {
+                            VerticalAlign::Top => 0,
+                            VerticalAlign::Center => 1,
+                            VerticalAlign::Bottom => 2,
+                        })
+                    }),
                     _ => 0.0,
                 }
             })
@@ -630,6 +690,27 @@ impl ScriptEngine {
                             layer.blend_mode = mode;
                         }
                         "brightness" => layer.brightness = clamp_layer_brightness(value),
+                        // M3e text scalars, each clamped at the bridge; a
+                        // write marks the state dirty so the worker rebuilds
+                        // the layout (text.rs) on the next sync.
+                        "pointsize" => {
+                            if let Some(text) = &mut layer.text {
+                                text.pointsize_px = clamp_pointsize_px(value);
+                                text.dirty = true;
+                            }
+                        }
+                        "horizontalAlign" => {
+                            if let Some(text) = &mut layer.text {
+                                text.horizontal_align = clamp_align_h(value);
+                                text.dirty = true;
+                            }
+                        }
+                        "verticalAlign" => {
+                            if let Some(text) = &mut layer.text {
+                                text.vertical_align = clamp_align_v(value);
+                                text.dirty = true;
+                            }
+                        }
                         _ => {}
                     }
                 })
@@ -662,6 +743,11 @@ impl ScriptEngine {
                         ("tint", "g") => f64::from(layer.tint[1]),
                         ("tint", "b") => f64::from(layer.tint[2]),
                         ("tint", "a") => f64::from(layer.tint[3]),
+                        // M3e: the text color (the draw's tint slot).
+                        ("color", "r") => layer.text.as_ref().map_or(0.0, |t| f64::from(t.color[0])),
+                        ("color", "g") => layer.text.as_ref().map_or(0.0, |t| f64::from(t.color[1])),
+                        ("color", "b") => layer.text.as_ref().map_or(0.0, |t| f64::from(t.color[2])),
+                        ("color", "a") => layer.text.as_ref().map_or(0.0, |t| f64::from(t.color[3])),
                         _ => 0.0,
                     }
                 },
@@ -696,6 +782,35 @@ impl ScriptEngine {
                         ("tint", "g") => layer.tint[1] = clamp_layer_tint(value),
                         ("tint", "b") => layer.tint[2] = clamp_layer_tint(value),
                         ("tint", "a") => layer.tint[3] = clamp_layer_tint(value),
+                        // M3e: text color, clamped per component like the
+                        // tint (0..=1, non-finite → 1.0); a write marks the
+                        // state dirty (the worker re-uploads the draw tint —
+                        // no geometry change needed, but dirty keeps the
+                        // bookkeeping simple).
+                        ("color", "r") => {
+                            if let Some(text) = &mut layer.text {
+                                text.color[0] = clamp_layer_tint(value);
+                                text.dirty = true;
+                            }
+                        }
+                        ("color", "g") => {
+                            if let Some(text) = &mut layer.text {
+                                text.color[1] = clamp_layer_tint(value);
+                                text.dirty = true;
+                            }
+                        }
+                        ("color", "b") => {
+                            if let Some(text) = &mut layer.text {
+                                text.color[2] = clamp_layer_tint(value);
+                                text.dirty = true;
+                            }
+                        }
+                        ("color", "a") => {
+                            if let Some(text) = &mut layer.text {
+                                text.color[3] = clamp_layer_tint(value);
+                                text.dirty = true;
+                            }
+                        }
                         _ => {}
                     }
                 },
@@ -704,6 +819,63 @@ impl ScriptEngine {
             ctx.globals()
                 .set("kweSceneSetVec", set_vec)
                 .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneSetVec: {e}")))?;
+
+            // ---- M3e: text-layer bridges. The bootstrap JS exposes the
+            // text properties only on text layers; everything is clamped
+            // here, and a write always marks the state dirty so the worker
+            // rebuilds the layout on its next sync.
+            let is_text_layers = self.layers.clone();
+            let is_text = Function::new(ctx.clone(), move |index: i32| -> bool {
+                is_text_layers
+                    .get(index as usize)
+                    .is_some_and(|layer| layer.borrow().text.is_some())
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("text is-text fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneIsText", is_text)
+                .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneIsText: {e}")))?;
+
+            let get_text_layers = self.layers.clone();
+            let get_text = Function::new(ctx.clone(), move |index: i32| -> String {
+                get_text_layers
+                    .get(index as usize)
+                    .and_then(|layer| layer.borrow().text.as_ref().map(|t| t.text.clone()))
+                    .unwrap_or_default()
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("text get fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneGetText", get_text)
+                .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneGetText: {e}")))?;
+
+            let set_text_layers = self.layers.clone();
+            let text_truncate_diag = Rc::clone(&self.text_truncate_diag);
+            let set_text = Function::new(ctx.clone(), move |index: i32, text: String| {
+                let Some(layer) = set_text_layers.get(index as usize) else {
+                    return;
+                };
+                let mut layer = layer.borrow_mut();
+                // The one-time truncate diagnostic reads the layer name;
+                // capture it before the mutable borrow of `text` (borrows
+                // through RefCell deref are not field-disjoint).
+                let name = layer.name.clone();
+                if let Some(state) = &mut layer.text {
+                    let truncated = truncate_chars(&text, MAX_TEXT_CHARS);
+                    if truncated.chars().count() < text.chars().count()
+                        && !text_truncate_diag.replace(true)
+                    {
+                        eprintln!(
+                            "event=renderer.scene.text_truncated layer={name} chars={} capped_at={MAX_TEXT_CHARS}",
+                            text.chars().count()
+                        );
+                    }
+                    state.text = truncated;
+                    state.dirty = true;
+                }
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("text set fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneSetText", set_text)
+                .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneSetText: {e}")))?;
 
             ctx.eval::<(), &str>(LAYER_BOOTSTRAP_JS)
                 .map_err(|e| EngineStartError::Bootstrap(format!("scene bootstrap: {e}")))?;
@@ -1095,14 +1267,46 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
       get: function () { return vectorProps(index, "scale", ["x", "y"]); },
       enumerable: true
     });
-    Object.defineProperty(layer, "size", {
-      get: function () { return vectorProps(index, "size", ["x", "y"]); },
-      enumerable: true
-    });
-    Object.defineProperty(layer, "tint", {
-      get: function () { return vectorProps(index, "tint", ["r", "g", "b", "a"]); },
-      enumerable: true
-    });
+    // M3e: text layers expose the text properties (text, pointsize, the
+    // alignment scalars, color) instead of the image-only size and tint —
+    // text size is automatic and the color drives the tint slot. A script
+    // touching a property the layer kind does not expose gets undefined,
+    // never a renderer error.
+    if (kweSceneIsText(index)) {
+      Object.defineProperty(layer, "text", {
+        get: function () { return kweSceneGetText(index); },
+        set: function (value) { kweSceneSetText(index, String(value)); },
+        enumerable: true
+      });
+      Object.defineProperty(layer, "pointsize", {
+        get: function () { return kweSceneGetScalar(index, "pointsize"); },
+        set: function (value) { kweSceneSetScalar(index, "pointsize", value); },
+        enumerable: true
+      });
+      Object.defineProperty(layer, "horizontalAlign", {
+        get: function () { return kweSceneGetScalar(index, "horizontalAlign"); },
+        set: function (value) { kweSceneSetScalar(index, "horizontalAlign", value); },
+        enumerable: true
+      });
+      Object.defineProperty(layer, "verticalAlign", {
+        get: function () { return kweSceneGetScalar(index, "verticalAlign"); },
+        set: function (value) { kweSceneSetScalar(index, "verticalAlign", value); },
+        enumerable: true
+      });
+      Object.defineProperty(layer, "color", {
+        get: function () { return vectorProps(index, "color", ["r", "g", "b", "a"]); },
+        enumerable: true
+      });
+    } else {
+      Object.defineProperty(layer, "size", {
+        get: function () { return vectorProps(index, "size", ["x", "y"]); },
+        enumerable: true
+      });
+      Object.defineProperty(layer, "tint", {
+        get: function () { return vectorProps(index, "tint", ["r", "g", "b", "a"]); },
+        enumerable: true
+      });
+    }
     cache[index] = layer;
     return layer;
   }
@@ -1538,6 +1742,144 @@ mod tests {
         assert_eq!(state.blend_mode, BlendMode::Normal);
         assert_eq!(state.brightness, 1.0);
         assert_eq!(state.tint, [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    // ---- M3e: text-layer proxies ----
+
+    #[test]
+    fn text_layer_proxy_exposes_and_clamps_text_properties() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var l = Scene.getLayer("t");
+                // Text layers expose the text properties; image layers do
+                // not (undefined, never an error).
+                var img = Scene.getLayer("bg");
+                l.text = "Hello world";
+                l.pointsize = 9999;            // -> 512
+                l.pointsize = -10;             // -> 4
+                l.horizontalAlign = 2;         // right
+                l.verticalAlign = 0;           // top
+                l.color.r = 2;                 // -> 1
+                l.color.g = NaN;               // -> 1 (identity)
+                l.color.b = 0.25;
+                l.color.a = 0.5;
+                Engine.clearcolor = {
+                    r: (l.text === "Hello world" && l.pointsize === 4) ? 0.5 : 0,
+                    g: (l.horizontalAlign === 2 && l.verticalAlign === 0 &&
+                        img.text === undefined && img.tint !== undefined) ? 0.5 : 0,
+                    b: (l.color.r === 1 && l.color.g === 1 && l.color.b === 0.25 &&
+                        l.color.a === 0.5) ? 0.5 : 0,
+                    a: 1
+                };
+            }"#,
+            r#"[{"name": "bg", "image": "bg.png"}, {"name": "t", "text": "Hi",
+                 "color": [0.5, 1.0, 0.25, 0.5]}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            matches!(engine.step(0.1), StepResult::NewFrame(color) if color == [0.5, 0.5, 0.5, 1.0])
+        );
+        // The clamped values landed on the Rust side, dirty for the next
+        // worker sync.
+        let layer = engine.layers()[1].clone();
+        let state = layer.borrow();
+        let text = state.text.as_ref().unwrap();
+        assert_eq!(text.text, "Hello world");
+        assert_eq!(text.pointsize_px, 4.0);
+        assert_eq!(text.horizontal_align, HorizontalAlign::Right);
+        assert_eq!(text.vertical_align, VerticalAlign::Top);
+        assert_eq!(text.color, [1.0, 1.0, 0.25, 0.5]);
+        assert!(text.dirty);
+        // The image layer never got a text state.
+        assert!(engine.layers()[0].borrow().text.is_none());
+    }
+
+    #[test]
+    fn text_proxy_writes_are_bounded() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var l = Scene.getLayer("t");
+                // NaN/Infinity sizes and alignments fall back to the
+                // defaults (48 px, center/center) instead of poisoning.
+                l.pointsize = NaN;
+                l.horizontalAlign = Infinity;
+                l.verticalAlign = -1;
+                l.text = "a";
+                Engine.clearcolor = {
+                    r: (l.pointsize === 48) ? 0.5 : 0,
+                    g: (l.horizontalAlign === 1 && l.verticalAlign === 0) ? 0.5 : 0,
+                    b: (l.text === "a") ? 0.5 : 0,
+                    a: 1
+                };
+            }"#,
+            r#"[{"name": "t", "text": "Hi"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            matches!(engine.step(0.1), StepResult::NewFrame(color) if color == [0.5, 0.5, 0.5, 1.0])
+        );
+        let layers = engine.layers();
+        let state = layers[0].borrow();
+        let text = state.text.as_ref().unwrap();
+        assert_eq!(text.pointsize_px, 48.0);
+        assert_eq!(text.horizontal_align, HorizontalAlign::Center);
+        // -1 rounds to -1 and clamps to 0: the vertical axis's 0 is Top.
+        assert_eq!(text.vertical_align, VerticalAlign::Top);
+    }
+
+    #[test]
+    fn over_long_text_writes_are_truncated() {
+        // The 4096-char cap is enforced at the bridge: the string is
+        // truncated (chars, not bytes) and the state still lands dirty.
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var l = Scene.getLayer("t");
+                var long = "";
+                for (var i = 0; i < 5000; i++) long += "x";
+                l.text = long;
+                Engine.clearcolor = { r: 0.5, g: 0.5, b: 0.5, a: 1 };
+            }"#,
+            r#"[{"name": "t", "text": "Hi"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        engine.step(0.1);
+        let layers = engine.layers();
+        let state = layers[0].borrow();
+        let text = state.text.as_ref().unwrap();
+        assert_eq!(text.text.chars().count(), MAX_TEXT_CHARS);
+        assert!(text.dirty);
+    }
+
+    #[test]
+    fn text_writes_mark_dirty_and_rebuild_each_step() {
+        // Every text write must land on the Rust side so the worker's next
+        // sync regenerates the layout (geometry is rebuilt on change, not
+        // per frame).
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"var n = 0;
+            function update(dt) {
+                var l = Scene.getLayer("t");
+                n += 1;
+                l.text = "tick" + n;
+                Engine.clearcolor = { r: 0.5, g: 0.5, b: 0.5, a: 1 };
+            }"#,
+            r#"[{"name": "t", "text": "start"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        engine.step(0.1);
+        engine.step(0.1);
+        let layers = engine.layers();
+        let state = layers[0].borrow();
+        assert_eq!(state.text.as_ref().unwrap().text, "tick2");
+        assert!(state.text.as_ref().unwrap().dirty);
     }
 
     #[test]

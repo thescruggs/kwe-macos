@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::scene::LayerSpec;
+use crate::text::{HorizontalAlign, VerticalAlign};
 
 /// Cap on registered image layers (scene.rs rejects beyond this at parse;
 /// the brief's bound — layers up to 256 are bound).
@@ -152,8 +153,37 @@ pub struct LayerState {
     /// design range — WE's default 1.0 is the identity), non-finite → 1.0.
     pub brightness: f32,
     /// Tint multiplier on the sampled RGBA (M3d): 0..=1 per component,
-    /// default [1, 1, 1, 1].
+    /// default [1, 1, 1, 1]. For text layers the draw's tint comes from
+    /// the text state's color instead (frame_draws).
     pub tint: [f32; 4],
+    /// M3e text content, `Some` exactly for text layers. The worker's text
+    /// renderer (text.rs) turns a dirty state into an atlas texture + quad
+    /// vertex data; frame_draws skips text layers with no vertex data.
+    pub text: Option<TextState>,
+}
+
+/// M3e text-layer runtime state. `dirty` is set by every script write
+/// (js.rs) and at load; the worker rebuilds the layout, atlas, and vertex
+/// data when it is set and clears it. `vertex_count` is written by the
+/// worker after a rebuild (quads built) and read by frame_draws — 0 means
+/// nothing to draw yet (empty text, missing font, or pre-sync).
+#[derive(Debug, Clone)]
+pub struct TextState {
+    /// The string to render (capped at text::MAX_TEXT_CHARS chars by the
+    /// worker, with a one-time diagnostic).
+    pub text: String,
+    /// Requested font family (`systemfont_` alias / path accepted; None =
+    /// the resolver's default).
+    pub font: Option<String>,
+    /// Effective pixel em size, clamped to text::MIN_FONT_PX..=MAX_FONT_PX.
+    pub pointsize_px: f32,
+    pub horizontal_align: HorizontalAlign,
+    pub vertical_align: VerticalAlign,
+    /// RGBA multiplier, 0..=1 each; drives the draw's tint slot, the
+    /// alpha folded into the pushed layer alpha (M3d alpha policy).
+    pub color: [f32; 4],
+    pub dirty: bool,
+    pub vertex_count: u32,
 }
 
 impl LayerState {
@@ -165,12 +195,32 @@ impl LayerState {
             angles: spec.angles,
             origin: spec.origin,
             scale: spec.scale,
-            size: spec.size,
+            // Text layers render at their automatic layout size: pinned to
+            // (1, 1) so the model maps layout pixels 1:1 to scene units
+            // (text.rs layouts in pixel units, y down — same space). A
+            // scene-written `size` on a text layer is ignored (counted for
+            // a one-time diagnostic); scaling happens through `scale` like
+            // every other layer.
+            size: if spec.text.is_some() {
+                [1.0, 1.0]
+            } else {
+                spec.size
+            },
             // The spec's raw value may be unimplemented (11/12/24/30 or an
             // unknown); the worker noted it once per scene at load.
             blend_mode: BlendMode::clamp(spec.blend_mode),
             brightness: spec.brightness,
             tint: spec.tint,
+            text: spec.text.as_ref().map(|spec| TextState {
+                text: spec.text.clone(),
+                font: spec.font.clone(),
+                pointsize_px: spec.pointsize,
+                horizontal_align: spec.horizontal_align,
+                vertical_align: spec.vertical_align,
+                color: spec.color,
+                dirty: true,
+                vertex_count: 0,
+            }),
         }
     }
 }
@@ -225,8 +275,19 @@ pub fn clamp_layer_tint(value: f64) -> f32 {
     }
 }
 
+/// What a draw command renders (M3e). Image draws use the renderer's
+/// shared unit quad; text draws use the layer's per-layer vertex buffer
+/// with an explicit vertex count. The vertex data is regenerated on text /
+/// alignment / font-size change, never per frame (text.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawKind {
+    Image,
+    Text { vertex_count: u32 },
+}
+
 /// One layer's draw command for one frame. `m` and `t` are the model
-/// transform in row-major form: world = m·pos + t for pos ∈ [-0.5, 0.5]².
+/// transform in row-major form: world = m·pos + t for pos ∈ [-0.5, 0.5]²
+/// (text layers map their layout-pixel quads 1:1 through size (1, 1)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerDraw {
     /// Index into the renderer's texture/descriptor table — the layer's
@@ -246,7 +307,10 @@ pub struct LayerDraw {
     pub brightness: f32,
     /// RGBA tint multiplier (M3d): rgb pushed into the effects vec, the
     /// alpha folded into the pushed layer alpha (m1.w = alpha · tint.a).
+    /// For text layers this is the text color (frame_draws).
     pub tint: [f32; 4],
+    /// What to draw: image (unit quad) or text (per-layer vertex buffer).
+    pub kind: DrawKind,
 }
 
 /// The model transform for one 2D layer: R(θ)·S(scale)·diag(size), about
@@ -264,8 +328,9 @@ pub fn layer_model(
 }
 
 /// The per-frame draw list: scene.json object order, skipping invisible
-/// layers and layers whose texture failed to load (texture_ok). Pure —
-/// unit-tested; the worker calls it once per render.
+/// layers, layers whose texture failed to load (texture_ok), and text
+/// layers with no vertex data yet (empty text, missing font, or not yet
+/// synced). Pure — unit-tested; the worker calls it once per render.
 pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> Vec<LayerDraw> {
     layers
         .iter()
@@ -275,6 +340,18 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
             if !state.visible || texture_ok.get(layer_index) != Some(&true) {
                 return None;
             }
+            // M3e: a text layer draws exactly when its vertex data exists
+            // (worker rebuilds it on change). Its tint is the text color.
+            let (kind, tint) = match &state.text {
+                Some(text) if text.vertex_count > 0 => (
+                    DrawKind::Text {
+                        vertex_count: text.vertex_count,
+                    },
+                    text.color,
+                ),
+                Some(_) => return None,
+                None => (DrawKind::Image, state.tint),
+            };
             let (m, t) = layer_model(state.angles[2], state.scale, state.size, state.origin);
             Some(LayerDraw {
                 layer_index,
@@ -283,7 +360,8 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
                 alpha: state.alpha,
                 blend_mode: state.blend_mode,
                 brightness: state.brightness,
-                tint: state.tint,
+                tint,
+                kind,
             })
         })
         .collect()
@@ -305,6 +383,37 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            text: None,
+        }))
+    }
+
+    fn text_state(
+        name: &str,
+        text: &str,
+        color: [f32; 4],
+        vertex_count: u32,
+    ) -> Rc<RefCell<LayerState>> {
+        Rc::new(RefCell::new(LayerState {
+            name: name.into(),
+            alpha: 1.0,
+            visible: true,
+            angles: [0.0, 0.0, 0.0],
+            origin: [0.0, 0.0],
+            scale: [1.0, 1.0],
+            size: [1.0, 1.0], // text layers: automatic size
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            text: Some(TextState {
+                text: text.into(),
+                font: None,
+                pointsize_px: 48.0,
+                horizontal_align: HorizontalAlign::Center,
+                vertical_align: VerticalAlign::Center,
+                color,
+                dirty: true,
+                vertex_count,
+            }),
         }))
     }
 
@@ -479,6 +588,7 @@ mod tests {
         assert_eq!(draws[0].blend_mode, BlendMode::Screen);
         assert_eq!(draws[0].brightness, 2.0);
         assert_eq!(draws[0].tint, [0.5, 1.0, 0.25, 0.75]);
+        assert_eq!(draws[0].kind, DrawKind::Image);
         // sx = 2·16 = 32, sy = 1·16 = 16, rotated 90°:
         // x = -1·16·y, y = 1·32·x (the off-diagonal cos terms are ~1e-6).
         let m = draws[0].m;
@@ -486,5 +596,89 @@ mod tests {
         assert_eq!(m[1][0], 32.0);
         assert!(m[0][0].abs() < 1e-4, "cos term on x: {}", m[0][0]);
         assert!(m[1][1].abs() < 1e-4, "cos term on y: {}", m[1][1]);
+    }
+
+    // ---- M3e: text layers ----
+
+    #[test]
+    fn text_draws_use_the_text_vertex_path() {
+        // A synced text layer (vertex_count > 0) draws with the Text kind,
+        // its color as the tint, and size (1,1) so layout pixels map 1:1.
+        let layer = text_state("t", "Hi", [1.0, 0.0, 0.0, 1.0], 12);
+        {
+            let mut state = layer.borrow_mut();
+            state.origin = [5.0, -3.0];
+            state.scale = [2.0, 0.5];
+            state.angles[2] = 90.0;
+            state.alpha = 0.5;
+        }
+        let draws = frame_draws(&[layer], &[true]);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].kind, DrawKind::Text { vertex_count: 12 });
+        // The text color drives the tint slot (not the layer's tint).
+        assert_eq!(draws[0].tint, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(draws[0].alpha, 0.5);
+        // m = R(90°)·S(2, 0.5)·I: x = -0.5·y, y = 2·x (cos terms ~1e-8).
+        let m = draws[0].m;
+        assert_eq!(m[0][1], -0.5);
+        assert_eq!(m[1][0], 2.0);
+        assert!(m[0][0].abs() < 1e-6, "cos term on x: {}", m[0][0]);
+        assert!(m[1][1].abs() < 1e-6, "cos term on y: {}", m[1][1]);
+        assert_eq!(draws[0].t, [5.0, -3.0]);
+    }
+
+    #[test]
+    fn text_layers_without_vertex_data_are_skipped() {
+        // Empty text, a missing font, or a not-yet-synced layer all yield
+        // vertex_count 0: no draw at all (never a 1x1 image quad).
+        let layers = vec![
+            text_state("t0", "", [1.0, 1.0, 1.0, 1.0], 0),
+            state("img", true),
+            text_state("t1", "later", [1.0, 1.0, 1.0, 1.0], 0),
+        ];
+        let draws = frame_draws(&layers, &[true, true, true]);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].layer_index, 1);
+        assert_eq!(draws[0].kind, DrawKind::Image);
+    }
+
+    #[test]
+    fn text_layer_state_comes_from_spec() {
+        // from_spec pins size to (1,1) for text layers, keeps image sizes,
+        // starts the text state dirty with 0 vertices.
+        let spec = crate::scene::TextSpec {
+            text: "Hi".into(),
+            font: Some("systemfont_DejaVu Sans".into()),
+            pointsize: 52.0,
+            horizontal_align: HorizontalAlign::Right,
+            vertical_align: VerticalAlign::Top,
+            color: [0.5, 0.25, 1.0, 0.75],
+            has_size: false,
+        };
+        let layer = LayerState::from_spec(&LayerSpec {
+            name: "t".into(),
+            image: None,
+            origin: [1.0, 2.0],
+            angles: [0.0, 0.0, 0.0],
+            scale: [2.0, 2.0],
+            size: [0.0, 0.0],
+            alpha: 1.0,
+            visible: true,
+            blend_mode: 0,
+            brightness: 1.0,
+            tint: [0.5, 0.25, 1.0, 0.75],
+            texture: None,
+            text: Some(spec),
+        });
+        assert_eq!(layer.size, [1.0, 1.0]);
+        let text = layer.text.as_ref().unwrap();
+        assert_eq!(text.text, "Hi");
+        assert_eq!(text.font.as_deref(), Some("systemfont_DejaVu Sans"));
+        assert_eq!(text.pointsize_px, 52.0);
+        assert_eq!(text.horizontal_align, HorizontalAlign::Right);
+        assert_eq!(text.vertical_align, VerticalAlign::Top);
+        assert_eq!(text.color, [0.5, 0.25, 1.0, 0.75]);
+        assert!(text.dirty);
+        assert_eq!(text.vertex_count, 0);
     }
 }

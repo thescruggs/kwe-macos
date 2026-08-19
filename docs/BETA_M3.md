@@ -13,8 +13,10 @@ end-to-end. M3c adds 2D image layers: a textured-quad compositor (per-layer
 push-constant transforms, src-over blending, draw order = scene.json
 order), bounded image decoding from the content root or the package entry
 table, and the `Scene.getLayer` layer proxy so scripts can move, resize,
-rotate, fade, and hide layers at runtime. The rest of the scene surface
-(effects, text, particles, 3D, user properties — M3d–M3k) and any manager
+rotate, fade, and hide layers at runtime. M3d adds the per-layer blend
+modes and color effects; M3e adds text layers (a glyph atlas rendered
+through the M3c compositor with zero shader changes). The rest of the
+scene surface (particles, 3D, user properties — M3f–M3k) and any manager
 changes are deliberately out of scope.
 
 ## Goal
@@ -242,6 +244,83 @@ tint alpha is folded into the pushed layer alpha host-side
 | smoke 9 (daemon lane) | scripted switch: `update()` writes `blendMode = t < 3 ? 6 : 1` | the first sample POLLS until the add composite is observed (a slow lane must not sample before the first update() or after the switch); then, after t crosses 3 s, the multiply composite — two frames, one layer |
 | standalone llvmpipe lanes | every implemented mode + effects + the alpha-128 and translucent-multiply cases + the scripted switch, EXACT bytes | normal (142,103,64,255), multiply (14,26,26,255), add (168,167,166,255), screen (154,141,140,255), subtract (0,0,38,255), add128 (71,52,32,128), multiply128 (11,20,20,192), effects (142,82,128,255), scripted add→multiply (polled) — all exact, tol 0 |
 | clamp/parse/JS units | enum mapping (researched table), variant selection, JS write clamping, scene.json parse of blend mode + effects | `blend_mode_table_matches_the_researched_we_mapping`, `blend_mode_clamp_falls_back_to_normal_for_unknown_values` (asserts 11/12/24/30), `brightness_and_tint_clamps_are_bounded`, `brightness_and_tint_parsed_with_clamps` (incl. the numeric-string brightness form), `blend_mode_and_effects_writes_clamp_on_the_rust_side`, `blend_attachment_table_matches_the_researched_we_semantics`, `color_effects_math_matches_the_shader`, `blend_modes_recorded` |
+| regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
+| plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
+
+### M3e — text layers (this commit)
+
+Text layers (`text` objects) render through one bounded glyph atlas per
+layer (2048² RGBA8, shelf-packed, 16 layers per scene): a script-visible
+layer draws as a single `DrawKind::Text` TRIANGLE_LIST of 6 vertices per
+glyph quad from a per-layer host-visible vertex buffer, with the atlas
+uploaded through the M3c image path. The atlas stores **white** glyphs
+(RGB=255, coverage in alpha) and the text color rides the draw's tint
+slot, so the existing M3d fragment shader (sampled RGB × brightness ×
+tint, alpha × layer alpha) renders glyph interiors exactly in the text
+color with antialiased edges that blend toward the background — **zero
+shader changes**, and the M3d alpha policy applies to the text color's
+alpha unchanged. Geometry is regenerated only on text / alignment /
+font-size change (dirty state synced before the initial render and each
+NewFrame); the font is resolved once per layer and cached per normalized
+family.
+
+Font rasterization is the vendored stb_truetype.h (public domain, pinned
+revision 6e9f34d5; a THIRD_PARTY.yml entry covers the header and the
+researched-but-unused redox-os crate) behind an opaque C shim
+(`vendor/stb/stb_shim.c`, built by a cc build.rs): the Rust side never
+sees stb's struct layout. The shim decodes the name-table records for
+family matching — Windows/Unicode records are UTF-16BE (the ASCII family
+names arrive as "N\0o\0t\0o\0..."), Mac records single-byte — and
+refuses outlines over 65 536 vertices. `font` accepts a family name, a
+`systemfont_` alias (prefix stripped), or a path; the resolution order is
+Exact (name-table-verified, bounded to 32 opens) → Basename (first
+unverified prefix match) → the fallback chain ["Noto Sans", "DejaVu
+Sans", "Liberation Sans", "FreeSans"] → Any usable font → None (renders
+nothing, one bounded `text_font_none` diagnostic). Font sources are the
+explicit `--font-dir` / `KWE_FONT_DIRS` entries first, then the standard
+per-user and system directories — so the daemon lanes resolve real system
+fonts, while the synthetic-font lanes (unit tests, `--font-dir`) drive
+the order deterministically.
+
+Researched WE facts (full evidence in SCENE_FORMAT_V1.md): `pointsize`
+is the WE key (points; OWE multiplies by `kPointsizeToPx = 4.0` and
+clamps 1..=1024 px — we clamp **4..=512 px**, a documented deviation);
+`fontsize` is **not** a WE key; alignment defaults to center/center (the
+OWE `horizontalalign` → `alignment` → center chain); `text`/`font` are
+property-wrapped in the corpus editor form. Text layers inherit every
+common property (origin, angles, scale, alpha, visible, blendMode,
+brightness, tint) through the M3c/M3d path, with `size` pinned to (1,1)
+so layout pixels map 1:1 to scene units (a scene-written `size` is
+ignored with a one-time count; `scale` does the resizing). The JS proxy
+adds read/write `text` (a write truncates to 4096 chars with a bounded
+`text_truncated` diagnostic and rebuilds the geometry), `pointsize`
+(clamped 4..=512, non-finite/≤0 → the default 12 pt → 48 px),
+`horizontalAlign`/`verticalAlign` (0/1/2, clamped) and a read-only
+`color` (`{r,g,b,a}` 0..=1 from the scene.json; alpha folds into the
+layer alpha). Atlas overflow clears and repacks, rate-limited to 2/s; a
+glyph over 520 px is skipped per layer — neither is ever fatal.
+
+**Corpus fact**: the corpus carries **zero textures and zero known text
+layers** — no real wallpaper exercises text — so M3e is validated with
+synthetic fixtures only: the smoke lanes below (generated at runtime,
+never committed) and unit tests over synthetic font directories.
+
+### M3e — acceptance evidence
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 369 tests pass (115 in `kwe-scene-renderer`) |
+| font resolution order | synthetic font dirs via `--font-dir` / `KWE_FONT_DIRS`: explicit dirs win, then basename, then the fallback chain | `resolution_order_prefers_explicit_dirs_then_family`, `resolver_bounds` (16 dirs / depth 4 / 4096 per dir / 16384 files / 64 MiB), `font_open_rejects_garbage` |
+| glyph rasterization | stb path through the shim: 1-byte coverage, bounded box, refuse-oversize | `system_font_layout_and_rasterization` (rasterizes a real system font and counts covered pixels), `alignment_parsing` |
+| quad layout math | 6 vertices per glyph, winding, bounds | `vertex_bytes_match_unit_quad_winding` |
+| atlas bounds | shelf packing, clear+repack on overflow, rebuilds rate-limited to 2/s | `atlas_packs_and_evicts_with_rate_limit`, `atlas_rate_limits_rebuilds`, `atlas_overflow_repacks` |
+| scene.json parse | defaults (12 pt → 48 px, center/center, opaque white), property-wrapped `text`/`font`, pointsize clamp 4..=512, alignment fallback like OWE, common props match image layers, 16-text-layer cap | `text_layers_parsed_with_defaults`, `text_layer_fields_parsed`, `text_pointsize_clamped_and_tolerant`, `text_alignment_falls_back_like_owe`, `text_common_props_match_image_layers`, `text_layer_caps_and_counts` |
+| JS proxy | text/pointsize/align/color reads + clamped writes, truncation, dirty-rebuild | `text_layer_proxy_exposes_and_clamps_text_properties`, `text_proxy_writes_are_bounded`, `over_long_text_writes_are_truncated`, `text_writes_mark_dirty_and_rebuild_each_step` |
+| smoke (a) llvmpipe lane | fixed string "SMOKE" + `font: "Noto Sans"` over the fullscreen blue clear — region oracle: text-colored pixels ≥ 300, pixels differing from the bg ≥ 400, mean-of-differing R-dominant | **foreground=606, differing=1788, mean=(R 234.0, G 0.0, B 128.9)** — the antialiased edges lean toward the blue background (documented in the script); glyph interiors are pure text color |
+| smoke (b) daemon lane | script swaps `layer.text` at t ≥ 3.0 — two stable frames differ, foreground collapses to ~¼ after the swap (long "WWWW" → single "W") | polled c1=630, then changed=1914 ≥ 150, foreground 630 → 180 (≤ c1/2) |
+| smoke (c) daemon lane | pointsize clamped at the parse and on script writes | stderr ring: `M3E-POINTSIZE-JSON 512` (JSON 9999), `M3E-POINTSIZE-SET 512` (script 9999), `M3E-POINTSIZE-NEG 4` (−5 → MIN_FONT_PX) |
+| smoke (d) daemon lane | `font: "DefinitelyNotAFontFamily_M3E"` → fallback chain resolves, layer renders, the diagnostic names the request | **foreground=1516, differing=1820, mean=(R 234.2, G 234.2, B 255.0)** (white text over red clear); `event=renderer.scene.text_font_fallback layer=txt requested=DefinitelyNotAFontFamily_M3E` in the ring; SKIP-with-message when the host has no system fonts |
+| corpus honesty | text layers in the corpus | **zero textures, zero known text layers** — synthetic fixtures only |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 
