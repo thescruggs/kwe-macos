@@ -13,12 +13,15 @@
 // stays with systemd; this class never spawns kwe-daemon itself, so a
 // manager-spawned daemon cannot die with the manager.
 //
-// Decision flow: probe the socket first. If present, state is Running and no
-// command runs. If absent, run the activation command with a bounded timeout
-// and up to MaxAttempts retries with backoff; success means the socket
-// appears within a bounded probe window. Exhausting the attempts yields a
-// Failed state with an actionable message instead of an error storm. One
-// activation cycle per activate() call; the QML retry action calls it again.
+// Decision flow: probe the daemon socket first — a live connect attempt, not
+// a file existence check, so a stale socket file left behind by a
+// hard-killed daemon (StartLimitExceeded) does not read as running. If live,
+// state is Running and no command runs. If absent, run the activation
+// command with a bounded timeout and up to MaxAttempts retries with backoff;
+// success means the socket becomes reachable within a bounded probe window.
+// Exhausting the attempts yields a Failed state with an actionable message
+// instead of an error storm. One activation cycle per activate() call; the
+// QML retry action calls it again.
 //
 // The spawned command inherits the manager environment plus KWE_DAEMON_SOCKET
 // set to the exact socket path, so stubs (smoke tests) can start a daemon on

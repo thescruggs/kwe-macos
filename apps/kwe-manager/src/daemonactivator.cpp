@@ -1,8 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "daemonactivator.h"
 
-#include <QFileInfo>
+#include <QLocalSocket>
 #include <QProcessEnvironment>
+
+namespace {
+// Liveness probe, not an existence check: a socket file left behind by a
+// hard-killed daemon (StartLimitExceeded, kill -9) reads as "present" but
+// accepts nothing, and must not skip activation. On Unix, connect(2) to a
+// stale socket fails immediately with ECONNREFUSED; a live daemon accepts
+// the connection and tolerates the probe closing without a request. Any
+// connect failure counts as absent — a redundant activation is idempotent
+// (systemctl start of a running unit is a no-op) and bounded.
+bool socketIsLive(const QString &socketPath) {
+    QLocalSocket socket;
+    socket.connectToServer(socketPath);
+    if (!socket.waitForConnected(50)) {
+        return false;
+    }
+    socket.disconnectFromServer();
+    return true;
+}
+}
 
 DaemonActivator::DaemonActivator(QString socketPath, QString commandProgram,
                                  QStringList commandArguments, QObject *parent)
@@ -44,7 +63,7 @@ void DaemonActivator::activate() {
         return;
     m_attempts = 0;
     m_backoffMilliseconds = m_initialBackoffMilliseconds;
-    if (QFileInfo::exists(m_socketPath)) {
+    if (socketIsLive(m_socketPath)) {
         setState(Running, {});
         return;
     }
@@ -127,7 +146,7 @@ void DaemonActivator::startProbing() {
 }
 
 void DaemonActivator::probeSocket() {
-    if (QFileInfo::exists(m_socketPath)) {
+    if (socketIsLive(m_socketPath)) {
         setState(Running, {});
         emit activated();
         return;

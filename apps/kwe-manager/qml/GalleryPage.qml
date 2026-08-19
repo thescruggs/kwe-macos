@@ -115,13 +115,26 @@ Kirigami.Page {
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Error
+            // The activator's Failed banner is authoritative for a
+            // daemon-down startup; showing both would stack two actions for
+            // the same root cause.
             visible: catalogClient.state === CatalogClient.Error
+                && daemonActivator.state !== DaemonActivator.Failed
             text: catalogClient.errorMessage
             actions: [
                 Kirigami.Action {
                     text: qsTr("Try Again")
                     icon.name: "view-refresh-symbolic"
                     onTriggered: catalogClient.refresh()
+                },
+                Kirigami.Action {
+                    text: qsTr("Start service")
+                    icon.name: "system-run-symbolic"
+                    // Belt-and-braces: whenever the daemon is not known to
+                    // be up, the catalog error offers the activation action
+                    // too, even if the activator never got a chance to run.
+                    visible: daemonActivator.state !== DaemonActivator.Running
+                    onTriggered: daemonActivator.activate()
                 }
             ]
         }

@@ -9,8 +9,8 @@
 1. **Manager activation (`apps/kwe-manager/src/daemonactivator.{h,cpp}`).**
    On startup the manager probes the daemon socket
    (`$XDG_RUNTIME_DIR/kwe/daemon-v1.sock`, same resolution as before, now
-   passed to a new `DaemonActivator`): if the socket is present it proceeds
-   as today; if absent it runs the activation command through a bounded
+   passed to a new `DaemonActivator`): if the socket is live it proceeds as
+   today; if absent it runs the activation command through a bounded
    `QProcess` — `systemctl --user start kwe-daemon` by default — 10 s
    timeout per attempt, SIGTERM then SIGKILL after a 1 s grace, no shell,
    max 3 attempts with 1 s → 2 s backoff, then a `Failed` state with the
@@ -54,6 +54,18 @@
    - Evidence: `scripts/smoke-ui.sh` exits 0 with both cases; ctest
      includes the new test; cargo fmt/clippy/test and qmllint green
      (see acceptance run below).
+4. **Independent review follow-up (commit `fix(manager): liveness-based
+   daemon probe and review findings`).** The probe is a live connect attempt
+   (`QLocalSocket::connectToServer` + bounded `waitForConnected`, ECONNREFUSED
+   treated as absent), not a file-existence check — a socket file left behind
+   by a hard-killed daemon (StartLimitExceeded) can no longer read as
+   "running" and skip activation. The catalog Error banner now hides while
+   the activator's Failed banner shows (one authoritative banner per root
+   cause) and offers the "Start service" action whenever the daemon is not
+   known to be up. New unit cases: stale socket at startup activates,
+   stale socket during the post-activation probe retries and fails bounded,
+   probe-window expiry retries exactly `maxAttempts`, and duplicate
+   `activate()` while in flight stacks nothing.
 
 ## Symptom
 

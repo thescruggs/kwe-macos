@@ -20,7 +20,7 @@ qt_add_executable(kwe-daemon-activator-test
     ../src/daemonactivator.cpp
     ../src/daemonactivator.h
 )
-target_link_libraries(kwe-daemon-activator-test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+target_link_libraries(kwe-daemon-activator-test PRIVATE Qt6::Core Qt6::Qml Qt6::Network Qt6::Test)
 add_test(NAME kwe-daemon-activator-test COMMAND kwe-daemon-activator-test)
 
 qt_add_executable(kwe-playlist-controller-test
