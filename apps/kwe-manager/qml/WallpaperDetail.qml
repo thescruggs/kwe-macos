@@ -35,6 +35,23 @@ Kirigami.ScrollablePage {
         }
     }
 
+    // Bounded staleness guard for the grant mirror: while the pane is
+    // visible, re-read the daemon-held record periodically so grants changed
+    // by another client (or by a daemon restart) surface without waiting for
+    // a toggle. Skipped while a request is queued or in flight — that request
+    // already refreshes the mirror, and stacking redundant gets would only
+    // lengthen the queue.
+    Timer {
+        id: permissionRefreshTimer
+        interval: 5000
+        repeat: true
+        running: detailPage.visible
+        onTriggered: {
+            if (!permissionsClient.isPending(WallpaperSelection.selectedId))
+                refreshPermissions();
+        }
+    }
+
     ColumnLayout {
         width: parent.width
         spacing: Kirigami.Units.largeSpacing

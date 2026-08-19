@@ -67,6 +67,10 @@ private:
 
     void send(Pending pending);
     void begin(Pending pending);
+    /// Marks a wallpaper busy from the moment its operation is enqueued (not
+    /// only when it goes out), idempotent, so queued operations show a busy
+    /// toggle and cannot stack duplicates.
+    void markPending(const QString &wallpaperId);
     void writeRequest();
     void consumeResponse();
     void failCurrent(const QString &error);

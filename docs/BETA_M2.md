@@ -444,8 +444,9 @@ positive and negative controls through the grant path alone.
   written atomically through `persist.rs::atomic_write`, loaded with
   `deny_unknown_fields`; a corrupt file is renamed aside
   (`permissions-v1.json.invalid-<seconds>-<nanos>`) and the store starts
-  fresh with a one-time log. Wallpaper ids follow the identity rule (1–128
-  ASCII letters, digits, `.`, `_`, `-`).
+  fresh with a one-time log. Invalid siblings are pruned to the newest 8 by
+  the shared `persist` helper (all three state stores benefit). Wallpaper
+  ids follow the identity rule (1–128 ASCII letters, digits, `.`, `_`, `-`).
 - **Default policy**: network off, audio off, **pointer on** (interactivity
   is core; the pointer grant is reserved for future stricter modes and is
   not enforced yet).
@@ -479,7 +480,7 @@ positive and negative controls through the grant path alone.
 | --- | --- | --- |
 | fmt | `cargo fmt --all -- --check` | pass |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| test | `cargo test --workspace --all-targets` | pass (214 tests, 0 failures) |
+| test | `cargo test --workspace --all-targets` | pass (215 tests, 0 failures) |
 | cmake | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | pass |
 | ctest | `cd build/cmake && ctest --output-on-failure` | pass (5/5, incl. `kwe-permissions-client-test`) |
 | qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | pass |

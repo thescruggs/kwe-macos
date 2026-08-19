@@ -168,7 +168,9 @@ grants or denies three capabilities — `network`, `audio`, and `pointer` — as
 booleans, all three stored. The file is bounded (≤ 256 records, 1 MiB) and
 written atomically; a corrupt file is renamed aside
 (`permissions-v1.json.invalid-<unix_seconds>-<unix_nanos>`) and the store
-starts empty with a one-time log. Identity keys follow the same rule as
+starts empty with a one-time log. Invalid siblings are pruned to the newest
+8 (shared `persist` policy), so repeated corruption cannot accumulate
+quarantine files without bound. Identity keys follow the same rule as
 `renderer.start` (1–128 ASCII letters, digits, `.`, `_`, `-`).
 
 The effective record defaults to the documented policy for every wallpaper

@@ -26,6 +26,17 @@ public:
         receivedMethods.clear();
         receivedParams.clear();
         failGet = false;
+        holdResponses = false;
+    }
+    /// Records requests but never answers them, so a client stays in the
+    /// loading state with its queue filling.
+    bool holdResponses = false;
+    /// Closes every accepted connection, simulating a daemon going away while
+    /// a request is in flight.
+    void dropClients() {
+        for (auto *socket : std::as_const(m_clients))
+            socket->close();
+        m_clients.clear();
     }
     QHash<QString, QJsonObject> records;
     QList<QString> receivedMethods;
@@ -34,9 +45,11 @@ public:
 
 private:
     QLocalServer m_server;
+    QList<QLocalSocket *> m_clients;
 
     void onConnection() {
         auto *socket = m_server.nextPendingConnection();
+        m_clients.append(socket);
         connect(socket, &QLocalSocket::readyRead, this, [this, socket] {
             for (;;) {
                 const auto newline = socket->peek(64 * 1024 + 1024).indexOf('\n');
@@ -48,6 +61,8 @@ private:
                 const auto params = request.value(QStringLiteral("params")).toObject();
                 receivedMethods.push_back(method);
                 receivedParams.push_back(params);
+                if (holdResponses)
+                    return;
                 const auto defaults = QJsonObject{
                     {QStringLiteral("network"), false},
                     {QStringLiteral("audio"), false},
@@ -203,6 +218,36 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(client.isGranted(QStringLiteral("a"), QStringLiteral("network")),
                                  5000);
         QTRY_VERIFY(!client.isPending(QStringLiteral("a")));
+    }
+
+    void fullQueueDropRunsTheDroppedCallbackAndSurfacesTheError() {
+        m_daemon.holdResponses = true;
+        PermissionsClient client(m_socketPath);
+        // The first call goes in flight; the rest queue while it stays
+        // unanswered (only the in-flight request ever reaches the wire).
+        client.setPermission(QStringLiteral("hold-1"), QStringLiteral("network"), true);
+        for (int i = 2; i <= 65; ++i)
+            client.setPermission(QStringLiteral("hold-%1").arg(i), QStringLiteral("network"), true);
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() == 1, 5000);
+        // 64 queued + one in flight: the 66th exceeds the bound and fails
+        // immediately with a surfaced error (the queue is untouched), and the
+        // queued operations show the busy state from enqueue time.
+        client.setPermission(QStringLiteral("hold-66"), QStringLiteral("network"), true);
+        QVERIFY(client.errorMessage().contains(QStringLiteral("too many")));
+        QVERIFY(!client.isPending(QStringLiteral("hold-66")));
+        QVERIFY(client.isPending(QStringLiteral("hold-2")));
+        // The daemon goes away with a request in flight and the queue at the
+        // bound: failCurrent re-queues the failed operation by dropping the
+        // least urgent queued one — and the drop must run its callback so the
+        // user's change surfaces and the pending flag is released, instead of
+        // silently vanishing.
+        m_daemon.dropClients();
+        QTRY_VERIFY_WITH_TIMEOUT(!client.isPending(QStringLiteral("hold-65")), 5000);
+        QVERIFY(client.isPending(QStringLiteral("hold-2")));
+        // The re-queued operation's own flag was released too (a permanently
+        // unreachable daemon must not leave the toggle busy forever).
+        QVERIFY(!client.isPending(QStringLiteral("hold-1")));
+        QVERIFY(client.errorMessage().contains(QStringLiteral("wallpaper service")));
     }
 
 private:

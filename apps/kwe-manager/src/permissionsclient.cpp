@@ -95,6 +95,11 @@ void PermissionsClient::setPermission(const QString &wallpaperId, const QString 
 }
 
 void PermissionsClient::send(Pending pending) {
+    // Mark pending at enqueue time, not only when the request goes out: a
+    // queued operation must already show the busy toggle (which disables
+    // further toggles, so duplicates cannot stack), and it must release the
+    // flag again if it fails before leaving the queue.
+    markPending(pending.wallpaperId);
     if (m_state == Loading) {
         if (m_queue.size() >= MaxQueuedOperations) {
             pending.callback(false, {},
@@ -110,10 +115,7 @@ void PermissionsClient::send(Pending pending) {
 
 void PermissionsClient::begin(Pending pending) {
     m_current = std::move(pending);
-    if (!m_current.wallpaperId.isEmpty()) {
-        m_pendingIds.insert(m_current.wallpaperId);
-        emit pendingChanged();
-    }
+    markPending(m_current.wallpaperId);
     setState(Loading);
     m_socket.abort();
     m_buffer.clear();
@@ -170,13 +172,21 @@ void PermissionsClient::failCurrent(const QString &error) {
         return;
     }
     // Re-queue the failed operation at the front so no toggle is lost, but
-    // respect the capacity bound: if the queue is already full the oldest
-    // pending operation is dropped to make room. Release the pending flag:
-    // a permanently unreachable daemon must not leave the toggle stuck in a
-    // busy state forever (the re-queued operation re-arms it on retry).
+    // respect the capacity bound: if the queue is already full the least
+    // urgent queued operation is dropped — never silently. Its callback runs
+    // with the queue-full error, so the user's permission change surfaces
+    // (and its pending flag is released) instead of vanishing. Release the
+    // current operation's pending flag too: a permanently unreachable daemon
+    // must not leave the toggle stuck in a busy state forever (the re-queued
+    // operation re-arms it on retry).
     const auto wallpaperId = m_current.wallpaperId;
-    if (m_queue.size() >= MaxQueuedOperations)
-        m_queue.removeLast();
+    if (m_queue.size() >= MaxQueuedOperations) {
+        const auto dropped = m_queue.takeLast();
+        if (dropped.callback)
+            dropped.callback(false, {},
+                             tr("The wallpaper service is unreachable and too many permission "
+                                "changes are pending."));
+    }
     m_queue.push_front(std::move(m_current));
     m_current = {};
     finishPending(wallpaperId);
@@ -228,6 +238,13 @@ void PermissionsClient::applyGranted(const QString &wallpaperId, const QJsonObje
         }
     }
     finishPending(wallpaperId);
+}
+
+void PermissionsClient::markPending(const QString &wallpaperId) {
+    if (wallpaperId.isEmpty() || m_pendingIds.contains(wallpaperId))
+        return;
+    m_pendingIds.insert(wallpaperId);
+    emit pendingChanged();
 }
 
 void PermissionsClient::finishPending(const QString &wallpaperId) {
