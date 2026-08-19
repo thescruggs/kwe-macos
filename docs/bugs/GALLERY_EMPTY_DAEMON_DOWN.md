@@ -2,8 +2,7 @@
 
 - **Reported:** 2026-08-19 (user regression report, post test-build install)
 - **Severity:** High user-facing (empty gallery reads as total data loss)
-- **Status:** FIXED (branch `beta-fix-daemon-activation`; fix commit hash
-  recorded in the docs follow-up)
+- **Status:** FIXED (commit `f9875a73c3603d35a983c6cd443322e109ebe449`, branch `beta-fix-daemon-activation`)
 
 ## Fix (2026-08-19)
 
