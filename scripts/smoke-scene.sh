@@ -12,7 +12,10 @@
 # (docs/BETA_M3.md). The M3c cases (a)-(f) exercise the compositor with
 # pixel oracles: two-layer composites, the src-over blend math, draw order,
 # missing-image skips, the 256-layer cap, and script-driven layer
-# transforms via Scene.getLayer.
+# transforms via Scene.getLayer. The standalone llvmpipe lane repeats the
+# scripted-color oracle AND the M3c composite/blend layer oracles, so a
+# driver-dependent readback orientation (mirrored frames) or a broken quad
+# is caught on the CI-friendly lane.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -801,17 +804,21 @@ scene_pixel_oracle "$m3c_a_frame" 150 85 "255,0,0,255" 1
 echo "scene smoke passed (M3c a): two layers — fullscreen red under blue 40x22 at (60,34)"
 
 # Case M3c-b: the src-over blend oracle. Opaque texel (64,103,142,255) at
-# layer alpha 191/255 over a zero clear: the blend scales the straight
-# source by the fragment alpha — stored (48,77,106,191) — and the readback
-# premultiplies: R=48*191/255=36, G=77*191/255=58, B=106*191/255=79. The
-# alpha channel blend factor is ONE (not SRC_ALPHA), so the stored alpha is
-# 191, not 143.
+# layer alpha 191/255 over a zero clear: the shader outputs straight color
+# and the color blend factor is ONE, so the attachment stores the STRAIGHT
+# composite (64,103,142,191); the readback premultiplies exactly once:
+# R=64*191/255=48, G=103*191/255=77, B=142*191/255=106 — BGRA memory order
+# (106,77,48,191). (A color factor of SRC_ALPHA would have stored an
+# already-premultiplied composite and the readback would premultiply AGAIN,
+# the double-darkened (79,58,36,191) — that was the M3c review finding.)
+# The alpha channel blend factor is ONE (not SRC_ALPHA), so the stored
+# alpha is 191, not 143.
 call_daemon renderer.start "$(jq -cn --arg content "$m3c_b_scene" \
     '{wallpaper_id:"scene-m3c-b",content_hash:"hash-m3c-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3c_b_status="$(wait_phase live)"
 m3c_b_frame="$(jq -r '.result.frame_file' <<<"$m3c_b_status")"
-scene_pixel_oracle "$m3c_b_frame" 80 45 "79,58,36,191" 1
-echo "scene smoke passed (M3c b): src-over blend — alpha 191/255 over zero clear -> (79,58,36,191)"
+scene_pixel_oracle "$m3c_b_frame" 80 45 "106,77,48,191" 1
+echo "scene smoke passed (M3c b): src-over blend — alpha 191/255 over zero clear -> (106,77,48,191)"
 
 # Case M3c-c: draw order — the same two layers with the blue mark FIRST in
 # scene.json: the fullscreen red layer draws last, so (60,34) is red now.
@@ -917,5 +924,52 @@ with open('$standalone', 'rb') as f:
 grep -q "event=renderer.complete frames=" "$smoke_root/standalone.log"
 grep -q "script_errors=0 soft_timeouts=0 hard_timeouts=0" "$smoke_root/standalone.log"
 echo "scene smoke passed: standalone llvmpipe lane (scripted color, SIGTERM exit 0, Stopping state)"
+
+# The M3c layer oracles on the llvmpipe lane: the composite case (draw
+# order + layer transform + orientation — a mirrored framebuffer or a
+# broken quad would move the mark's pixels and fail these samples) and the
+# blend oracle (the ONE-factor premultiplied value). Same frame pixel
+# oracle as the daemon lane, against the worker's own frame file.
+standalone_m3c="$smoke_root/standalone-m3c.bin"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$standalone_m3c" --width 160 --height 90 --fps 30 \
+    --content "$m3c_ab_scene" --device llvmpipe >"$smoke_root/standalone-m3c.log" 2>&1 &
+standalone_m3c_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$standalone_m3c" ]] && head -c 8 "$standalone_m3c" | grep -q KWEFRM1 && break
+    kill -0 "$standalone_m3c_pid" 2>/dev/null || {
+        echo "standalone M3c renderer exited early" >&2
+        sed -n '1,120p' "$smoke_root/standalone-m3c.log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$standalone_m3c" | grep -q KWEFRM1
+scene_pixel_oracle "$standalone_m3c" 90 55 "0,0,255,255" 1
+scene_pixel_oracle "$standalone_m3c" 140 79 "255,0,0,255" 1
+scene_pixel_oracle "$standalone_m3c" 150 85 "255,0,0,255" 1
+kill -TERM "$standalone_m3c_pid"
+wait "$standalone_m3c_pid"
+echo "scene smoke passed: standalone llvmpipe lane — M3c two-layer composite oracles"
+
+standalone_blend="$smoke_root/standalone-blend.bin"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$standalone_blend" --width 160 --height 90 --fps 30 \
+    --content "$m3c_b_scene" --device llvmpipe >"$smoke_root/standalone-blend.log" 2>&1 &
+standalone_blend_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$standalone_blend" ]] && head -c 8 "$standalone_blend" | grep -q KWEFRM1 && break
+    kill -0 "$standalone_blend_pid" 2>/dev/null || {
+        echo "standalone blend renderer exited early" >&2
+        sed -n '1,120p' "$smoke_root/standalone-blend.log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$standalone_blend" | grep -q KWEFRM1
+scene_pixel_oracle "$standalone_blend" 80 45 "106,77,48,191" 1
+kill -TERM "$standalone_blend_pid"
+wait "$standalone_blend_pid"
+echo "scene smoke passed: standalone llvmpipe lane — M3c blend oracle (106,77,48,191)"
 
 echo "all scene smoke cases passed"

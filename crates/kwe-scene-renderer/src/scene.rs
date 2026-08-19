@@ -254,8 +254,10 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
 /// others). An object is an image layer exactly when it carries an `image`
 /// field; everything else (models, particles, audio, text — M3d+) is
 /// ignored. A reference that ends in `.json` is a model instance under the
-/// WE solid-model architecture (all 685 corpus image references point at
-/// model files) — skipped without a diagnostic, not counted toward the
+/// WE solid-model architecture (620 of the 685 corpus image references
+/// point at model files; the other 65 carry a null image value) — skipped
+/// BEFORE any validation, so a malformed model layer (no name, out-of-range
+/// alpha, ...) can never reject the scene, and it is not counted toward the
 /// layer cap, until models arrive (M3h).
 fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerSpec>, SceneError> {
     let Some(value) = root_obj.get("objects") else {
@@ -278,16 +280,18 @@ fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerS
         if !object.contains_key("image") {
             continue; // particles, audio, text, ... — M3d+
         }
-        let layer = parse_image_layer(object, index)?;
-        if layer
-            .image
-            .as_deref()
+        // A model instance: WE stores every visual (2D included) as a
+        // model; model layers are M3h. The scene renders without it. The
+        // check runs on the raw (property-unwrapped) reference BEFORE
+        // parse_image_layer, so a malformed model layer skips like any
+        // model layer instead of rejecting the whole scene.
+        if property_value(object.get("image").expect("caller checked"))
+            .as_str()
             .is_some_and(|image| image.to_ascii_lowercase().ends_with(".json"))
         {
-            // A model instance: WE stores every visual (2D included) as a
-            // model; model layers are M3h. The scene renders without it.
             continue;
         }
+        let layer = parse_image_layer(object, index)?;
         layers.push(layer);
     }
     if layers.len() > MAX_LAYERS {
@@ -326,10 +330,11 @@ fn parse_image_layer(
     };
 
     // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
-    // editor serializes user-bindable fields — 46% of alpha and 43% of
-    // visible fields in the 60-scene corpus. The initial `value` is the
-    // behavior until user properties arrive (M3j); the wrapper is unwrapped
-    // here, and a wrapped scalar without a value rejects like any malformed
+    // editor serializes user-bindable fields — corpus re-scan: 70%
+    // (315/447) of image layers carrying alpha and 49% (276/568) of those
+    // carrying visible are wrapped. The initial `value` is the behavior
+    // until user properties arrive (M3j); the wrapper is unwrapped here,
+    // and a wrapped scalar without a value rejects like any malformed
     // scalar.
     let image = match property_value(object.get("image").expect("caller checked")) {
         Value::String(reference) => Some(reference.clone()),
@@ -1328,8 +1333,8 @@ mod tests {
     #[test]
     fn property_wrapped_values_unwrapped() {
         // The corpus's dominant serialization for user-bindable fields
-        // (46% of alpha, 43% of visible); the initial value is the
-        // behavior until user properties (M3j).
+        // (70% of alpha, 49% of visible — re-scanned); the initial value
+        // is the behavior until user properties (M3j).
         let layers = parse_objects_of(
             r#"{"objects": [
                 {"name": "a", "image": "a.png",
@@ -1384,6 +1389,21 @@ mod tests {
         }
         objects.push_str(r#"{"name": "real", "image": "tex.png"}]}"#);
         let layers = parse_objects_of(&objects).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "real");
+    }
+
+    #[test]
+    fn malformed_model_layers_skip_never_reject() {
+        // A model layer is skipped BEFORE validation: no name, an
+        // out-of-range alpha, or a non-string name must never reject the
+        // scene — the skip-never-reject policy applies to the whole layer.
+        let objects = r#"{"objects": [
+            {"image": "models/missing-name.json"},
+            {"name": 7, "image": "models/bad-name.json", "alpha": 2.0},
+            {"name": "real", "image": "tex.png"}
+        ]}"#;
+        let layers = parse_objects_of(objects).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].name, "real");
     }

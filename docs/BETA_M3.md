@@ -98,16 +98,19 @@ compositor's draw list, in scene.json order — later objects draw over
 earlier ones; no z-sorting, matching the original's array-order drawing.
 Each layer is a unit quad of 6 fan-ordered vertices
 `[v0,v1,v2, v0,v2,v3]` (v0=(-0.5,-0.5,0,0), v1=(0.5,-0.5,1,0),
-v2=(0.5,0.5,1,1), v3=(-0.5,0.5,0,1)) drawn as **two** 3-vertex
-`TRIANGLE_LIST` draws: a 4-vertex draw emits only the first triangle (the
-quad's right half) and empirically a single multi-primitive draw rasterizes
-only its first primitive on both llvmpipe and NVIDIA, so the split is
-required to tile the full quad. The vertex shader has **no y-flip**: scene
-y grows down while NDC y grows up, so scene y=0 maps to NDC y=-1, the
-framebuffer's bottom; `VK_IMAGE_TILING_OPTIMAL` color attachments come back
-bottom-first in the readback (row 0 = the scene's top row), so rendering
-the scene bottom-first delivers it upright — proven on both drivers with a
-shader that skipped the transform (the readback mirrored it).
+v2=(0.5,0.5,1,1), v3=(-0.5,0.5,0,1)) drawn as one 6-vertex
+`TRIANGLE_LIST` draw — a standard draw of two primitives. (The original
+half-quad bug was not the draw shape: a vertex-buffer element/byte mix-up
+sized the buffer at 16 bytes — one vertex — so the GPU's reads of
+vertices 2..5 ran out of bounds and the second triangle rasterized
+garbage; fixed and pinned by the isolated_draw probe.) The vertex shader
+applies **no y-flip**; frame orientation is an *empirical contract*:
+delivered frames are upright on both tested drivers (NVIDIA RTX 3070 and
+llvmpipe), pinned by the quad_orientation device test and the smoke
+suite's layer oracles on **both** lanes (daemon + standalone llvmpipe) —
+how an OPTIMAL-tiling color attachment comes back in the readback is
+driver-dependent, so a new driver must be re-verified against those
+oracles before it is declared supported.
 
 Per-layer push constants are 48 bytes: m0=(a,c,tx,0), m1=(b,d,ty,alpha),
 viewport=(w,h,0,0); `world = mat2(m0.xy, m1.xy) * pos + vec2(m0.z, m1.z)`
@@ -120,16 +123,20 @@ linear min/mag, clamp-to-edge) from a bounded pool of at most `MAX_LAYERS`
 (256) sets, so a runtime texture swap can land per layer later — planned,
 not implemented: the M3c `image` property is load-time only.
 
-Blending is src-over by default: color SRC_ALPHA / ONE_MINUS_SRC_ALPHA,
-alpha ONE / ONE_MINUS_SRC_ALPHA. The alpha factor must be ONE — SRC_ALPHA
-double-scaled the layer alpha (191/255 over an opaque destination produced
-143/255 instead of 191/255). The fragment shader multiplies the decoded
-alpha: `outColor = vec4(c.rgb, c.a * pc.m1.w)` (straight source). Oracle,
-byte-exact on both drivers: opaque texel (64,103,142,255) at layer alpha
-191/255 over a zero clear blends to stored (48,77,106,191), which the
-readback premultiply converts to BGRA (79,58,36,191). A non-default
-`blendMode` is parsed and, when it is not 0, emits one bounded diagnostic
-per scene; only src-over is rendered until M3d.
+Blending is src-over by default: color ONE / ONE_MINUS_SRC_ALPHA, alpha
+ONE / ONE_MINUS_SRC_ALPHA. The fragment shader outputs straight color
+(`outColor = vec4(c.rgb, c.a * pc.m1.w)`), so the attachment stores the
+straight composite and the readback's premultiplication happens exactly
+once, at the protocol boundary. Both factors must be ONE: SRC_ALPHA on
+the color factor would store an already-premultiplied composite that the
+readback then premultiplies AGAIN (translucent pixels α/255 too dark —
+the review-fixed double premultiplication); SRC_ALPHA on the alpha factor
+would double-scale the layer alpha (191/255 over an opaque destination
+produced 143/255 instead of 191/255). Oracle, byte-exact on both
+drivers: opaque texel (64,103,142,255) at layer alpha 191/255 over a zero
+clear is delivered as premultiplied BGRA **(106,77,48,191)**. A
+non-default `blendMode` is parsed and, when it is not 0, emits one
+bounded diagnostic per scene; only src-over is rendered until M3d.
 
 Image sources resolve root-relative (symlink-escape-validated) from the
 content root, or by path from the package entry table. Decoding is bounded
@@ -152,12 +159,14 @@ rules as `Engine.clearcolor`: non-finite → 0, alpha 0..=1, magnitude
 `update()`, so scripted motion reapplies per frame while the image source
 itself stays load-time-only (planned slice).
 
-Corpus findings (60 real packages, 685 image-bearing objects): 432 carry a
-`colorBlendMode` — 410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 —
-all rendered as src-over until M3d. **All 685 image references point at
-model `.json` files** (WE's animated-model format, M3h), so no corpus
-wallpaper yet exercises the decoded-texture path. 46% of `alpha` and 43%
-of `visible` fields are property-wrapped; the M3c parser unwraps the
+Corpus findings (60 real packages, 685 image-bearing objects, re-scanned):
+432 carry a `colorBlendMode` — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7,
+1×9, 1×12 (sums to 432) — all rendered as src-over until M3d. **620 image
+references point at model `.json` files** (WE's animated-model format,
+M3h) and 65 carry a null image value; **none point at a real texture**, so
+no corpus wallpaper yet exercises the decoded-texture path. 70% (315/447)
+of image layers carrying `alpha` and 49% (276/568) of those carrying
+`visible` are property-wrapped; the M3c parser unwraps the
 `{"user": ..., "value": ...}` wrapper at load time for image-layer fields
 (user properties themselves are M3j), while the property-wrapped
 *clearcolor* form (1 of 60) remains rejected per the M3b finding.
@@ -169,6 +178,7 @@ scripts/smoke-scene.sh       # M3a..M3c: scene renderer through the daemon,
                              #   scripted-color oracle, containment, the
                              #   scene.pkg lanes, the M3c image-layer cases
                              #   (a)-(f), plus a standalone llvmpipe lane
+                             #   (scripted color AND the M3c layer oracles)
 scripts/smoke-corpus-pkg.sh  # M3b evidence: preflight over real Workshop
                              #   scene packages (KWE_CORPUS_DIR); SKIPPED
                              #   with exit 0 when unset/missing
@@ -230,16 +240,17 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 
 | Case | Expected containment | Result |
 |---|---|---|
-| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 335 tests pass, 81 in `kwe-scene-renderer` (6 layer-math + 5 texture-bounds + 37 scene-parse + 19 Layer-proxy + 14 earlier) |
-| device tests (both drivers) | `KWE_TEST_DEVICE`-gated renders: fullscreen red 1×1 (`isolated_draw`), 2×2 four-color orientation quad (`quad_orientation`), straight-alpha blend (`blend_partial_alpha`) | byte-exact on llvmpipe and NVIDIA RTX 3070: every pixel [0,0,255,255]; at(8,8)/(56,8)/(8,40)/(56,40) = blue/green/red/white; every pixel (79,58,36,191) |
-| smoke (a): two layers, scene order | red 64×64 then blue 32×32 centered; draw order = scene.json order | daemon lane: (90,55)=(0,0,255,255) red, (140,79)=(255,0,0,255) blue, (150,85)=(255,0,0,255) blue — byte-exact, tol 0 |
-| smoke (b): src-over blend | blue 64×64 at alpha 191/255 over the red layer | (80,45)=(79,58,36,191) tol 1 — the ONE-factor oracle |
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 336 tests pass (82 in `kwe-scene-renderer`) |
+| device tests (both drivers) | `KWE_TEST_DEVICE`-gated renders: fullscreen red 1×1 (`isolated_draw`), 2×2 four-color orientation quad (`quad_orientation`), straight-alpha blend (`blend_partial_alpha`) | byte-exact on llvmpipe and NVIDIA RTX 3070: every pixel [0,0,255,255]; at(8,8)/(56,8)/(8,40)/(56,40) = blue/green/red/white; every pixel (106,77,48,191) — the once-premultiplied oracle |
+| smoke (a): two layers, scene order | red fullscreen under a blue 40×22 mark at (60,34); draw order = scene.json order | daemon lane: (90,55)=(0,0,255,255) red, (140,79)=(255,0,0,255) blue, (150,85)=(255,0,0,255) blue — byte-exact, tol 0 |
+| smoke (b): src-over blend | fullscreen (64,103,142) texel at alpha 191/255 over a zero clear | (80,45)=(106,77,48,191) tol 1 — the straight-composite + one-readback-premultiply oracle |
 | smoke (c): reversed order | same scene with the objects array reversed | (140,79)=(0,0,255,255) — blue now on top, array order wins |
 | smoke (d): missing image | `image: "broken.png"` that does not exist | renderer stays `live`, sequence advances, stderr ring carries `event=renderer.scene.layer_skip layer=broken`; remaining layers render |
 | smoke (e): 257 layers | 257 image objects | `rolled_back`, `last_failure_detail` carries `exit_code_73` and `over the 256 layer cap`; pid unchanged from the previous worker — no bounce |
 | smoke (f): scripted move | script sets `mark.origin.x=60, origin.y=34, size 40×22` on the blue layer every frame | (140,79)=(255,0,0,255) blue (moved onto the red region), (158,85)=(255,0,0,255), (90,55)=(0,0,255,255) red — the proxy read/write + clamp round-trip |
-| layer cap / clamp units | 256 accepted, 257 rejected; clamps: non-finite→0, alpha 0..=1, \|v\| ≤ 1e6, size ≥ 0, `visible` boolean coercion | `exactly_256_image_layers_accepted`, `rejects_257th`; clamp tests in layers.rs + js.rs |
-| corpus stats | image-bearing objects, blendMode histogram, property-wrapping rates | 685 objects; 432 with `colorBlendMode` (410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12); **all 685 reference model `.json` files (M3h)**; 46% alpha / 43% visible property-wrapped |
+| standalone llvmpipe lane: M3c oracles | the M3c (a) composite and (b) blend scenes under the software rasterizer | same pixel oracles pass on llvmpipe: (90,55)/(140,79)/(150,85) = red/blue/blue and (80,45)=(106,77,48,191) — a mirrored readback or broken quad fails these samples |
+| layer cap / clamp units | 256 accepted, 257 rejected; clamps: non-finite→0, alpha 0..=1, \|v\| ≤ 1e6, size ≥ 0, `visible` boolean coercion; malformed model layers skip | `exactly_256_image_layers_accepted`, `rejects_257th`, `malformed_model_layers_skip_never_reject`; clamp tests in layers.rs + js.rs |
+| corpus stats (re-scan) | image-bearing objects, blendMode histogram, reference classes, property-wrapping rates | 685 objects; 432 with `colorBlendMode` (410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 — sums to 432); **620 model `.json` refs + 65 null image values, 0 textures (M3h)**; 70% (315/447) alpha / 49% (276/568) visible property-wrapped |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4), `smoke-supervisor.sh` exit 0 |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 

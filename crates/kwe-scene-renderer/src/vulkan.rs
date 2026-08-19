@@ -6,15 +6,24 @@
 // discrete GPUs preferred, llvmpipe works for the test lane), and a W x H
 // COLOR_OPTIMAL image that is cleared every frame. The M3c slice replaced
 // the M3a fullscreen-triangle clear pass with a textured-quad pipeline: one
-// unit-quad vertex buffer (6 verts of pos+uv as two fan-ordered triangles), a per-layer combined image
-// sampler from a bounded per-layer descriptor set pool (at most MAX_LAYERS
-// layers, each its own set), and 48 bytes of push constants per draw —
-// m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha), viewport = (w, h, 0, 0) —
-// so world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z) with alpha carried to
-// the fragment shader (see layers.rs for the model math and
-// docs/SCENE_FORMAT_V1.md for the format). Layers draw in scene.json order
-// with src-over blending (the pipeline's blend state; M3d brings blend
-// modes). The clear is a CLEAR_VALUE, not a draw.
+// unit-quad vertex buffer (6 verts of pos+uv, two fan-ordered triangles),
+// a per-layer combined image sampler from a bounded per-layer descriptor
+// set pool (at most MAX_LAYERS layers, each its own set), and 48 bytes of
+// push constants per draw — m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha),
+// viewport = (w, h, 0, 0) — so world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)
+// with alpha carried to the fragment shader (see layers.rs for the model
+// math and docs/SCENE_FORMAT_V1.md for the format). Layers draw in
+// scene.json order with src-over blending (the pipeline's blend state; M3d
+// brings blend modes). The clear is a CLEAR_VALUE, not a draw.
+//
+// Frame orientation is an empirical contract: the delivered frames are
+// upright on both tested drivers (NVIDIA RTX 3070 and llvmpipe), pinned by
+// the quad_orientation device test and the smoke suite's layer oracles on
+// both lanes. How an OPTIMAL-tiling color attachment comes back in the
+// readback is driver-dependent (not specified by Vulkan), so a new driver
+// MUST be re-verified against those oracles before it is declared
+// supported — the vertex shader applies no y-flip (quad.vert documents
+// this).
 //
 // Textures are R8G8B8A8_UNORM (RGBA8, identity channel order — the M3a
 // readback lesson), sampled with a linear clamp-to-edge sampler. Uploads
@@ -386,12 +395,17 @@ impl LayerRenderer {
 
         // The unit quad (pos + uv). The uv origin is the image's top-left
         // corner (row 0 = the top of the picture), which in scene space
-        // (+y down) is the smaller y — so v=0 sits at pos.y = -0.5 and the
-        // image renders upright, not mirrored. The buffer size and map range
-        // are the BYTE count (64): UNIT_QUAD.len() is the f32 element count
-        // (16), and an element/byte mix-up made the buffer 16 bytes — the
-        // GPU's read of vertices 2..4 ran out of bounds and nothing
-        // rasterized (found via the isolated_draw probe).
+        // (+y down) is the smaller y — so v=0 sits at pos.y = -0.5. The
+        // DELIVERED frame's orientation is an empirical contract, not a
+        // chain of inference: frames are upright on both tested drivers
+        // (NVIDIA RTX 3070 and llvmpipe), pinned by quad_orientation and
+        // the smoke suite's layer oracles on both lanes; OPTIMAL-tiling
+        // readback orientation is driver-dependent and must be re-verified
+        // per driver. The buffer size and map range are the BYTE count
+        // (64): UNIT_QUAD.len() is the f32 element count (16), and an
+        // element/byte mix-up made the buffer 16 bytes — the GPU's read of
+        // vertices 2..5 ran out of bounds and the second triangle
+        // rasterized garbage (found via the isolated_draw probe).
         let vertex_bytes = (UNIT_QUAD.len() * std::mem::size_of::<f32>()) as vk::DeviceSize;
         let vertex_info = vk::BufferCreateInfo::default()
             .size(vertex_bytes)
@@ -518,14 +532,21 @@ impl LayerRenderer {
         // src-over blending: the M3c default (blend modes are M3d). The
         // blend runs on the fragment's float alpha (the layer alpha from
         // the push constants), which is what the smoke oracle computes
-        // against. Color uses SRC_ALPHA / ONE_MINUS_SRC_ALPHA (straight
-        // source); the ALPHA channel uses ONE / ONE_MINUS_SRC_ALPHA —
-        // scaling the source alpha by itself (SRC_ALPHA) would double-scale
-        // it (a 191/255 layer over an opaque dst would land at 143/255
-        // instead of staying opaque). The readback premultiplies.
+        // against. The fragment shader outputs STRAIGHT color, and the
+        // color factors are ONE / ONE_MINUS_SRC_ALPHA — the attachment
+        // stores src + dst·(1 - src.a), still straight. The protocol
+        // wants premultiplied BGRA, and bgra_premultiplied is the ONE
+        // premultiplication, applied at the readback boundary. Using
+        // SRC_ALPHA here would store an already-premultiplied composite
+        // and the readback would premultiply AGAIN, darkening translucent
+        // pixels by alpha/255 (the (79,58,36,191) double-premultiplied
+        // oracle vs the correct (106,77,48,191)). The ALPHA channel uses
+        // ONE / ONE_MINUS_SRC_ALPHA — scaling the source alpha by itself
+        // (SRC_ALPHA) would double-scale it (a 191/255 layer over an
+        // opaque dst would land at 143/255 instead of staying opaque).
         let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -640,14 +661,16 @@ impl LayerRenderer {
         }
 
         // Build + upload; every handle created here is tracked so a failure
-        // cleans up and the caller skips the layer (the staging buffer is
-        // freed on the success path only — on the error path the renderer
-        // is being torn down or the layer skipped, so the bounded leak is
-        // acceptable and documented).
+        // cleans up and the caller skips the layer — including the staging
+        // buffer/memory, whose per-upload size can reach the 64 MiB image
+        // cap (a leak across the 256 layers would hold 16 GiB).
         let mut image: Option<vk::Image> = None;
         let mut image_memory: Option<vk::DeviceMemory> = None;
         let mut view: Option<vk::ImageView> = None;
         let mut set: Option<vk::DescriptorSet> = None;
+        let mut staging: Option<vk::Buffer> = None;
+        let mut staging_memory: Option<vk::DeviceMemory> = None;
+        let mut staging_mapped = false;
         let outcome = (|| -> Result<(), RenderError> {
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -682,25 +705,31 @@ impl LayerRenderer {
                 .size(rgba.len() as vk::DeviceSize)
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let staging = unsafe { self.device.create_buffer(&staging_info, None) }?;
+            let created_staging = unsafe { self.device.create_buffer(&staging_info, None) }?;
+            staging = Some(created_staging);
             let staging_requirements =
-                unsafe { self.device.get_buffer_memory_requirements(staging) };
-            let staging_memory = allocate_host_visible(
+                unsafe { self.device.get_buffer_memory_requirements(created_staging) };
+            let created_staging_memory = allocate_host_visible(
                 &self.instance,
                 &self.device,
                 self.physical,
                 &staging_requirements,
             )?;
-            unsafe { self.device.bind_buffer_memory(staging, staging_memory, 0) }?;
+            staging_memory = Some(created_staging_memory);
+            unsafe {
+                self.device
+                    .bind_buffer_memory(created_staging, created_staging_memory, 0)
+            }?;
             let staging_map = unsafe {
                 self.device.map_memory(
-                    staging_memory,
+                    created_staging_memory,
                     0,
                     rgba.len() as vk::DeviceSize,
                     vk::MemoryMapFlags::empty(),
                 )?
             }
             .cast::<u8>();
+            staging_mapped = true;
             unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), staging_map, rgba.len()) };
 
             unsafe { self.device.reset_fences(&[self.fence]) }?;
@@ -709,10 +738,17 @@ impl LayerRenderer {
                 self.device
                     .begin_command_buffer(self.upload_buffer, &begin_info)
             }?;
-            // UNDEFINED -> TRANSFER_DST_OPTIMAL.
+            // UNDEFINED -> TRANSFER_DST_OPTIMAL. The access masks make the
+            // transition a real memory dependency (zero masks would be an
+            // execution-only barrier): srcAccess TRANSFER_WRITE orders any
+            // prior transfer writes before the layout change, and
+            // dstAccess TRANSFER_WRITE orders the layout change before the
+            // copy below.
             let to_transfer = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(created)
@@ -753,16 +789,22 @@ impl LayerRenderer {
             unsafe {
                 self.device.cmd_copy_buffer_to_image(
                     self.upload_buffer,
-                    staging,
+                    created_staging,
                     created,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     std::slice::from_ref(&region),
                 );
             }
-            // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL.
+            // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL. The access
+            // masks give the draw's sampled-image reads the spec's
+            // visibility guarantee: TRANSFER_WRITE (the copy) is ordered
+            // before SHADER_READ (the fragment-sampler accesses in the
+            // render pass).
             let to_shader = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(created)
@@ -797,9 +839,9 @@ impl LayerRenderer {
             }
 
             unsafe {
-                self.device.unmap_memory(staging_memory);
-                self.device.destroy_buffer(staging, None);
-                self.device.free_memory(staging_memory, None);
+                self.device.unmap_memory(created_staging_memory);
+                self.device.destroy_buffer(created_staging, None);
+                self.device.free_memory(created_staging_memory, None);
             }
 
             let view_info = vk::ImageViewCreateInfo::default()
@@ -841,6 +883,23 @@ impl LayerRenderer {
             Ok(())
         })();
         if let Err(error) = outcome {
+            // Every error here happens before or after the submit's fence
+            // completed (the submit either succeeded and the fence was
+            // waited, or it never ran); FenceTimeout — the one error with a
+            // still-pending submit — is the process-fatal path, so freeing
+            // while the GPU might still read the staging is bounded to the
+            // exit window. The staging is destroyed on ALL other paths so a
+            // skipped layer never holds up to 64 MiB of host memory.
+            if let Some(memory) = staging_memory.filter(|_| staging_mapped) {
+                unsafe { self.device.unmap_memory(memory) };
+            }
+
+            if let Some(buffer) = staging {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+            }
+            if let Some(memory) = staging_memory {
+                unsafe { self.device.free_memory(memory, None) };
+            }
             if let Some(created_view) = view {
                 unsafe { self.device.destroy_image_view(created_view, None) };
             }
@@ -962,16 +1021,15 @@ impl LayerRenderer {
                     std::slice::from_ref(&set),
                     &[],
                 );
-                // The quad is two fan-ordered triangles in the vertex buffer
-                // ([v0,v1,v2, v0,v2,v3]): a 4-vertex TRIANGLE_LIST draw emits
-                // exactly one triangle and covers only half the quad, and
-                // empirically a single multi-primitive draw call rasterizes
-                // only its first primitive on both llvmpipe and NVIDIA (the
-                // second half of the quad was the original "missing
-                // triangle"). Two 3-vertex draws render both halves on both
-                // drivers, so this loop issues two draws per layer.
-                self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
-                self.device.cmd_draw(self.command_buffer, 3, 1, 3, 0);
+                // The quad is two fan-ordered triangles in the vertex
+                // buffer ([v0,v1,v2, v0,v2,v3]); one 6-vertex TRIANGLE_LIST
+                // draw emits both. The original half-quad bug was NOT the
+                // draw shape — it was the vertex-buffer size: an
+                // element/byte mix-up sized the buffer at 16 bytes (one
+                // vertex), so the GPU's reads of vertices 2..5 ran out of
+                // bounds and the second triangle rasterized garbage
+                // (found via the isolated_draw probe; see `new`).
+                self.device.cmd_draw(self.command_buffer, 6, 1, 0, 0);
             }
         }
         unsafe {
@@ -1536,8 +1594,13 @@ mod tests {
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 0.0], &draws)
             .expect("render once");
+        // The shader outputs straight (64,103,142) with alpha 191/255; the
+        // blend stores it straight (color factor ONE) and the readback
+        // premultiplies exactly once: R=48, G=77, B=106 — BGRA memory order
+        // (106,77,48,191). The old oracle (79,58,36,191) was the
+        // double-premultiplied value (blend factor SRC_ALPHA + readback).
         for pixel in pixels.chunks_exact(4) {
-            assert_eq!(pixel, &[79, 58, 36, 191], "premultiplied BGRA");
+            assert_eq!(pixel, &[106, 77, 48, 191], "premultiplied BGRA");
         }
     }
 }

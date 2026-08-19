@@ -62,11 +62,14 @@ compositor's draw order: the layer listed last draws on top, src-over
 blending (blend modes are M3d). An object is an image layer exactly when
 it carries an `image` field; everything else (particles, audio, text —
 M3d+) is ignored. A reference ending in `.json` is a model instance under
-the WE solid-model architecture — **all 685 corpus image references point
-at model `.json` files** — and is skipped without a diagnostic, not
-counted toward the layer cap, until models arrive (M3h). At most
-**256 image layers** (`MAX_LAYERS`); a scene with 257 is a Shape
-rejection (exit 73, "over the 256 layer cap").
+the WE solid-model architecture — **620 of the 685 corpus image
+references point at model `.json` files, the other 65 carry a null image
+value; none point at a real texture** — so no corpus wallpaper yet
+exercises the decoded-texture path. Model references are skipped BEFORE
+any validation (a malformed model layer can never reject the scene),
+without a diagnostic, and are not counted toward the layer cap, until
+models arrive (M3h). At most **256 image layers** (`MAX_LAYERS`); a scene
+with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
 
 ```json
 {
@@ -90,13 +93,14 @@ rejection (exit 73, "over the 256 layer cap").
 | `size` | `[w, h]` (exactly 2 entries) | `[0, 0]` | the size in scene units the texture is drawn at; `[0, 0]` (absent) takes the decoded texture's own dimensions at load |
 | `alpha` | float in `0.0..=1.0` | `1.0` | straight layer alpha; out-of-range or non-finite rejects the scene (like clearcolor) |
 | `visible` | boolean | `true` | an invisible layer draws nothing |
-| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key (all observed occurrences). Only `0` (normal) renders in M3c — a non-zero mode draws src-over with a bounded one-time note (`event=renderer.scene.blend_mode`) until M3d; a non-numeric value is tolerated (src-over), never a rejection. Corpus: 432 of 685 image-bearing objects carry it — 410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 — the rest omit it |
+| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key (all observed occurrences). Only `0` (normal) renders in M3c — a non-zero mode draws src-over with a bounded one-time note (`event=renderer.scene.blend_mode`) until M3d; a non-numeric value is tolerated (src-over), never a rejection. Corpus (re-scan): 432 of 685 image-bearing objects carry it — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 (sums to 432) — the rest omit it |
 
 Property-wrapped values (`{"user": ..., "value": ...}` — how the editor
-serializes user-bindable fields; **46% of alpha and 43% of visible fields**
-in the 60-scene corpus) are unwrapped to their initial `value`; the
-wrapper's user binding is M3j, and a wrapped scalar without a `value`
-rejects like any malformed scalar.
+serializes user-bindable fields; corpus re-scan: **70% (315/447) of image
+layers carrying `alpha` and 49% (276/568) of those carrying `visible`**
+are wrapped) are unwrapped to their initial `value`; the wrapper's user
+binding is M3j, and a wrapped scalar without a `value` rejects like any
+malformed scalar.
 
 The transform model: a layer is a rectangle of `size` scene units centered
 on `origin`, drawn as two fan-ordered triangles (one unit quad, 6
@@ -109,11 +113,17 @@ compositor pushes 48 bytes per layer: m0 = (a, c, tx, 0),
 m1 = (b, d, ty, alpha), viewport = (w, h, 0, 0), with
 `world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)` and the fragment shader
 multiplying the texture's alpha by the layer alpha. Blending is src-over:
-color SRC_ALPHA / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA —
-the source alpha is never scaled by itself (a 191/255 layer over an
-opaque destination stays 191/255, not 143/255). The readback
-premultiplies (see Output). The model math is byte-tested: identity
-exact, quarter-turn axis mapping, corner positions for known inputs.
+color ONE / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA — the
+fragment shader outputs straight color, so the attachment stores the
+straight composite and the readback's premultiplication is applied exactly
+once, at the protocol boundary (see Output); the source alpha is never
+scaled by itself (a 191/255 layer over an opaque destination stays
+191/255, not 143/255, and a translucent layer is not darkened by a second
+alpha multiply). Blend oracle, byte-exact on both drivers: opaque texel
+(64,103,142,255) at layer alpha 191/255 over a zero clear is delivered as
+premultiplied BGRA (106,77,48,191). The model math is byte-tested:
+identity exact, quarter-turn axis mapping, corner positions for known
+inputs.
 
 ## Image sources (M3c)
 
@@ -122,8 +132,9 @@ exact, quarter-turn axis mapping, corner positions for known inputs.
   relative with no `..`/absolute components, a regular file, at most
   `MAX_TEXTURE_SOURCE_BYTES` (64 MiB).
 - **Pkg scenes**: the reference names a package entry (`kwe_core::image_entry`,
-  exact path match, case-sensitive), read through the bounded reader;
-  the host file system is never touched.
+  case-insensitive — the literal path or the entry's tail after a `/`,
+  exactly one match), read through the bounded reader; the host file
+  system is never touched.
 
 A missing, escaping, unreadable, or over-budget image **skips its layer**
 with a bounded one-time diagnostic (`event=renderer.scene.layer_skip

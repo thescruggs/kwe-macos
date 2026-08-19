@@ -24,13 +24,15 @@ layout(location = 0) out vec2 vUV;
 void main() {
     vec2 world = mat2(pc.m0.xy, pc.m1.xy) * aPos + vec2(pc.m0.z, pc.m1.z);
     vec2 ndc = (world * 2.0) / pc.viewport.xy;
-    // No y-flip: scene y grows down, NDC y grows up, so scene y=0 maps to
-    // NDC y=-1 (the framebuffer's bottom). Color attachments stored with
-    // VK_IMAGE_TILING_OPTIMAL come back bottom-first in the readback (the
-    // protocol's row 0 is the scene's top row), so rendering the scene
-    // bottom-first on the framebuffer delivers it upright. This was verified
-    // with a shader that skipped the transform (the readback mirrored it);
-    // the M3a fullscreen clear was orientation-invariant and never exposed it.
+    // No y-flip: NDC is passed straight through. Whether the delivered
+    // frame is upright depends on how the driver stores an OPTIMAL-tiling
+    // color attachment relative to the readback — driver-dependent, not
+    // specified by Vulkan. Empirically the frames are UPRIGHT on both
+    // tested drivers (NVIDIA RTX 3070 and llvmpipe), pinned by the
+    // quad_orientation device test and the smoke suite's layer oracles on
+    // both lanes. A driver with a different readback orientation would
+    // deliver mirrored frames, so every new driver must be re-verified
+    // against those oracles before it is declared supported.
     gl_Position = vec4(ndc, 0.0, 1.0);
     vUV = aUV;
 }
