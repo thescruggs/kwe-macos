@@ -10,6 +10,15 @@ Read `docs/PROJECT_PLAN.md`, `docs/ARCHITECTURE.md`, `docs/UX_DESIGN.md`,
 `docs/FEATURE_COMPATIBILITY.md`, and `docs/PROVENANCE.md` before changing
 architecture, UI, compatibility behavior, or dependencies.
 
+## Multi-agent coordination
+
+Read `AI-Skills/INSTRUCTIONS.md` before starting any work — it holds the
+maintainer's standing directive for multi-agent sessions (orchestrator uses
+less costly sub-agents; the plan is a living document; mark it up and log
+changes as you go). `AI-Skills/PROJECT_MEMORY.md` carries current repo state
+and the session log; `AI-Skills/BETA_PLAN.md` is the canonical working plan;
+`AI-Skills/TASK_TEMPLATE.md` is the task-contract form for every delegated task.
+
 ## Work decomposition
 
 Every AI task must be an issue-sized vertical change with:

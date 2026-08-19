@@ -1,0 +1,111 @@
+# KDE Wallpaper Engine — Beta 0.1: Video, Web, and Scene Renderers + Live Apply
+
+> **LIVING PLAN** — this file is the canonical working plan for the beta effort.
+> Mark milestone/sub-slice status inline as work progresses and record every
+> deviation, discovery, or design change in the **Change log** below (dated).
+> Update `PROJECT_MEMORY.md` at the end of every session. See `INSTRUCTIONS.md`
+> for the maintainer's multi-agent operating directive.
+
+## Change log
+
+- 2026-08-18 — Plan authored (user decisions locked: full SceneScript engine; Chromium+CDP web; live apply authorized). Moved from `docs/BETA_PLAN.md` to `AI-Skills/BETA_PLAN.md` as the living plan. No slices started.
+
+## Status at a glance
+
+| Milestone | Status |
+|---|---|
+| BETA_M1 (contract + video) | pending |
+| BETA_M2 (web) | pending |
+| BETA_M3 (scene, a–k) | pending |
+| BETA_M4 (live apply) | pending |
+| BETA_M5 (release) | pending |
+
+## Context
+
+The alpha (0.1.0-alpha.1) is installed and running, but video/web/scene wallpapers show as "planned" — no real renderers exist, and Apply is hardcoded disabled. The user wants all three renderers completed and the project upgraded to a beta that actually applies wallpapers to the live Plasma desktop.
+
+**User decisions:** (1) Scene = **full SceneScript engine**, original implementation per ADR 0001 (GPL projects are behavior references only); (2) Web = **headless Chromium via DevTools Protocol** in the existing bwrap sandbox; (3) **Live Plasma apply is explicitly authorized** on this CachyOS machine, including live-session tests.
+
+**Iron rules (AGENTS.md + docs):** no parsing/rendering in plasmashell; every milestone is a runnable vertical slice with acceptance + failure tests and a `docs/BETA_*.md` evidence file; THIRD_PARTY.yml entry **before** dependent code merges; synthetic fixtures only; bounded everything (queues, allocs, retries, logs); renderer failure never restarts Plasma; FEATURE_COMPATIBILITY parity ladder (6-step evidence) updated in the same change; implementation and adversarial review as separate passes; worktree + branch per milestone.
+
+## Key design decisions (verified against code)
+
+- **D1 — JS engine: QuickJS(-ng) via `rquickjs` (MIT).** ES2023 level, has `JS_SetMemoryLimit`, interrupt handler (step budget), small footprint. Boa too slow for 60fps `update()`; Duktape too old; V8 too heavy. Execution contract: 64 MiB heap cap, 8 ms soft / 33 ms hard budget per `update()`; script exceptions log at bounded rate and keep last state — never kill the renderer.
+- **D2 — Shaders:** internal passes GLSL→SPIR-V at build time (glslang, precompiled bytes in crate); wallpaper-provided shaders compiled at runtime via `naga` GLSL subset, fail-closed to default material, manifest `scene3d.shaders=subset`.
+- **D3 — Video: libmpv linked into `kwe-video-renderer`** (LGPL-2.1+ dynamic, separate-process worker), `MPV_RENDER_API_TYPE_SW` render API (no EGL), `--hwdec=auto-safe` with one documented software retry. Keepalive re-publish loop so paused video never trips frame-timeout.
+- **D4 — Web: `--remote-debugging-pipe` over a socketpair** (sandbox has `--unshare-net`; a debug *port* would be unreachable). `Page.startScreencast` JPEG → decode (image crate) → BGRA publish; **must ack `Page.screencastFrameAck`** or capture stalls. Pointer via `Input.dispatchMouseEvent` (real CSS :hover/:active); audio via `Runtime.evaluate` of the WE `audio_web` callback (128 floats, ≤30/s). Chromium flags add `--no-sandbox` (bwrap is the sandbox), `--disable-dev-shm-usage`, `--disable-gpu`, `--headless=new`. One-day CDP framing spike first; port+`DevToolsActivePort` bind is the fallback.
+- **D5 — Audio worker: separate `kwe-audio-worker`** spawned by the daemon; captures via `pw-record --raw` (resolved once through bounded `pw-dump`), reuses `kwe_core::audio::analyze_stereo` (audio.rs:10-27), pushes 64-band frames over a socket; daemon forwards to active renderer latest-wins (pointer pattern, supervisor.rs:817-823). Opt-in: `--audio-capture` + per-wallpaper audio grant; teardown immediate on stop.
+- **D6 — Renderer contract generalization:** `StartSpec` (supervisor.rs:114-123) gains `kind: RendererKind` + `content: ContentSpec` (Video{path}/Web{root}/Scene{path}); per-kind renderer paths, timeouts, resource limits, and env allowlist in `SupervisorConfig`; argv adds `--content <path>`; stderr piped into a bounded ring surfaced in `renderer.status`.
+
+## Found gaps (resolved in the milestones)
+
+| # | Gap | Fix |
+|---|---|---|
+| G1 | `stderr(Stdio::null())` (supervisor.rs:692) | M1: pipe + bounded ring → `WorkerStatus.stderr_tail` |
+| G2 | `env_clear()` breaks bwrap/Chromium/mpv helpers | M1: per-kind env allowlist (HOME=/tmp, PATH, XDG_RUNTIME_DIR) |
+| G3 | RLIMIT_AS 4096 MiB < V8's 4 GiB virtual cage | M1: per-kind limits (web address_space 16384 MiB, open_files 1024) |
+| G4 | systemd MemoryMax=1G too small for daemon+audio+renderers | M1: MemoryMax=3G, CPUQuota=400%, TasksMax=96 |
+| G5 | 3s startup / 2s frame timeouts vs Chromium cold start | M1: per-kind startup timeouts (web 10s) + keepalive re-publish |
+| G7 | playlist_session never starts renderers | M4 |
+| G8 | Permission grants exist only in manager-local state | M2: daemon-owned `permissions-v1.json` + `permissions.get/set` |
+| G9 | Shipped mpv/bwrap/chromium previews have no THIRD_PARTY entries; preview chromium flags broken under bwrap | M1/M2: ledger entries; fix webpreview.cpp args |
+| G10 | scan.rs "planned" rows (scan.rs:393-411) | flip to `RendererDependent` with honest details in M1/M2/M3 |
+| G12 | preflight_scene accepts any JSON object; pkg unvalidated | M3: pkg magic/entry validation in preflight |
+
+## Milestones (each ends runnable with `docs/BETA_*.md` evidence + green `./scripts/check.sh`)
+
+### BETA_M1 — Contract generalization + VIDEO renderer (~2.6k LOC)
+- **M1a Contract:** supervisor.rs (StartSpec/ContentSpec, per-kind config map, spawn argv/env/stderr ring, ControlCommand AudioFrame/MediaState variants), main.rs (kind/content params, `audio.forward`/`media.state` RPC), SUPERVISOR_API/INPUT_PROTOCOL doc updates. Tests: existing smoke-supervisor.sh unchanged; kind dispatch, stderr ring bounds, coalescing.
+- **M1b `crates/kwe-video-renderer`:** libmpv SW render API → BGRA → SharedFrameWriter paced loop; InputChannel copy from test-renderer (main.rs:79-139, 168-228) extended for media_state (pause/seek); keepalive re-publish; fault flags preserved. `scripts/smoke-video.sh`: canary promotes, kill→rollback, corrupt→quarantine, paused→keepalive.
+- **M1c preflight_video** (kwe-core preflight.rs pattern) + scan.rs Video→RendererDependent + synthetic video fixtures (never Workshop payloads).
+- **M1d `crates/kwe-audio-worker`** + daemon audio forwarding module. Accept: ≤30/s 64-band frames to active renderer; no grant → no capture; teardown ≤1s.
+- **M1e Capability/provenance:** THIRD_PARTY (mpv/libmpv LGPL, mpv crate MIT, PipeWire tools), FEATURE_COMPATIBILITY `content.video` evidence, systemd bump, docs/BETA_M1.md.
+
+### BETA_M2 — WEB renderer (~2.9k LOC)
+- **M2a** CDP spike on installed Chromium 151 (pipe framing) + `crates/kwe-cdp` client (bounded 4 MiB messages, timeouts, fake-peer unit tests).
+- **M2b `crates/kwe-web-renderer`:** extend websandbox.rs builder (headless/debug flags, window-size, pipe fds); screencast→BGRA keepalive loop; pointer via CDP; audio injection. Failure tests incl. omitted screencastFrameAck → stall → rollback. Compromise tests: fetch('/etc/passwd') and external fetch both fail (ro-bind + unshare-net).
+- **M2c Grant enforcement:** daemon `grants.rs` + `permissions-v1.json` + `permissions.get/set`; network grant toggles `--unshare-net`; manager delegates (WallpaperDetail.qml:60-66).
+- **M2d** `kwe preflight --web`, fix webpreview.cpp chromium flags, THIRD_PARTY entries (Chromium BSD-3, bubblewrap LGPL) **before merge**, smoke-web.sh + compromise script.
+- **M2e** FEATURE_COMPATIBILITY `content.web` + `runtime.audio-web-64` evidence; scan.rs Web→RendererDependent; docs/BETA_M2.md.
+
+### BETA_M3 — SCENE renderer: SceneScript engine + Vulkan compositor (largest; slices M3a–M3k, ~11.8k LOC)
+Format research contract first (docs/BETA_M3.md + docs/SCENE_FORMAT_V1.md): scene.json schema + SceneScript API matrix derived from official docs + behavior references only (no copied code). pkg = `PKGV####` magic, length-prefixed entry table, LZ4 data (`lz4_flex`, bounded entry count/sizes).
+
+- **M3a** `crates/kwe-scene-renderer`: device setup reusing kwe-vulkan probe patterns, QuickJS runtime, full InputChannel, keepalive loop, fault flags; scene.json parse (16 MiB bound); init/update/resized callbacks; script timeout counters. Failure: throw→bounded log; OOM→exit-71 path→ResourceLimit.
+- **M3b** original pkg reader (kwe-core/src/pkg.rs) + preflight pkg validation; corpus smoke (all 60 local scenes preflight without crash).
+- **M3c** 2D image layers: renderpass/quad pipeline, texture upload, transforms, opacity/draw order; image-oracle tests; manifest `scene2d=partial`.
+- **M3d** blend modes + color effects (WE set) via pipeline blending; oracle per mode.
+- **M3e** TextLayer via stb_truetype, bounded glyph atlas.
+- **M3f** ParticleSystem CPU-sim, bounded count (~4096).
+- **M3g** VideoLayer textures via libmpv (≤2 concurrent).
+- **M3h** scene3d P1: .obj/.mtl parser, camera/lights, naga shader subset with fail-closed default.
+- **M3i** AudioAnalyser (16/32/64 bands from daemon 64-band frames) + mouse/buttons/keyboard; `runtime.audio-scene-16-32-64` evidence.
+- **M3j** Properties: IProperty objects, `property_set` wire message (additive, protocol doc update), per-wallpaper persistence; manager property UI deferred to M4 (flagged in docs).
+- **M3k** Exit gate: bad scene → rollback → quarantine → reproducible report (`renderer_report` side file ≤8 KiB read by daemon); destructive suite (infinite loop, OOM, shader bomb, corrupt/oversized pkg); `runtime.scenescript` per-class coverage matrix; `plasmashell` PID unchanged.
+
+### BETA_M4 — LIVE APPLY (~2.4k LOC)
+- **M4a** daemon `apply.rs`: `assignments-v1.json`, `wallpaper.apply/restore/assignments`; apply transaction = preflight → canary → promote → ack; Plasma config write via bounded `org.kde.PlasmaShell.evaluateScript` (daemon-constructed strings only, never wallpaper content); safe-mode restore to org.kde.image. Research slice pins the exact desktop-id↔output script first.
+- **M4b** manager Apply UI: enable WallpaperDetail.qml:98-107, per-kind preflight summary, permission grants (daemon-backed), output picker, safe-mode wiring, accessible loading/success/degraded/failed states.
+- **M4c** playlist renderer assignment/transitions (playlist_session calls supervisor.start, skips quarantined).
+- **M4d** live enablement + `scripts/smoke-live-apply.sh` (authorized): apply video/web/bad-scene on the live session, rollback + safe-mode assertions, `plasmashell` PID unchanged across every destructive step; evidence in docs/BETA_M4.md.
+
+### BETA_M5 — RELEASE (~1.2k LOC)
+- Version `0.1.0-beta.1`: Cargo.toml:14 workspace, CMakeLists.txt:3, PKGBUILD pkgver+pkgrel, `.SRCINFO` regen via `KWE_FORCE_AUR_SOURCE=1 makepkg --printsrcinfo`, README Beta 0.1 section, docs/BETA_0_1.md guide, manager About page + app strings.
+- M7 CLI: `kwe test-wallpaper`, `kwe safe-mode`, `kwe export-report` (privacy-reviewed), `kwe diagnose` renderer lanes.
+- Completed THIRD_PARTY ledger (quickjs/rquickjs, lz4_flex, image, stb_truetype, naga, glslang, chromium, bubblewrap, mpv family, PipeWire) + license review sign-off.
+- FEATURE_COMPATIBILITY full refresh (honest rows; scene2d/3d partial-subset; per-class scenescript matrix); PROJECT_PLAN.md statuses amended (M2-M7, ordering note).
+- Packaging: install all four renderer binaries + audio worker; installed-layout smoke; Intel Mesa + NVIDIA lane evidence (machine recorded: NVIDIA via loader).
+
+## Rollout order
+
+M1 → M2 → M3a-b → M3c-e → M3f-g → M3h-j → M3k → M4 → M5. Total ≈ 17–19 kLOC across nine merge trains. Each milestone: new git branch/worktree, implementation + separate adversarial review pass (AGENTS.md), docs/BETA_*.md evidence, THIRD_PARTY ledger before merge.
+
+## Verification
+
+Per milestone: `cargo test --workspace`, `./scripts/check.sh` (fmt/clippy/build/qmllint), new smoke script per milestone (smoke-video.sh, smoke-web.sh + compromise, scene destructive suite, smoke-live-apply.sh), image-oracle tests for rendering, `plasmashell` PID unchanged during all destructive tests, package rebuild + install smoke at M5. Live-session tests only in M4 (explicitly authorized).
+
+## Notes
+
+- `runtime.pointer-buttons` stays P1: wire plumbing in M1a, consumer wiring in M3i.
+- Post-release optimization backlog (mmap/DMA-BUF) stays deferred; pread/shmem baseline is the correctness path.
+- If `--remote-debugging-pipe` framing misbehaves on the installed Chromium, documented fallback: port 0 + `--bind` of a runtime dir into the sandbox + read DevToolsActivePort.
