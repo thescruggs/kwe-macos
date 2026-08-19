@@ -57,6 +57,13 @@ makedepends=(
 build() {
     cd "${srcdir}/kde-wallpaper-engine"
     export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    # CachyOS/Arch toolchain envs carry -flto=auto. The cc-built C archives
+    # (bundled QuickJS, the stb_truetype shim) compile as GCC-LTO objects and
+    # rust-lld cannot LTO-link them: the final link fails with undefined
+    # JS_*/kwe_font_* symbols. Drop the flag for the cargo steps.
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
     cargo build --release --workspace
     cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
@@ -68,6 +75,9 @@ build() {
 check() {
     cd "${srcdir}/kde-wallpaper-engine"
     export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
     # kwe-vulkan exercises real Vulkan instances and is excluded so the test
     # run also works in GPU-less build environments.
     cargo test --release --workspace --exclude kwe-vulkan
