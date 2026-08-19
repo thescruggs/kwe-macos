@@ -178,3 +178,12 @@ entries:
     use: dependency
     approved_for_code_use: true
     notes: Decodes the BGRA frames the web renderer publishes from chromium CDP screencast events; exact transitive set pinned in Cargo.lock.
+
+  - id: quickjs-rquickjs
+    project: QuickJS JavaScript engine via rquickjs (rquickjs/rquickjs-sys)
+    url: https://crates.io/crates/rquickjs
+    revision: 0.12.2 (rquickjs 0.12.2; rquickjs-sys 0.12.2 vendored quickjs-ng 0.15.1 — QJS_VERSION 0.15.1 in vendored quickjs/quickjs.h, license MIT per upstream)
+    license_observed: MIT
+    use: dependency
+    approved_for_code_use: true
+    notes: JS engine for the original SceneScript implementation (ADR 0001; docs/SCENE_FORMAT_V1.md). Used only by the separate-process kwe-scene-renderer worker; never in plasmashell. Bounded execution is enforced with Runtime::set_memory_limit (64 MiB heap) and set_interrupt_handler (per-update wall-clock soft/hard budget, M3a) — no WE code is copied or linked; the engine just evaluates the wallpaper's script. Exact transitive set pinned in Cargo.lock (rquickjs-core, rquickjs-sys, cc build of vendored QuickJS C).

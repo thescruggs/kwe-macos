@@ -8,6 +8,7 @@ members = [
     "crates/kwe-daemon",
     "crates/kwe-frame-protocol",
     "crates/kwe-input-protocol",
+    "crates/kwe-scene-renderer",
     "crates/kwe-test-renderer",
     "crates/kwe-video-renderer",
     "crates/kwe-vulkan",
@@ -28,6 +29,7 @@ clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
 libc = "0.2"
 memmap2 = "0.9"
+rquickjs = "0.12.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
