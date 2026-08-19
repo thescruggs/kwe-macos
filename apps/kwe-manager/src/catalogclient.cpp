@@ -22,8 +22,10 @@ CatalogClient::CatalogClient(QString socketPath, QObject *parent)
     connect(&m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
         const QString message = tr("Could not connect to the wallpaper service at %1: %2")
                                     .arg(m_socketPath, m_socket.errorString());
+        // The manager activates the user service itself when the socket is
+        // absent; DaemonActivator owns the actionable recovery guidance.
         const QString hint = QFileInfo::exists(m_socketPath) ? QString()
-            : tr(". Start the service with: systemctl --user enable --now kwe-daemon.service");
+            : tr(". The wallpaper service is not running.");
         setState(Error, message + hint);
     });
     m_autoRefreshTimer.setInterval(AutomaticRefreshMilliseconds);

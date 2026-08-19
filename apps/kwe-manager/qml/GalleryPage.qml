@@ -126,6 +126,30 @@ Kirigami.Page {
             ]
         }
 
+        // The manager starts the daemon user service itself when its socket
+        // is absent; these two messages cover the activation in progress and
+        // the actionable failure state once the bounded attempts run out.
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            type: Kirigami.MessageType.Information
+            visible: daemonActivator.state === DaemonActivator.Activating
+            text: daemonActivator.message
+        }
+
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            type: Kirigami.MessageType.Error
+            visible: daemonActivator.state === DaemonActivator.Failed
+            text: daemonActivator.message
+            actions: [
+                Kirigami.Action {
+                    text: qsTr("Start service")
+                    icon.name: "system-run-symbolic"
+                    onTriggered: daemonActivator.activate()
+                }
+            ]
+        }
+
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Error

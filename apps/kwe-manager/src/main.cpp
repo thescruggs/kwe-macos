@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "catalogclient.h"
 #include "catalogmodel.h"
+#include "daemonactivator.h"
 #include "packageinstaller.h"
 #include "workshopclient.h"
 #include "videopreview.h"
@@ -60,6 +61,11 @@ int main(int argc, char *argv[]) {
         QStringLiteral("leave-safe-mode"),
         QStringLiteral("Re-enable the user-local KWE Plasma package before starting"));
     parser.addOption(leaveSafeModeOption);
+    QCommandLineOption daemonActivationOption(
+        QStringLiteral("daemon-activation-command"),
+        QStringLiteral("Command that starts the daemon user service when its socket is absent (development only)"),
+        QStringLiteral("path"));
+    parser.addOption(daemonActivationOption);
     parser.process(application);
 
     QString socketPath = parser.value(socketOption);
@@ -90,6 +96,20 @@ int main(int argc, char *argv[]) {
     RendererStatus rendererStatus(socketPath);
     WebPreview webPreview;
     PlaylistController playlistController(socketPath);
+    // When the daemon socket is absent, start the user service before the
+    // catalog begins. Defaults to the systemd user unit; the smoke suite
+    // injects a stub command instead of touching the user's real unit.
+    QString activationProgram = QStringLiteral("systemctl");
+    QStringList activationArguments{QStringLiteral("--user"), QStringLiteral("start"),
+                                    QStringLiteral("kwe-daemon")};
+    const QString activationCommand = parser.value(daemonActivationOption);
+    if (!activationCommand.isEmpty()) {
+        activationProgram = activationCommand;
+        activationArguments.clear();
+    }
+    DaemonActivator daemonActivator(socketPath, activationProgram, activationArguments);
+    // The probe is synchronous; QML then sees a truthful initial state.
+    daemonActivator.activate();
     if (parser.isSet(safeModeOption)) {
         if (!packageInstaller.enterSafeMode())
             qWarning("Warning: --safe-mode could not be activated (%s)",
@@ -106,6 +126,10 @@ int main(int argc, char *argv[]) {
     workshopFiltered.setWorkshopView(true);
 
     QQmlApplicationEngine engine;
+    // Once the activated daemon socket appears, refresh the catalog right
+    // away instead of waiting for the client's exponential retry backoff.
+    QObject::connect(&daemonActivator, &DaemonActivator::activated, &client, &CatalogClient::refresh);
+    engine.rootContext()->setContextProperty(QStringLiteral("daemonActivator"), &daemonActivator);
     engine.rootContext()->setContextProperty(QStringLiteral("catalogClient"), &client);
     engine.rootContext()->setContextProperty(QStringLiteral("wallpaperModel"), &filtered);
     engine.rootContext()->setContextProperty(QStringLiteral("workshopModel"), &workshopFiltered);

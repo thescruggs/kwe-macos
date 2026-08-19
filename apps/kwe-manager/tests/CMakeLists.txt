@@ -15,6 +15,14 @@ qt_add_executable(kwe-workshop-client-test
 target_link_libraries(kwe-workshop-client-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
 add_test(NAME kwe-workshop-client-test COMMAND kwe-workshop-client-test)
 
+qt_add_executable(kwe-daemon-activator-test
+    daemonactivatortest.cpp
+    ../src/daemonactivator.cpp
+    ../src/daemonactivator.h
+)
+target_link_libraries(kwe-daemon-activator-test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
+add_test(NAME kwe-daemon-activator-test COMMAND kwe-daemon-activator-test)
+
 qt_add_executable(kwe-playlist-controller-test
     playlistcontrollertest.cpp
     ../src/playlistcontroller.cpp

@@ -1,5 +1,5 @@
 /build/
-/target/
+/target
 /.cache/
 /catalog.json
 /graphify-out/

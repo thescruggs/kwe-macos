@@ -34,6 +34,10 @@ user systemd unit. After installing, enable the daemon user service:
 systemctl --user enable --now kwe-daemon.service
 ```
 
+The manager also starts the service on demand when it is not running, and
+surfaces a manual `systemctl --user start kwe-daemon` hint if activation
+fails.
+
 On CachyOS the AUR helper `yay` is already in the `cachyos` repository
 (`sudo pacman -S yay`); AUR packages are then installed with `yay -S <name>`.
 There is no repository to "add" — `yay` queries the AUR API directly.

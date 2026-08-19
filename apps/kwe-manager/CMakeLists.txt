@@ -3,6 +3,8 @@ qt_add_executable(kwe-manager
     src/main.cpp
     src/catalogmodel.cpp
     src/catalogmodel.h
+    src/daemonactivator.cpp
+    src/daemonactivator.h
     src/workshopclient.cpp
     src/workshopclient.h
     src/videopreview.cpp
@@ -35,6 +37,8 @@ qt_add_qml_module(kwe-manager
     SOURCES
         src/catalogclient.cpp
         src/catalogclient.h
+        src/daemonactivator.cpp
+        src/daemonactivator.h
         src/packageinstaller.cpp
         src/packageinstaller.h
     QML_FILES

@@ -8,7 +8,12 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/bin/kwe-daemon --state-dir=${STATE_DIRECTORY}
-Restart=on-failure
+# Restart=always, not on-failure: a clean stop at session teardown is not a
+# failure, yet the desktop must not lose its wallpaper service when the next
+# session starts. StartLimitBurst/IntervalSec in [Unit] bound restart loops,
+# and an explicit `systemctl --user stop kwe-daemon` still wins because
+# systemd does not restart a unit stopped by the administrator.
+Restart=always
 RestartSec=2s
 RuntimeDirectory=kwe
 RuntimeDirectoryMode=0700
