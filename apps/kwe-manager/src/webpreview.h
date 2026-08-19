@@ -15,6 +15,15 @@ class PermissionsClient;
 // all. DISPLAY is inherited from the manager's environment: the preview is
 // the user-facing window, not the headless renderer.
 //
+// Display sockets: the namespace shadows /tmp with an empty tmpfs and
+// leaves /run unbound, so inherited DISPLAY/WAYLAND_DISPLAY would point at
+// sockets that do not exist inside the sandbox — the preview could never
+// connect to any display without binds for them. Only the socket FILES are
+// bound (never $XDG_RUNTIME_DIR as a whole, which would leak
+// kwallet/pipewire/ssh sockets to wallpaper JS); a local X11 DISPLAY binds
+// the /tmp/.X11-unix socket dir, a Wayland session binds its socket file,
+// and an offscreen run (neither set) binds nothing.
+//
 // Network wiring (M2c grants): the effective network grant for the
 // wallpaper is mirrored through PermissionsClient. play() launches with the
 // currently mirrored value, requests the effective record, and relaunches
@@ -35,6 +44,18 @@ public:
     /// process is spawned there); the kwe-core `web_preview_command` builder
     /// pins the same command shape on the Rust side.
     static QStringList argumentsFor(const QString &root, bool networkAllowed);
+    /// Pure selection of the display-socket binds (mirrors
+    /// kwe_core::websandbox::display_binds): flat `--ro-bind SOURCE DEST`
+    /// triples. The caller drops a triple whose source does not exist
+    /// (bwrap refuses to start on a missing source).
+    static QStringList displayBinds(const QString &display, const QString &waylandDisplay,
+                                    const QString &xdgRuntimeDir);
+    /// True when a grant change should relaunch the preview: the permission
+    /// is network, the ids match the previewed wallpaper, the preview is
+    /// running, and the new value differs from the launched one.
+    static bool wantsGrantRelaunch(const QString &permission, const QString &wallpaperId,
+                                   const QString &previewId, bool running, bool granted,
+                                   bool networkAllowed);
 signals:
     void runningChanged();
     void errorMessageChanged();
@@ -47,4 +68,5 @@ private:
     QUrl m_url;
     QString m_wallpaperId;
     bool m_networkAllowed = false;
+    bool m_pendingRelaunch = false;
 };

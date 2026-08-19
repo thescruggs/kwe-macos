@@ -517,14 +517,33 @@ directory exactly like the existing `--path`/`--video` variants (exit 0 safe /
 ### 7.2 The compromise matrix (attempt × scenario × expected → actual)
 
 All results measured 2026-08-19 on Chromium 151.0.7922.137 through the
-daemon pipeline, verified by `scripts/smoke-web-compromise.sh`:
+daemon pipeline, verified by `scripts/smoke-web-compromise.sh`. Attempt 1's
+positive control is a host-side STALL listener (scratch loopback port whose
+listener accepts every connection and never answers) — deterministic on
+any machine, unlike an external address: scenario A's `--unshare-net`
+namespace has NO loopback, so the connect fails fast; scenario B's shared
+host netns connects to the listener and waits for an answer that never
+comes (1.5 s abort).
 
 | Attempt | Escape | Scenario A (default, no grant) | Scenario B (network grant) |
 | --- | --- | --- | --- |
-| 1 | network fetch to `http://203.0.113.1/` (TEST-NET-3, RFC 5737), 1.5 s abort bound | blocked fast (~10 ms TypeError, no route under `--unshare-net`) → **green**; actual: green | leaves the sandbox, enters the host network, SYN blackholed by the default route → aborts at the 1.5 s bound → **orange** (positive control); actual: **orange (255,139,0)** |
+| 1 | network fetch to `http://127.0.0.1:<scratch>/` (host stall listener), 1.5 s abort bound | no loopback in the isolated netns: connect fails fast (~10 ms TypeError) → **green**; actual: green | connects to the host listener, hangs, aborts at the 1.5 s bound → **orange** (positive control); actual: **orange (255,139,0)** |
 | 2 | cors-mode fetch of `file:///etc/passwd` + traversal XHR `file:///wallpaper/../../../../etc/passwd` | both fail → **green**; actual: green | same → **green**; actual: green |
 | 3 | content-root reachability: `file:///wallpaper/index.html` | succeeds → **green**; actual: green | same → **green**; actual: green |
 | 4 | allowed reads: localStorage + `navigator.userAgent` | succeed → **green**; actual: green | same → **green**; actual: green |
+
+Honest reading of row 2: the boundary under test is the BROWSER's
+file-scheme/CORS isolation — chromium 151 blocks cors-mode fetch/XHR to
+every `file:` URL from a `file://` page (the page's own URL included), so
+the traversal cannot distinguish a bound path from a non-bound one through
+this attempt alone. The sandbox's non-bound-path contribution (only the
+system paths and the content root are reachable — there IS no traversal
+target) is asserted by the command-builder unit tests
+(`webpreviewtest.cpp::isolationByDefault`, the kwe-core builder tests),
+not by this case. The row's RED condition still holds: a resolution would
+be a genuine host-file read by the browser's own code (the traversal
+normalizes to `file:///etc/passwd`, which EXISTS inside the sandbox because
+/etc is ro-bound).
 
 The fixture colors are GREEN `#00c000` (sandbox held), ORANGE `#ff8c00`
 (attempt left the sandbox — only the positive control may paint it), RED
@@ -547,27 +566,30 @@ lines are read from `/proc/<pid>/cmdline` (NUL-separated, `tr '\0' ' '`).
 | bwrap argv | contains `--unshare-net` (measured) | no `--unshare-net` (measured) |
 
 Scenario B's painted ORANGE box proves the lack of `--unshare-net` is not a
-cosmetic argv diff: the fetch genuinely reached the host network stack.
+cosmetic argv diff: the fetch CONNECTED to the host's listener and hung
+until the abort — the namespace's network stack is genuinely the host's.
 
 ### 7.4 Measured deviations from the task text (all documented in the fixture)
 
-1. **Attempt 1's positive control cannot literally succeed**: TEST-NET-3 is
-   unroutable by design (RFC 5737); on the host netns the SYN is blackholed
-   by the default route, so the fetch cannot resolve. The observable that
-   proves the fetch LEFT the sandbox is the abort at the 1.5 s bound —
-   ORANGE "network-present", documented honestly in the matrix.
-2. **The abort reason is named `TimeoutError`**: `AbortSignal.timeout()`'s
+1. **The abort reason is named `TimeoutError`**: `AbortSignal.timeout()`'s
    abort reason is a TimeoutError DOMException (spec behavior, confirmed
    through the daemon pipeline — the fixture's first `AbortError`-only check
    left scenario B green; the name is `TimeoutError` on chromium 151).
-3. **Attempt 3 must use `no-cors`**: cors-mode fetch/XHR of ANY `file:` URL
+2. **Attempt 3 must use `no-cors`**: cors-mode fetch/XHR of ANY `file:` URL
    from a `file://` page is blocked — including the page's own URL (measured
    in M2d). A no-cors fetch resolves opaque exactly when the file exists, so
-   it is the probe that proves attempt 2's failures come from scheme
-   isolation, not a broken content mount.
-4. **`/etc/passwd` exists inside the sandbox** (a no-cors probe of it
+   it is the probe that proves attempt 2's failures are isolation (see the
+   honest reading of row 2 in §7.2), not a broken content mount.
+3. **`/etc/passwd` exists inside the sandbox** (a no-cors probe of it
    resolves): attempt 2's RED would be a genuine host-file read, not a
    missing-file artifact.
+4. **Attempt 1's positive control is the 1.5 s abort, not a resolved
+   response**: the stall listener never answers, so the fetch cannot
+   resolve; the observable that proves the fetch LEFT the sandbox is the
+   abort at the bound — ORANGE "network-present". This is deterministic
+   (see §7.2), unlike the RFC 5737 probe of the first form, which depended
+   on the host's route table (an offline or ICMP-refusing host painted
+   GREEN and spurious-failed the suite).
 
 ### 7.5 The WebPreview fix
 
@@ -578,26 +600,56 @@ toggle, plus `web_preview_command()` as the pinned windowed form): bwrap
 then `chromium --no-sandbox --disable-dev-shm-usage --no-first-run
 --no-default-browser-check --disable-extensions
 --user-data-dir=/tmp/kwe-preview-profile file:///wallpaper/index.html` —
-no `--headless`, no CDP pipe, no screencast viewport; DISPLAY is inherited
-(the preview is the user-facing window). The grant wiring: `WebPreview`
-holds a `PermissionsClient*`; on `play()` it requests the wallpaper's
-permissions, snapshots `isGranted(network)` into the launch, and on a
-`grantedChanged(network)` while the same wallpaper is running relaunches
-the browser with the new argv. Unit coverage without spawning anything:
-`webpreviewtest.cpp` pins the isolation (ro-bind pairs, `--unshare-net`
-default and its removal under grant), the windowed flags (no headless/CDP
-prefixes), and the pre-spawn validation gates (non-local URL rejected,
-non-`index.html` file rejected), plus the `kwe-core` builder test
-`web_preview_command_is_windowed_with_the_m2b_isolation`.
+no `--headless`, no CDP pipe, no screencast viewport. DISPLAY and
+WAYLAND_DISPLAY are inherited (the preview is the user-facing window) AND
+the session's display SOCKETS are bound into the namespace by
+`display_binds()` (`web_preview_command` / `WebPreview::displayBinds`):
+the namespace shadows /tmp with an empty tmpfs and leaves /run unbound, so
+the inherited variables would otherwise point at sockets that do not exist
+inside the sandbox and the window could never connect to any display. A
+local X11 DISPLAY binds the /tmp/.X11-unix socket dir; a Wayland session
+binds only its socket FILE under $XDG_RUNTIME_DIR — never the runtime dir
+as a whole, which would leak kwallet/pipewire/ssh sockets to wallpaper JS;
+an offscreen run (neither set) binds nothing. Binds whose source does not
+exist are dropped (bwrap refuses a missing source).
+
+The grant wiring: `WebPreview` holds a `PermissionsClient*`; on `play()`
+it requests the wallpaper's permissions, snapshots `isGranted(network)`
+into the launch, and on a `grantedChanged(network)` while the same
+wallpaper is running relaunches the browser with the new argv. The
+relaunch is ASYNC and pending-flagged: `QProcess::kill()` is async and
+`start()` on a non-NotRunning process is a silent no-op (the first form
+called start() immediately and silently DROPPED the correcting launch,
+leaving the wrong network flag forever); the decision predicate
+`wantsGrantRelaunch()` sets a pending flag, and the stateChanged handler
+starts the new instance only once the old one is actually NotRunning —
+one relaunch per change, and `launch()` re-reads the grant, so a second
+toggle before the restart simply updates the value it starts with.
+`stop()` cancels the pending flag so a user stop is never followed by an
+unexpected relaunch.
+
+Unit coverage without spawning anything: `webpreviewtest.cpp` pins the
+isolation (ro-bind pairs, `--unshare-net` default and its removal under
+grant), the windowed flags (no headless/CDP prefixes), the display binds
+(selection for X11 local/remote, Wayland socket-only, neither, plus the
+env-driven argumentsFor path), the `wantsGrantRelaunch` decision, and the
+pre-spawn validation gates (non-local URL rejected, non-`index.html` file
+rejected); the kwe-core builder tests pin the same command shape
+(`web_preview_command_is_windowed_with_the_m2b_isolation`,
+`display_binds_*`, `web_preview_command_binds_a_present_wayland_socket…`).
 
 ### 7.6 Web preflight
 
 `kwe preflight --web <root>` mirrors the `--path`/`--video` variants:
 `--web` takes a wallpaper directory, `--path` takes a scene dir — exactly
-one is required (anything else exits 1). A web root is safe (exit 0) when
-it is a directory containing an `index.html` (the `sandbox_root` rule);
-anything else exits 2 with the reason. Like the other variants it never
-launches a renderer.
+one is required (anything else exits 1). The entry check is
+`preflight_web`'s real behavior, not a directory rule: there is NO
+canonicalization and no requirement that root itself be a directory — only
+`root/index.html` is validated (not a symlink, a regular file, ≤ 16 MiB,
+readable, and containing an `<html` root, case-insensitive); anything else
+exits 2 with the reason. Like the other variants it never launches a
+renderer, and network stays disabled in the report (grants are the
+daemon's job, M2c).
 
 ### 7.7 M2d acceptance
 
@@ -605,7 +657,7 @@ launches a renderer.
 | --- | --- | --- |
 | fmt | `cargo fmt --all -- --check` | pass |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| test | `cargo test --workspace --all-targets` | pass (216 tests, 0 failures) |
+| test | `cargo test --workspace --all-targets` | pass (221 tests, 0 failures) |
 | cmake | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | pass |
 | ctest | `cd build/cmake && ctest --output-on-failure` | pass (7/7, incl. `kwe-web-preview-test`) |
 | qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | pass |

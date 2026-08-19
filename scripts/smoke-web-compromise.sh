@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Sandbox-compromise smoke suite (BETA_M2d). A runtime-generated fixture
-# page attempts four sandbox escapes in order — (1) a network fetch to the
-# unroutable TEST-NET-3 address, (2) a cors-mode fetch of file:///etc/passwd
-# plus a traversal XHR to file:///wallpaper/../../../../etc/passwd, (3) a
-# no-cors fetch of file:///wallpaper/index.html proving the content root is
+# page attempts four sandbox escapes in order — (1) a network fetch to a
+# host STALL listener (a scratch loopback port whose listener accepts every
+# connection and never answers: deterministic on any machine, unlike an
+# external address), (2) a cors-mode fetch of file:///etc/passwd plus a
+# traversal XHR to file:///wallpaper/../../../../etc/passwd, (3) a no-cors
+# fetch of file:///wallpaper/index.html proving the content root is
 # reachable, (4) localStorage and userAgent reads — and paints one
 # color-coded result box per attempt. The suite runs the fixture through the
 # daemon pipeline twice (Scenario A: default grants, network off; Scenario
@@ -24,12 +26,18 @@ socket="$smoke_root/daemon.sock"
 runtime_dir="$smoke_root/runtime"
 state_dir="$smoke_root/state"
 fixture="$smoke_root/fixture"
+stall_port_file="$smoke_root/stall.port"
 daemon_pid=""
+stall_pid=""
 
 cleanup() {
     if [[ -n "$daemon_pid" ]]; then
         kill "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$stall_pid" ]]; then
+        kill "$stall_pid" 2>/dev/null || true
+        wait "$stall_pid" 2>/dev/null || true
     fi
     rm -rf -- "$smoke_root"
 }
@@ -131,9 +139,53 @@ probe_frame() {
 # more after 2 s (attempt 1 aborts at 1.5 s), so the last compositor frame
 # carries the final state; the suite polls the frame file with bounded
 # retries.
+# A host-side stall listener on a scratch loopback port: it ACCEPTS every
+# connection and never answers. This is the deterministic positive control
+# for the network grant — no dependence on external addresses or the host
+# route table. The fixture fetch targets 127.0.0.1:$STALL_PORT; scenario A
+# (--unshare-net) has no loopback inside the namespace, so the connect
+# fails fast, while scenario B (shared host netns) connects to the listener
+# and waits for an answer that never comes (abort at the 1.5 s bound).
+start_stall_listener() {
+    cat >"$smoke_root/stall_listener.py" <<'PY'
+import socket
+import sys
+
+port_file = sys.argv[1]
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(("127.0.0.1", 0))
+listener.listen(16)
+with open(port_file, "w") as handle:
+    handle.write(str(listener.getsockname()[1]) + "\n")
+    handle.flush()
+while True:
+    conn, _ = listener.accept()
+    try:
+        while True:
+            if not conn.recv(65536):
+                break
+    except OSError:
+        pass
+PY
+    python3 "$smoke_root/stall_listener.py" "$stall_port_file" >"$smoke_root/stall.log" 2>&1 &
+    stall_pid=$!
+    for _attempt in {1..100}; do
+        [[ -s "$stall_port_file" ]] && return
+        kill -0 "$stall_pid" 2>/dev/null || {
+            echo "stall listener exited during startup" >&2
+            sed -n '1,40p' "$smoke_root/stall.log" >&2
+            return 1
+        }
+        sleep 0.05
+    done
+    echo "stall listener port did not appear" >&2
+    return 1
+}
+
 make_fixture() {
     mkdir -p "$fixture"
-    cat >"$fixture/index.html" <<'HTML'
+    cat >"$fixture/index.html" <<HTML
 <!doctype html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;padding:0;overflow:hidden;background:#101214}
 canvas{display:block}
@@ -155,20 +207,21 @@ function paintBoxes() {
   }
 }
 function settle(i, color) { states[i] = color; paintBoxes(); }
-// Attempt 1 (network): fetch to the unroutable TEST-NET-3 documentation
-// address (RFC 5737). Under --unshare-net the sandbox has no route at all
-// and the fetch rejects FAST with a TypeError in ~10 ms. With a network
-// grant the attempt leaves the sandbox and enters the host network, where
-// the SYN is blackholed by the default route — the fetch aborts at the
-// 1.5 s bound: the positive control. The abort reason is the
+// Attempt 1 (network): fetch to the host's STALL listener (scratch
+// loopback port $STALL_PORT — accepts every connection, never answers).
+// Scenario A (--unshare-net) has no loopback inside the namespace: the
+// connect fails fast with a TypeError in ~10 ms -> green. Scenario B
+// shares the host netns: the connect succeeds (the listener accepted) and
+// the response never comes — the fetch aborts at the 1.5 s bound: the
+// positive control, deterministic on any machine. The abort reason is the
 // AbortSignal.timeout() DOMException, named 'TimeoutError' (measured on
 // chromium 151 through the daemon pipeline; 'AbortError' is accepted too
 // for engines that reject with the generic name). The elapsed guard is
 // belt-and-braces — the signal timeout is the only abort source, so the
-// abort cannot fire before the 1.5 s bound. A resolved response is
-// impossible today and would mean a full network compromise (red).
+// abort cannot fire before the 1.5 s bound. A resolved response would
+// mean the listener answered — or a full network compromise (red).
 var netStart = performance.now();
-fetch('http://203.0.113.1/', {signal: AbortSignal.timeout(1500)}).then(
+fetch('http://127.0.0.1:$STALL_PORT/', {signal: AbortSignal.timeout(1500)}).then(
   function () { settle(0, RED); },
   function (e) {
     settle(0, ((e.name === 'TimeoutError' || e.name === 'AbortError')
@@ -283,9 +336,6 @@ wait_boxes() {
     return 1
 }
 
-make_fixture
-echo "web compromise smoke: fixtures generated"
-
 command -v jq >/dev/null
 command -v python3 >/dev/null
 
@@ -294,6 +344,13 @@ if ! command -v chromium >/dev/null || ! command -v bwrap >/dev/null; then
     echo "web compromise smoke skipped: chromium/bwrap not installed"
     exit 0
 fi
+
+# The fixture fetch targets the stall listener's port, so the listener must
+# be up (and its port known) before the fixture is generated.
+start_stall_listener
+STALL_PORT="$(cat "$stall_port_file")"
+make_fixture
+echo "web compromise smoke: fixtures generated (stall listener on 127.0.0.1:$STALL_PORT)"
 
 # The suite spawns a whole browser under the desktop session; record
 # plasmashell's pid before anything runs and assert it is untouched (and
@@ -331,7 +388,8 @@ echo "web compromise smoke passed: scenario A boxes 1-4 green; worker argv witho
 # Scenario B: the network grant (permissions.set, patch semantics — the
 # answer is the new effective record) is the ONLY path to a network-enabled
 # sandbox. Attempt 1 must now show the positive control (box 1 orange: the
-# fetch left the sandbox and hit the real network), the isolation attempts
+# fetch connected to the host's stall listener and hung until the 1.5 s
+# abort — the netns is shared, deterministically), the isolation attempts
 # must still fail (boxes 2-4 green), and the bwrap argv must carry NO
 # --unshare-net while the worker argv carries --allow-network.
 grant_status="$(call_daemon permissions.set '{"wallpaper_id":"web-comp-b","network":true}')"

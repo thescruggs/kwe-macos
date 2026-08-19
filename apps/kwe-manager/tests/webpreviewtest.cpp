@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../src/webpreview.h"
 
+#include <QDir>
 #include <QFile>
 #include <QTemporaryDir>
 #include <QUrl>
 #include <QtTest>
+
+#include <cstdlib>
 
 // The WebPreview command shape and its validation gates are exercised
 // WITHOUT spawning any process (bwrap/chromium are never started here); the
@@ -16,6 +19,11 @@ private slots:
     void isolationByDefault();
     void networkGrantDropsUnshareNet();
     void windowedChromiumFlags();
+    void displayBindsX11();
+    void displayBindsWayland();
+    void displayBindsNone();
+    void argumentsForAddsPresentDisplayBinds();
+    void grantRelaunchDecision();
     void rejectsNonLocalUrlWithoutSpawning();
     void rejectsNonIndexFileWithoutSpawning();
 };
@@ -73,6 +81,92 @@ void WebPreviewTest::windowedChromiumFlags() {
         QVERIFY(args.contains(QStringLiteral("--")));
         QVERIFY(args.contains(QStringLiteral("chromium")));
     }
+}
+
+void WebPreviewTest::displayBindsX11() {
+    // A local display binds the /tmp/.X11-unix socket dir; the destination
+    // is the same dir inside the namespace (the tmpfs /tmp would otherwise
+    // shadow it with nothing).
+    const auto binds = WebPreview::displayBinds(QStringLiteral(":0"), {}, {});
+    QCOMPARE(binds.size(), 3);
+    QCOMPARE(binds.at(0), QStringLiteral("--ro-bind"));
+    QCOMPARE(binds.at(1), QStringLiteral("/tmp/.X11-unix"));
+    QCOMPARE(binds.at(2), QStringLiteral("/tmp/.X11-unix"));
+    // The screen-suffixed form is local too.
+    QCOMPARE(WebPreview::displayBinds(QStringLiteral(":0.0"), {}, {}),
+             WebPreview::displayBinds(QStringLiteral(":0"), {}, {}));
+    // A hostname-prefixed DISPLAY reaches a remote server: no local socket
+    // file exists to bind.
+    QVERIFY(WebPreview::displayBinds(QStringLiteral("workstation:10.0"), {}, {}).isEmpty());
+    // Garbage forms bind nothing.
+    QVERIFY(WebPreview::displayBinds(QStringLiteral(":"), {}, {}).isEmpty());
+    QVERIFY(WebPreview::displayBinds(QStringLiteral(":abc"), {}, {}).isEmpty());
+    QVERIFY(WebPreview::displayBinds(QStringLiteral(":123abc"), {}, {}).isEmpty());
+}
+
+void WebPreviewTest::displayBindsWayland() {
+    // Only the socket FILE is bound — the runtime dir itself would carry
+    // the user's kwallet/pipewire/ssh sockets.
+    const auto binds = WebPreview::displayBinds({}, QStringLiteral("wayland-0"),
+                                                QStringLiteral("/run/user/1000"));
+    QCOMPARE(binds.size(), 3);
+    QCOMPARE(binds.at(0), QStringLiteral("--ro-bind"));
+    QCOMPARE(binds.at(1), QStringLiteral("/run/user/1000/wayland-0"));
+    QCOMPARE(binds.at(2), QStringLiteral("/run/user/1000/wayland-0"));
+    // Trailing slashes on the runtime dir are tolerated.
+    const auto trimmed = WebPreview::displayBinds({}, QStringLiteral("wayland-0"),
+                                                  QStringLiteral("/run/user/1000/"));
+    QCOMPARE(trimmed.at(1), QStringLiteral("/run/user/1000/wayland-0"));
+    // A missing runtime dir means no socket path to bind; "none" is the
+    // explicit offscreen sentinel some sessions export.
+    QVERIFY(WebPreview::displayBinds({}, QStringLiteral("wayland-0"), {}).isEmpty());
+    QVERIFY(WebPreview::displayBinds({}, QStringLiteral("none"), QStringLiteral("/run/user/1000"))
+                .isEmpty());
+}
+
+void WebPreviewTest::displayBindsNone() {
+    // Offscreen preview (neither display set): nothing is bound.
+    QVERIFY(WebPreview::displayBinds({}, {}, {}).isEmpty());
+    // X11 and Wayland can both be bound (X11 fallback sessions).
+    QCOMPARE(WebPreview::displayBinds(QStringLiteral(":0"), QStringLiteral("wayland-0"),
+                                      QStringLiteral("/run/user/1000"))
+                 .size(),
+             6);
+}
+
+void WebPreviewTest::argumentsForAddsPresentDisplayBinds() {
+    // Environment-driven path: argumentsFor() reads DISPLAY etc. Only the
+    // present sockets are bound (bwrap refuses a missing source). The pure
+    // selection logic is covered by the displayBinds tests above.
+    const QDir x11Dir(QStringLiteral("/tmp/.X11-unix"));
+    const bool x11Present = x11Dir.exists();
+    if (x11Present) {
+        QVERIFY(setenv("DISPLAY", ":0", 1) == 0);
+        const auto arguments = WebPreview::argumentsFor(QStringLiteral("/tmp/wallpaper"), false);
+        QVERIFY(hasPair(arguments, QStringLiteral("--ro-bind"), QStringLiteral("/tmp/.X11-unix")));
+        QVERIFY(unsetenv("DISPLAY") == 0);
+    }
+    QVERIFY(unsetenv("WAYLAND_DISPLAY") == 0);
+    QVERIFY(unsetenv("XDG_RUNTIME_DIR") == 0);
+    const auto offscreen = WebPreview::argumentsFor(QStringLiteral("/tmp/wallpaper"), false);
+    QVERIFY(!hasPair(offscreen, QStringLiteral("--ro-bind"), QStringLiteral("/tmp/.X11-unix")));
+}
+
+void WebPreviewTest::grantRelaunchDecision() {
+    // The relaunch predicate: only a network permission for the previewed
+    // wallpaper, while it runs, with a value different from the launch.
+    QVERIFY(WebPreview::wantsGrantRelaunch(QStringLiteral("network"), QStringLiteral("web-x"),
+                                           QStringLiteral("web-x"), true, true, false));
+    QVERIFY(WebPreview::wantsGrantRelaunch(QStringLiteral("network"), QStringLiteral("web-x"),
+                                           QStringLiteral("web-x"), true, false, true));
+    QVERIFY(!WebPreview::wantsGrantRelaunch(QStringLiteral("audio"), QStringLiteral("web-x"),
+                                            QStringLiteral("web-x"), true, true, false));
+    QVERIFY(!WebPreview::wantsGrantRelaunch(QStringLiteral("network"), QStringLiteral("other"),
+                                            QStringLiteral("web-x"), true, true, false));
+    QVERIFY(!WebPreview::wantsGrantRelaunch(QStringLiteral("network"), QStringLiteral("web-x"),
+                                            QStringLiteral("web-x"), false, true, false));
+    QVERIFY(!WebPreview::wantsGrantRelaunch(QStringLiteral("network"), QStringLiteral("web-x"),
+                                            QStringLiteral("web-x"), true, true, true));
 }
 
 void WebPreviewTest::rejectsNonLocalUrlWithoutSpawning() {
