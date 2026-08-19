@@ -204,6 +204,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kwe-cdp"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kwe-cli"
 version = "0.1.0-alpha.1"
 dependencies = [

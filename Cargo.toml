@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kwe-audio-worker",
+    "crates/kwe-cdp",
     "crates/kwe-core",
     "crates/kwe-cli",
     "crates/kwe-daemon",
