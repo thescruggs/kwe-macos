@@ -15,7 +15,7 @@
 //   0  normal or graceful SIGTERM stop
 //   70 --exit-after fired
 //   71 --memory-pressure-after allocation denied
-//   72 --memory-pressure-after allocation threw (unexpected)
+//   72 --memory-pressure-after allocation unexpectedly succeeded
 //   73 backend rejection: decode/render unusable even with --hwdec=no
 //
 // Everything that could produce unbounded output is bounded: stderr lines
@@ -216,20 +216,16 @@ struct Arguments {
     memory_pressure_mib: Option<u64>,
 }
 
-/// Synthetic fault exit codes (the daemon maps exit 71 into
-/// `resource_limit`; exit 72 documents the unexpected allocation path, which
-/// surfaces as a panic/abort rather than a deliberate exit — asserted in
-/// tests, never produced deliberately).
+/// Synthetic fault exit codes, identical to the test renderer's contract
+/// (the daemon maps exit 71 into `resource_limit`).
 const EXIT_EXIT_AFTER: i32 = 70;
 const EXIT_MEMORY_DENIED: i32 = 71;
-#[cfg_attr(not(test), allow(dead_code))]
 const EXIT_MEMORY_UNEXPECTED: i32 = 72;
 
 fn try_memory_pressure(mib: Option<u64>) -> Result<(), ()> {
     // Simulate an allocation that crosses the supervisor's address-space
     // rlimit. `malloc` returns NULL for an over-limit mmap on glibc (exit 71);
-    // a failed reserve elsewhere surfaces as an allocation panic (exit 72),
-    // which the task table maps to the same resource_limit class.
+    // an allocation that unexpectedly succeeds is still a fault (exit 72).
     let bytes = mib.unwrap_or(1024) * 1024 * 1024;
     let mut pointer: *mut c_void = std::ptr::null_mut();
     // SAFETY: posix_memalign initializes `pointer` on success; we only free
@@ -297,12 +293,16 @@ impl InputChannel {
                 break; // nothing ready (EAGAIN) or closed: stop polling
             }
             self.pending.extend_from_slice(&chunk[..read as usize]);
-            // One trailing newline per line; a no-newline tail is only
-            // processed once a newline arrives, so a silent peer cannot grow
-            // the buffer beyond the cap.
             while let Some(position) = self.pending.iter().position(|&b| b == b'\n') {
                 let line = self.pending.drain(..=position).collect::<Vec<u8>>();
                 self.dispatch(&line[..line.len() - 1]);
+            }
+            // Bound the pending buffer: a peer that never sends newlines
+            // grows it by up to 4 KiB per poll, so once the cap is crossed
+            // the partial line is discarded wholesale (it is junk anyway;
+            // mirror of the test renderer's guard).
+            if self.pending.len() > MAX_INPUT_MESSAGE_BYTES {
+                self.pending.clear();
             }
         }
     }
@@ -646,7 +646,9 @@ impl MpvSession {
     fn render(&mut self, scratch: &mut [u8], stride: usize, format: &str) -> Result<()> {
         let mut size = [self.width as c_int, self.height as c_int];
         let format = CString::new(format).context("invalid SW format string")?;
-        let mut stride_value = stride;
+        // render.h declares SW_STRIDE as int*; the stride is bounded by the
+        // spec (width <= 8192, 4 bytes per pixel), so c_int cannot overflow.
+        let mut stride_value = stride as c_int;
         // 0: never block on target-time pacing inside the render call; the
         // outer loop owns pacing.
         let block_for_target_time = 0_i32;
@@ -661,7 +663,7 @@ impl MpvSession {
             },
             mpv_ffi::mpv_render_param {
                 type_: mpv_ffi::MPV_RENDER_PARAM_SW_STRIDE,
-                data: (&mut stride_value as *mut usize).cast(),
+                data: (&mut stride_value as *mut c_int).cast(),
             },
             mpv_ffi::mpv_render_param {
                 type_: mpv_ffi::MPV_RENDER_PARAM_SW_POINTER,
@@ -802,7 +804,9 @@ impl VideoWorker {
         {
             eprintln!("event=renderer.fault kind=memory_pressure_after");
             match try_memory_pressure(self.arguments.memory_pressure_mib) {
-                Ok(()) => eprintln!("event=renderer.fault kind=memory_pressure_survived"),
+                // An allocation that unexpectedly succeeded is itself the
+                // anomaly: exit 72 (mirrors the test renderer exactly).
+                Ok(()) => exit(EXIT_MEMORY_UNEXPECTED),
                 Err(()) => exit(EXIT_MEMORY_DENIED),
             }
         }

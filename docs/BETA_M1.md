@@ -57,13 +57,14 @@ Validated on 2026-08-18 (mpv 1:0.41.0, libmpv.so.2.5.0, CachyOS).
 | Case | Expected | Result |
 |---|---|---|
 | live start (default renderer path) | `kwe-video-renderer` resolved beside the daemon | phase `live`, kind `video`, content_hash, sequence advancing, last-good P6 |
-| paused media state | keepalive re-publish | `pause=true` applied; sequence still advances every interval; failures 0 |
+| paused media state | keepalive re-publish | `pause=true` applied; `input_ack_sequence > 0` (ack round-trip); sequence still advances every interval; failures 0 |
 | playing media state | resume | phase `live`, failures 0 |
+| stopped media state | pause + seek 0 | `applied=Stop` on the stderr ring; keepalive keeps the sequence advancing; failures 0 |
 | kill -9 of active worker | one failure + auto-restart | `process_exit signal_9` recorded in the restart window; new pid promoted; never quarantined |
 | repeated kill -9, no intervening success | three-failure budget | quarantined with failures 3; `renderer.start` for the identity refused (phase `quarantined`) |
 | missing content path | path-level rejection | `invalid_params`, nothing spawned |
 | 64 KiB garbage content | backend rejection | worker exits 73; active base preserved; phase `rolled_back`, `last_failure_detail` names `exit_code_73` |
-| graceful SIGTERM | stop without restart | exit 0; `producer_state` `Stopping`; frames published up to stop |
+| graceful SIGTERM | stop without restart | standalone: exit 0, `producer_state` `Stopping` (the daemon records no failure on graceful stops, so `last_failure` is not smoke-assertable); smoke: phase `stopped`, no worker, daemon healthy |
 | input channel | decode + ack | `pointer_position`, `media_state`, `audio_bands` acked on stdout; malformed/junk lines ignored silently |
 | media-state mapping | pause/seek | `paused`→pause, `playing`→pause=false, `stopped`→pause + seek 0 |
 | unit tests | 7 in-crate | rgb24→BGRA exact bytes, keepalive decision, media mapping, fault-flag exit table |
@@ -88,9 +89,12 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
   `FrameSpec.pixel_bytes` fails closed — the frame is skipped and counted;
   diagnostics are rate-limited (`event=renderer.video.invalid_frame`) so a
   pathological decoder cannot flood the 64 KiB stderr ring.
-- **Format mismatch**: the SW API may deliver rgb24, rgba, bgr0, 0bgr, or
-  0rgb; all are converted to BGRA8888 premultiplied (alpha 0xFF). Any other
-  format is a backend rejection (exit 73).
+- **Format mismatch**: the worker requests bgr0 (the SW API's native
+  little-endian BGRA byte layout, which renders as-is); the converter keeps
+  defensive arms for rgb24, 0bgr, rgb0, and 0rgb in case a libmpv version
+  answers with a different layout. Any other format is a backend rejection
+  (exit 73). All accepted formats convert to BGRA8888 premultiplied
+  (alpha 0xFF).
 - **Startup hang**: a worker that neither exits nor publishes is killed by
   the bounded startup timeout, counted, and restarted up to the quarantine
   budget — recovery never restarts Plasma.
@@ -119,8 +123,9 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
    before exposing the handle, and libmpv 0.41 aborts when a render context
    is created after initialization (empirically verified). The render API is
    therefore bound directly in `mpv_ffi` against the system libmpv
-   (THIRD_PARTY.yml, revision 0.41.0), which also keeps the crate usable on
-   distros without the 0.41 ABI guarantees. The crate is used only for the
+   (THIRD_PARTY.yml, revision 0.41.0). The binary hard-requires the system
+   `libmpv.so`; a distro without the SW render API (pre-0.33) fails closed
+   with exit 73 rather than misbehaving. The crate is used only for the
    client API-version diagnostic (`mpv_api=2.5`).
 4. **libmpv 0.41 `mpv_create` failure-path hang.** Independent of the NPROC
    trigger above, libmpv's shutdown loop can spin forever if

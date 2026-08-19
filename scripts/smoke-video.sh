@@ -143,15 +143,18 @@ last_good_file="$(jq -r '.last_good.file' "$state_dir/supervisor-v1.json")"
 head -c 2 "$state_dir/$last_good_file" | cmp -s - <(printf 'P6')
 echo "video smoke passed: live start, kind/content, advancing sequence, last-good P6"
 
-# Case 3: paused media state; keepalive keeps the sequence advancing.
+# Case 3: paused media state; keepalive keeps the sequence advancing, and the
+# worker's ack round-trips into renderer.status.input_ack_sequence.
 media_state "$live_generation" paused
 sleep 1.5
-paused_first="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+paused_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.input_ack_sequence' <<<"$paused_status")" != "0" ]]
+paused_first="$(jq -r '.result.sequence' <<<"$paused_status")"
 sleep 1
 paused_second="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
 [[ "$paused_second" -gt "$paused_first" ]]
 [[ "$(jq -r '.result.failures' <<<"$(call_daemon renderer.status)")" == "0" ]]
-echo "video smoke passed: paused media state keeps keepalive publishing, no failure"
+echo "video smoke passed: paused media state keeps keepalive publishing, acked, no failure"
 
 # Case 4: playing resumes; renderer stays healthy.
 media_state "$live_generation" playing
@@ -159,6 +162,19 @@ sleep 0.5
 [[ "$(jq -r '.result.phase' <<<"$(call_daemon renderer.status)")" == "live" ]]
 [[ "$(jq -r '.result.failures' <<<"$(call_daemon renderer.status)")" == "0" ]]
 echo "video smoke passed: resumed playback, renderer healthy"
+
+# Case 4b: stopped media state maps to pause + seek 0 (surfaced on the live
+# worker's stderr ring), and keepalive keeps the sequence advancing.
+media_state "$live_generation" stopped
+sleep 1.5
+stop_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$stop_tail" == *"applied=Stop"* ]]
+stopped_first="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+sleep 1
+stopped_second="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+[[ "$stopped_second" -gt "$stopped_first" ]]
+[[ "$(jq -r '.result.failures' <<<"$(call_daemon renderer.status)")" == "0" ]]
+echo "video smoke passed: stopped media state pauses with seek 0, keepalive continues"
 
 # Case 5: kill -9 the active worker; the daemon records one failure (visible
 # during the restart window) and auto-restarts. The restarted worker's first
@@ -180,14 +196,15 @@ echo "video smoke passed: kill -9 recorded once, auto-restarted, not quarantined
 
 # Case 6: repeated kill -9s with no intervening success hit the three-failure
 # budget -> quarantined, and renderer.start for the same identity is refused
-# with the quarantine phase. The first kill takes the promoted active worker;
-# the later kills must land on the restarted candidate before its first
-# successful promotion, because a promotion clears the failure record.
-for _attempt in {1..3}; do
+# with the quarantine phase. A kill landing on the promoted active worker
+# would let the next promotion clear the failure record, so each iteration
+# prefers the canary-window candidate and the loop runs until the counter
+# actually reads 3 (hard cap 8; case 5 already covers the signal path).
+for _attempt in {1..8}; do
     target=""
     for _poll in {1..100}; do
         status="$(call_daemon renderer.status)"
-        target="$(jq -r '.result.pid // .result.candidate_pid // empty' <<<"$status")"
+        target="$(jq -r '.result.candidate_pid // .result.pid // empty' <<<"$status")"
         [[ -n "$target" ]] && break
         sleep 0.02
     done
@@ -198,7 +215,8 @@ for _attempt in {1..3}; do
         [[ "$phase" == "restarting" || "$phase" == "quarantined" ]] && break
         sleep 0.02
     done
-    [[ "$(jq -r '.result.phase' <<<"$(call_daemon renderer.status)")" == "quarantined" ]] && break
+    failures="$(jq -r '.result.failures // 0' <<<"$(call_daemon renderer.status)")"
+    [[ "$failures" == "3" ]] && break
 done
 quarantined_status="$(wait_phase quarantined)"
 [[ "$(jq -r '.result.failures' <<<"$quarantined_status")" == "3" ]]
@@ -232,7 +250,13 @@ rollback_status="$(wait_phase rolled_back)"
 kill -0 "$base_pid"
 echo "video smoke passed: garbage content -> worker exit 73 -> rolled_back with exit_code_73"
 
+# Final stop: the daemon stops the active worker and stays healthy. A
+# graceful stop records no failure (last_failure surfaces the *requested*
+# identity's record — here the quarantined garbage one — so it is not
+# asserted); the worker's own exit-0 and Stopping-state evidence is verified
+# standalone, docs/BETA_M1.md.
 call_daemon renderer.stop >/dev/null
-wait_phase stopped >/dev/null
+stopped_status="$(wait_phase stopped)"
+[[ "$(jq -r '.result.pid' <<<"$stopped_status")" == "null" ]]
 call_daemon health >/dev/null
 echo "all video smoke cases passed"

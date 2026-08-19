@@ -1140,6 +1140,10 @@ impl SupervisorRuntime {
             &mut worker.pending_audio,
             &mut worker.audio_coalesced,
         )?;
+        // The wire sequence carries the display generation by design; record
+        // it so the worker's echoed ack passes the acceptance ceiling below
+        // (mirrors the pointer path's bookkeeping).
+        worker.input_sequence = generation;
         Ok(self.status())
     }
 
@@ -1158,6 +1162,10 @@ impl SupervisorRuntime {
             &mut worker.pending_media,
             &mut worker.media_coalesced,
         )?;
+        // The wire sequence carries the display generation by design; record
+        // it so the worker's echoed ack passes the acceptance ceiling below
+        // (mirrors the pointer path's bookkeeping).
+        worker.input_sequence = generation;
         Ok(self.status())
     }
 
@@ -1780,10 +1788,11 @@ fn drain_input_acks(worker: &mut ActiveWorker) {
         {
             let line: Vec<u8> = worker.input_ack_buffer.drain(..=newline).collect();
             match decode_ack_line(&line) {
-                Ok(ack)
-                    if ack.sequence > worker.input_ack_sequence
-                        && ack.sequence <= worker.input_sequence =>
-                {
+                // Last-wins acceptance: media/audio messages legitimately
+                // repeat a sequence (the wire sequence is the display
+                // generation), so strict monotonicity would reject valid
+                // acks. The ceiling check still rejects stale echoes.
+                Ok(ack) if ack.sequence <= worker.input_sequence => {
                     worker.input_ack_sequence = ack.sequence;
                 }
                 Ok(_) | Err(_) => {
