@@ -36,6 +36,7 @@
 - 2026-08-19 — **M3e done** (`bf96411` + `6514981`). TextLayer: vendored stb_truetype (pinned 6e9f34d5, bit-verified vs upstream; dual MIT/public-domain — ledger corrected) behind a C shim, per-layer 2048² glyph atlases (16 layers, shelf-packed, white-glyph+tint design — zero shader changes), system font resolution (Exact name-table → Basename → fallback chain), SceneTextLayer proxy (text/pointsize/alignments writable, clamped; color read/write settled+documented), structural smoke oracles (font-version honesty) with real negative controls. Review found 3 must-fix: upload_layer leaked image/view/memory + descriptor sets per rebuild (16 MiB/frame + pool exhaustion → text layers permanently dead — fixed with in-place replacement + FREE_DESCRIPTOR_SET + device test 320 re-uploads); **stb's offset reads unbounded on hostile fonts** (the header itself warns; scene fonts can name arbitrary host files → full sfnt pre-flight in the shim incl. maxp/loca/glyf bounds + 6 hostile-fixture tests); font/pointsize changes bypassed the 2/s rebuild budget (→ clear_budgeted()). UV pad inset fixed (1:1 texel mapping). Atlas memory now counted in the 256 MiB budget. 373 tests.
 - 2026-08-19 — **Plan deviation (user-requested):** kwe-scene-renderer added to the PKGBUILD ahead of M5 (same policy as the video/web/audio workers) and the package rebuilt from trunk — the user's installed build was several slices stale (no web lane in diagnose, web still "planned", no scene worker) and the Apply button stays disabled until M4 by design; the scene capability manifest stays all-false until M3k by design.
 - 2026-08-19 — **Packaging bug fixed (CachyOS-specific):** makepkg failed to link kwe-scene-renderer — undefined JS_*/kwe_font_* symbols. Root cause: the CachyOS toolchain env carries `-flto=auto` in CFLAGS/CXXFLAGS/LDFLAGS (plus RUSTFLAGS=-C target-cpu=native); the cc-built C archives (bundled QuickJS, stb shim) compile as GCC-LTO objects and rust-lld cannot LTO-link them. Reproductions outside makepkg passed because the env vars are absent from plain shells — the delta was the env, found by dumping makepkg's build() environment. Fix: PKGBUILD build()/check() strip `-flto=auto` from CFLAGS/CXXFLAGS/LDFLAGS for the cargo steps (with an explanatory comment).
+- 2026-08-19 — **REORDER (maintainer-requested):** M4 (live apply) moves to IMMEDIATELY AFTER M3f — the maintainer wants to apply wallpapers from the UI now, and video/web renderers are complete and apply-ready. New order: M3a–M3f → **M4** → M3g–M3k (scene completion) → M5. Scene apply is enabled when the scene renderer passes its M3k gate. Rationale documented: M4 was already maintainer-authorized for live-session work; the blocking preconditions (renderer workers, grants, preflight, apply-capable daemon) all exist.
 
 ## Status at a glance
 
@@ -43,8 +44,8 @@
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
-| BETA_M3 (scene, a–k) | M3a–M3e done, M3f in_progress, M3g–M3k pending |
-| BETA_M4 (live apply) | pending |
+| BETA_M3 (scene, a–k) | M3a–M3e done, M3f in_progress, M3g–M3k paused until after M4 (maintainer reorder) |
+| BETA_M4 (live apply) | NEXT after M3f merges |
 | BETA_M5 (release) | pending |
 
 ## Context
