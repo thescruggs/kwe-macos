@@ -144,6 +144,16 @@ struct Arguments {
     /// ~1265-thread session).
     #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
     renderer_web_processes: u64,
+    /// Session-scoped liveness probe interval for web renderers: the
+    /// worker probes the page's renderer main thread every interval and
+    /// exits 73 after consecutive failures (a page that wedges after first
+    /// paint otherwise looks alive forever behind the keepalive
+    /// re-publication).
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(250..=60000))]
+    renderer_web_heartbeat_ms: u64,
+    /// Consecutive heartbeat failures before a web renderer exits 73.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+    renderer_web_heartbeat_max_failures: u32,
     /// Enable synthetic hang/corruption/exit requests for development tests.
     #[arg(long)]
     allow_test_faults: bool,
@@ -279,6 +289,8 @@ fn main() -> Result<()> {
         canary_duration: Duration::from_millis(arguments.renderer_canary_ms),
         handoff_timeout: Duration::from_millis(arguments.renderer_handoff_timeout_ms),
         max_failures: arguments.renderer_max_failures,
+        web_heartbeat_ms: arguments.renderer_web_heartbeat_ms,
+        web_heartbeat_max_failures: arguments.renderer_web_heartbeat_max_failures,
         resource_limits_by_kind,
     })?;
     let supervisor = supervisor_service.handle();
@@ -674,7 +686,9 @@ fn process_request(
                 let parsed = serde_json::from_value::<RendererStartParams>(request.params.clone());
                 match parsed {
                     Ok(params)
-                        if (params.test_fault.is_some() || params.stderr_lines.is_some())
+                        if (params.test_fault.is_some()
+                            || params.stderr_lines.is_some()
+                            || params.allow_network)
                             && !allow_test_faults =>
                     {
                         json!({
@@ -721,6 +735,11 @@ struct RendererStartParams {
     test_fault: Option<TestFaultParams>,
     /// Development-only: ask the test renderer for this many stderr lines.
     stderr_lines: Option<u32>,
+    /// Test hook: grant the web sandbox host-loopback network access for the
+    /// sandbox-integrity smoke's positive control. Rejected unless the daemon
+    /// runs with --allow-test-faults; production grants land in M2c.
+    #[serde(default)]
+    allow_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -842,6 +861,7 @@ impl TryFrom<RendererStartParams> for StartSpec {
             content,
             test_fault,
             stderr_lines: params.stderr_lines,
+            allow_network: params.allow_network,
         };
         // Single validation point per start: the supervisor event loop no
         // longer re-validates, so content preflight cannot block it twice.
@@ -1144,6 +1164,11 @@ mod tests {
         // pipe bootstrap silently refuses to answer below ~98 GiB. 128 GiB is
         // the production default, clear of the floor with margin.
         assert_eq!(arguments.renderer_web_address_space_mib, 131072);
+        // The web liveness heartbeat defaults: probe every 5 s, exit 73
+        // after 3 consecutive failures (a page wedged after first paint
+        // otherwise looks alive forever behind the keepalive).
+        assert_eq!(arguments.renderer_web_heartbeat_ms, 5000);
+        assert_eq!(arguments.renderer_web_heartbeat_max_failures, 3);
     }
 
     #[test]

@@ -286,7 +286,12 @@ Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
 `--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
 `--renderer-web-address-space-mib`, `--renderer-web-open-files`,
 `--renderer-video-processes`, and `--renderer-web-processes` tune these;
-frame timeouts and the canary stay global. Per-kind renderer binaries default
+frame timeouts and the canary stay global. *(M2b:)* web renderers also take
+`--renderer-web-heartbeat-ms` (default 5000) and
+`--renderer-web-heartbeat-max-failures` (default 3): the worker probes the
+page's renderer main thread every interval and exits 73 after consecutive
+failures, so a page wedged after first paint cannot hide behind the keepalive
+re-publication forever (docs/BETA_M2.md §5.3). Per-kind renderer binaries default
 to `kwe-<kind>-renderer` beside the daemon executable (`--renderer-video`,
 `--renderer-web`, `--renderer-scene` override; `--renderer` keeps meaning the
 test kind).

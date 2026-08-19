@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kwe_core::{
-    ScanLimits, chromium_command, default_steam_roots, preflight_scene, preflight_video,
-    preflight_web, probe_mpris, probe_pipewire, sandbox_root, scan_installed,
+    ScanLimits, default_steam_roots, preflight_scene, preflight_video, preflight_web, probe_mpris,
+    probe_pipewire, sandbox_root, scan_installed, web_renderer_command,
 };
 
 #[derive(Debug, Parser)]
@@ -57,12 +57,24 @@ enum Command {
     },
     /// Probe PipeWire availability without opening an audio stream.
     AudioStatus,
-    /// Print the sandboxed Chromium command for a web wallpaper.
+    /// Print the sandboxed Chromium command for a web wallpaper. This is
+    /// the M2b web-renderer bwrap command (ro-binds for /usr /etc /lib
+    /// /lib64 /bin /sbin, content at /wallpaper, tmpfs profile, unshared
+    /// network unless --allow-network, chromium
+    /// --headless=new --remote-debugging-pipe), NOT the M2a chromium
+    /// command — a renderer spawned from the M2a form would lack the
+    /// system ro-binds and fail to exec inside the empty root.
     WebSandbox {
         #[arg(long)]
         path: PathBuf,
         #[arg(long)]
         allow_network: bool,
+        /// Frame width in pixels (matches the worker's --width default).
+        #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        width: u32,
+        /// Frame height in pixels (matches the worker's --height default).
+        #[arg(long, default_value_t = 540, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        height: u32,
     },
     /// Probe the user MPRIS bus without controlling a player.
     MediaStatus,
@@ -181,9 +193,11 @@ fn main() -> Result<()> {
         Command::WebSandbox {
             path,
             allow_network,
+            width,
+            height,
         } => {
             let root = sandbox_root(&path).context("path must contain a regular index.html")?;
-            let command = chromium_command(&root, allow_network);
+            let command = web_renderer_command(&root, allow_network, width, height);
             println!(
                 "{} {}",
                 command.program,

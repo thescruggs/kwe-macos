@@ -206,7 +206,7 @@ never escape the worker's fault envelope.
 
 Deliverables: `crates/kwe-web-renderer` (worker binary, ~1500 lines),
 `web_renderer_command()` in `crates/kwe-core/src/websandbox.rs` (the bwrap
-sandbox builder), `scripts/smoke-web.sh` (8 cases), THIRD_PARTY.yml entries,
+sandbox builder), `scripts/smoke-web.sh` (9 cases), THIRD_PARTY.yml entries,
 this section.
 
 ### 5.2 The sandbox
@@ -237,14 +237,29 @@ the CDP pipe on fds 3/4 exactly as pinned in §1.1/§2.
 - **Frames**: `Page.screencastFrame` events (jpeg q80, delivered at the spec
   size) are acked per frame (the §1.6 contract), base64-decoded by a
   hand-rolled bounded decoder, JPEG-decoded through the `image` crate with
-  `Limits` capped at 16384 px per dimension / 64 MiB alloc / 268 M pixels,
-  converted to opaque BGRA8888, and published through the shared frame
-  protocol at the pacing deadline (fps). A frame that fails to decode or
-  exceeds the caps is counted (`event=renderer.web.decode_failure`) and
-  skipped, never published.
+  `Limits` capped at **8192 px per dimension / 64 MiB alloc / 16 777 216
+  pixels**, converted to opaque BGRA8888, and published through the shared
+  frame protocol at the pacing deadline (fps). A frame that fails to decode
+  or exceeds the caps is counted (`event=renderer.web.decode_failure`) and
+  skipped, never published. (`MAX_DECODE_DIMENSION = 8192`,
+  `MAX_DECODE_ALLOC_BYTES = 64 MiB`, `MAX_DECODED_PIXELS = 16_777_216` in
+  `crates/kwe-web-renderer/src/main.rs` — the doc and the code agree.)
 - **Keepalive**: a static page produces no screencast frames, so the last
   decoded frame is re-published at each pacing deadline; the supervisor's
   frame timeout can never trip on a page that painted once.
+- **Heartbeat**: the keepalive cannot distinguish a still page from a
+  *wedged* page — a page whose renderer main thread hangs after first paint
+  stops answering CDP (acks included) while the browser process survives and
+  the keepalive keeps the sequence advancing forever. A page-independent
+  probe therefore runs every `--web-heartbeat-ms` (default 5000): a
+  session-scoped `Runtime.evaluate("1+1")` sent through the non-blocking CDP
+  API (`Client::send_session` + `take_response` — a blocking probe would
+  stall the publish pipeline past the supervisor's frame timeout, so the
+  daemon would reap the worker before this path could fire). An unanswered
+  probe within its one-interval deadline counts as one consecutive failure;
+  `--web-heartbeat-max-failures` (default 3) consecutive failures/timeouts
+  emit `event=renderer.web.heartbeat_failed` and exit 73. A healthy static
+  page answers every probe, so only genuinely unresponsive pages trip it.
 - **Scale policy**: the frame slot is fixed-size, so letterboxing is
   unavailable; a delivered frame whose dimensions differ from the spec
   (compositor aspect rounding, e.g. 160x89 for a 160x90 spec) is stretched
@@ -264,8 +279,9 @@ the CDP pipe on fds 3/4 exactly as pinned in §1.1/§2.
   block as the test/video workers, with the same exit codes: 70
   (`--exit-after` fired), 71 (memory denied under rlimit), 72 (memory
   unexpectedly succeeded), 73 (backend rejected — the browser failed to
-  answer the CDP pipe, or the sandbox never came up; the daemon folds the
-  chromium stderr tail into the failure detail).
+  answer the CDP pipe, the sandbox never came up, or the page failed the
+  heartbeat; the daemon folds the chromium stderr tail into the failure
+  detail).
 - **Teardown**: closing the CDP pipe ends is the bounded shutdown signal
   (chromium exits rc=0 within ~50 ms, §1.7); the bwrap process group is
   SIGTERMed after a grace, SIGKILLed past it, and reaped with a bound.
@@ -315,24 +331,48 @@ The 160x90 decode is ~0.2 % of the 33 ms pacing budget; even 960x540 costs
 | --- | --- | --- |
 | fmt | `cargo fmt --all -- --check` | pass |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| test | `cargo test --workspace --all-targets` | pass (194 tests, 0 failures) |
-| smoke-web | `./scripts/smoke-web.sh` | pass (8 cases, plasmashell pid unchanged) |
+| test | `cargo test --workspace --all-targets` | pass (201 tests, 0 failures) |
+| smoke-web | `./scripts/smoke-web.sh` | pass (11 cases, plasmashell pid unchanged) |
 | smoke-cdp | `./scripts/smoke-cdp.sh` | pass (M2a regression) |
 | smoke-video | `./scripts/smoke-video.sh` | pass (M2a regression) |
 | smoke-supervisor | `./scripts/smoke-supervisor.sh` | pass (M2a regression) |
 
 Smoke-web case evidence (2026-08-19 run): canary promote with the 128 GiB
-budget applied (sequence advances, sandbox holds, red-probe access to the
-host `/etc/passwd` blocked, last-good P6 persisted); static-page keepalive
-(sequence advances, 0 failures, no decode diagnostics); pointer oracle
-(baseline clean, dot at normalized (0.5, 0.5) painted and acked, probe
-verified); audio.forward (acks advance to the display generation, 0 protocol
-errors); kill -9 (recorded once, last-good preserved, auto-restarted, not
-quarantined); missing content root rejected `invalid_params`; busy-loop page
-(worker exit 73, rolled back with `exit_code_73`); three candidate-window
-kills → quarantine (`failures=3`, pid null) and `renderer.start` refused
-with the quarantine phase. plasmashell's pid was identical and alive before
-and after the suite.
+budget applied (sequence advances, sandbox holds, last-good P6 persisted).
+The sandbox-integrity case is network-dependent, not scheme-isolation-based:
+the fixture fetches `http://127.0.0.1:<port>/probe` (1.5 s abort timeout)
+and paints a red marker covering the probe box (10,10,4,4) in the captured
+frame on success; under `--unshare-net` the sandbox's own loopback does not
+exist and the fetch fails fast, so the marker never paints and the probe
+box stays empty — while the positive control (the same fixture started
+through the daemon with the per-request `allow_network` test hook, gated
+behind `--allow-test-faults`, plus a loopback CORS `python3 -m
+http.server`) paints the marker, proving the negative comes from the
+network namespace, not from a marker that could never paint. The marker is
+positioned in viewport X fractions and spans the full canvas height
+because of the screencast geometry (see §5.7): the headless surface is
+500x3, the screencast aspect-fits it to a 160x1 JPEG, and the slot fill
+duplicates that single row across all 90 frame rows — the marker must
+dominate the row average, or it decodes as a dim smear that fails the
+probe (measured root cause of the earlier positive-control failures).
+Further cases: static-page keepalive (sequence advances, 0 failures, no
+decode diagnostics); pointer oracle (baseline clean, dot at normalized
+(0.5, 0.5) painted and acked, probe verified); audio.forward (acks advance
+to the display generation, 0 protocol errors); kill -9 (recorded once,
+last-good preserved, auto-restarted, not quarantined); missing content root
+rejected `invalid_params`; busy-loop page (worker exit 73, rolled back with
+`exit_code_73`); three candidate-window kills → quarantine (`failures=3`,
+pid null) and `renderer.start` refused with the quarantine phase; late-wedge
+page (promotes to live, then wedges its renderer main thread: the keepalive
+masks the dead stream, the heartbeat times out twice under the smoke
+override and the worker exits 73 with `event=renderer.web.heartbeat_failed`
+in the failure detail, the supervisor records the exit and restarts, and the
+wedge repeats — the case observes three consecutive exit-73 cycles, never
+masked. Note the wedge does NOT quarantine: the failure budget is
+pre-promotion by design (a promotion clears the record — a worker that
+reached live is trusted, so post-promotion exits restart cleanly; the same
+rule that makes case-8's candidate kills accumulate). plasmashell's pid was
+identical and alive before and after the suite.
 
 ### 5.7 Open risks
 
@@ -345,13 +385,37 @@ and after the suite.
   `kernel.threads-max`) would hit EAGAIN at spawn, surfacing as an opaque
   `exit_code_73`/backend-reject with an empty stderr tail. Mitigation is
   the failure budget + the sandbox holding no secrets.
-- **The 1-frame chromium quirk**: a canvas-only rAF page delivered exactly
-  one screencast frame in an isolated plain-spawn capture while the
-  supervisor path delivered continuous frames; the mechanism (likely the
-  headless begin-frame clock under the daemon's environment) was not
-  investigated. The keepalive re-publish masks it for still pages; a page
-  that genuinely stops painting is indistinguishable from one that paints
-  once (by design).
+- **Screencast geometry (measured root cause of the early positive-control
+  failures, 2026-08-19)**: headless=new ignores `--window-size` — the
+  window is 500x90 with a 500x3 layout viewport — and
+  `Page.startScreencast` aspect-fits the surface into maxWidth/maxHeight,
+  producing a **160x1 JPEG** whose single row is the area-average of the
+  three canvas rows; the worker's bounded slot fill then duplicates that
+  row across all 90 frame rows (`y*src_h/dst_h` is 0 for a 1-row source),
+  so the frame's y-axis carries no information at all. Consequences: a
+  marker painted on a subset of canvas rows decodes as a dim full-height
+  smear (measured (85,13,14) from rows (208,3,3)/(63,14,16)/(16,18,20)),
+  and a fixed-coordinate marker is fragile at best, off-canvas at worst.
+  Fixtures handle it by painting the marker in viewport X fractions
+  spanning the full canvas height — invariant to the surface size, landing
+  at frame columns 6..18 on any geometry. Relatedly, a page that paints
+  identical pixels every frame stops the compositor from producing new
+  frames, which stops rAF callbacks entirely (this was the earlier
+  "1-frame quirk" in isolated captures): animations must change pixels per
+  frame to keep frames flowing. The keepalive re-publish masks still pages;
+  a page that genuinely stops painting is indistinguishable from one that
+  paints once by the frame path alone — the heartbeat bounds that blind
+  spot (a stopped-painting page whose main thread still answers probes is
+  fine; a wedged one exits 73).
+- **Heartbeat interplay with the frame timeout**: the probe deadline is one
+  full interval (default 5 s) and a healthy-but-busy page can take longer
+  than that to answer under extreme load — the worker would then exit 73
+  even though the page is alive. The interval/failure budget is
+  configurable (`--web-heartbeat-ms` / `--web-heartbeat-max-failures`) and
+  the daemon defaults (5 s / 3) sit far above the measured <100 ms answer
+  time; a page that stalls the renderer main thread for >15 s is wedged in
+  every practical sense. The probe is strictly non-blocking, so it never
+  competes with the pacing deadline for the worker's single thread.
 - **Decode budget**: worst-case 960x540 decode ≈1.4 ms is fine at 30 fps;
   a future 4K spec (3840x2160) would cost ~20 ms/frame in software decode —
   the caps keep it bounded, but the pacing budget shrinks.

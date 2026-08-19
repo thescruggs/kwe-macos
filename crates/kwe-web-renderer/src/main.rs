@@ -24,8 +24,12 @@
 //   71 --memory-pressure-after allocation denied
 //   72 --memory-pressure-after allocation unexpectedly succeeded
 //   73 backend rejection: preflight failed, the browser refused the CDP
-//      pipe, or no decodable frame arrived within the 8 s startup
-//      deadline (inside the daemon's 10 s web startup timeout)
+//      pipe, no decodable frame arrived within the 8 s startup deadline
+//      (inside the daemon's 10 s web startup timeout), or the page failed
+//      the session-scoped liveness heartbeat (a page whose renderer main
+//      thread wedges after first paint stops answering CDP — acks
+//      included — while the browser process survives; the keepalive
+//      re-publication would otherwise mask the dead stream forever)
 //
 // Scale policy (documented in docs/BETA_M2.md): the screencast is
 // requested at exactly the spec dimensions, so the decoded jpeg normally
@@ -283,6 +287,23 @@ struct Arguments {
     /// Allocation size in MiB for the memory-pressure fault.
     #[arg(long)]
     memory_pressure_mib: Option<u64>,
+    /// Session-scoped liveness probe interval in ms: the page's renderer
+    /// main thread is probed every interval with Runtime.evaluate("1+1")
+    /// through the non-blocking CDP API (see `HeartbeatTracker`). Never
+    /// blocks the publish loop, so a wedged page cannot stall the pacing.
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(250..=60000))]
+    web_heartbeat_ms: u64,
+    /// Consecutive heartbeat failures/timeouts (each one is one full
+    /// interval without an answer) before the worker exits 73.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+    web_heartbeat_max_failures: u32,
+    /// Test hook: request the shared network namespace for the sandboxed
+    /// browser (omit --unshare-net) instead of always isolating. Network
+    /// grants for wallpapers land in M2c; this flag exists for the
+    /// sandbox smoke-test positive control, which must reach a loopback
+    /// listener from inside the sandbox.
+    #[arg(long)]
+    allow_network: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +514,15 @@ fn decode_screencast(base64: &str, spec: FrameSpec) -> Option<Vec<u8>> {
 /// letterboxing is unavailable).
 fn scale_and_convert(rgb: &image::RgbImage, spec: FrameSpec) -> Vec<u8> {
     let (source_width, source_height) = rgb.dimensions();
+    // Defensive zero-dimension guard: the nearest-neighbor mapping below
+    // would divide by zero and index an empty image (a decode panic would
+    // abort the worker with SIGABRT — a hostile or broken fixture must be
+    // skipped and counted, never allowed to take the process down). An
+    // empty result fails the caller's exact-size check and is counted as
+    // an invalid frame; the spec is always >= 1x1 by construction.
+    if source_width == 0 || source_height == 0 {
+        return Vec::new();
+    }
     let mut output = Vec::with_capacity(spec.pixel_bytes());
     for y in 0..spec.height {
         let source_y = if source_height == spec.height {
@@ -562,9 +592,9 @@ impl BrowserSession {
     /// everyNthFrame:1}. Startup completes only when the first screencast
     /// frame has been acked and decoded, so the daemon's canary sees
     /// progress immediately.
-    fn start(content: &Path, spec: FrameSpec) -> Result<Self> {
+    fn start(content: &Path, spec: FrameSpec, allow_network: bool) -> Result<Self> {
         let deadline = Instant::now() + STARTUP_DEADLINE;
-        let (mut child, read_fd, write_fd) = spawn_browser(content, spec)?;
+        let (mut child, read_fd, write_fd) = spawn_browser(content, spec, allow_network)?;
         let stderr = StderrRing::new(STDERR_RING_LIMIT);
         let mut client = Client::new(read_fd, write_fd)?;
         // Stderr must drain or a chatty browser could fill the pipe buffer;
@@ -687,7 +717,12 @@ impl BrowserSession {
                 ("mouseMoved", None, 0)
             }
             kwe_input_protocol::PointerPhase::Leave => {
-                // Move outside the viewport to clear hover state.
+                // Move outside the viewport to clear hover state, and drop
+                // the held-button mask: the pointer left the surface, so
+                // any button held across the leave is implicitly released —
+                // a stale mask would otherwise bleed into every later
+                // mouseMoved and leave Chromium thinking a button is still
+                // down (drag state that never ends).
                 let response = self.client.request_session(
                     &self.session_id,
                     "Input.dispatchMouseEvent",
@@ -699,6 +734,7 @@ impl BrowserSession {
                     }),
                 )?;
                 ensure_ok(&response, "Input.dispatchMouseEvent (leave)")?;
+                self.held_buttons = 0;
                 return Ok(());
             }
             kwe_input_protocol::PointerPhase::Down | kwe_input_protocol::PointerPhase::Up => {
@@ -833,8 +869,12 @@ impl BrowserSession {
 /// land on fds 3/4 in the sandboxed child (they survive bwrap's exec of
 /// chromium because they are real, non-CLOEXEC descriptors — verified and
 /// pinned in docs/BETA_M2.md). The worker keeps only its own pipe ends.
-fn spawn_browser(content: &Path, spec: FrameSpec) -> Result<(Child, RawFd, RawFd)> {
-    let web_command = web_renderer_command(content, false, spec.width, spec.height);
+fn spawn_browser(
+    content: &Path,
+    spec: FrameSpec,
+    allow_network: bool,
+) -> Result<(Child, RawFd, RawFd)> {
+    let web_command = web_renderer_command(content, allow_network, spec.width, spec.height);
     let (client_read, browser_write) = socket_pair()?;
     let (browser_read, client_write) = socket_pair()?;
     let mut process = Command::new(&web_command.program);
@@ -1049,6 +1089,115 @@ fn next_publish(
 }
 
 // ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+/// Result of one in-flight (or attempted) probe, computed by the caller
+/// from the transport; the tracker only decides what it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatProbeResult {
+    /// A response arrived; the bool is whether it carried no CDP error
+    /// envelope (a protocol error counts as a failure).
+    Answered(bool),
+    /// No response within the probe deadline (one full interval).
+    TimedOut,
+    /// The send itself failed (transport dead, in-flight cap reached).
+    SendFailed,
+}
+
+/// Outcome of one heartbeat evaluation tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatOutcome {
+    /// Within bounds; keep running.
+    Continue,
+    /// `max_failures` consecutive failures/timeouts crossed; the worker
+    /// must shut down with exit 73 (bounded stderr diagnostic emitted by
+    /// the caller).
+    Exceeded { consecutive: u32 },
+}
+
+/// Page-independent liveness probe (adversarial review MUST-FIX 2): a page
+/// whose renderer main thread wedges after first paint stops answering CDP
+/// — screencast acks included — while the browser process survives and the
+/// keepalive re-publication keeps the supervisor's frame timeout from ever
+/// tripping. Without a page-independent probe the dead stream would be
+/// masked forever. Every `interval`, the capture loop sends a
+/// session-scoped `Runtime.evaluate("1+1")` through the non-blocking
+/// [`Client::send_session`] (the response is checked on later ticks; a
+/// blocking probe would stall the publish pipeline past the supervisor's
+/// frame timeout, so the daemon would reap the worker before this exit-73
+/// path could fire). A static page answers probes fine — the heartbeat
+/// only trips when the page is genuinely unresponsive. Pure decision
+/// logic, unit-tested below.
+struct HeartbeatTracker {
+    interval: Duration,
+    max_failures: u32,
+    consecutive_failures: u32,
+    /// Earliest time the next probe may be sent.
+    next_probe_at: Instant,
+    /// In-flight probe: request id and the moment it was sent (its
+    /// deadline is one interval later). At most one probe is ever in
+    /// flight.
+    pending: Option<(u32, Instant)>,
+}
+
+impl HeartbeatTracker {
+    fn new(interval: Duration, max_failures: u32, now: Instant) -> Self {
+        Self {
+            interval,
+            max_failures,
+            consecutive_failures: 0,
+            next_probe_at: now + interval,
+            pending: None,
+        }
+    }
+
+    /// Whether a fresh probe should be sent now: nothing in flight and the
+    /// interval has elapsed since the last resolution.
+    fn should_probe(&self, now: Instant) -> bool {
+        self.pending.is_none() && now >= self.next_probe_at
+    }
+
+    /// The in-flight probe, if any.
+    fn pending_probe(&self) -> Option<(u32, Instant)> {
+        self.pending
+    }
+
+    /// Record that a probe was sent.
+    fn note_sent(&mut self, id: u32, now: Instant) {
+        self.pending = Some((id, now));
+    }
+
+    /// Resolve the current probe with the transport's answer. Success
+    /// resets the streak; a protocol-error envelope, a timeout, or a
+    /// failed send all count as one consecutive failure. The next probe is
+    /// scheduled one full interval from `now` (a failed probe is retried,
+    /// not hammered). Crossing `max_failures` consecutive failures returns
+    /// `Exceeded`.
+    fn resolve(&mut self, now: Instant, result: HeartbeatProbeResult) -> HeartbeatOutcome {
+        self.pending = None;
+        match result {
+            HeartbeatProbeResult::Answered(true) => {
+                self.consecutive_failures = 0;
+            }
+            HeartbeatProbeResult::Answered(false)
+            | HeartbeatProbeResult::TimedOut
+            | HeartbeatProbeResult::SendFailed => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            }
+        }
+        self.next_probe_at = now + self.interval;
+        if self.consecutive_failures >= self.max_failures {
+            HeartbeatOutcome::Exceeded {
+                consecutive: self.consecutive_failures,
+            }
+        } else {
+            HeartbeatOutcome::Continue
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker loop
 // ---------------------------------------------------------------------------
 
@@ -1111,8 +1260,10 @@ impl WebWorker {
     fn run(&mut self) -> Result<()> {
         // Defense in depth: the daemon validated the content root already;
         // re-run the bounded preflight here so a root swapped between the
-        // daemon's check and this spawn fails closed (network grants land
-        // in M2c; until then the worker always requests isolation).
+        // daemon's check and this spawn fails closed. The browser is
+        // isolated unless the --allow-network test hook was given (the
+        // wallpaper network-grant lane lands in M2c; until then the
+        // production path always requests isolation).
         let report = preflight_web(&self.content, &[]);
         if !report.safe {
             bail!(
@@ -1121,7 +1272,8 @@ impl WebWorker {
                 report.reasons.join("; ")
             );
         }
-        let browser = BrowserSession::start(&self.content, self.spec)?;
+        let browser =
+            BrowserSession::start(&self.content, self.spec, self.arguments.allow_network)?;
         self.browser = Some(browser);
         self.capture_loop()
     }
@@ -1130,6 +1282,11 @@ impl WebWorker {
         let interval = Duration::from_secs_f64(1.0 / f64::from(self.arguments.fps));
         let mut deadline = Instant::now();
         let mut last_pixels: Option<Vec<u8>> = None;
+        let mut heartbeat = HeartbeatTracker::new(
+            Duration::from_millis(self.arguments.web_heartbeat_ms),
+            self.arguments.web_heartbeat_max_failures,
+            Instant::now(),
+        );
         loop {
             self.input.poll();
             self.dispatch_input();
@@ -1147,6 +1304,55 @@ impl WebWorker {
                     browser.stop();
                 }
                 return Ok(());
+            }
+            // Heartbeat (page-independent liveness): strictly non-blocking —
+            // at most one probe in flight, the answer is checked on later
+            // ticks, and sending a probe never stalls the publish pacing (a
+            // blocking probe would trip the supervisor's frame timeout and
+            // the daemon would reap the worker before this exit-73 path).
+            // Responses delivered by the previous poll are consumed here,
+            // so resolution lags a probe by at most one MAX_WAIT.
+            let heartbeat_outcome = {
+                let browser = self.browser.as_mut().expect("browser present");
+                let now = Instant::now();
+                let mut outcome = HeartbeatOutcome::Continue;
+                if let Some((probe_id, sent_at)) = heartbeat.pending_probe() {
+                    let result = match browser.client.take_response(probe_id) {
+                        Some(response) => {
+                            Some(HeartbeatProbeResult::Answered(response.error.is_none()))
+                        }
+                        None if now.duration_since(sent_at) >= heartbeat.interval => {
+                            Some(HeartbeatProbeResult::TimedOut)
+                        }
+                        None => None, // still in flight: wait for the next tick
+                    };
+                    if let Some(result) = result {
+                        outcome = heartbeat.resolve(now, result);
+                    }
+                }
+                if heartbeat.should_probe(now) {
+                    match browser.client.send_session(
+                        &browser.session_id,
+                        "Runtime.evaluate",
+                        &json!({ "expression": "1+1" }),
+                    ) {
+                        Ok(id) => heartbeat.note_sent(id, now),
+                        Err(error) => {
+                            eprintln!("event=renderer.web.heartbeat_send_failed detail={error}");
+                            outcome = heartbeat.resolve(now, HeartbeatProbeResult::SendFailed);
+                        }
+                    }
+                }
+                outcome
+            };
+            if let HeartbeatOutcome::Exceeded { consecutive } = heartbeat_outcome {
+                eprintln!("event=renderer.web.heartbeat_failed consecutive={consecutive}");
+                // Bounded browser teardown, then exit 73 (the supervisor
+                // folds it into `exit_code_73` and restarts the worker).
+                if let Some(browser) = self.browser.take() {
+                    browser.stop();
+                }
+                exit(EXIT_BACKEND_REJECT);
             }
             let Some(browser) = self.browser.as_mut() else {
                 unreachable!("the browser is always present in the capture loop");
@@ -1493,5 +1699,103 @@ mod tests {
         assert_eq!(parsed.len(), 128);
         assert!(parsed[..64].iter().all(|&v| v == 0.25));
         assert!(parsed[64..].iter().all(|&v| v == 0.75));
+    }
+
+    #[test]
+    fn heartbeat_success_resets_the_streak_and_reschedules() {
+        let interval = Duration::from_millis(1000);
+        let now = Instant::now();
+        let mut tracker = HeartbeatTracker::new(interval, 3, now);
+        // The first probe waits one full interval.
+        assert!(!tracker.should_probe(now));
+        assert!(tracker.should_probe(now + interval));
+        tracker.note_sent(7, now + interval);
+        assert!(!tracker.should_probe(now + interval)); // in flight
+        assert_eq!(
+            tracker.resolve(now + interval * 2, HeartbeatProbeResult::Answered(true)),
+            HeartbeatOutcome::Continue
+        );
+        assert_eq!(tracker.consecutive_failures, 0);
+        // The next probe is rescheduled a full interval after the resolve.
+        assert!(tracker.should_probe(now + interval * 3));
+        // Two failures followed by success reset the streak entirely.
+        tracker.note_sent(8, now + interval * 3);
+        assert_eq!(
+            tracker.resolve(now + interval * 4, HeartbeatProbeResult::TimedOut),
+            HeartbeatOutcome::Continue
+        );
+        tracker.note_sent(9, now + interval * 5);
+        assert_eq!(
+            tracker.resolve(now + interval * 6, HeartbeatProbeResult::TimedOut),
+            HeartbeatOutcome::Continue
+        );
+        tracker.note_sent(10, now + interval * 7);
+        assert_eq!(
+            tracker.resolve(now + interval * 8, HeartbeatProbeResult::Answered(true)),
+            HeartbeatOutcome::Continue
+        );
+        assert_eq!(tracker.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn heartbeat_timeouts_count_up_to_the_threshold() {
+        let interval = Duration::from_millis(1000);
+        let mut tracker = HeartbeatTracker::new(interval, 2, Instant::now());
+        let now = Instant::now() + interval; // first probe eligible
+        // A response whose deadline has NOT passed yet is still in flight.
+        tracker.note_sent(1, now);
+        assert_eq!(tracker.pending_probe(), Some((1, now)));
+        assert_eq!(
+            tracker.resolve(now + interval / 2, HeartbeatProbeResult::Answered(false)),
+            HeartbeatOutcome::Continue
+        );
+        // A protocol-error envelope counts as a failure.
+        assert_eq!(tracker.consecutive_failures, 1);
+        // Second consecutive timeout crosses the threshold of 2.
+        tracker.note_sent(2, now + interval * 2);
+        assert_eq!(
+            tracker.resolve(now + interval * 3, HeartbeatProbeResult::TimedOut),
+            HeartbeatOutcome::Exceeded { consecutive: 2 }
+        );
+    }
+
+    #[test]
+    fn heartbeat_send_failure_is_a_failure() {
+        let interval = Duration::from_millis(1000);
+        let mut tracker = HeartbeatTracker::new(interval, 2, Instant::now());
+        let now = Instant::now() + interval;
+        tracker.note_sent(1, now);
+        assert_eq!(
+            tracker.resolve(now + interval, HeartbeatProbeResult::SendFailed),
+            HeartbeatOutcome::Continue
+        );
+        tracker.note_sent(2, now + interval * 2);
+        assert_eq!(
+            tracker.resolve(now + interval * 3, HeartbeatProbeResult::SendFailed),
+            HeartbeatOutcome::Exceeded { consecutive: 2 }
+        );
+    }
+
+    #[test]
+    fn heartbeat_max_failures_of_one_fails_fast() {
+        let interval = Duration::from_millis(1000);
+        let mut tracker = HeartbeatTracker::new(interval, 1, Instant::now());
+        let now = Instant::now() + interval;
+        tracker.note_sent(1, now);
+        assert_eq!(
+            tracker.resolve(now + interval, HeartbeatProbeResult::TimedOut),
+            HeartbeatOutcome::Exceeded { consecutive: 1 }
+        );
+    }
+
+    #[test]
+    fn scale_and_convert_guards_against_zero_dimension_sources() {
+        // A hostile zero-dimension source must be skipped, never panicked
+        // on (a decode panic would abort the worker via SIGABRT).
+        let spec = spec_160x90();
+        let empty = image::RgbImage::new(0, 0);
+        assert!(scale_and_convert(&empty, spec).is_empty());
+        // The exact-size check in the publish path rejects the empty slice.
+        assert_ne!(scale_and_convert(&empty, spec).len(), spec.pixel_bytes());
     }
 }
