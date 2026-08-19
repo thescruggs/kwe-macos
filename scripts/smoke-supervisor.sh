@@ -3,6 +3,8 @@
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Honor an external CARGO_TARGET_DIR (acceptance reuses the shared dep build).
+target_dir="${CARGO_TARGET_DIR:-$project_root/target}"
 smoke_root="$(mktemp -d -t kwe-supervisor-smoke.XXXXXX)"
 socket="$smoke_root/daemon.sock"
 runtime_dir="$smoke_root/runtime"
@@ -24,13 +26,13 @@ call_daemon() {
     if (( $# >= 2 )); then
         params="$2"
     fi
-    target/debug/kwe daemon-call --socket "$socket" --method "$method" --params "$params"
+    "$target_dir/debug/kwe" daemon-call --socket "$socket" --method "$method" --params "$params"
 }
 
 start_daemon() {
-    target/debug/kwe-daemon \
+    "$target_dir/debug/kwe-daemon" \
         --socket "$socket" \
-        --renderer "$project_root/target/debug/kwe-test-renderer" \
+        --renderer "$target_dir/debug/kwe-test-renderer" \
         --renderer-runtime-dir "$runtime_dir" \
         --state-dir "$state_dir" \
         --renderer-startup-timeout-ms 500 \
@@ -148,6 +150,21 @@ head -c 2 "$state_dir/$last_good_file" | cmp -s - <(printf 'P6')
 call_daemon renderer.stop >/dev/null
 wait_phase stopped >/dev/null
 echo "supervisor healthy start/frame/fallback/stop passed"
+
+stderr_params='{"wallpaper_id":"stderr-tail","content_hash":"hash-stderr-tail","width":160,"height":90,"fps":60,"kind":"test","stderr_lines":100}'
+call_daemon renderer.start "$stderr_params" >/dev/null
+wait_phase live >/dev/null
+for _attempt in {1..100}; do
+    stderr_status="$(call_daemon renderer.status)"
+    [[ "$(jq -r '.result.stderr_tail | length' <<<"$stderr_status")" == "64" ]] && break
+    sleep 0.02
+done
+[[ "$(jq -r '.result.stderr_tail | length' <<<"$stderr_status")" == "64" ]]
+[[ "$(jq -r '.result.stderr_tail[-1] | contains("index=99")' <<<"$stderr_status")" == "true" ]]
+[[ "$(jq -r '.result.stderr_dropped_bytes' <<<"$stderr_status")" != "0" ]]
+[[ "$(jq -r '.result.kind' <<<"$stderr_status")" == "test" ]]
+call_daemon renderer.stop >/dev/null
+echo "supervisor bounded stderr ring surfaced passed"
 
 base_params='{"wallpaper_id":"transaction-base","content_hash":"hash-transaction-base","width":160,"height":90,"fps":60}'
 call_daemon renderer.start "$base_params" >/dev/null

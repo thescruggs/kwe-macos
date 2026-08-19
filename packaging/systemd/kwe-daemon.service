@@ -31,11 +31,15 @@ AmbientCapabilities=
 LimitNOFILE=1024
 LimitCORE=0
 MemoryHigh=768M
-MemoryMax=1G
+# The daemon plus audio worker and a Chromium-based web renderer need more
+# than the alpha's single test renderer budget; MemoryHigh stays as a soft
+# cap so OOM policy continues to prefer killing the renderer.
+MemoryMax=3G
 MemorySwapMax=256M
 OOMPolicy=continue
-CPUQuota=300%
-TasksMax=64
+CPUQuota=400%
+# Chromium spawns many helper threads/tasks; 64 was too tight for the beta.
+TasksMax=96
 TimeoutStopSec=5s
 
 # Do not add PrivateDevices= or MemoryDenyWriteExecute=: Vulkan renderers need

@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, Read},
     os::unix::{
@@ -13,8 +14,8 @@ use std::{
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
-    path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
+    path::{Path, PathBuf},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -24,10 +25,11 @@ use std::{
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
 use anyhow::{Context, Result, anyhow, bail};
-use kwe_core::preflight_scene;
+use kwe_core::{preflight_scene, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
 use kwe_input_protocol::{
-    MAX_MESSAGE_BYTES as MAX_INPUT_MESSAGE_BYTES, PointerMessage, PointerPhase, decode_ack_line,
+    AudioFrame, MAX_MESSAGE_BYTES as MAX_INPUT_MESSAGE_BYTES, MediaState, PointerButton,
+    PointerMessage, PointerPhase, decode_ack_line, encode_audio_frame, encode_media_state,
     encode_pointer_line,
 };
 use serde::{Deserialize, Serialize};
@@ -41,20 +43,59 @@ const MAX_SUPERVISED_MAPPING_BYTES: u64 = 128 * 1024 * 1024;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_ACK_BUFFER_BYTES: usize = 1024;
 const MAX_ACK_READ_BYTES_PER_TICK: usize = 4096;
+/// Bounded diagnostics: 64 complete lines or 16 KiB, whichever binds first.
+const STDERR_RING_LINES: usize = 64;
+const STDERR_RING_BYTES: usize = 16 * 1024;
+const STDERR_READ_BYTES_PER_TICK: usize = 8 * 1024;
+
+/// Renderer binary families the supervisor can launch. Each kind carries its
+/// own binary path, startup timeout, and resource budget so the heavy web
+/// renderer cannot be throttled by the test renderer's constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererKind {
+    Test,
+    Video,
+    Web,
+    Scene,
+}
+
+impl RendererKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Video => "video",
+            Self::Web => "web",
+            Self::Scene => "scene",
+        }
+    }
+}
+
+/// Validated content handed to a renderer kind through `--content`.
+#[derive(Debug, Clone)]
+pub enum ContentSpec {
+    Video { path: PathBuf },
+    Web { root: PathBuf },
+    Scene { path: PathBuf },
+}
 
 #[derive(Debug, Clone)]
 pub struct SupervisorConfig {
-    pub renderer_path: PathBuf,
+    /// Per-kind renderer binaries. A kind may be absent; requesting it to
+    /// spawn then fails closed instead of launching the wrong binary.
+    pub renderer_paths: BTreeMap<RendererKind, PathBuf>,
     pub runtime_dir: PathBuf,
     pub state_dir: PathBuf,
-    pub startup_timeout: Duration,
+    /// Per-kind startup deadlines in milliseconds; every kind must be present.
+    pub startup_timeout_ms_by_kind: BTreeMap<RendererKind, u64>,
     pub frame_timeout: Duration,
     pub stop_grace: Duration,
     pub restart_delay: Duration,
     pub canary_duration: Duration,
     pub handoff_timeout: Duration,
     pub max_failures: u32,
-    pub resource_limits: RendererResourceLimits,
+    /// Per-kind pre-exec resource ceilings; every kind must be present.
+    pub resource_limits_by_kind: BTreeMap<RendererKind, RendererResourceLimits>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -82,20 +123,36 @@ impl RendererResourceLimits {
 
 impl SupervisorConfig {
     pub fn validate(mut self) -> Result<Self> {
-        self.renderer_path = fs::canonicalize(&self.renderer_path).with_context(|| {
-            format!(
-                "resolve renderer executable {}",
-                self.renderer_path.display()
-            )
-        })?;
-        if !self.renderer_path.is_file() {
-            bail!(
-                "renderer executable is not a regular file: {}",
-                self.renderer_path.display()
-            );
+        for (kind, path) in std::mem::take(&mut self.renderer_paths) {
+            // Canonicalize whatever binaries exist now; absent kinds stay
+            // unresolved and fail closed at spawn time instead of blocking
+            // daemon startup on an uninstalled renderer family.
+            match fs::canonicalize(&path) {
+                Ok(canonical) => {
+                    if !canonical.is_file() {
+                        bail!(
+                            "renderer executable for kind {} is not a regular file: {}",
+                            kind.as_str(),
+                            canonical.display()
+                        );
+                    }
+                    self.renderer_paths.insert(kind, canonical);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.renderer_paths.insert(kind, path);
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "resolve renderer executable for kind {}: {}",
+                            kind.as_str(),
+                            path.display()
+                        )
+                    });
+                }
+            }
         }
-        if self.startup_timeout.is_zero()
-            || self.frame_timeout.is_zero()
+        if self.frame_timeout.is_zero()
             || self.stop_grace.is_zero()
             || self.canary_duration.is_zero()
             || self.handoff_timeout.is_zero()
@@ -104,10 +161,60 @@ impl SupervisorConfig {
         {
             bail!("supervisor deadlines and failure budget must be bounded and non-zero");
         }
-        self.resource_limits = self.resource_limits.validate()?;
+        for (kind, timeout_ms) in &self.startup_timeout_ms_by_kind {
+            if !(100..=30_000).contains(timeout_ms) {
+                bail!(
+                    "startup timeout for renderer kind {} is outside 100..=30000 ms",
+                    kind.as_str()
+                );
+            }
+        }
+        for kind in [
+            RendererKind::Test,
+            RendererKind::Video,
+            RendererKind::Web,
+            RendererKind::Scene,
+        ] {
+            if !self.startup_timeout_ms_by_kind.contains_key(&kind) {
+                bail!(
+                    "missing startup timeout for renderer kind {}",
+                    kind.as_str()
+                );
+            }
+            if !self.resource_limits_by_kind.contains_key(&kind) {
+                bail!(
+                    "missing resource limits for renderer kind {}",
+                    kind.as_str()
+                );
+            }
+        }
+        for (kind, limits) in &mut self.resource_limits_by_kind {
+            *limits = limits
+                .validate()
+                .with_context(|| format!("resource limits for renderer kind {}", kind.as_str()))?;
+        }
         ensure_private_dir(&self.runtime_dir)?;
         ensure_private_dir(&self.state_dir)?;
         Ok(self)
+    }
+
+    /// The binary for `kind`, or an error when it was never configured.
+    fn renderer_path_for(&self, kind: RendererKind) -> Result<PathBuf> {
+        self.renderer_paths
+            .get(&kind)
+            .cloned()
+            .with_context(|| format!("no renderer binary configured for kind {}", kind.as_str()))
+    }
+
+    /// Per-kind startup deadline. `validate()` guarantees every kind is
+    /// present, so this lookup cannot miss on a validated config.
+    fn startup_timeout_for(&self, kind: RendererKind) -> Duration {
+        Duration::from_millis(self.startup_timeout_ms_by_kind[&kind])
+    }
+
+    /// Per-kind pre-exec resource ceilings, with the same guaranteed presence.
+    fn resource_limits_for(&self, kind: RendererKind) -> RendererResourceLimits {
+        self.resource_limits_by_kind[&kind]
     }
 }
 
@@ -118,8 +225,11 @@ pub struct StartSpec {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub kind: RendererKind,
+    pub content: Option<ContentSpec>,
     pub test_fault: Option<TestFault>,
-    pub scene_path: Option<PathBuf>,
+    /// Development-only: ask the test renderer for this many stderr lines.
+    pub stderr_lines: Option<u32>,
 }
 
 impl StartSpec {
@@ -136,15 +246,47 @@ impl StartSpec {
         if let Some(fault) = &self.test_fault {
             fault.validate()?;
         }
-        if let Some(path) = &self.scene_path {
-            let report = preflight_scene(path);
-            if !report.safe {
-                bail!(
-                    "scene preflight rejected {}: {}",
-                    path.display(),
-                    report.reasons.join("; ")
-                );
+        if self.stderr_lines.is_some() && self.kind != RendererKind::Test {
+            bail!("stderr_lines is only available to the test renderer kind");
+        }
+        if let Some(count) = self.stderr_lines
+            && !(1..=4096).contains(&count)
+        {
+            bail!("stderr_lines must be in 1..=4096");
+        }
+        match (&self.kind, &self.content) {
+            (RendererKind::Test, None) => {}
+            (RendererKind::Video, Some(ContentSpec::Video { path })) => {
+                // TODO(m1c): full video preflight (container, codec, probes)
+                // lands in M1c; path-level checks are temporary.
+                validate_video_path(path)?
             }
+            (RendererKind::Web, Some(ContentSpec::Web { root })) => {
+                // No permission grants yet: the empty list keeps network
+                // disabled per the preflight default.
+                let report = preflight_web(root, &[]);
+                if !report.safe {
+                    bail!(
+                        "web preflight rejected {}: {}",
+                        root.display(),
+                        report.reasons.join("; ")
+                    );
+                }
+            }
+            (RendererKind::Scene, Some(ContentSpec::Scene { path })) => {
+                let report = preflight_scene(path);
+                if !report.safe {
+                    bail!(
+                        "scene preflight rejected {}: {}",
+                        path.display(),
+                        report.reasons.join("; ")
+                    );
+                }
+            }
+            _ => bail!(
+                "renderer kind {} requires matching content (test takes none)",
+                self.kind.as_str()
+            ),
         }
         Ok(())
     }
@@ -152,6 +294,20 @@ impl StartSpec {
     fn identity(&self) -> String {
         format!("{}:{}", self.wallpaper_id, self.content_hash)
     }
+}
+
+/// Temporary path-level video validation; superseded by preflight_video in M1c.
+fn validate_video_path(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat video content {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("video content must not be a symlink: {}", path.display());
+    }
+    if !metadata.is_file() {
+        bail!("video content is not a regular file: {}", path.display());
+    }
+    fs::canonicalize(path).with_context(|| format!("resolve video content {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +359,7 @@ pub enum WorkerPhase {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerStatus {
     pub phase: WorkerPhase,
+    pub kind: RendererKind,
     pub wallpaper_id: Option<String>,
     pub content_hash: Option<String>,
     pub pid: Option<u32>,
@@ -232,6 +389,14 @@ pub struct WorkerStatus {
     pub pointer_inside: bool,
     pub pointer_x: u16,
     pub pointer_y: u16,
+    pub audio_pending: bool,
+    pub audio_coalesced: u64,
+    pub media_pending: bool,
+    pub media_coalesced: u64,
+    /// Bounded stderr diagnostics, newest last. Content is advisory only and
+    /// is never parsed as a command.
+    pub stderr_tail: Vec<String>,
+    pub stderr_dropped_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -358,6 +523,17 @@ enum ControlCommand {
         phase: PointerPhase,
         x: f64,
         y: f64,
+        button: Option<PointerButton>,
+        reply: mpsc::Sender<Result<WorkerStatus>>,
+    },
+    AudioFrame {
+        generation: u64,
+        frame: AudioFrame,
+        reply: mpsc::Sender<Result<WorkerStatus>>,
+    },
+    MediaState {
+        generation: u64,
+        state: MediaState,
         reply: mpsc::Sender<Result<WorkerStatus>>,
     },
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
@@ -396,12 +572,30 @@ impl SupervisorHandle {
         phase: PointerPhase,
         x: f64,
         y: f64,
+        button: Option<PointerButton>,
     ) -> Result<WorkerStatus> {
         self.request(|reply| ControlCommand::PointerInput {
             generation,
             phase,
             x,
             y,
+            button,
+            reply,
+        })
+    }
+
+    pub fn audio_frame(&self, generation: u64, frame: AudioFrame) -> Result<WorkerStatus> {
+        self.request(|reply| ControlCommand::AudioFrame {
+            generation,
+            frame,
+            reply,
+        })
+    }
+
+    pub fn media_state(&self, generation: u64, state: MediaState) -> Result<WorkerStatus> {
+        self.request(|reply| ControlCommand::MediaState {
+            generation,
+            state,
             reply,
         })
     }
@@ -491,6 +685,14 @@ struct ActiveWorker {
     pointer_inside: bool,
     pointer_x: u16,
     pointer_y: u16,
+    // One pending frame per stream; a newer message replaces the older one
+    // instead of queuing, exactly like pointer input.
+    pending_audio: Option<Vec<u8>>,
+    audio_coalesced: u64,
+    pending_media: Option<Vec<u8>>,
+    media_coalesced: u64,
+    stderr: ChildStderr,
+    stderr_ring: StderrRing,
 }
 
 struct PendingRestart {
@@ -567,9 +769,26 @@ impl SupervisorRuntime {
                     phase,
                     x,
                     y,
+                    button,
                     reply,
                 }) => {
-                    let result = self.forward_pointer_input(generation, phase, x, y);
+                    let result = self.forward_pointer_input(generation, phase, x, y, button);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::AudioFrame {
+                    generation,
+                    frame,
+                    reply,
+                }) => {
+                    let result = self.forward_audio_frame(generation, frame);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::MediaState {
+                    generation,
+                    state,
+                    reply,
+                }) => {
+                    let result = self.forward_media_state(generation, state);
                     let _ = reply.send(result);
                 }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
@@ -672,12 +891,15 @@ impl SupervisorRuntime {
 
     fn spawn_worker(&mut self, spec: StartSpec) -> Result<ActiveWorker> {
         self.launch_serial = self.launch_serial.wrapping_add(1);
+        // Fails closed when this kind has no configured binary; the launch
+        // never falls back to another kind's renderer.
+        let renderer_path = self.config.renderer_path_for(spec.kind)?;
         let frame_path = self.config.runtime_dir.join(format!(
             "frame-{}-{}.bin",
             std::process::id(),
             self.launch_serial
         ));
-        let mut command = ProcessCommand::new(&self.config.renderer_path);
+        let mut command = ProcessCommand::new(&renderer_path);
         command
             .arg("--output")
             .arg(&frame_path)
@@ -686,11 +908,23 @@ impl SupervisorRuntime {
             .arg("--height")
             .arg(spec.height.to_string())
             .arg("--fps")
-            .arg(spec.fps.to_string())
+            .arg(spec.fps.to_string());
+        if let Some(content) = &spec.content {
+            let path = match content {
+                ContentSpec::Video { path } | ContentSpec::Scene { path } => path,
+                ContentSpec::Web { root } => root,
+            };
+            command.arg("--content").arg(path);
+        }
+        if let Some(count) = spec.stderr_lines {
+            command.arg("--stderr-lines").arg(count.to_string());
+        }
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .env_clear();
+            .stderr(Stdio::piped())
+            .env_clear()
+            .envs(env_allowlist(spec.kind));
         if let Some(fault) = &spec.test_fault {
             match fault {
                 TestFault::StartupHang => {
@@ -721,7 +955,7 @@ impl SupervisorRuntime {
             }
         }
         let expected_parent = i32::try_from(std::process::id()).context("daemon pid overflow")?;
-        let resource_limits = self.config.resource_limits;
+        let resource_limits = self.config.resource_limits_for(spec.kind);
         // SAFETY: this closure runs in the child after fork and before exec. It
         // calls only async-signal-safe libc functions and does not allocate.
         unsafe {
@@ -747,8 +981,8 @@ impl SupervisorRuntime {
         }
         let mut child = command
             .spawn()
-            .with_context(|| format!("launch renderer {}", self.config.renderer_path.display()))?;
-        let channels = (|| -> Result<(ChildStdin, ChildStdout)> {
+            .with_context(|| format!("launch renderer {}", renderer_path.display()))?;
+        let channels = (|| -> Result<(ChildStdin, ChildStdout, ChildStderr)> {
             let input = child
                 .stdin
                 .take()
@@ -757,12 +991,17 @@ impl SupervisorRuntime {
                 .stdout
                 .take()
                 .context("renderer input acknowledgement pipe unavailable")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("renderer diagnostic pipe unavailable")?;
             set_nonblocking(input.as_raw_fd()).context("configure renderer input pipe")?;
             set_nonblocking(input_ack.as_raw_fd())
                 .context("configure renderer acknowledgement pipe")?;
-            Ok((input, input_ack))
+            set_nonblocking(stderr.as_raw_fd()).context("configure renderer diagnostic pipe")?;
+            Ok((input, input_ack, stderr))
         })();
-        let (input, input_ack) = match channels {
+        let (input, input_ack, stderr) = match channels {
             Ok(channels) => channels,
             Err(error) => {
                 terminate_and_reap(&mut child, self.config.stop_grace);
@@ -790,6 +1029,12 @@ impl SupervisorRuntime {
             pointer_inside: false,
             pointer_x: 0,
             pointer_y: 0,
+            pending_audio: None,
+            audio_coalesced: 0,
+            pending_media: None,
+            media_coalesced: 0,
+            stderr,
+            stderr_ring: StderrRing::default(),
         })
     }
 
@@ -799,6 +1044,7 @@ impl SupervisorRuntime {
         phase: PointerPhase,
         x: f64,
         y: f64,
+        button: Option<PointerButton>,
     ) -> Result<WorkerStatus> {
         if generation == 0 || generation != self.display_generation {
             bail!("pointer input display generation is stale or invalid");
@@ -811,20 +1057,57 @@ impl SupervisorRuntime {
             .input_sequence
             .checked_add(1)
             .context("pointer input sequence exhausted")?;
-        let message = PointerMessage::from_normalized(sequence, phase, x, y)?;
+        let message = match button {
+            Some(button) => PointerMessage::button_event(sequence, phase, button, x, y)?,
+            None => PointerMessage::from_normalized(sequence, phase, x, y)?,
+        };
         let bytes = encode_pointer_line(&message)?;
-
-        if worker.pending_input.take().is_some() {
-            worker.input_coalesced = worker.input_coalesced.saturating_add(1);
-        }
-        match try_write_input(&worker.input, &bytes)? {
-            PipeWrite::Written => {}
-            PipeWrite::WouldBlock => worker.pending_input = Some(bytes),
-        }
+        queue_control_message(
+            &worker.input,
+            bytes,
+            &mut worker.pending_input,
+            &mut worker.input_coalesced,
+        )?;
         worker.input_sequence = sequence;
         worker.pointer_inside = phase != PointerPhase::Leave;
         worker.pointer_x = message.x;
         worker.pointer_y = message.y;
+        Ok(self.status())
+    }
+
+    fn forward_audio_frame(&mut self, generation: u64, frame: AudioFrame) -> Result<WorkerStatus> {
+        if generation == 0 || generation != self.display_generation {
+            bail!("audio frame display generation is stale or invalid");
+        }
+        let worker = self
+            .active
+            .as_mut()
+            .context("no promoted renderer is available for audio forwarding")?;
+        let bytes = encode_audio_frame(&frame)?;
+        queue_control_message(
+            &worker.input,
+            bytes,
+            &mut worker.pending_audio,
+            &mut worker.audio_coalesced,
+        )?;
+        Ok(self.status())
+    }
+
+    fn forward_media_state(&mut self, generation: u64, state: MediaState) -> Result<WorkerStatus> {
+        if generation == 0 || generation != self.display_generation {
+            bail!("media state display generation is stale or invalid");
+        }
+        let worker = self
+            .active
+            .as_mut()
+            .context("no promoted renderer is available for media state")?;
+        let bytes = encode_media_state(&state)?;
+        queue_control_message(
+            &worker.input,
+            bytes,
+            &mut worker.pending_media,
+            &mut worker.media_coalesced,
+        )?;
         Ok(self.status())
     }
 
@@ -833,17 +1116,24 @@ impl SupervisorRuntime {
             return;
         };
         drain_input_acks(worker);
-        let Some(bytes) = worker.pending_input.take() else {
-            return;
-        };
-        match try_write_input(&worker.input, &bytes) {
-            Ok(PipeWrite::Written) => {}
-            Ok(PipeWrite::WouldBlock) => worker.pending_input = Some(bytes),
-            Err(error) => {
-                worker.input_protocol_errors = worker.input_protocol_errors.saturating_add(1);
-                eprintln!("event=renderer.input_write_error detail={error}");
-            }
-        }
+        flush_pending(
+            &worker.input,
+            &mut worker.pending_input,
+            &mut worker.input_protocol_errors,
+            "renderer.input_write_error",
+        );
+        flush_pending(
+            &worker.input,
+            &mut worker.pending_audio,
+            &mut worker.input_protocol_errors,
+            "renderer.audio_write_error",
+        );
+        flush_pending(
+            &worker.input,
+            &mut worker.pending_media,
+            &mut worker.input_protocol_errors,
+            "renderer.media_write_error",
+        );
     }
 
     fn tick(&mut self) {
@@ -1193,8 +1483,13 @@ impl SupervisorRuntime {
         let requested = self.requested.as_ref();
         let candidate = self.candidate.as_ref();
         let record = requested.and_then(|spec| self.persisted.records.get(&spec.identity()));
+        // The active worker is the supervised process, so its kind names the
+        // limits that were actually applied; idle falls back to the requested
+        // kind, then to the test budget as the former single global policy.
+        let status_kind = active.map_or(RendererKind::Test, |worker| worker.spec.kind);
         WorkerStatus {
             phase: self.phase,
+            kind: status_kind,
             wallpaper_id: active.map(|worker| worker.spec.wallpaper_id.clone()),
             content_hash: active.map(|worker| worker.spec.content_hash.clone()),
             pid: active.map(|worker| worker.child.id()),
@@ -1225,7 +1520,7 @@ impl SupervisorRuntime {
                 .map(|retired| retired.worker.frame_path.clone()),
             display_generation: self.display_generation,
             awaiting_display_ack: self.retired.is_some(),
-            resource_limits: self.config.resource_limits,
+            resource_limits: self.config.resource_limits_for(status_kind),
             input_sequence: active.map_or(0, |worker| worker.input_sequence),
             input_ack_sequence: active.map_or(0, |worker| worker.input_ack_sequence),
             input_pending: active.is_some_and(|worker| worker.pending_input.is_some()),
@@ -1234,6 +1529,12 @@ impl SupervisorRuntime {
             pointer_inside: active.is_some_and(|worker| worker.pointer_inside),
             pointer_x: active.map_or(0, |worker| worker.pointer_x),
             pointer_y: active.map_or(0, |worker| worker.pointer_y),
+            audio_pending: active.is_some_and(|worker| worker.pending_audio.is_some()),
+            audio_coalesced: active.map_or(0, |worker| worker.audio_coalesced),
+            media_pending: active.is_some_and(|worker| worker.pending_media.is_some()),
+            media_coalesced: active.map_or(0, |worker| worker.media_coalesced),
+            stderr_tail: active.map_or_else(Vec::new, |worker| worker.stderr_ring.tail.clone()),
+            stderr_dropped_bytes: active.map_or(0, |worker| worker.stderr_ring.dropped_bytes),
         }
     }
 }
@@ -1249,6 +1550,9 @@ fn inspect_worker(
 ) -> Option<WorkerObservation> {
     match worker.child.try_wait() {
         Ok(Some(status)) => {
+            // Drain the full diagnostic pipe once the child is gone so the
+            // final stderr lands in the ring before the caller reaps it.
+            drain_stderr(worker, usize::MAX);
             let controlled_memory_pressure = matches!(
                 worker.spec.test_fault.as_ref(),
                 Some(TestFault::MemoryPressure { .. })
@@ -1276,6 +1580,7 @@ fn inspect_worker(
         }
         Ok(None) => {}
         Err(error) => {
+            drain_stderr(worker, STDERR_READ_BYTES_PER_TICK);
             return Some(WorkerObservation::Failure(
                 FailureKind::ProcessExit,
                 format!("wait_error:{error}"),
@@ -1283,6 +1588,7 @@ fn inspect_worker(
         }
     }
 
+    drain_stderr(worker, STDERR_READ_BYTES_PER_TICK);
     let now = Instant::now();
     if worker.reader.is_none() {
         match SharedFrameReader::open(&worker.frame_path) {
@@ -1300,7 +1606,9 @@ fn inspect_worker(
             }
             Ok(_) | Err(ProtocolError::Busy) => {}
             Err(error) if worker.sequence == 0 => {
-                if now.duration_since(worker.started) >= config.startup_timeout {
+                if now.duration_since(worker.started)
+                    >= config.startup_timeout_for(worker.spec.kind)
+                {
                     return Some(WorkerObservation::Failure(
                         FailureKind::StartupTimeout,
                         error.to_string(),
@@ -1315,7 +1623,9 @@ fn inspect_worker(
             }
         }
     }
-    if worker.sequence == 0 && now.duration_since(worker.started) >= config.startup_timeout {
+    if worker.sequence == 0
+        && now.duration_since(worker.started) >= config.startup_timeout_for(worker.spec.kind)
+    {
         return Some(WorkerObservation::Failure(
             FailureKind::StartupTimeout,
             "no_valid_frame".into(),
@@ -1414,6 +1724,148 @@ fn drain_input_acks(worker: &mut ActiveWorker) {
             worker.input_ack_buffer.clear();
             worker.input_protocol_errors = worker.input_protocol_errors.saturating_add(1);
         }
+    }
+}
+
+/// Latest-wins queueing onto the active worker's control pipe: a newer
+/// message replaces an unsent one instead of forming an unbounded queue.
+fn queue_control_message(
+    input: &ChildStdin,
+    bytes: Vec<u8>,
+    pending: &mut Option<Vec<u8>>,
+    coalesced: &mut u64,
+) -> Result<()> {
+    if pending.take().is_some() {
+        *coalesced = coalesced.saturating_add(1);
+    }
+    match try_write_input(input, &bytes)? {
+        PipeWrite::Written => {}
+        PipeWrite::WouldBlock => *pending = Some(bytes),
+    }
+    Ok(())
+}
+
+/// One bounded write attempt per tick for a previously backed-up control
+/// message. `event` names the diagnostics stream for error logging.
+fn flush_pending(
+    input: &ChildStdin,
+    pending: &mut Option<Vec<u8>>,
+    protocol_errors: &mut u64,
+    event: &str,
+) {
+    let Some(bytes) = pending.take() else {
+        return;
+    };
+    match try_write_input(input, &bytes) {
+        Ok(PipeWrite::Written) => {}
+        Ok(PipeWrite::WouldBlock) => *pending = Some(bytes),
+        Err(error) => {
+            *protocol_errors = protocol_errors.saturating_add(1);
+            eprintln!("event={event} detail={error}");
+        }
+    }
+}
+
+/// Per-kind environment allowlist. All renderers get a private HOME and a
+/// fixed PATH; Web additionally inherits the daemon's XDG_RUNTIME_DIR because
+/// Chromium needs it for session plumbing. It is deliberately not granted to
+/// the video/scene/test kinds.
+fn env_allowlist(kind: RendererKind) -> Vec<(String, String)> {
+    env_allowlist_with_runtime(kind, std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+fn env_allowlist_with_runtime(
+    kind: RendererKind,
+    runtime_dir: Option<OsString>,
+) -> Vec<(String, String)> {
+    let mut entries = vec![
+        ("HOME".to_string(), "/tmp".to_string()),
+        ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
+    ];
+    if kind == RendererKind::Web
+        && let Some(runtime) = runtime_dir
+    {
+        entries.push((
+            "XDG_RUNTIME_DIR".to_string(),
+            runtime.to_string_lossy().into_owned(),
+        ));
+    }
+    entries
+}
+
+/// Bounded ring of worker stderr diagnostics, newest last. Oldest lines are
+/// evicted (their bytes counted as dropped) whenever the 64-line or 16 KiB
+/// budget binds; a single unterminated line that passes the byte budget is
+/// dropped whole. Contents are advisory only and never parsed as commands.
+#[derive(Debug, Default)]
+struct StderrRing {
+    tail: Vec<String>,
+    tail_bytes: usize,
+    dropped_bytes: u64,
+    pending: Vec<u8>,
+}
+
+impl StderrRing {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=newline).collect();
+            self.push_line(line);
+        }
+        self.enforce_budget();
+    }
+
+    fn push_line(&mut self, mut line: Vec<u8>) {
+        line.pop(); // strip the trailing newline; the entry keeps its bytes
+        let text = String::from_utf8_lossy(&line).into_owned();
+        self.tail_bytes += text.len();
+        self.tail.push(text);
+        self.enforce_budget();
+    }
+
+    fn enforce_budget(&mut self) {
+        while self.tail.len() > STDERR_RING_LINES
+            || self.tail_bytes.saturating_add(self.pending.len()) > STDERR_RING_BYTES
+        {
+            if self.tail.is_empty() {
+                // The unterminated line alone exceeds the whole budget.
+                self.dropped_bytes = self.dropped_bytes.saturating_add(self.pending.len() as u64);
+                self.pending.clear();
+                break;
+            }
+            let evicted = self.tail.remove(0);
+            self.tail_bytes -= evicted.len();
+            self.dropped_bytes = self.dropped_bytes.saturating_add(evicted.len() as u64);
+        }
+    }
+}
+
+/// Nonblocking drain of worker stderr into the bounded ring. `budget` limits
+/// bytes consumed per tick; `usize::MAX` drains everything once after exit.
+fn drain_stderr(worker: &mut ActiveWorker, budget: usize) {
+    let mut total = 0_usize;
+    while total < budget {
+        let mut chunk = [0_u8; 512];
+        let read = unsafe {
+            libc::read(
+                worker.stderr.as_raw_fd(),
+                chunk.as_mut_ptr().cast::<libc::c_void>(),
+                chunk.len(),
+            )
+        };
+        if read == 0 {
+            break;
+        }
+        if read < 0 {
+            if io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock {
+                // Best-effort diagnostics; a failed pipe only stops the tail.
+                eprintln!("event=renderer.stderr_read_error");
+            }
+            break;
+        }
+        let read = read as usize;
+        total += read;
+        worker.stderr_ring.push_bytes(&chunk[..read]);
     }
 }
 
@@ -1539,8 +1991,10 @@ mod tests {
             width: 1920,
             height: 1080,
             fps: 60,
+            kind: RendererKind::Test,
+            content: None,
             test_fault: None,
-            scene_path: None,
+            stderr_lines: None,
         };
         assert!(valid.validate().is_ok());
         let mut invalid = valid.clone();
@@ -1549,7 +2003,7 @@ mod tests {
         invalid = valid.clone();
         invalid.fps = 0;
         assert!(invalid.validate().is_err());
-        invalid = valid;
+        invalid = valid.clone();
         invalid.width = 8192;
         invalid.height = 8192;
         assert!(invalid.validate().is_err());
@@ -1559,12 +2013,73 @@ mod tests {
             width: 1920,
             height: 1080,
             fps: 60,
+            kind: RendererKind::Scene,
+            content: Some(ContentSpec::Scene {
+                path: std::env::temp_dir().join("kwe-missing-scene.json"),
+            }),
             test_fault: None,
-            scene_path: Some(std::env::temp_dir().join("kwe-missing-scene.json")),
+            stderr_lines: None,
         };
         assert!(invalid_scene.validate().is_err());
-        invalid_scene.scene_path = None;
+        invalid_scene.kind = RendererKind::Test;
+        invalid_scene.content = None;
         assert!(invalid_scene.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_mismatched_kind_content_and_dev_only_stderr_lines() {
+        let base = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 960,
+            height: 540,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+        };
+        // Test takes no content.
+        let mut mismatched = base.clone();
+        mismatched.content = Some(ContentSpec::Video {
+            path: std::env::temp_dir().join("kwe-any.mp4"),
+        });
+        assert!(mismatched.validate().is_err());
+        // Video requires video content.
+        mismatched.kind = RendererKind::Video;
+        assert!(mismatched.validate().is_err());
+        // Missing video file fails the temporary path-level check.
+        let missing_video = StartSpec {
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video {
+                path: std::env::temp_dir().join("kwe-missing-video.mp4"),
+            }),
+            ..base.clone()
+        };
+        assert!(missing_video.validate().is_err());
+        // A symlinked video path is rejected before it could resolve.
+        let root = temporary_directory("video-symlink");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("real.mp4"), b"not a real video").unwrap();
+        std::os::unix::fs::symlink(root.join("real.mp4"), root.join("link.mp4")).unwrap();
+        let symlink_video = StartSpec {
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video {
+                path: root.join("link.mp4"),
+            }),
+            ..base.clone()
+        };
+        assert!(symlink_video.validate().is_err());
+        fs::remove_dir_all(root).unwrap();
+        // stderr_lines is a test-renderer dev helper.
+        let mut dev_only = base.clone();
+        dev_only.stderr_lines = Some(10);
+        assert!(dev_only.validate().is_ok());
+        dev_only.kind = RendererKind::Scene;
+        assert!(dev_only.validate().is_err());
+        dev_only.kind = RendererKind::Test;
+        dev_only.stderr_lines = Some(0);
+        assert!(dev_only.validate().is_err());
     }
 
     #[test]
@@ -1662,5 +2177,229 @@ mod tests {
         symlink(&real, &link).unwrap();
         assert!(ensure_private_dir(&link).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn validated_config(root: &Path) -> SupervisorConfig {
+        let limits = RendererResourceLimits {
+            address_space_mib: 4096,
+            file_size_mib: 160,
+            open_files: 256,
+            processes: 1024,
+            core_dump_bytes: 0,
+        };
+        SupervisorConfig {
+            renderer_paths: BTreeMap::from([(
+                RendererKind::Test,
+                std::env::current_exe().unwrap(),
+            )]),
+            runtime_dir: root.join("runtime"),
+            state_dir: root.join("state"),
+            startup_timeout_ms_by_kind: BTreeMap::from([
+                (RendererKind::Test, 3000),
+                (RendererKind::Video, 6000),
+                (RendererKind::Web, 10_000),
+                (RendererKind::Scene, 3000),
+            ]),
+            frame_timeout: Duration::from_secs(2),
+            stop_grace: Duration::from_millis(500),
+            restart_delay: Duration::from_millis(250),
+            canary_duration: Duration::from_secs(1),
+            handoff_timeout: Duration::from_secs(5),
+            max_failures: 3,
+            resource_limits_by_kind: BTreeMap::from([
+                (RendererKind::Test, limits),
+                (RendererKind::Video, limits),
+                (
+                    RendererKind::Web,
+                    RendererResourceLimits {
+                        address_space_mib: 16_384,
+                        open_files: 1024,
+                        ..limits
+                    },
+                ),
+                (RendererKind::Scene, limits),
+            ]),
+        }
+        .validate()
+        .unwrap()
+    }
+
+    #[test]
+    fn env_allowlist_keeps_home_and_path_and_grants_runtime_only_to_web() {
+        let expected_base = vec![
+            ("HOME".to_string(), "/tmp".to_string()),
+            ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
+        ];
+        for kind in [RendererKind::Test, RendererKind::Video, RendererKind::Scene] {
+            assert_eq!(
+                env_allowlist_with_runtime(kind, Some("/run/user/1000".into())),
+                expected_base,
+                "kind {} must not inherit XDG_RUNTIME_DIR",
+                kind.as_str()
+            );
+        }
+        assert_eq!(
+            env_allowlist_with_runtime(RendererKind::Web, None),
+            expected_base
+        );
+        let web = env_allowlist_with_runtime(RendererKind::Web, Some("/run/user/1000".into()));
+        assert_eq!(web.len(), 3);
+        assert!(web.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())));
+    }
+
+    #[test]
+    fn stderr_ring_evicts_oldest_lines_and_counts_dropped_bytes() {
+        let mut ring = StderrRing::default();
+        for index in 0..80 {
+            ring.push_bytes(format!("line-{index}\n").as_bytes());
+        }
+        assert_eq!(ring.tail.len(), STDERR_RING_LINES);
+        assert_eq!(ring.tail.first().unwrap(), "line-16");
+        assert_eq!(ring.tail.last().unwrap(), "line-79");
+        // Evicted lines 0..10 are 6 bytes, lines 10..16 are 7 bytes.
+        assert_eq!(ring.dropped_bytes, 10 * 6 + 6 * 7);
+    }
+
+    #[test]
+    fn stderr_ring_binds_on_bytes_before_lines() {
+        let mut ring = StderrRing::default();
+        for _ in 0..8 {
+            ring.push_bytes(&vec![b'a'; 3000]);
+            ring.push_bytes(b"\n");
+        }
+        // 6 * 3000 would exceed 16 KiB, so the oldest line is evicted each
+        // time until 5 lines (15000 bytes) remain.
+        assert_eq!(ring.tail.len(), 5);
+        assert_eq!(ring.dropped_bytes, 3 * 3000);
+    }
+
+    #[test]
+    fn stderr_ring_joins_lines_split_across_reads() {
+        let mut ring = StderrRing::default();
+        ring.push_bytes(b"first-half");
+        assert!(ring.tail.is_empty());
+        ring.push_bytes(b"-joined\nsecond\n");
+        assert_eq!(ring.tail, vec!["first-half-joined", "second"]);
+        assert_eq!(ring.dropped_bytes, 0);
+    }
+
+    #[test]
+    fn stderr_ring_drops_an_unterminated_line_that_passes_the_budget() {
+        let mut ring = StderrRing::default();
+        ring.push_bytes(&vec![b'x'; 10 * 1024]);
+        assert_eq!(ring.pending.len(), 10 * 1024);
+        ring.push_bytes(&vec![b'y'; 10 * 1024]);
+        assert!(ring.tail.is_empty());
+        assert!(ring.pending.is_empty());
+        assert_eq!(ring.dropped_bytes, 20 * 1024);
+        ring.push_bytes(b"tail\n");
+        assert_eq!(ring.tail, vec!["tail"]);
+    }
+
+    #[test]
+    fn spawn_resolves_the_kind_specific_binary_and_fails_closed_when_missing() {
+        let root = temporary_directory("kinds");
+        fs::create_dir_all(&root).unwrap();
+        let test_bin = root.join("test-renderer");
+        let video_bin = root.join("video-renderer");
+        fs::write(&test_bin, b"x").unwrap();
+        fs::write(&video_bin, b"x").unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([
+            (RendererKind::Test, test_bin.clone()),
+            (RendererKind::Video, video_bin.clone()),
+        ]);
+        let config = config.validate().unwrap();
+        assert_eq!(
+            config.renderer_path_for(RendererKind::Test).unwrap(),
+            fs::canonicalize(&test_bin).unwrap()
+        );
+        assert_eq!(
+            config.renderer_path_for(RendererKind::Video).unwrap(),
+            fs::canonicalize(&video_bin).unwrap()
+        );
+        let error = config.renderer_path_for(RendererKind::Web).unwrap_err();
+        assert!(
+            format!("{error}").contains("no renderer binary configured for kind web"),
+            "unexpected error: {error}"
+        );
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(config, store, state);
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 960,
+            height: 540,
+            fps: 30,
+            kind: RendererKind::Web,
+            content: Some(ContentSpec::Web { root: root.clone() }),
+            test_fault: None,
+            stderr_lines: None,
+        };
+        let error = runtime
+            .spawn_worker(spec)
+            .err()
+            .expect("spawning a web worker without a configured binary must fail");
+        assert!(
+            format!("{error}").contains("no renderer binary configured for kind web"),
+            "unexpected error: {error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn queued_audio_commands_coalesce_and_only_the_latest_reaches_the_worker() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::io::FromRawFd;
+
+        let mut fds = [0_i32; 2];
+        // SAFETY: fds is a valid writable pair buffer for a fresh pipe.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        set_nonblocking(fds[1]).unwrap();
+        let input = ChildStdin::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+        let _read_end = unsafe { fs::File::from_raw_fd(fds[0]) };
+        // Fill the pipe so every control message hits backpressure.
+        let filler = vec![b'f'; 64 * 1024];
+        // SAFETY: filler is a valid readable buffer and the write end is open.
+        let written =
+            unsafe { libc::write(fds[1], filler.as_ptr().cast::<libc::c_void>(), filler.len()) };
+        assert_eq!(written, filler.len() as isize);
+        let first =
+            encode_audio_frame(&AudioFrame::new(1, vec![0.25; 64], vec![0.25; 64]).unwrap())
+                .unwrap();
+        let second =
+            encode_audio_frame(&AudioFrame::new(2, vec![0.75; 64], vec![0.75; 64]).unwrap())
+                .unwrap();
+        let mut pending = None;
+        let mut coalesced = 0_u64;
+        queue_control_message(&input, first, &mut pending, &mut coalesced).unwrap();
+        assert!(pending.is_some());
+        queue_control_message(&input, second.clone(), &mut pending, &mut coalesced).unwrap();
+        assert_eq!(coalesced, 1);
+        assert_eq!(pending.as_ref().unwrap(), &second);
+        // Make room, then the per-tick flush must deliver only the latest.
+        let mut drain_buffer = vec![0_u8; 64 * 1024];
+        let drained = unsafe {
+            libc::read(
+                fds[0],
+                drain_buffer.as_mut_ptr().cast::<libc::c_void>(),
+                drain_buffer.len(),
+            )
+        };
+        assert_eq!(drained, filler.len() as isize);
+        let mut errors = 0_u64;
+        flush_pending(&input, &mut pending, &mut errors, "test");
+        assert!(pending.is_none());
+        let mut received = vec![0_u8; second.len()];
+        let read = unsafe {
+            libc::read(
+                fds[0],
+                received.as_mut_ptr().cast::<libc::c_void>(),
+                received.len(),
+            )
+        };
+        assert_eq!(read, second.len() as isize);
+        assert_eq!(received, second);
+        assert_eq!(errors, 0);
     }
 }

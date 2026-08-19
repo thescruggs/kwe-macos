@@ -16,6 +16,8 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `renderer.retry`
 - `renderer.ack`
 - `renderer.input`
+- `audio.forward` *(BETA_M1a)*
+- `media.state` *(BETA_M1a)*
 
 ## Start and retry
 
@@ -27,9 +29,21 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
   "content_hash": "sha256-placeholder",
   "width": 960,
   "height": 540,
-  "fps": 30
+  "fps": 30,
+  "kind": "test",
+  "content": "/path/to/content"
 }
 ```
+
+*(M1a: `kind` and `content` replaced the alpha's `scene_path`.)* `kind` names
+the renderer family — `test`, `video`, `web`, or `scene` — and defaults to
+`test`. `content` is the validated content path: a video file for `video`, a
+directory with an `index.html` for `web`, and a scene file for `scene`. Test
+takes no content; every other kind requires it, and a kind/content mismatch is
+rejected. Content is validated before launch: video gets path-level checks
+(exists, regular file, not a symlink) until the full `preflight_video` lands in
+M1c; web runs `preflight_web` with no permission grants (network stays
+disabled); scene keeps its existing `preflight_scene`.
 
 Identity components are restricted to 1–128 ASCII letters, digits, `.`, `_`,
 and `-`. Frame protocol v1 bounds dimensions and allocation size; FPS is
@@ -44,6 +58,8 @@ Synthetic `test_fault` parameters are rejected unless the daemon was launched
 with `--allow-test-faults`. They are development-only and support
 `startup_hang`, `hang`, `corrupt`, `exit`, `ignore_term_hang`, and
 `memory_pressure`. The last form also requires a bounded `mib` value.
+*(M1a: `stderr_lines` — ask the test renderer to print N diagnostic lines at
+startup — is gated by the same flag.)*
 
 ## Status
 
@@ -52,6 +68,7 @@ The result contains:
 ```json
 {
   "phase": "live",
+  "kind": "test",
   "wallpaper_id": "synthetic-canary",
   "content_hash": "sha256-placeholder",
   "pid": 1234,
@@ -69,9 +86,20 @@ The result contains:
     "open_files": 256,
     "processes": 1024,
     "core_dump_bytes": 0
-  }
+  },
+  "stderr_tail": ["event=renderer.stderr_line index=99"],
+  "stderr_dropped_bytes": 0
 }
 ```
+
+*(M1a: `kind`, `stderr_tail`, and `stderr_dropped_bytes` were added;
+`resource_limits` now reports the active worker's per-kind budget.)* `kind`
+names the supervised renderer family. `stderr_tail` holds at most the newest
+64 lines / 16 KiB of renderer diagnostics (newest last) and
+`stderr_dropped_bytes` counts bytes evicted from that ring — diagnostics only,
+never parsed as commands. `audio_pending`, `audio_coalesced`, `media_pending`,
+and `media_coalesced` mirror the pointer counters for the two control streams
+below.
 
 Phases are `idle`, `starting`, `canary`, `live`, `restarting`, `awaiting_ack`,
 `rolled_back`, `stopped`, and `quarantined`. Stable failure classes are
@@ -104,6 +132,11 @@ must exactly match the current promoted display generation; phase is `enter`,
 The daemon quantizes coordinates and routes the bounded event only to the
 active renderer. Candidates and retired workers receive no input.
 
+*(M1a: the optional `button` field — `primary`, `secondary`, or `middle` —
+passes through to the wire `button_event`, which requires a `down`/`up`
+phase; phase names `down` and `up` are accepted alongside `enter`/`move`/
+`leave`.)*
+
 Status exposes `input_sequence`, `input_ack_sequence`, `input_pending`,
 `input_coalesced`, `input_protocol_errors`, `pointer_inside`, `pointer_x`, and
 `pointer_y`. Sequence numbers report accepted and renderer-observed events;
@@ -113,15 +146,72 @@ coordinates are the quantized unsigned 16-bit values. See
 The status path is diagnostic, not a heartbeat from the display client. The
 daemon watches frame progression even when no client is connected.
 
+## Audio and media control
+
+*(BETA_M1a: daemon-side producers/forwarders for the two media wire types.)*
+
+`audio.forward` accepts `generation` and a stereo `frame` of 64 `f32` bands per
+channel:
+
+```json
+{
+  "generation": 4,
+  "frame": {"left": [0.1, 0.2], "right": [0.1, 0.2]}
+}
+```
+
+`media.state` accepts `generation` plus `playback` (`playing`, `paused`, or
+`stopped`) and optional `title`, `artist`, `album`, `position_seconds`, and
+`duration_seconds` (finite, `0..=86400`):
+
+```json
+{
+  "generation": 4,
+  "playback": "paused",
+  "title": "Track",
+  "position_seconds": 12.5
+}
+```
+
+Both are encoded through the versioned protocol types in
+`docs/INPUT_PROTOCOL_V1.md` — band counts and value ranges are rejected by the
+protocol constructors before any worker message exists. The generation must
+match the current promoted display generation exactly (like pointer input),
+and with no active renderer the request errors with `supervisor_failed` /
+`no_active_renderer` (the `error` field carries the detail). Each stream is
+latest-wins: one pending frame per stream, replaced — not queued — when the
+worker pipe is under backpressure, counting into `audio_coalesced` /
+`media_coalesced`.
+
 ## Lifecycle and recovery
 
 The daemon starts each worker in a new process group with `no_new_privs` and a
-Linux parent-death signal. It opens only its configured renderer executable,
-passes bounded arguments directly, clears the inherited environment, and
-discards worker standard streams in this alpha to prevent pipe or log growth.
-Before exec it also applies finite address-space, output-file, descriptor, and
-UID-scoped process ceilings and disables core dumps. Any failure to install the
-policy fails the launch.
+Linux parent-death signal. It opens only the configured renderer executable
+for the requested kind — a missing kind binary fails the launch closed rather
+than falling back to another renderer — and passes bounded arguments directly.
+*(M1a: `--content <path>` follows `--fps` for kinds with content.)* The
+inherited environment is replaced by a per-kind allowlist: every renderer gets
+`HOME=/tmp` and `PATH=/usr/bin:/usr/sbin:/bin`; the web kind additionally
+inherits the daemon's `XDG_RUNTIME_DIR` (Chromium needs it; video/scene/test
+deliberately do not get it). Renderer stderr is piped into a bounded ring (64
+lines / 16 KiB, drained nonblocking per supervisor tick and once more after
+exit) and surfaced through `renderer.status`; it cannot grow logs or feed the
+control stream. Before exec it also applies finite address-space, output-file,
+descriptor, and UID-scoped process ceilings and disables core dumps. Any
+failure to install the policy fails the launch.
+
+Per-kind policies replace the alpha's single set: startup timeouts default to
+6 s for video and 10 s for web (Chromium's cold start), everything else keeps
+the global 3 s; resource limits default to the global budget
+(address-space 4096 MiB, file 160 MiB, 256 descriptors, 1024 processes) except
+web, which needs a 16384 MiB virtual address space and 1024 descriptors
+because V8 reserves a 4 GiB cage before `main`. The daemon flags
+`--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
+`--renderer-web-address-space-mib`, and `--renderer-web-open-files` tune these;
+frame timeouts and the canary stay global. Per-kind renderer binaries default
+to `kwe-<kind>-renderer` beside the daemon executable (`--renderer-video`,
+`--renderer-web`, `--renderer-scene` override; `--renderer` keeps meaning the
+test kind).
 
 Before promotion, the daemon requires at least three advancing frames across a
 bounded canary interval. A failed candidate is restarted and quarantined
@@ -144,8 +234,11 @@ depend on the live mmap.
 
 ## Current limits
 
-- The generated renderer is the only production-shaped worker exercised here.
-- The packaged systemd unit bounds aggregate memory, swap, CPU, and task usage;
+- The generated renderer is the only production-shaped worker exercised here;
+  video/web/scene binaries arrive in later milestones, and video content
+  validation is path-level only until M1c.
+- The packaged systemd unit bounds aggregate memory, swap, CPU, and task usage
+  (raised in M1a to fit daemon + audio worker + Chromium);
   GPU-specific budgets and a stable seccomp allowlist remain later hardening
   work.
 - The M1e Plasma display bridge consumes this local JSON contract in isolated

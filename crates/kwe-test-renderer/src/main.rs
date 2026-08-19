@@ -51,6 +51,10 @@ struct Arguments {
     /// Allocation size used with --memory-pressure-after.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=4096))]
     memory_pressure_mib: Option<u64>,
+    /// Print this many diagnostic lines to stderr at startup, so the daemon's
+    /// bounded stderr ring can be observed in smoke tests.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4096))]
+    stderr_lines: Option<u32>,
 }
 
 fn main() -> Result<()> {
@@ -59,6 +63,11 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "--memory-pressure-after and --memory-pressure-mib must be supplied together"
         );
+    }
+    if let Some(count) = arguments.stderr_lines {
+        for index in 0..count {
+            eprintln!("event=renderer.stderr_line index={index}");
+        }
     }
     if arguments.ignore_term {
         // SAFETY: installing SIG_IGN for SIGTERM uses a process-global constant

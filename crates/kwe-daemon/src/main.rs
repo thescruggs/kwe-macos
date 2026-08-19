@@ -8,7 +8,7 @@ mod supervisor;
 mod workshop_cache;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufReader, Read, Write},
     os::unix::fs::{FileTypeExt, PermissionsExt},
@@ -21,7 +21,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
-use kwe_input_protocol::PointerPhase;
+use kwe_input_protocol::{AudioFrame, MediaState, PointerButton, PointerPhase};
 use playlist_session::{
     ImportPlaylist, PlaylistSessionConfig, PlaylistSessionHandle, PlaylistSessionService,
     SessionError,
@@ -29,8 +29,8 @@ use playlist_session::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supervisor::{
-    RendererResourceLimits, StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService,
-    TestFault, WorkerStatus,
+    ContentSpec, RendererKind, RendererResourceLimits, StartSpec, SupervisorConfig,
+    SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
 };
 use workshop_cache::WorkshopCache;
 
@@ -55,9 +55,18 @@ struct Arguments {
     /// Exit after handling one connection (integration-test helper).
     #[arg(long)]
     once: bool,
-    /// Generated renderer executable supervised by this alpha daemon.
+    /// Test renderer executable supervised by this daemon.
     #[arg(long)]
     renderer: Option<PathBuf>,
+    /// Video renderer executable (default: kwe-video-renderer beside the daemon).
+    #[arg(long)]
+    renderer_video: Option<PathBuf>,
+    /// Web renderer executable (default: kwe-web-renderer beside the daemon).
+    #[arg(long)]
+    renderer_web: Option<PathBuf>,
+    /// Scene renderer executable (default: kwe-scene-renderer beside the daemon).
+    #[arg(long)]
+    renderer_scene: Option<PathBuf>,
     /// Private directory for ephemeral renderer frame files.
     #[arg(long)]
     renderer_runtime_dir: Option<PathBuf>,
@@ -66,6 +75,12 @@ struct Arguments {
     state_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 3000, value_parser = clap::value_parser!(u64).range(100..=30000))]
     renderer_startup_timeout_ms: u64,
+    /// Video renderers get more time than the test pattern needs.
+    #[arg(long, default_value_t = 6000, value_parser = clap::value_parser!(u64).range(100..=30000))]
+    renderer_video_startup_timeout_ms: u64,
+    /// Chromium needs the most: cold start plus first screenshot.
+    #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u64).range(100..=30000))]
+    renderer_web_startup_timeout_ms: u64,
     #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(100..=30000))]
     renderer_frame_timeout_ms: u64,
     #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(20..=5000))]
@@ -86,6 +101,13 @@ struct Arguments {
     /// Maximum file descriptors available to each renderer.
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(32..=4096))]
     renderer_open_files: u64,
+    /// Web renderers reserve a 4 GiB virtual cage for V8 before main; the
+    /// global RLIMIT_AS default would kill Chromium at exec.
+    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(256..=65536))]
+    renderer_web_address_space_mib: u64,
+    /// Chromium needs more descriptors than the test renderer.
+    #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(32..=4096))]
+    renderer_web_open_files: u64,
     /// UID-scoped process ceiling inherited by each renderer.
     #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(64..=32768))]
     renderer_processes: u64,
@@ -138,7 +160,33 @@ fn main() -> Result<()> {
     } else {
         arguments.steam_roots
     };
-    let renderer_path = arguments.renderer.unwrap_or(default_renderer_path()?);
+    let default_paths = default_renderer_paths()?;
+    let renderer_paths = BTreeMap::from([
+        (
+            RendererKind::Test,
+            arguments
+                .renderer
+                .unwrap_or_else(|| default_paths[&RendererKind::Test].clone()),
+        ),
+        (
+            RendererKind::Video,
+            arguments
+                .renderer_video
+                .unwrap_or_else(|| default_paths[&RendererKind::Video].clone()),
+        ),
+        (
+            RendererKind::Web,
+            arguments
+                .renderer_web
+                .unwrap_or_else(|| default_paths[&RendererKind::Web].clone()),
+        ),
+        (
+            RendererKind::Scene,
+            arguments
+                .renderer_scene
+                .unwrap_or_else(|| default_paths[&RendererKind::Scene].clone()),
+        ),
+    ]);
     let renderer_runtime_dir = arguments
         .renderer_runtime_dir
         .unwrap_or_else(|| socket.parent().unwrap_or(Path::new(".")).join("renderers"));
@@ -147,24 +195,47 @@ fn main() -> Result<()> {
         None => default_state_dir()?,
     };
     let playlist_state_dir = state_dir.clone();
+    let startup_timeout_ms_by_kind = BTreeMap::from([
+        (RendererKind::Test, arguments.renderer_startup_timeout_ms),
+        (
+            RendererKind::Video,
+            arguments.renderer_video_startup_timeout_ms,
+        ),
+        (RendererKind::Web, arguments.renderer_web_startup_timeout_ms),
+        (RendererKind::Scene, arguments.renderer_startup_timeout_ms),
+    ]);
+    let global_limits = RendererResourceLimits {
+        address_space_mib: arguments.renderer_address_space_mib,
+        file_size_mib: 160,
+        open_files: arguments.renderer_open_files,
+        processes: arguments.renderer_processes,
+        core_dump_bytes: 0,
+    };
+    let resource_limits_by_kind = BTreeMap::from([
+        (RendererKind::Test, global_limits),
+        (RendererKind::Video, global_limits),
+        (
+            RendererKind::Web,
+            RendererResourceLimits {
+                address_space_mib: arguments.renderer_web_address_space_mib,
+                open_files: arguments.renderer_web_open_files,
+                ..global_limits
+            },
+        ),
+        (RendererKind::Scene, global_limits),
+    ]);
     let supervisor_service = SupervisorService::start(SupervisorConfig {
-        renderer_path,
+        renderer_paths,
         runtime_dir: renderer_runtime_dir,
         state_dir,
-        startup_timeout: Duration::from_millis(arguments.renderer_startup_timeout_ms),
+        startup_timeout_ms_by_kind,
         frame_timeout: Duration::from_millis(arguments.renderer_frame_timeout_ms),
         stop_grace: Duration::from_millis(arguments.renderer_stop_grace_ms),
         restart_delay: Duration::from_millis(arguments.renderer_restart_delay_ms),
         canary_duration: Duration::from_millis(arguments.renderer_canary_ms),
         handoff_timeout: Duration::from_millis(arguments.renderer_handoff_timeout_ms),
         max_failures: arguments.renderer_max_failures,
-        resource_limits: RendererResourceLimits {
-            address_space_mib: arguments.renderer_address_space_mib,
-            file_size_mib: 160,
-            open_files: arguments.renderer_open_files,
-            processes: arguments.renderer_processes,
-            core_dump_bytes: 0,
-        },
+        resource_limits_by_kind,
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -448,8 +519,60 @@ fn process_request(
             "renderer.input" => {
                 match serde_json::from_value::<RendererInputParams>(request.params.clone()) {
                     Ok(params) => supervisor_call(supervisor, |handle| {
-                        handle.pointer_input(params.generation, params.phase, params.x, params.y)
+                        handle.pointer_input(
+                            params.generation,
+                            params.phase,
+                            params.x,
+                            params.y,
+                            params.button,
+                        )
                     }),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "audio.forward" => {
+                match serde_json::from_value::<AudioForwardParams>(request.params.clone()) {
+                    Ok(params) => {
+                        // The protocol constructor enforces 16/32/64 matching
+                        // bands with finite values in 0..=1.
+                        match AudioFrame::new(
+                            params.generation,
+                            params.frame.left,
+                            params.frame.right,
+                        ) {
+                            Ok(frame) => supervisor_call(supervisor, |handle| {
+                                handle.audio_frame(params.generation, frame)
+                            }),
+                            Err(error) => {
+                                json!({"error": "invalid_params", "detail": error.to_string()})
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "media.state" => {
+                match serde_json::from_value::<MediaStateParams>(request.params.clone()) {
+                    Ok(params) => match MediaState::new(
+                        params.generation,
+                        &params.playback,
+                        params.title,
+                        params.artist,
+                        params.album,
+                        params.position_seconds,
+                        params.duration_seconds,
+                    ) {
+                        Ok(state) => supervisor_call(supervisor, |handle| {
+                            handle.media_state(params.generation, state)
+                        }),
+                        Err(error) => {
+                            json!({"error": "invalid_params", "detail": error.to_string()})
+                        }
+                    },
                     Err(error) => {
                         json!({"error": "invalid_params", "detail": error.to_string()})
                     }
@@ -458,10 +581,15 @@ fn process_request(
             "renderer.start" | "renderer.retry" => {
                 let parsed = serde_json::from_value::<RendererStartParams>(request.params.clone());
                 match parsed {
-                    Ok(params) if params.test_fault.is_some() && !allow_test_faults => json!({
-                        "error": "test_faults_disabled",
-                        "detail": "restart the daemon with --allow-test-faults for synthetic testing"
-                    }),
+                    Ok(params)
+                        if (params.test_fault.is_some() || params.stderr_lines.is_some())
+                            && !allow_test_faults =>
+                    {
+                        json!({
+                            "error": "test_faults_disabled",
+                            "detail": "restart the daemon with --allow-test-faults for synthetic testing"
+                        })
+                    }
                     Ok(params) => match StartSpec::try_from(params) {
                         Ok(spec) if request.method == "renderer.retry" => {
                             supervisor_call(supervisor, |handle| handle.retry(spec))
@@ -494,8 +622,13 @@ struct RendererStartParams {
     height: u32,
     #[serde(default = "default_fps")]
     fps: u32,
+    #[serde(default = "default_kind")]
+    kind: RendererKind,
+    /// Content path required for video/web/scene; rejected for test.
+    content: Option<std::path::PathBuf>,
     test_fault: Option<TestFaultParams>,
-    scene_path: Option<std::path::PathBuf>,
+    /// Development-only: ask the test renderer for this many stderr lines.
+    stderr_lines: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -519,6 +652,33 @@ struct RendererInputParams {
     phase: PointerPhase,
     x: f64,
     y: f64,
+    button: Option<PointerButton>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioForwardParams {
+    generation: u64,
+    frame: AudioFrameParams,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioFrameParams {
+    left: Vec<f32>,
+    right: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MediaStateParams {
+    generation: u64,
+    playback: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    position_seconds: Option<f64>,
+    duration_seconds: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -570,14 +730,26 @@ impl TryFrom<RendererStartParams> for StartSpec {
                 _ => bail!("unknown synthetic fault kind"),
             }),
         };
+        let content = match (params.kind, params.content) {
+            (RendererKind::Test, None) => None,
+            (RendererKind::Video, Some(path)) => Some(ContentSpec::Video { path }),
+            (RendererKind::Web, Some(path)) => Some(ContentSpec::Web { root: path }),
+            (RendererKind::Scene, Some(path)) => Some(ContentSpec::Scene { path }),
+            _ => bail!(
+                "renderer kind {} requires a content path (test takes none)",
+                params.kind.as_str()
+            ),
+        };
         let spec = Self {
             wallpaper_id: params.wallpaper_id,
             content_hash: params.content_hash,
             width: params.width,
             height: params.height,
             fps: params.fps,
+            kind: params.kind,
+            content,
             test_fault,
-            scene_path: params.scene_path,
+            stderr_lines: params.stderr_lines,
         };
         spec.validate()?;
         Ok(spec)
@@ -658,18 +830,30 @@ const fn default_fps() -> u32 {
     30
 }
 
+const fn default_kind() -> RendererKind {
+    RendererKind::Test
+}
+
 fn default_socket_path() -> Result<PathBuf> {
     let runtime =
         std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set; pass --socket")?;
     Ok(PathBuf::from(runtime).join("kwe/daemon-v1.sock"))
 }
 
-fn default_renderer_path() -> Result<PathBuf> {
+/// Default per-kind renderer binaries beside the daemon executable. Absent
+/// binaries are tolerated at startup; requesting that kind fails closed at
+/// spawn time instead of launching the wrong renderer.
+fn default_renderer_paths() -> Result<BTreeMap<RendererKind, PathBuf>> {
     let executable = std::env::current_exe().context("resolve daemon executable")?;
     let directory = executable
         .parent()
         .context("daemon executable has no parent")?;
-    Ok(directory.join("kwe-test-renderer"))
+    Ok(BTreeMap::from([
+        (RendererKind::Test, directory.join("kwe-test-renderer")),
+        (RendererKind::Video, directory.join("kwe-video-renderer")),
+        (RendererKind::Web, directory.join("kwe-web-renderer")),
+        (RendererKind::Scene, directory.join("kwe-scene-renderer")),
+    ]))
 }
 
 fn default_state_dir() -> Result<PathBuf> {
@@ -1007,6 +1191,109 @@ mod tests {
         assert!(
             format!("{error}").contains("without a newline"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn renderer_start_rejects_unknown_kind_and_kind_content_mismatches() {
+        let catalog = empty_catalog();
+        // Unknown kind string.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"bogus"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Video without a content path.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"video"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Test kind with a content path.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"test","content":"/tmp/kwe-any.mp4"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Video content path that does not exist fails the path-level check.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"video","content":"/nonexistent/kwe-m1a-video.mp4"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Web content without a preflightable index.html is rejected.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"web","content":"/nonexistent/kwe-m1a-web"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+    }
+
+    #[test]
+    fn audio_and_media_rpc_validate_via_the_protocol_types() {
+        let catalog = empty_catalog();
+        // Bad band count fails inside AudioFrame::new.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"audio.forward","params":{"generation":1,"frame":{"left":[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],"right":[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]}}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Well-formed frame parses and reaches the supervisor boundary.
+        let bands = serde_json::json!({"left": vec![0.5_f32; 64], "right": vec![0.5_f32; 64]});
+        let request_json = format!(
+            r#"{{"version":1,"method":"audio.forward","params":{{"generation":1,"frame":{bands}}}}}"#
+        );
+        let (ok, result) = process(&request_json, &catalog, None);
+        assert!(!ok);
+        assert_eq!(result["error"], "supervisor_unavailable");
+        // Out-of-range timeline fails inside MediaState::new.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"media.state","params":{"generation":1,"playback":"playing","position_seconds":-1}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Valid media state parses and reaches the supervisor boundary.
+        let (ok, result) = process(
+            r#"{"version":1,"method":"media.state","params":{"generation":1,"playback":"paused","title":"Track"}}"#,
+            &catalog,
+            None,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "supervisor_unavailable");
+    }
+
+    #[test]
+    fn media_state_encoding_round_trips_through_the_protocol_type() {
+        let state = MediaState::new(
+            7,
+            "playing",
+            Some("Track".into()),
+            Some("Artist".into()),
+            None,
+            Some(12.5),
+            Some(240.0),
+        )
+        .unwrap();
+        assert_eq!(
+            kwe_input_protocol::decode_media_state(
+                &kwe_input_protocol::encode_media_state(&state).unwrap()
+            )
+            .unwrap(),
+            state
         );
     }
 }

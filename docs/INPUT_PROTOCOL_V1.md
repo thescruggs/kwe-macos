@@ -9,7 +9,11 @@ transport remains renderer-to-display, while input is display-to-renderer and
 has different backpressure semantics.
 
 The current slice implements only capability `runtime.pointer-position`.
-Buttons, scrolling, touch, long press, drag, and keyboard input are absent.
+Scrolling, touch, long press, drag, and keyboard input are absent.
+*(BETA_M1a: the pointer `button` field passes through to the wire
+`button_event`, and `audio_bands` / `media_state` gained a daemon-side
+producer/forwarder — see below — while the renderer-side consumers arrive
+with the video/web/scene binaries.)*
 
 ## Display-to-daemon request
 
@@ -54,7 +58,29 @@ The renderer acknowledges observation on its reserved control stdout:
 The daemon reads at most 4096 acknowledgement bytes per supervisor tick, keeps
 at most 1024 unterminated bytes, rejects unknown fields/types/versions, and
 accepts only monotonic acknowledgements no newer than the latest sent event.
-Renderer stderr remains discarded and cannot enter this control stream.
+Renderer stderr is piped into a bounded daemon-side ring (64 lines / 16 KiB,
+drained nonblocking) and surfaced in `renderer.status`; it is diagnostics only
+and cannot enter this control stream.
+
+## Audio and media control
+
+*(BETA_M1a: daemon-side producers/forwarders on the same control pipe.)*
+
+The supervisor writes the versioned `audio_bands` and `media_state` wire types
+(see `docs/SUPERVISOR_API_V1.md` for the daemon API that feeds them) through
+the same nonblocking, latest-wins path as pointer input — one pending frame
+per stream, replaced rather than queued under backpressure, never parsed as
+commands. Renderers that cannot handle a message type ignore it at the framing
+boundary.
+
+```json
+{"version":1,"type":"audio_bands","sequence":4,"left":[0.1,0.2],"right":[0.1,0.2]}
+{"version":1,"type":"media_state","sequence":4,"playback":"paused","title":"Track"}
+```
+
+The wire `sequence` carries the display generation the state was captured
+under; the supervisor rejects stale generations before writing, exactly like
+pointer input.
 
 ## Display behavior
 
