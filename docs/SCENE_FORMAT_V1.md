@@ -51,8 +51,93 @@ before the canary, so the supervisor records `exit_code_73` and rolls back.
 | `general.fps` | finite float in `(0.0, 240.0]` (optional) | none | Same: parsed and validated, non-binding hint; a mismatch is logged (`event=renderer.scene.fps`), not an error. The pacing always comes from the daemon's `--fps`. |
 | `general.script` | string (optional) | none | A path **relative to the scene.json's directory** (file scenes) or **an entry path inside the package** (pkg scenes, M3b). File scenes: resolved against the canonicalized content root so symlinks cannot escape it; must end in `.js` (a `.pkg` reference is rejected — the archive itself is only consumable through the M3b reader), must exist, be a regular file, and be at most **2 MiB** (`MAX_SCRIPT_BYTES`). Pkg scenes: see "scene.pkg" below. |
 
-Anything else in `general` or at the root is ignored (future slices: layers,
-effects, properties). Unknown top-level structure never fails the parse.
+Anything else in `general` or at the root is ignored (future slices:
+effects, properties — image layers are M3c). Unknown top-level structure
+never fails the parse.
+
+## Image layers (M3c)
+
+`objects` is an array of layer objects drawn in **scene.json order** — the
+compositor's draw order: the layer listed last draws on top, src-over
+blending (blend modes are M3d). An object is an image layer exactly when
+it carries an `image` field; everything else (particles, audio, text —
+M3d+) is ignored. A reference ending in `.json` is a model instance under
+the WE solid-model architecture — **all 685 corpus image references point
+at model `.json` files** — and is skipped without a diagnostic, not
+counted toward the layer cap, until models arrive (M3h). At most
+**256 image layers** (`MAX_LAYERS`); a scene with 257 is a Shape
+rejection (exit 73, "over the 256 layer cap").
+
+```json
+{
+  "general": {"clearcolor": [0, 0, 0, 1], "resolution": [160, 90], "fps": 30},
+  "objects": [
+    {"name": "bg", "image": "textures/red.png",
+     "origin": [0, 0], "size": [160, 90], "alpha": 1.0, "visible": true},
+    {"name": "mark", "image": "textures/blue.png",
+     "origin": [60, 34], "size": [40, 22]}
+  ]
+}
+```
+
+| Field | Type | Default | Meaning in M3c |
+|---|---|---|---|
+| `name` | string, **required** | — | the layer's name for `Scene.getLayer(name)`; a missing or non-string name rejects the layer entry |
+| `image` | string | none | the image reference (see "Image sources" below); a non-string value makes the object inert (skipped, not rejected) |
+| `origin` | `[x, y]` (2 or 3 entries) | `[0, 0]` | the layer's **center** in scene units (WE alignment "center", the default); scene (0,0) is the frame center, +y down; z is unused by 2D rendering |
+| `angles` | `[rx, ry, rz]` (2 or 3 entries) | `[0, 0, 0]` | **radians in the file**, converted to degrees at parse (the script API speaks degrees); corpus-verified: exact π, none at 90/180 |
+| `scale` | `[sx, sy]` (2 or 3 entries) | `[1, 1]` | relative scale about the origin; negative values mirror |
+| `size` | `[w, h]` (exactly 2 entries) | `[0, 0]` | the size in scene units the texture is drawn at; `[0, 0]` (absent) takes the decoded texture's own dimensions at load |
+| `alpha` | float in `0.0..=1.0` | `1.0` | straight layer alpha; out-of-range or non-finite rejects the scene (like clearcolor) |
+| `visible` | boolean | `true` | an invisible layer draws nothing |
+| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key (all observed occurrences). Only `0` (normal) renders in M3c — a non-zero mode draws src-over with a bounded one-time note (`event=renderer.scene.blend_mode`) until M3d; a non-numeric value is tolerated (src-over), never a rejection. Corpus: 432 of 685 image-bearing objects carry it — 410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 — the rest omit it |
+
+Property-wrapped values (`{"user": ..., "value": ...}` — how the editor
+serializes user-bindable fields; **46% of alpha and 43% of visible fields**
+in the 60-scene corpus) are unwrapped to their initial `value`; the
+wrapper's user binding is M3j, and a wrapped scalar without a `value`
+rejects like any malformed scalar.
+
+The transform model: a layer is a rectangle of `size` scene units centered
+on `origin`, drawn as two fan-ordered triangles (one unit quad, 6
+vertices of pos+uv — `TRIANGLE_LIST` primitives (v0,v1,v2) and (v0,v2,v3)
+tile the full quad). Per layer:
+`world = R(θz)·diag(scale·size)·pos + origin` for `pos ∈ [-0.5, 0.5]²` —
+rotation and scale happen about the origin, in that order; the z-angle
+rotates 2D layers (radians in the file, degrees in the API). The
+compositor pushes 48 bytes per layer: m0 = (a, c, tx, 0),
+m1 = (b, d, ty, alpha), viewport = (w, h, 0, 0), with
+`world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)` and the fragment shader
+multiplying the texture's alpha by the layer alpha. Blending is src-over:
+color SRC_ALPHA / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA —
+the source alpha is never scaled by itself (a 191/255 layer over an
+opaque destination stays 191/255, not 143/255). The readback
+premultiplies (see Output). The model math is byte-tested: identity
+exact, quarter-turn axis mapping, corner positions for known inputs.
+
+## Image sources (M3c)
+
+- **File scenes**: the reference is resolved against the canonicalized
+  scene directory (symlink-escape-validated, exactly like scripts):
+  relative with no `..`/absolute components, a regular file, at most
+  `MAX_TEXTURE_SOURCE_BYTES` (64 MiB).
+- **Pkg scenes**: the reference names a package entry (`kwe_core::image_entry`,
+  exact path match, case-sensitive), read through the bounded reader;
+  the host file system is never touched.
+
+A missing, escaping, unreadable, or over-budget image **skips its layer**
+with a bounded one-time diagnostic (`event=renderer.scene.layer_skip
+layer=...`) — never the scene: the renderer stays healthy and the other
+layers render. The same skip covers undecodable files and the total
+texture budget.
+
+Decoding (the `image` crate — see THIRD_PARTY.yml): PNG and JPEG always,
+WebP when the crate builds with its webp feature. Bounds (textures.rs):
+dimension ≤ 8192, pixels ≤ 16,777,216, decoded ≤ 64 MiB per texture,
+source ≤ 64 MiB per texture, ≤ 256 MiB total across layers. Decoded
+textures are RGBA8, uploaded as R8G8B8A8_UNORM (identity channel order —
+the M3a readback lesson) with a shared linear clamp-to-edge sampler and a
+per-layer descriptor set (pool capped at 256 sets).
 
 ## scene.pkg
 
@@ -236,9 +321,12 @@ image compositing in M3a.
 
 | API | Status | Notes |
 |---|---|---|
-| layers, effects, text, particles, 3D models, properties | *planned* (M3c–M3k) | the parse tolerates extra keys but renders none of them |
-| `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; textures/models are M3c+ |
-| image assets | *planned* | no asset loading in M3a; the clear pass is the only draw |
+| `Scene.getLayer(name \| index)` | **implemented (M3c)** | returns the `Layer` proxy for a registered image layer, or `null` for an unknown name/index (never throws); layers are registered in `objects` order |
+| `Scene.getLayerCount()` | **implemented (M3c)** | the number of registered image layers |
+| `SceneLayer` (`Layer`) | **implemented (M3c)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). Writes are clamped like `Engine.clearcolor`: non-finite → 0, alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
+| effects, text, particles, 3D models, properties | *planned* (M3d–M3k) | the parse tolerates extra keys but renders none of them |
+| `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
+| image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
 | audio/pointer/media input in script | *planned* | the worker receives and acks the wire inputs (M1a plumbing, unchanged) but exposes none of them to the script in M3a |
 
 ## Output
@@ -255,8 +343,8 @@ identity for `B8G8R8A8` readback (bytes are already B,G,R,A) and a
 
 ## See also
 
-- docs/BETA_M3.md — the M3a slice: goal, acceptance evidence, exit codes,
-  open risks (interrupt-budget deviation, llvmpipe determinism, reader
-  staleness, loader lifetime).
+- docs/BETA_M3.md — the M3a..M3c slices: goal, acceptance evidence, exit
+  codes, open risks (interrupt-budget deviation, llvmpipe determinism,
+  reader staleness, loader lifetime).
 - docs/adr/0001-original-vulkan-renderer.md — the architecture this slice
   implements (ADR 0001 is binding).

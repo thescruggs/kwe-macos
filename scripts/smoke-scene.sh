@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Supervised SceneScript smoke suite (BETA_M3a).
+# Supervised SceneScript smoke suite (BETA_M3a..M3c).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. The
-# scene.json + script.js fixtures are generated at runtime and never
-# committed, and the SceneScript engine is exercised end-to-end: the frame
-# oracle proves update() drives rendering (the clear color is scripted, not
-# the scene.json default), a throwing script stays contained, and a final
-# standalone llvmpipe lane runs the worker directly under the software
-# rasterizer with --device llvmpipe (docs/BETA_M3.md).
+# scene.json + script.js fixtures (and the M3c solid-PNG images) are
+# generated at runtime and never committed, and the SceneScript engine is
+# exercised end-to-end: the frame oracle proves update() drives rendering
+# (the clear color is scripted, not the scene.json default), a throwing
+# script stays contained, and a final standalone llvmpipe lane runs the
+# worker directly under the software rasterizer with --device llvmpipe
+# (docs/BETA_M3.md). The M3c cases (a)-(f) exercise the compositor with
+# pixel oracles: two-layer composites, the src-over blend math, draw order,
+# missing-image skips, the 256-layer cap, and script-driven layer
+# transforms via Scene.getLayer.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -613,6 +617,252 @@ oom_rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.pid' <<<"$oom_rollback_status")" == "$base_pid" ]]
 kill -0 "$base_pid"
 echo "scene smoke passed: real QuickJS heap-cap OOM -> exit 71 -> rolled_back with resource_limit"
+
+# ---------------------------------------------------------------------------
+# M3c: 2D image layers (BETA_M3c) — cases (a)-(f). The M3c fixtures are
+# solid PNGs generated at runtime; the compositor stretches each texture
+# over its layer quad. Scene coordinates map to frame pixels as scene
+# (0,0) = frame CENTER (the WE origin semantics; the daemon lane renders
+# 160x90, so scene (x,y) is frame pixel (80 + x, 45 + y)). A layer's
+# `origin` is its CENTER (WE alignment "center", the default), so a layer
+# at origin (60,34) with size (40,22) spans scene x in [40,100],
+# y in [23,45]. The pixel oracle reads an arbitrary frame pixel through
+# the same stable even-generation snapshot as the clear-color oracle.
+m3c_red="$smoke_root/m3c-red.png"
+m3c_blue="$smoke_root/m3c-blue.png"
+m3c_blend="$smoke_root/m3c-blend.png"
+m3c_ab_scene="$smoke_root/m3c-ab.json"
+m3c_b_scene="$smoke_root/m3c-b.json"
+m3c_c_scene="$smoke_root/m3c-c.json"
+m3c_d_scene="$smoke_root/m3c-d.json"
+m3c_e_scene="$smoke_root/m3c-e.json"
+m3c_f_scene="$smoke_root/m3c-f.json"
+m3c_f_script="$smoke_root/m3c-f.js"
+python3 - "$m3c_red" "$m3c_blue" "$m3c_blend" "$m3c_ab_scene" "$m3c_b_scene" "$m3c_c_scene" "$m3c_d_scene" "$m3c_e_scene" "$m3c_f_scene" "$m3c_f_script" <<'PY'
+import json
+import struct
+import sys
+import zlib
+
+
+def png_solid(r, g, b, a=255):
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0)  # 8x8, color type 6 (RGBA)
+    raw = b"".join(b"\x00" + bytes((r, g, b, a)) * 8 for _ in range(8))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+red, blue, blend = sys.argv[1], sys.argv[2], sys.argv[3]
+open(red, "wb").write(png_solid(255, 0, 0))
+open(blue, "wb").write(png_solid(0, 0, 255))
+open(blend, "wb").write(png_solid(64, 103, 142))
+
+
+def scene(objects, clear=(0.0, 0.0, 0.0, 1.0), script=None):
+    general = {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30}
+    if script is not None:
+        general["script"] = script
+    return {"general": general, "objects": objects}
+
+
+bg = {"name": "bg", "image": "m3c-red.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 1.0, "visible": True}
+mark = {"name": "mark", "image": "m3c-blue.png", "origin": [60.0, 34.0], "size": [40.0, 22.0], "alpha": 1.0, "visible": True}
+# (a): bg under mark. (b): a single fullscreen blend texel over a fully
+# transparent black clear — dst contributes nothing, so the delivered pixel
+# is exactly the layer's src-over at alpha 191/255, premultiplied at
+# readback. (c): same geometry as (a) with mark FIRST — the fullscreen bg
+# draws last and covers it. (d): a layer whose image is missing. (e): 257
+# image layers, over the 256 cap. (f): the script moves the mark (origin
+# AND size) via Scene.getLayer in init().
+json.dump(scene([bg, mark]), open(sys.argv[4], "w"))
+json.dump(
+    scene(
+        [{"name": "blend", "image": "m3c-blend.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 191.0 / 255.0}],
+        clear=(0.0, 0.0, 0.0, 0.0),
+    ),
+    open(sys.argv[5], "w"),
+)
+json.dump(scene([mark, bg]), open(sys.argv[6], "w"))
+json.dump(
+    scene([bg, {"name": "broken", "image": "no-such-file.png", "origin": [0.0, 0.0], "size": [10.0, 10.0]}]),
+    open(sys.argv[7], "w"),
+)
+json.dump(
+    scene([{"name": "l%d" % i, "image": "m3c-red.png", "origin": [0.0, 0.0], "size": [10.0, 10.0]} for i in range(257)]),
+    open(sys.argv[8], "w"),
+)
+json.dump(
+    scene(
+        [bg, {"name": "mark", "image": "m3c-blue.png", "origin": [10.0, 10.0], "size": [60.0, 33.0]}],
+        script="m3c-f.js",
+    ),
+    open(sys.argv[9], "w"),
+)
+open(sys.argv[10], "w").write(
+    "function init() {\n"
+    "  var mark = Scene.getLayer(\"mark\");\n"
+    "  if (mark === null) throw new Error(\"layer not registered\");\n"
+    "  mark.origin.x = 60; mark.origin.y = 34;\n"
+    "  mark.size.x = 40; mark.size.y = 22;\n"
+    "}\n"
+)
+PY
+echo "scene smoke: M3c fixtures generated"
+
+# Frame pixel oracle for the shared frame file: like scene_oracle, but for
+# one arbitrary pixel against an expected BGRA value with a tolerance
+# (driver float rounding). Reads whole, stable even generation.
+scene_pixel_oracle() {
+    local frame_file="$1"
+    local x="$2"
+    local y="$3"
+    local expected="$4"
+    local tolerance="$5"
+    python3 - "$frame_file" "$x" "$y" "$expected" "$tolerance" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+x, y = int(sys.argv[2]), int(sys.argv[3])
+expected = tuple(int(v) for v in sys.argv[4].split(","))
+tol = int(sys.argv[5])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue  # publish in progress; retry
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue  # writer advanced mid-read; retry
+        i = y * header["stride"] + x * 4
+        return tuple(pixels[i : i + 4])
+    sys.exit("frame generation never stabilized")
+
+
+got = snapshot()
+if max(abs(g - e) for g, e in zip(got, expected)) > tol:
+    sys.exit(
+        "pixel (%d,%d) = BGRa %s, expected %s (tolerance %d)"
+        % (x, y, ",".join(map(str, got)), ",".join(map(str, expected)), tol)
+    )
+print("ORACLE-OK pixel (%d,%d) = %s" % (x, y, ",".join(map(str, got))))
+PY
+}
+
+# Case M3c-a: two image layers — a red fullscreen under a blue 40x22 layer
+# centered at scene (60,34) (frame (140,79)). Samples: (10,10) -> (90,55)
+# red (outside the mark's [40,100]x[23,45] rect); (60,34) and (70,40) blue.
+call_daemon renderer.start "$(jq -cn --arg content "$m3c_ab_scene" \
+    '{wallpaper_id:"scene-m3c-a",content_hash:"hash-m3c-a",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3c_a_status="$(wait_phase live)"
+m3c_a_frame="$(jq -r '.result.frame_file' <<<"$m3c_a_status")"
+scene_pixel_oracle "$m3c_a_frame" 90 55 "0,0,255,255" 1
+scene_pixel_oracle "$m3c_a_frame" 140 79 "255,0,0,255" 1
+scene_pixel_oracle "$m3c_a_frame" 150 85 "255,0,0,255" 1
+echo "scene smoke passed (M3c a): two layers — fullscreen red under blue 40x22 at (60,34)"
+
+# Case M3c-b: the src-over blend oracle. Opaque texel (64,103,142,255) at
+# layer alpha 191/255 over a zero clear: the blend scales the straight
+# source by the fragment alpha — stored (48,77,106,191) — and the readback
+# premultiplies: R=48*191/255=36, G=77*191/255=58, B=106*191/255=79. The
+# alpha channel blend factor is ONE (not SRC_ALPHA), so the stored alpha is
+# 191, not 143.
+call_daemon renderer.start "$(jq -cn --arg content "$m3c_b_scene" \
+    '{wallpaper_id:"scene-m3c-b",content_hash:"hash-m3c-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3c_b_status="$(wait_phase live)"
+m3c_b_frame="$(jq -r '.result.frame_file' <<<"$m3c_b_status")"
+scene_pixel_oracle "$m3c_b_frame" 80 45 "79,58,36,191" 1
+echo "scene smoke passed (M3c b): src-over blend — alpha 191/255 over zero clear -> (79,58,36,191)"
+
+# Case M3c-c: draw order — the same two layers with the blue mark FIRST in
+# scene.json: the fullscreen red layer draws last, so (60,34) is red now.
+call_daemon renderer.start "$(jq -cn --arg content "$m3c_c_scene" \
+    '{wallpaper_id:"scene-m3c-c",content_hash:"hash-m3c-c",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3c_c_status="$(wait_phase live)"
+m3c_c_frame="$(jq -r '.result.frame_file' <<<"$m3c_c_status")"
+scene_pixel_oracle "$m3c_c_frame" 140 79 "0,0,255,255" 1
+echo "scene smoke passed (M3c c): draw order — scene.json order, later layers on top"
+
+# Case M3c-d: a missing image skips its layer, never the scene: the daemon
+# stays live, the valid layer renders, and the bounded one-time diagnostic
+# names the layer.
+call_daemon renderer.start "$(jq -cn --arg content "$m3c_d_scene" \
+    '{wallpaper_id:"scene-m3c-d",content_hash:"hash-m3c-d",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3c_d_status="$(wait_phase live)"
+m3c_d_frame="$(jq -r '.result.frame_file' <<<"$m3c_d_status")"
+scene_pixel_oracle "$m3c_d_frame" 90 55 "0,0,255,255" 1
+m3c_d_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$m3c_d_status")"
+[[ "$m3c_d_tail" == *"event=renderer.scene.layer_skip layer=broken"* ]]
+echo "scene smoke passed (M3c d): missing image -> layer skipped, scene live, diagnostic bounded"
+
+# Case M3c-e: 257 image layers are over the 256-layer cap — the worker
+# rejects the scene before the canary (exit 73), the daemon rolls back to
+# the active base worker, and the failure detail names the cap.
+m3c_e_params="$(jq -cn --arg content "$m3c_e_scene" \
+    '{wallpaper_id:"scene-m3c-e",content_hash:"hash-m3c-e",width:160,height:90,fps:30,kind:"scene",content:$content}')"
+call_daemon renderer.start "$m3c_e_params" >/dev/null
+m3c_e_status="$(wait_phase rolled_back)"
+[[ "$(jq -r '.result.last_failure' <<<"$m3c_e_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$m3c_e_status")" == *"exit_code_73"* ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$m3c_e_status")" == *"over the 256 layer cap"* ]]
+[[ "$(jq -r '.result.pid' <<<"$m3c_e_status")" == "$(jq -r '.result.pid' <<<"$m3c_d_status")" ]]
+kill -0 "$(jq -r '.result.pid' <<<"$m3c_e_status")"
+echo "scene smoke passed (M3c e): 257 layers -> worker exit 73 -> rolled_back with the layer cap"
+
+# Case M3c-f: the SceneScript layer API — init() moves the blue layer via
+# Scene.getLayer("mark"), changing origin AND size: the file places it at
+# (10,10) with size 60x33 ([−20,40]x[−6.5,26.5] in scene units); the script
+# re-centers it at (60,34) with size 40x22 ([40,100]x[23,45]). Samples:
+# (60,34) -> (140,79) blue (the scripted center); (78,40) -> (158,85) blue
+# (inside the scripted rect, outside the file rect); (10,10) -> (90,55) red
+# (inside the file rect — the script moved the layer away from it).
+call_daemon renderer.start "$(jq -cn --arg content "$m3c_f_scene" \
+    '{wallpaper_id:"scene-m3c-f",content_hash:"hash-m3c-f",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3c_f_status="$(wait_phase live)"
+m3c_f_frame="$(jq -r '.result.frame_file' <<<"$m3c_f_status")"
+scene_pixel_oracle "$m3c_f_frame" 140 79 "255,0,0,255" 1
+scene_pixel_oracle "$m3c_f_frame" 158 85 "255,0,0,255" 1
+scene_pixel_oracle "$m3c_f_frame" 90 55 "0,0,255,255" 1
+echo "scene smoke passed (M3c f): Scene.getLayer proxy — init() moved origin and size"
 
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null

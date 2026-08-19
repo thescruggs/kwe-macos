@@ -675,6 +675,44 @@ pub fn scene_json_entry(entries: &[PkgEntry]) -> Result<usize, String> {
     }
 }
 
+/// The entry-resolution core shared by `script_entry` and `image_entry`:
+/// relative, no `..`/backslash/NUL/absolute path, matching either the
+/// literal path or the entry's tail after a `/` (case-insensitive), exactly
+/// one match. Entry paths were already validated at package open (no `..`,
+/// no absolute paths), so resolution can never leave the table; the
+/// diagnostic strings exist for the caller's error message, not for safety.
+fn resolve_pkg_entry(reference: &str, entries: &[PkgEntry], what: &str) -> Result<usize, String> {
+    if reference.starts_with('/')
+        || reference.contains('\\')
+        || reference.contains('\0')
+        || reference.split('/').any(|component| component == "..")
+    {
+        return Err(format!(
+            "scene {what} \"{reference}\" must stay inside the package"
+        ));
+    }
+    let needle = reference.to_ascii_lowercase();
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let path = entry.path.to_ascii_lowercase();
+            path == needle || path.ends_with(&format!("/{needle}"))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "scene {what} \"{reference}\" is not an entry of the package"
+        )),
+        [idx] => Ok(*idx),
+        _ => Err(format!(
+            "scene {what} \"{reference}\" matches {} package entries; exactly one is required",
+            matches.len()
+        )),
+    }
+}
+
 /// Resolve a `general.script` reference against the package entry table.
 /// Rules (shared with the renderer and preflight): relative, `.js`, no
 /// `..`/backslash/NUL/absolute path, matching either the literal path or
@@ -694,35 +732,21 @@ pub fn script_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, Stri
             "scene script must be a .js file, got \"{reference}\""
         ));
     }
-    if reference.starts_with('/')
-        || reference.contains('\\')
-        || reference.contains('\0')
-        || reference.split('/').any(|component| component == "..")
-    {
-        return Err(format!(
-            "scene script \"{reference}\" must stay inside the package"
-        ));
+    resolve_pkg_entry(reference, entries, "script")
+}
+
+/// Resolve a layer `image` reference against the package entry table (M3c).
+/// The same rule as `script_entry` minus the extension requirements: a
+/// relative reference, no `..`/backslash/NUL/absolute path, matching either
+/// the literal path or the entry's tail after a `/` (case-insensitive),
+/// exactly one match. The image's format is decided by the renderer's
+/// decoder (png/jpeg/webp); a reference naming a non-image entry resolves
+/// fine here and is skipped at decode.
+pub fn image_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, String> {
+    if reference.is_empty() {
+        return Err("scene layer image reference must not be empty".into());
     }
-    let needle = reference.to_ascii_lowercase();
-    let matches: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            let path = entry.path.to_ascii_lowercase();
-            path == needle || path.ends_with(&format!("/{needle}"))
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-    match matches.as_slice() {
-        [] => Err(format!(
-            "scene script \"{reference}\" is not an entry of the package"
-        )),
-        [idx] => Ok(*idx),
-        _ => Err(format!(
-            "scene script \"{reference}\" matches {} package entries; exactly one is required",
-            matches.len()
-        )),
-    }
+    resolve_pkg_entry(reference, entries, "image")
 }
 
 /// Extract the `general.script` string from scene.json bytes, if any.
@@ -1396,5 +1420,86 @@ mod tests {
             error.message
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // ---- image_entry (M3c) ----
+
+    /// Entries for the image_entry tests: two textures in different
+    /// directories and one nested copy.
+    fn image_entries() -> Vec<PkgEntry> {
+        vec![
+            PkgEntry {
+                path: "textures/red.png".into(),
+                offset: 0,
+                size: 4,
+                compressed: false,
+            },
+            PkgEntry {
+                path: "textures/blue.jpg".into(),
+                offset: 4,
+                size: 4,
+                compressed: false,
+            },
+            PkgEntry {
+                path: "scenes/main/red.png".into(),
+                offset: 8,
+                size: 4,
+                compressed: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn image_entry_matches_literal_and_tail() {
+        let entries = image_entries();
+        // Literal path.
+        let idx = image_entry("textures/red.png", &entries).unwrap();
+        assert_eq!(entries[idx].path, "textures/red.png");
+        // Tail-after-slash (the WE pkg convention the script resolver
+        // already uses), case-insensitive.
+        let idx = image_entry("textures/RED.PNG", &entries).unwrap();
+        assert_eq!(entries[idx].path, "textures/red.png");
+        // Case-insensitive extension on a literal path.
+        let idx = image_entry("textures/blue.JPG", &entries).unwrap();
+        assert_eq!(entries[idx].path, "textures/blue.jpg");
+    }
+
+    #[test]
+    fn image_entry_rejects_missing_empty_and_ambiguous() {
+        let entries = image_entries();
+        let error = image_entry("textures/missing.png", &entries).unwrap_err();
+        assert!(error.contains("is not an entry of the package"), "{error}");
+        let error = image_entry("", &entries).unwrap_err();
+        assert!(error.contains("must not be empty"), "{error}");
+        // "red.png" matches two entries by tail — ambiguity is a failure,
+        // exactly like the script resolver.
+        let error = image_entry("red.png", &entries).unwrap_err();
+        assert!(error.contains("matches 2 package entries"), "{error}");
+    }
+
+    #[test]
+    fn image_entry_rejects_hostile_references() {
+        let entries = image_entries();
+        for hostile in ["../red.png", "/etc/red.png", "a\\b.png", "nul\0byte.png"] {
+            let error = image_entry(hostile, &entries).unwrap_err();
+            assert!(
+                error.contains("must stay inside the package"),
+                "{hostile:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_entry_needs_no_extension_restriction() {
+        // Unlike the script resolver, images carry no extension policy —
+        // the renderer's decoder decides png/jpeg/webp from the bytes.
+        let entries = vec![PkgEntry {
+            path: "tex/weird.tex".into(),
+            offset: 0,
+            size: 4,
+            compressed: false,
+        }];
+        let idx = image_entry("weird.tex", &entries).unwrap();
+        assert_eq!(entries[idx].path, "tex/weird.tex");
     }
 }

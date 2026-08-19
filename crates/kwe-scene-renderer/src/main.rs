@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// kwe-scene-renderer: the M3a SceneScript worker (original implementation,
-// ADR 0001). The daemon spawns it as:
+// kwe-scene-renderer: the M3a..M3c SceneScript worker (original
+// implementation, ADR 0001). The daemon spawns it as:
 //
 //   kwe-scene-renderer --output <frame> --width W --height H --fps N \
 //       --content <scene.json> [fault flags]
@@ -12,21 +12,31 @@
 // device unusable, or a sustained render failure streak).
 //
 // Every frame: update(dt) runs under the 8 ms/33 ms budget (src/js.rs), the
-// script's Engine.clearcolor is read back, an offscreen Vulkan clear renders
-// that color (src/vulkan.rs), and the readback is published premultiplied
-// BGRA. Script exceptions never kill the renderer; a soft-timeout frame is
-// skipped by re-publishing the last pixels (the supervisor only watches
-// sequence progression).
+// script's Engine.clearcolor is read back, the per-frame layer draw list is
+// built from the script-mutated layer states (src/layers.rs), an offscreen
+// Vulkan compositor clears to that color and draws the layers in scene.json
+// order (src/vulkan.rs), and the readback is published premultiplied BGRA.
+// M3c added 2D image layers: the scene's image references are resolved
+// (relative to the content root, or through the package entry table for
+// scene.pkg), decoded with bounded limits (src/textures.rs), and uploaded
+// before the first render; a missing or over-budget image skips its layer
+// with a bounded one-time diagnostic, never the scene. Script exceptions
+// never kill the renderer; a soft-timeout frame is skipped by re-publishing
+// the last pixels (the supervisor only watches sequence progression).
 
 mod js;
+mod layers;
 mod scene;
+mod textures;
 mod vulkan;
 
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::exit;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,8 +49,10 @@ use kwe_input_protocol::{
 };
 
 use js::{EngineStartError, ScriptEngine, StepResult};
-use scene::{SceneConfig, SceneError};
-use vulkan::{ClearRenderer, RenderError};
+use layers::{LayerState, frame_draws};
+use scene::{SceneConfig, SceneError, read_bounded};
+use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
+use vulkan::{LayerRenderer, RenderError};
 
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
@@ -333,7 +345,13 @@ struct SceneWorker {
     writer: SharedFrameWriter,
     input: InputChannel,
     engine: ScriptEngine,
-    renderer: ClearRenderer,
+    renderer: LayerRenderer,
+    /// The script-visible layer states, index-aligned with the scene's
+    /// `objects` array and with `texture_ok`.
+    layers: Vec<Rc<RefCell<LayerState>>>,
+    /// Per layer: whether its texture uploaded (or it has no image at all —
+    /// a model/particle object). frame_draws skips false entries.
+    texture_ok: Vec<bool>,
     published: u64,
     consecutive_render_failures: u64,
 }
@@ -390,7 +408,8 @@ impl SceneWorker {
         // canary must pass regardless of script health. An initial render
         // failure means the compositor cannot produce frames at all: that
         // is a backend rejection (exit 73), not an internal error.
-        let initial = match self.renderer.render(self.engine.clear_color()) {
+        let draws = frame_draws(&self.layers, &self.texture_ok);
+        let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
             Ok(pixels) => pixels,
             Err(error) => reject_render(&error, "initial render failure"),
         };
@@ -423,7 +442,11 @@ impl SceneWorker {
                     let StepResult::NewFrame(color) = step else {
                         unreachable!("publish_decision matched NewFrame");
                     };
-                    match self.renderer.render(color) {
+                    // The draw list is rebuilt per frame: the script may
+                    // have mutated layer alpha, position, size, visibility,
+                    // or rotation since the last step.
+                    let draws = frame_draws(&self.layers, &self.texture_ok);
+                    match self.renderer.render(color, &draws) {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
                             // Exact-size check: the conversion is exact by
                             // construction; a mismatch means a malformed
@@ -495,7 +518,7 @@ impl SceneWorker {
 // ---------------------------------------------------------------------------
 
 fn print_probe_report(arguments: &Arguments) {
-    let report = match ClearRenderer::probe(arguments.device.as_deref()) {
+    let report = match LayerRenderer::probe(arguments.device.as_deref()) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("event=renderer.probe.failed detail={error}");
@@ -579,24 +602,32 @@ fn main() -> Result<()> {
     };
 
     // 4. Vulkan compositor: an unusable backend is a rejection.
-    let renderer = match ClearRenderer::new(arguments.device.as_deref(), spec.width, spec.height) {
-        Ok(renderer) => renderer,
-        Err(RenderError::Vulkan(message)) => {
-            eprintln!("event=renderer.scene.backend_reject detail={message}");
-            eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
-            exit(EXIT_BACKEND_REJECT);
-        }
-        // Defensive: `new` performs no fence waits today, but a setup path
-        // that ever does must reject the backend instead of inventing a
-        // recovery (fence waits happen at the initial render below too).
-        Err(RenderError::FenceTimeout) => {
-            eprintln!(
-                "event=renderer.scene.backend_reject detail=fence timeout during device setup"
-            );
-            eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
-            exit(EXIT_BACKEND_REJECT);
-        }
-    };
+    let mut renderer =
+        match LayerRenderer::new(arguments.device.as_deref(), spec.width, spec.height) {
+            Ok(renderer) => renderer,
+            Err(RenderError::Vulkan(message)) => {
+                eprintln!("event=renderer.scene.backend_reject detail={message}");
+                eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+                exit(EXIT_BACKEND_REJECT);
+            }
+            // Defensive: `new` performs no fence waits today, but a setup path
+            // that ever does must reject the backend instead of inventing a
+            // recovery (fence waits happen at the initial render below too).
+            Err(RenderError::FenceTimeout) => {
+                eprintln!(
+                    "event=renderer.scene.backend_reject detail=fence timeout during device setup"
+                );
+                eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+                exit(EXIT_BACKEND_REJECT);
+            }
+        };
+
+    // 5. Layer textures: upload every decoded layer texture before the first
+    //    render (all uploads share the startup fence, which is waited to
+    //    completion per upload). A failed upload skips the layer with a
+    //    bounded one-time diagnostic — the renderer stays healthy.
+    let layers = engine.layers();
+    let texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
 
     let mut worker = SceneWorker {
         arguments,
@@ -605,6 +636,8 @@ fn main() -> Result<()> {
         input,
         engine,
         renderer,
+        layers,
+        texture_ok,
         published: 0,
         consecutive_render_failures: 0,
     };
@@ -625,7 +658,7 @@ fn reject_render(error: &RenderError, detail: &str) -> ! {
 }
 
 /// Load the scene descriptor: a plain scene.json (M3a) or a scene.pkg
-/// archive (M3b).
+/// archive (M3b), then resolve and decode its layer images (M3c).
 ///
 /// Packaged scenes are opened and validated by kwe-core's PkgReader, the
 /// unique `scene.json` entry (exact basename, case-insensitive, at most
@@ -637,18 +670,32 @@ fn reject_render(error: &RenderError, detail: &str) -> ! {
 /// removes the directory on its graceful exit path (cleanup_script_dir);
 /// a stale directory left by a hard kill is replaced by extract_script's
 /// pid-recycle retry, so a restarted worker with a recycled pid never
-/// bounces on AlreadyExists. Textures and other assets are M3c+ and are
-/// deliberately not extracted.
+/// bounces on AlreadyExists.
+///
+/// M3c: after parsing, every image layer's reference is resolved against
+/// the same root the script uses — the canonicalized content directory
+/// (file scenes) or the package entry table (pkg scenes) — then decoded
+/// with bounded limits (textures.rs). A missing, escaping, unreadable, or
+/// over-budget image skips its layer with a bounded one-time diagnostic;
+/// only the descriptor and script problems above reject the scene.
 fn load_scene(content: &Path) -> SceneConfig {
     let is_pkg = content
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("pkg"));
     if !is_pkg {
-        return match SceneConfig::parse(content) {
+        let mut config = match SceneConfig::parse(content) {
             Ok(config) => config,
             Err(error) => reject_scene(&error),
         };
+        let root = match scene::canonical_root(content) {
+            Ok(root) => root,
+            Err(error) => reject_scene(&error),
+        };
+        load_layer_textures(&mut config.layers, |reference| {
+            resolve_layer_image(&root, reference)
+        });
+        return config;
     }
 
     let reader = match kwe_core::PkgReader::open(content) {
@@ -680,12 +727,151 @@ fn load_scene(content: &Path) -> SceneConfig {
         };
         config.script_path = Some(extracted);
     }
+    // Image references resolve against the package entry table, never the
+    // host file system; entries were already validated at package open.
+    load_layer_textures(&mut config.layers, |reference| {
+        let index = kwe_core::image_entry(reference, reader.entries())?;
+        reader
+            .read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
+            .map_err(|error| format!("cannot read entry: {error}"))
+    });
     eprintln!(
         "event=renderer.scene.pkg entries={} script_entry={}",
         reader.entries().len(),
         config.script_entry.is_some()
     );
     config
+}
+
+/// Resolve one layer's image reference against the content root (file
+/// scenes): relative, no `..`/absolute components, canonicalized inside the
+/// root (so symlinks cannot smuggle the image out), a regular file, at most
+/// MAX_TEXTURE_SOURCE_BYTES. Mirrors resolve_script's checks, but a failure
+/// is a `Err(detail)` the caller logs once and skips the layer over — an
+/// image problem never rejects the scene.
+fn resolve_layer_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> {
+    if reference.is_empty() {
+        return Err("image reference must not be empty".into());
+    }
+    let joined = Path::new(reference);
+    if joined.is_absolute() {
+        return Err(format!(
+            "image \"{reference}\" must be relative to the scene directory"
+        ));
+    }
+    for component in joined.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(format!(
+                "image \"{reference}\" must stay inside the scene directory"
+            ));
+        }
+    }
+    let candidate = root.join(joined);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("image \"{reference}\" is missing or unreadable: {error}"))?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "image \"{reference}\" resolves outside the scene directory"
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(format!("image \"{reference}\" is not a regular file"));
+    }
+    read_bounded(&canonical, MAX_TEXTURE_SOURCE_BYTES)
+        .map_err(|error| format!("read image \"{reference}\": {}", error.message))
+}
+
+/// Fill `layers[*].texture` for every image layer: resolve the
+/// reference (the caller's closure is lane-specific — file system or
+/// package), decode within the bounded limits, and account the decoded
+/// bytes against the total texture budget. A layer whose image is absent
+/// (non-string `image` field), unresolved, undecodable, or over budget is
+/// skipped with a bounded one-time diagnostic and stays registered but
+/// textureless; a layer with `size` [0, 0] takes the texture's decoded
+/// dimensions (WE semantics: absent size = the image's own size), so the
+/// script's init() always sees the real size. Non-normal blend modes are
+/// noted once per layer (src-over until M3d).
+fn load_layer_textures(
+    layers: &mut [scene::LayerSpec],
+    mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
+) {
+    let mut used_bytes: u64 = 0;
+    for layer in layers {
+        let Some(reference) = layer.image.as_deref() else {
+            continue; // no image reference (model/particle objects or a
+            // non-string image field): nothing to load
+        };
+        if layer.blend_mode != 0 {
+            eprintln!(
+                "event=renderer.scene.blend_mode layer={} mode={} note=src-over-until-M3d",
+                layer.name, layer.blend_mode
+            );
+        }
+        let bytes = match resolve(reference) {
+            Ok(bytes) => bytes,
+            Err(detail) => {
+                eprintln!(
+                    "event=renderer.scene.layer_skip layer={} detail={detail}",
+                    layer.name
+                );
+                continue;
+            }
+        };
+        let Some(texture) = decode_texture(&bytes) else {
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={} detail=undecodable-or-over-budget",
+                layer.name
+            );
+            continue;
+        };
+        let pixels = u64::from(texture.width) * u64::from(texture.height);
+        if !texture_budget_allows(used_bytes, texture.width, texture.height) {
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={} detail=total-texture-budget",
+                layer.name
+            );
+            continue;
+        }
+        used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
+        if layer.size == [0.0, 0.0] {
+            layer.size = [texture.width as f32, texture.height as f32];
+        }
+        layer.texture = Some(texture);
+    }
+}
+
+/// Upload the decoded layer textures into the compositor. Index-aligned
+/// with `config.layers` and `engine.layers()` (the scene's `objects`
+/// order). Returns the per-layer `texture_ok` table frame_draws consults:
+/// true when the layer uploaded or has no image at all, false when a decode
+/// or upload failed (the layer then draws nothing; the renderer stays
+/// healthy). Upload failures are bounded one-time diagnostics.
+fn upload_layer_textures(
+    renderer: &mut LayerRenderer,
+    config_layers: &[scene::LayerSpec],
+    layers: &[Rc<RefCell<LayerState>>],
+) -> Vec<bool> {
+    let mut texture_ok = vec![true; layers.len()];
+    for (index, layer) in config_layers.iter().enumerate() {
+        let Some(texture) = &layer.texture else {
+            continue; // skipped at load or no image reference
+        };
+        match renderer.upload_layer(index, &texture.rgba, texture.width, texture.height) {
+            Ok(()) => {}
+            Err(error) => {
+                texture_ok[index] = false;
+                eprintln!(
+                    "event=renderer.scene.layer_skip layer={} detail=upload-failed: {error}",
+                    layer.name
+                );
+            }
+        }
+    }
+    texture_ok
 }
 
 /// Write a script entry into a private 0700 directory under the worker's
@@ -877,5 +1063,156 @@ mod tests {
         assert!(foreign.exists(), "foreign dirs must not be touched");
         cleanup_script_dir(None);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ---- M3c: layer image resolution and loading ----
+
+    /// A tiny decodable RGBA png (2×2, red at the first pixel), via the
+    /// image crate encoder — the fixtures and the decoder agree by
+    /// construction.
+    fn tiny_png() -> Vec<u8> {
+        let rgba = image::RgbaImage::from_raw(
+            2,
+            2,
+            vec![255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// An image layer with every field at its default, `image` optional.
+    fn layer(name: &str, image: Option<&str>) -> scene::LayerSpec {
+        scene::LayerSpec {
+            name: name.into(),
+            image: image.map(Into::into),
+            origin: [0.0, 0.0],
+            angles: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0],
+            size: [0.0, 0.0],
+            alpha: 1.0,
+            visible: true,
+            blend_mode: 0,
+            texture: None,
+        }
+    }
+
+    #[test]
+    fn resolve_layer_image_confines_to_the_content_root() {
+        // The file lane's resolution must match the script resolver's
+        // confinement: relative paths only, no `..`, nothing a symlink can
+        // smuggle out of the root, regular files only.
+        let root = std::env::temp_dir().join(format!("kwe-image-root-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("kwe-image-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("textures")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("textures").join("red.png"), tiny_png()).unwrap();
+        fs::write(outside.join("secret.png"), tiny_png()).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("secret.png"),
+            root.join("textures").join("link.png"),
+        )
+        .unwrap();
+
+        // Relative and inside the root: resolves and reads the bytes.
+        let bytes = resolve_layer_image(&root, "textures/red.png").expect("inside root");
+        assert_eq!(bytes, tiny_png());
+        // Absolute, parent-directory, symlink-escape, missing, directory,
+        // and empty references are all refused.
+        assert!(resolve_layer_image(&root, "/etc/passwd").is_err());
+        assert!(resolve_layer_image(&root, "../outside/secret.png").is_err());
+        assert!(resolve_layer_image(&root, "textures/link.png").is_err());
+        assert!(resolve_layer_image(&root, "textures/missing.png").is_err());
+        assert!(resolve_layer_image(&root, "textures").is_err());
+        assert!(resolve_layer_image(&root, "").is_err());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn load_layer_textures_resolves_decodes_and_fills_size() {
+        // The file lane, through a real closure: a decodable texture fills
+        // `texture` and (when `size` is absent) the decoded dimensions; a
+        // missing image and a layer without an image reference stay
+        // textureless — the layer is skipped, never the scene.
+        let root = std::env::temp_dir().join(format!("kwe-layer-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("red.png"), tiny_png()).unwrap();
+        let mut layers = vec![
+            layer("a", Some("red.png")),
+            layer("b", Some("missing.png")),
+            layer("c", None),
+        ];
+        layers[0].size = [0.0, 0.0]; // absent size
+        load_layer_textures(&mut layers, |reference| {
+            resolve_layer_image(&root, reference)
+        });
+        let a = layers[0].texture.as_ref().expect("a decodes");
+        assert_eq!((a.width, a.height), (2, 2));
+        assert_eq!(&a.rgba[0..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            layers[0].size,
+            [2.0, 2.0],
+            "absent size takes the texture's decoded dimensions"
+        );
+        assert!(layers[1].texture.is_none(), "missing image skips the layer");
+        assert!(
+            layers[2].texture.is_none(),
+            "no image reference stays textureless"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_layer_textures_keeps_explicit_size() {
+        let mut layers = vec![layer("a", Some("red.png"))];
+        layers[0].size = [100.0, 50.0];
+        load_layer_textures(&mut layers, |_| Ok(tiny_png()));
+        assert_eq!(
+            layers[0].size,
+            [100.0, 50.0],
+            "an explicit size is never overwritten by the texture"
+        );
+        assert!(layers[0].texture.is_some());
+    }
+
+    #[test]
+    fn load_layer_textures_pkg_lane_contract_and_undecodable_skip() {
+        // The closure is lane-agnostic: this one simulates the pkg entry
+        // table (a `kwe_core::image_entry`-shaped resolver: literal or tail
+        // match, everything else an Err), which is what the pkg lane feeds
+        // in. Undecodable bytes skip the layer.
+        let mut layers = vec![
+            layer("pkg", Some("textures/red.png")),
+            layer("junk", Some("textures/junk.png")),
+        ];
+        let mut calls = 0;
+        load_layer_textures(&mut layers, |reference| {
+            calls += 1;
+            match reference {
+                "textures/red.png" => Ok(tiny_png()),
+                "textures/junk.png" => Ok(b"not an image".to_vec()),
+                other => Err(format!("{other} is not an entry of the package")),
+            }
+        });
+        assert_eq!(calls, 2, "every image reference is resolved exactly once");
+        assert!(
+            layers[0].texture.is_some(),
+            "the pkg lane decodes through the same path"
+        );
+        assert!(
+            layers[1].texture.is_none(),
+            "undecodable bytes skip the layer"
+        );
     }
 }

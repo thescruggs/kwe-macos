@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
-// Original offscreen Vulkan compositor for the M3a slice (ADR 0001).
+// Original offscreen Vulkan compositor for the M3a..M3c slices (ADR 0001).
 //
 // No window, no swapchain, no extensions: a Vulkan 1.2 instance, the first
 // physical device with a graphics queue (--device filters by name substring,
 // discrete GPUs preferred, llvmpipe works for the test lane), and a W x H
-// COLOR_OPTIMAL image that is cleared every frame by a fullscreen triangle
-// whose fragment color comes from a push constant. The result is copied
-// image->buffer, mapped, converted to the frame protocol's premultiplied
-// BGRA, and handed to the caller for SharedFrameWriter::publish.
+// COLOR_OPTIMAL image that is cleared every frame. The M3c slice replaced
+// the M3a fullscreen-triangle clear pass with a textured-quad pipeline: one
+// unit-quad vertex buffer (6 verts of pos+uv as two fan-ordered triangles), a per-layer combined image
+// sampler from a bounded per-layer descriptor set pool (at most MAX_LAYERS
+// layers, each its own set), and 48 bytes of push constants per draw —
+// m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha), viewport = (w, h, 0, 0) —
+// so world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z) with alpha carried to
+// the fragment shader (see layers.rs for the model math and
+// docs/SCENE_FORMAT_V1.md for the format). Layers draw in scene.json order
+// with src-over blending (the pipeline's blend state; M3d brings blend
+// modes). The clear is a CLEAR_VALUE, not a draw.
+//
+// Textures are R8G8B8A8_UNORM (RGBA8, identity channel order — the M3a
+// readback lesson), sampled with a linear clamp-to-edge sampler. Uploads
+// go through a per-upload host-visible staging buffer + one-shot transfer
+// command buffer, waited to completion before the texture is used; each
+// upload is bounded (textures.rs caps) and a failed upload skips the layer
+// without touching the renderer's health.
 //
 // Format: B8G8R8A8_UNORM when the device supports COLOR_ATTACHMENT +
 // TRANSFER_SRC in optimal tiling (the common case, and what the protocol
@@ -29,6 +43,8 @@ use std::fmt;
 
 use ash::vk;
 use ash::{Device, Entry, Instance};
+
+use crate::layers::{LayerDraw, MAX_LAYERS};
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
 /// backend failure by the caller.
@@ -120,9 +136,21 @@ pub struct ProbeReport {
     pub format: String,
 }
 
-pub struct ClearRenderer {
+/// One uploaded layer texture: the sampled image plus its view. The
+/// descriptor set referencing it lives in `descriptor_sets`.
+struct LayerTexture {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
+pub struct LayerRenderer {
     instance: Instance,
     device: Device,
+    /// The picked physical device; kept for memory allocation decisions
+    /// (uploads allocate per-layer, so the probe results must outlive
+    /// `new_with`).
+    physical: vk::PhysicalDevice,
     queue: vk::Queue,
     format: vk::Format,
     image: vk::Image,
@@ -138,8 +166,25 @@ pub struct ClearRenderer {
     pipeline: vk::Pipeline,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
+    /// Unit quad: 6 × (pos vec2, uv vec2) — see UNIT_QUAD.
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
+    /// Linear clamp-to-edge sampler shared by every layer texture.
+    sampler: vk::Sampler,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    /// Bounded pool: at most MAX_LAYERS sets of one combined image sampler.
+    descriptor_pool: vk::DescriptorPool,
+    /// One descriptor set per layer index; None until the layer uploaded.
+    descriptor_sets: Vec<Option<vk::DescriptorSet>>,
+    /// Uploaded textures per layer index; None = skipped at load or failed
+    /// upload.
+    textures: Vec<Option<LayerTexture>>,
     command_pool: vk::CommandPool,
+    /// Per-frame command buffer.
     command_buffer: vk::CommandBuffer,
+    /// One-shot upload command buffer (uploads complete before any render
+    /// submits, so the single fence serializes them).
+    upload_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     width: u32,
     height: u32,
@@ -153,7 +198,7 @@ pub struct ClearRenderer {
     _entry: Entry,
 }
 
-impl ClearRenderer {
+impl LayerRenderer {
     pub fn new(device_filter: Option<&str>, width: u32, height: u32) -> Result<Self, RenderError> {
         // SAFETY: loading the Vulkan loader functions is safe as long as the
         // returned entry is used only to call Vulkan functions, which is all
@@ -265,7 +310,9 @@ impl ClearRenderer {
             });
         let image_view = unsafe { device.create_image_view(&image_view_info, None) }?;
 
-        // Host-visible staging buffer for the readback.
+        // Host-visible staging buffer for the readback. Requiring
+        // HOST_VISIBLE here (no empty-flags fallback) is the point: a
+        // non-host-visible type would fail at map time, mid-frame.
         let buffer_size = width as usize * height as usize * 4;
         let buffer_info = vk::BufferCreateInfo::default()
             .size(buffer_size as vk::DeviceSize)
@@ -273,13 +320,8 @@ impl ClearRenderer {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
         let buffer_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
-        let buffer_memory = allocate(
-            &instance,
-            &device,
-            physical,
-            &buffer_requirements,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
+        let buffer_memory =
+            allocate_host_visible(&instance, &device, physical, &buffer_requirements)?;
         unsafe { device.bind_buffer_memory(buffer, buffer_memory, 0) }?;
         let mapped = unsafe {
             device.map_memory(
@@ -339,14 +381,83 @@ impl ClearRenderer {
             .layers(1);
         let framebuffer = unsafe { device.create_framebuffer(&framebuffer_info, None) }?;
 
-        let vertex_module = shader_module(&device, FULLSCREEN_SPIRV)?;
-        let fragment_module = shader_module(&device, SOLID_SPIRV)?;
+        let vertex_module = shader_module(&device, QUAD_SPIRV)?;
+        let fragment_module = shader_module(&device, TEXTURE_SPIRV)?;
 
+        // The unit quad (pos + uv). The uv origin is the image's top-left
+        // corner (row 0 = the top of the picture), which in scene space
+        // (+y down) is the smaller y — so v=0 sits at pos.y = -0.5 and the
+        // image renders upright, not mirrored. The buffer size and map range
+        // are the BYTE count (64): UNIT_QUAD.len() is the f32 element count
+        // (16), and an element/byte mix-up made the buffer 16 bytes — the
+        // GPU's read of vertices 2..4 ran out of bounds and nothing
+        // rasterized (found via the isolated_draw probe).
+        let vertex_bytes = (UNIT_QUAD.len() * std::mem::size_of::<f32>()) as vk::DeviceSize;
+        let vertex_info = vk::BufferCreateInfo::default()
+            .size(vertex_bytes)
+            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let vertex_buffer = unsafe { device.create_buffer(&vertex_info, None) }?;
+        let vertex_requirements = unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
+        let vertex_buffer_memory =
+            allocate_host_visible(&instance, &device, physical, &vertex_requirements)?;
+        unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0) }?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                UNIT_QUAD.as_ptr(),
+                device
+                    .map_memory(
+                        vertex_buffer_memory,
+                        0,
+                        vertex_bytes,
+                        vk::MemoryMapFlags::empty(),
+                    )?
+                    .cast::<f32>(),
+                UNIT_QUAD.len(),
+            );
+            device.unmap_memory(vertex_buffer_memory);
+        }
+
+        // One linear clamp-to-edge sampler for every layer texture.
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .max_lod(0.25); // single mip level: the LOD clamps to 0
+        let sampler = unsafe { device.create_sampler(&sampler_info, None) }?;
+
+        // Per-layer descriptor sets: at most MAX_LAYERS, one combined image
+        // sampler each (the bounded table the draw list indexes into).
+        let set_layout_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(std::slice::from_ref(&set_layout_binding));
+        let descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }?;
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(MAX_LAYERS as u32);
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(MAX_LAYERS as u32)
+            .pool_sizes(std::slice::from_ref(&pool_size));
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
+
+        // 48 bytes of per-draw push constants shared by both stages:
+        //   m0 = (a, c, tx, 0)          column 0 + translate x
+        //   m1 = (b, d, ty, alpha)      column 1 + translate y + alpha
+        //   viewport = (w, h, 0, 0)     scene size in pixels
         let push_constant = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(16);
+            .size(48);
         let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant));
         let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None) }?;
 
@@ -361,7 +472,25 @@ impl ClearRenderer {
                 .module(fragment_module)
                 .name(c"main"),
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(16)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(8),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding))
+            .vertex_attribute_descriptions(&attributes);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport = vk::Viewport::default()
@@ -386,8 +515,22 @@ impl ClearRenderer {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        // src-over blending: the M3c default (blend modes are M3d). The
+        // blend runs on the fragment's float alpha (the layer alpha from
+        // the push constants), which is what the smoke oracle computes
+        // against. Color uses SRC_ALPHA / ONE_MINUS_SRC_ALPHA (straight
+        // source); the ALPHA channel uses ONE / ONE_MINUS_SRC_ALPHA —
+        // scaling the source alpha by itself (SRC_ALPHA) would double-scale
+        // it (a 191/255 layer over an opaque dst would land at 143/255
+        // instead of staying opaque). The readback premultiplies.
         let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(false)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
@@ -423,14 +566,17 @@ impl ClearRenderer {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info) }?[0];
+            .command_buffer_count(2);
+        let buffers = unsafe { device.allocate_command_buffers(&alloc_info) }?;
+        let command_buffer = buffers[0];
+        let upload_buffer = buffers[1];
 
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
 
         Ok(Self {
             instance,
             device,
+            physical,
             queue,
             format,
             image,
@@ -446,8 +592,16 @@ impl ClearRenderer {
             pipeline,
             vertex_module,
             fragment_module,
+            vertex_buffer,
+            vertex_buffer_memory,
+            sampler,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets: Vec::new(),
+            textures: Vec::new(),
             command_pool,
             command_buffer,
+            upload_buffer,
             fence,
             width,
             height,
@@ -457,10 +611,265 @@ impl ClearRenderer {
         })
     }
 
-    /// Clear the attachment with `color` (straight RGBA), read the pixels
-    /// back, and return them premultiplied BGRA. In-flight 1: a single fence
-    /// is waited on before the next submit.
-    pub fn render(&mut self, color: [f32; 4]) -> Result<Vec<u8>, RenderError> {
+    /// Upload one layer's RGBA8 texture (R8G8B8A8_UNORM — identity channel
+    /// order) into a device-local sampled image and bind its descriptor set.
+    /// Bounded by the caller (textures.rs caps: ≤ 64 MiB, ≤ 8192², ≤ 16.7M
+    /// pixels); a failed upload returns an error and the caller skips the
+    /// layer — the renderer stays healthy. The staging buffer is
+    /// host-visible and per-upload; the single fence is waited to
+    /// completion before the texture is used, and no render submits are in
+    /// flight during startup uploads, so sharing it is safe.
+    pub fn upload_layer(
+        &mut self,
+        index: usize,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        if index >= MAX_LAYERS {
+            return Err(RenderError::Vulkan(format!(
+                "layer index {index} beyond the {MAX_LAYERS} layer cap"
+            )));
+        }
+        let expected = width as usize * height as usize * 4;
+        if rgba.len() != expected {
+            return Err(RenderError::Vulkan(format!(
+                "texture byte count {} does not match {width}x{height} RGBA8",
+                rgba.len()
+            )));
+        }
+
+        // Build + upload; every handle created here is tracked so a failure
+        // cleans up and the caller skips the layer (the staging buffer is
+        // freed on the success path only — on the error path the renderer
+        // is being torn down or the layer skipped, so the bounded leak is
+        // acceptable and documented).
+        let mut image: Option<vk::Image> = None;
+        let mut image_memory: Option<vk::DeviceMemory> = None;
+        let mut view: Option<vk::ImageView> = None;
+        let mut set: Option<vk::DescriptorSet> = None;
+        let outcome = (|| -> Result<(), RenderError> {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let created = unsafe { self.device.create_image(&image_info, None) }?;
+            image = Some(created);
+            let requirements = unsafe { self.device.get_image_memory_requirements(created) };
+            let memory = allocate(
+                &self.instance,
+                &self.device,
+                self.physical,
+                &requirements,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            image_memory = Some(memory);
+            unsafe { self.device.bind_image_memory(created, memory, 0) }?;
+
+            // Staging: host-visible, copied, then freed after the fence.
+            let staging_info = vk::BufferCreateInfo::default()
+                .size(rgba.len() as vk::DeviceSize)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let staging = unsafe { self.device.create_buffer(&staging_info, None) }?;
+            let staging_requirements =
+                unsafe { self.device.get_buffer_memory_requirements(staging) };
+            let staging_memory = allocate_host_visible(
+                &self.instance,
+                &self.device,
+                self.physical,
+                &staging_requirements,
+            )?;
+            unsafe { self.device.bind_buffer_memory(staging, staging_memory, 0) }?;
+            let staging_map = unsafe {
+                self.device.map_memory(
+                    staging_memory,
+                    0,
+                    rgba.len() as vk::DeviceSize,
+                    vk::MemoryMapFlags::empty(),
+                )?
+            }
+            .cast::<u8>();
+            unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), staging_map, rgba.len()) };
+
+            unsafe { self.device.reset_fences(&[self.fence]) }?;
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            unsafe {
+                self.device
+                    .begin_command_buffer(self.upload_buffer, &begin_info)
+            }?;
+            // UNDEFINED -> TRANSFER_DST_OPTIMAL.
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(created)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    self.upload_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&to_transfer),
+                );
+            }
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            unsafe {
+                self.device.cmd_copy_buffer_to_image(
+                    self.upload_buffer,
+                    staging,
+                    created,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    std::slice::from_ref(&region),
+                );
+            }
+            // TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL.
+            let to_shader = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(created)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    self.upload_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&to_shader),
+                );
+            }
+            unsafe { self.device.end_command_buffer(self.upload_buffer) }?;
+            let submit = vk::SubmitInfo::default()
+                .command_buffers(std::slice::from_ref(&self.upload_buffer));
+            unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }?;
+            match unsafe {
+                self.device
+                    .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+            } {
+                Ok(()) => {}
+                Err(_) => return Err(RenderError::FenceTimeout),
+            }
+
+            unsafe {
+                self.device.unmap_memory(staging_memory);
+                self.device.destroy_buffer(staging, None);
+                self.device.free_memory(staging_memory, None);
+            }
+
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(created)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .components(vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                })
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            let created_view = unsafe { self.device.create_image_view(&view_info, None) }?;
+            view = Some(created_view);
+
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+            let created_set = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }?[0];
+            let image_info = vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(created_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(created_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&image_info));
+            unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+            set = Some(created_set);
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            if let Some(created_view) = view {
+                unsafe { self.device.destroy_image_view(created_view, None) };
+            }
+            if let Some(created) = image {
+                unsafe { self.device.destroy_image(created, None) };
+            }
+            if let Some(memory) = image_memory {
+                unsafe { self.device.free_memory(memory, None) };
+            }
+            return Err(error);
+        }
+        while self.textures.len() <= index {
+            self.textures.push(None);
+            self.descriptor_sets.push(None);
+        }
+        self.textures[index] = Some(LayerTexture {
+            image: image.expect("upload succeeded"),
+            memory: image_memory.expect("upload succeeded"),
+            view: view.expect("upload succeeded"),
+        });
+        self.descriptor_sets[index] = set;
+        Ok(())
+    }
+
+    /// Clear the attachment with `color` (straight RGBA), draw the given
+    /// layers in order (scene.json order, src-over blending), read the
+    /// pixels back, and return them premultiplied BGRA. In-flight 1: a
+    /// single fence is waited on before the next submit.
+    pub fn render(&mut self, clear: [f32; 4], draws: &[LayerDraw]) -> Result<Vec<u8>, RenderError> {
         unsafe { self.device.reset_fences(&[self.fence]) }?;
 
         let begin_info = vk::CommandBufferBeginInfo::default();
@@ -477,21 +886,17 @@ impl ClearRenderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline,
             );
-        }
-        let color_bytes = unsafe { std::slice::from_raw_parts(color.as_ptr().cast::<u8>(), 16) };
-        unsafe {
-            self.device.cmd_push_constants(
+            self.device.cmd_bind_vertex_buffers(
                 self.command_buffer,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
                 0,
-                color_bytes,
+                std::slice::from_ref(&self.vertex_buffer),
+                &[0],
             );
         }
 
         // ClearValue is a union in ash 0.38; only the color member is set.
-        let clear = vk::ClearValue {
-            color: vk::ClearColorValue { float32: color },
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue { float32: clear },
         };
         let render_pass_info = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass)
@@ -503,14 +908,73 @@ impl ClearRenderer {
                     height: self.height,
                 },
             })
-            .clear_values(std::slice::from_ref(&clear));
+            .clear_values(std::slice::from_ref(&clear_value));
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.command_buffer,
                 &render_pass_info,
                 vk::SubpassContents::INLINE,
             );
-            self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+        }
+        for draw in draws {
+            // A draw whose texture never uploaded (skipped at load) is
+            // silently dropped here — the draw list builder already skips
+            // it, so this is only a defense.
+            let Some(set) = self
+                .descriptor_sets
+                .get(draw.layer_index)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            // The push constant layout (shared by both stages, 48 bytes):
+            // m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha),
+            // viewport = (w, h, 0, 0) — see the vertex shader's PC block.
+            let push: [f32; 12] = [
+                draw.m[0][0],
+                draw.m[1][0],
+                draw.t[0],
+                0.0,
+                draw.m[0][1],
+                draw.m[1][1],
+                draw.t[1],
+                draw.alpha,
+                self.width as f32,
+                self.height as f32,
+                0.0,
+                0.0,
+            ];
+            let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 48) };
+            unsafe {
+                self.device.cmd_push_constants(
+                    self.command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    push_bytes,
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    std::slice::from_ref(&set),
+                    &[],
+                );
+                // The quad is two fan-ordered triangles in the vertex buffer
+                // ([v0,v1,v2, v0,v2,v3]): a 4-vertex TRIANGLE_LIST draw emits
+                // exactly one triangle and covers only half the quad, and
+                // empirically a single multi-primitive draw call rasterizes
+                // only its first primitive on both llvmpipe and NVIDIA (the
+                // second half of the quad was the original "missing
+                // triangle"). Two 3-vertex draws render both halves on both
+                // drivers, so this loop issues two draws per layer.
+                self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+                self.device.cmd_draw(self.command_buffer, 3, 1, 3, 0);
+            }
+        }
+        unsafe {
             self.device.cmd_end_render_pass(self.command_buffer);
         }
         let region = vk::BufferImageCopy::default()
@@ -558,10 +1022,8 @@ impl ClearRenderer {
         // The fence guarantees the copy finished; the mapping is host-coherent
         // so no flush is needed.
         let bytes = unsafe { std::slice::from_raw_parts(self.mapped, self.buffer_size) };
-        Ok(bgra_premultiplied(
-            bytes,
-            self.format == vk::Format::B8G8R8A8_UNORM,
-        ))
+        let out = bgra_premultiplied(bytes, self.format == vk::Format::B8G8R8A8_UNORM);
+        Ok(out)
     }
 
     /// A cheap health probe: create a minimal device and report the pick.
@@ -590,26 +1052,40 @@ impl ClearRenderer {
     }
 }
 
-impl Drop for ClearRenderer {
+impl Drop for LayerRenderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            // The descriptor pool frees the sets; the layout outlives the
+            // pool so the sets never reference a destroyed layout.
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.device.destroy_sampler(self.sampler, None);
             self.device
                 .destroy_shader_module(self.fragment_module, None);
             self.device.destroy_shader_module(self.vertex_module, None);
             self.device.destroy_framebuffer(self.framebuffer, None);
             self.device.destroy_render_pass(self.render_pass, None);
+            self.device.destroy_buffer(self.vertex_buffer, None);
+            self.device.free_memory(self.vertex_buffer_memory, None);
             self.device.unmap_memory(self.buffer_memory);
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.buffer_memory, None);
             self.device.destroy_image_view(self.image_view, None);
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.image_memory, None);
+            for texture in self.textures.iter().flatten() {
+                self.device.destroy_image_view(texture.view, None);
+                self.device.destroy_image(texture.image, None);
+                self.device.free_memory(texture.memory, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -725,78 +1201,165 @@ fn allocate(
     unsafe { device.allocate_memory(&info, None) }.map_err(Into::into)
 }
 
+/// Host-visible memory for buffers that are mapped (the readback staging and
+/// the per-upload staging). Requiring HOST_VISIBLE here — no empty-flags
+/// fallback — is the point: a non-host-visible type would only fail at map
+/// time, mid-frame. HOST_COHERENT is preferred so no flush is needed.
+fn allocate_host_visible(
+    instance: &Instance,
+    device: &Device,
+    physical: vk::PhysicalDevice,
+    requirements: &vk::MemoryRequirements,
+) -> Result<vk::DeviceMemory, RenderError> {
+    let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+    let index = find_memory_type(
+        instance,
+        physical,
+        requirements,
+        visible | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+    .or_else(|| find_memory_type(instance, physical, requirements, visible))
+    .ok_or_else(|| RenderError::Vulkan("no host-visible memory type".into()))?;
+    let info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(index);
+    unsafe { device.allocate_memory(&info, None) }.map_err(Into::into)
+}
+
 fn shader_module(device: &Device, code: &[u32]) -> Result<vk::ShaderModule, RenderError> {
     let info = vk::ShaderModuleCreateInfo::default().code(code);
     unsafe { device.create_shader_module(&info, None) }.map_err(Into::into)
 }
 
-/// The fullscreen triangle: gl_VertexIndex 0,1,2 -> (-1,-1), (3,-1), (-1,3)
-/// with matching UVs; compiled with glslangValidator -V --target-env vulkan1.2
-/// from shaders/fullscreen.vert.
+/// The M3c layer-quad vertex shader: the unit quad (pos, uv) transformed
+/// by the per-layer push-constant model matrix; compiled with
+/// glslangValidator -V --target-env vulkan1.2 from shaders/quad.vert.
 #[rustfmt::skip]
-const FULLSCREEN_SPIRV: &[u32] = &[
-    0x07230203, 0x00010500, 0x0008000B, 0x00000031, 0x00000000, 0x00020011, 0x00000001, 0x0006000B,
-    0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E, 0x00000000, 0x0003000E, 0x00000000, 0x00000001,
-    0x0008000F, 0x00000000, 0x00000004, 0x6E69616D, 0x00000000, 0x00000018, 0x0000001C, 0x00000029,
-    0x00030003, 0x00000002, 0x000001C2, 0x00040005, 0x00000004, 0x6E69616D, 0x00000000, 0x00030005,
-    0x0000000C, 0x00736F70, 0x00060005, 0x00000016, 0x505F6C67, 0x65567265, 0x78657472, 0x00000000,
-    0x00060006, 0x00000016, 0x00000000, 0x505F6C67, 0x7469736F, 0x006E6F69, 0x00070006, 0x00000016,
-    0x00000001, 0x505F6C67, 0x746E696F, 0x657A6953, 0x00000000, 0x00070006, 0x00000016, 0x00000002,
-    0x435F6C67, 0x4470696C, 0x61747369, 0x0065636E, 0x00070006, 0x00000016, 0x00000003, 0x435F6C67,
-    0x446C6C75, 0x61747369, 0x0065636E, 0x00030005, 0x00000018, 0x00000000, 0x00060005, 0x0000001C,
-    0x565F6C67, 0x65747265, 0x646E4978, 0x00007865, 0x00040005, 0x00000029, 0x76755F76, 0x00000000,
-    0x00030047, 0x00000016, 0x00000002, 0x00050048, 0x00000016, 0x00000000, 0x0000000B, 0x00000000,
-    0x00050048, 0x00000016, 0x00000001, 0x0000000B, 0x00000001, 0x00050048, 0x00000016, 0x00000002,
-    0x0000000B, 0x00000003, 0x00050048, 0x00000016, 0x00000003, 0x0000000B, 0x00000004, 0x00040047,
-    0x0000001C, 0x0000000B, 0x0000002A, 0x00040047, 0x00000029, 0x0000001E, 0x00000000, 0x00020013,
+const QUAD_SPIRV: &[u32] = &[
+    0x07230203, 0x00010500, 0x0008000b, 0x00000047, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x000a000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000023, 0x0000003c,
+    0x00000044, 0x00000045, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x00040005, 0x00000009, 0x6c726f77, 0x00000064, 0x00030005, 0x0000000b, 0x00004350,
+    0x00040006, 0x0000000b, 0x00000000, 0x0000306d, 0x00040006, 0x0000000b, 0x00000001, 0x0000316d,
+    0x00060006, 0x0000000b, 0x00000002, 0x77656976, 0x74726f70, 0x00000000, 0x00030005, 0x0000000d,
+    0x00006370, 0x00040005, 0x00000023, 0x736f5061, 0x00000000, 0x00030005, 0x0000002f, 0x0063646e,
+    0x00060005, 0x0000003a, 0x505f6c67, 0x65567265, 0x78657472, 0x00000000, 0x00060006, 0x0000003a,
+    0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006, 0x0000003a, 0x00000001, 0x505f6c67,
+    0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x0000003a, 0x00000002, 0x435f6c67, 0x4470696c,
+    0x61747369, 0x0065636e, 0x00070006, 0x0000003a, 0x00000003, 0x435f6c67, 0x446c6c75, 0x61747369,
+    0x0065636e, 0x00030005, 0x0000003c, 0x00000000, 0x00030005, 0x00000044, 0x00565576, 0x00030005,
+    0x00000045, 0x00565561, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000,
+    0x00000023, 0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x00000023, 0x00000010, 0x00050048,
+    0x0000000b, 0x00000002, 0x00000023, 0x00000020, 0x00040047, 0x00000023, 0x0000001e, 0x00000000,
+    0x00030047, 0x0000003a, 0x00000002, 0x00050048, 0x0000003a, 0x00000000, 0x0000000b, 0x00000000,
+    0x00050048, 0x0000003a, 0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000003a, 0x00000002,
+    0x0000000b, 0x00000003, 0x00050048, 0x0000003a, 0x00000003, 0x0000000b, 0x00000004, 0x00040047,
+    0x00000044, 0x0000001e, 0x00000000, 0x00040047, 0x00000045, 0x0000001e, 0x00000001, 0x00020013,
     0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
-    0x00000007, 0x00000006, 0x00000002, 0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004002B,
-    0x00000008, 0x00000009, 0x00000003, 0x0004001C, 0x0000000A, 0x00000007, 0x00000009, 0x00040020,
-    0x0000000B, 0x00000007, 0x0000000A, 0x0004002B, 0x00000006, 0x0000000D, 0xBF800000, 0x0005002C,
-    0x00000007, 0x0000000E, 0x0000000D, 0x0000000D, 0x0004002B, 0x00000006, 0x0000000F, 0x40400000,
-    0x0005002C, 0x00000007, 0x00000010, 0x0000000F, 0x0000000D, 0x0005002C, 0x00000007, 0x00000011,
-    0x0000000D, 0x0000000F, 0x0006002C, 0x0000000A, 0x00000012, 0x0000000E, 0x00000010, 0x00000011,
-    0x00040017, 0x00000013, 0x00000006, 0x00000004, 0x0004002B, 0x00000008, 0x00000014, 0x00000001,
-    0x0004001C, 0x00000015, 0x00000006, 0x00000014, 0x0006001E, 0x00000016, 0x00000013, 0x00000006,
-    0x00000015, 0x00000015, 0x00040020, 0x00000017, 0x00000003, 0x00000016, 0x0004003B, 0x00000017,
-    0x00000018, 0x00000003, 0x00040015, 0x00000019, 0x00000020, 0x00000001, 0x0004002B, 0x00000019,
-    0x0000001A, 0x00000000, 0x00040020, 0x0000001B, 0x00000001, 0x00000019, 0x0004003B, 0x0000001B,
-    0x0000001C, 0x00000001, 0x00040020, 0x0000001E, 0x00000007, 0x00000007, 0x0004002B, 0x00000006,
-    0x00000021, 0x00000000, 0x0004002B, 0x00000006, 0x00000022, 0x3F800000, 0x00040020, 0x00000026,
-    0x00000003, 0x00000013, 0x00040020, 0x00000028, 0x00000003, 0x00000007, 0x0004003B, 0x00000028,
-    0x00000029, 0x00000003, 0x0004002B, 0x00000006, 0x0000002D, 0x3F000000, 0x00050036, 0x00000002,
-    0x00000004, 0x00000000, 0x00000003, 0x000200F8, 0x00000005, 0x0004003B, 0x0000000B, 0x0000000C,
-    0x00000007, 0x0003003E, 0x0000000C, 0x00000012, 0x0004003D, 0x00000019, 0x0000001D, 0x0000001C,
-    0x00050041, 0x0000001E, 0x0000001F, 0x0000000C, 0x0000001D, 0x0004003D, 0x00000007, 0x00000020,
-    0x0000001F, 0x00050051, 0x00000006, 0x00000023, 0x00000020, 0x00000000, 0x00050051, 0x00000006,
-    0x00000024, 0x00000020, 0x00000001, 0x00070050, 0x00000013, 0x00000025, 0x00000023, 0x00000024,
-    0x00000021, 0x00000022, 0x00050041, 0x00000026, 0x00000027, 0x00000018, 0x0000001A, 0x0003003E,
-    0x00000027, 0x00000025, 0x0004003D, 0x00000019, 0x0000002A, 0x0000001C, 0x00050041, 0x0000001E,
-    0x0000002B, 0x0000000C, 0x0000002A, 0x0004003D, 0x00000007, 0x0000002C, 0x0000002B, 0x0005008E,
-    0x00000007, 0x0000002E, 0x0000002C, 0x0000002D, 0x00050050, 0x00000007, 0x0000002F, 0x0000002D,
-    0x0000002D, 0x00050081, 0x00000007, 0x00000030, 0x0000002E, 0x0000002F, 0x0003003E, 0x00000029,
-    0x00000030, 0x000100FD, 0x00010038,
+    0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00040017,
+    0x0000000a, 0x00000006, 0x00000004, 0x0005001e, 0x0000000b, 0x0000000a, 0x0000000a, 0x0000000a,
+    0x00040020, 0x0000000c, 0x00000009, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000009,
+    0x00040015, 0x0000000e, 0x00000020, 0x00000001, 0x0004002b, 0x0000000e, 0x0000000f, 0x00000000,
+    0x00040020, 0x00000010, 0x00000009, 0x0000000a, 0x0004002b, 0x0000000e, 0x00000014, 0x00000001,
+    0x00040018, 0x00000018, 0x00000007, 0x00000002, 0x0004002b, 0x00000006, 0x00000019, 0x3f800000,
+    0x0004002b, 0x00000006, 0x0000001a, 0x00000000, 0x00040020, 0x00000022, 0x00000001, 0x00000007,
+    0x0004003b, 0x00000022, 0x00000023, 0x00000001, 0x00040015, 0x00000026, 0x00000020, 0x00000000,
+    0x0004002b, 0x00000026, 0x00000027, 0x00000002, 0x00040020, 0x00000028, 0x00000009, 0x00000006,
+    0x0004002b, 0x00000006, 0x00000031, 0x40000000, 0x0004002b, 0x0000000e, 0x00000033, 0x00000002,
+    0x0004002b, 0x00000026, 0x00000038, 0x00000001, 0x0004001c, 0x00000039, 0x00000006, 0x00000038,
+    0x0006001e, 0x0000003a, 0x0000000a, 0x00000006, 0x00000039, 0x00000039, 0x00040020, 0x0000003b,
+    0x00000003, 0x0000003a, 0x0004003b, 0x0000003b, 0x0000003c, 0x00000003, 0x00040020, 0x00000041,
+    0x00000003, 0x0000000a, 0x00040020, 0x00000043, 0x00000003, 0x00000007, 0x0004003b, 0x00000043,
+    0x00000044, 0x00000003, 0x0004003b, 0x00000022, 0x00000045, 0x00000001, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009,
+    0x00000007, 0x0004003b, 0x00000008, 0x0000002f, 0x00000007, 0x00050041, 0x00000010, 0x00000011,
+    0x0000000d, 0x0000000f, 0x0004003d, 0x0000000a, 0x00000012, 0x00000011, 0x0007004f, 0x00000007,
+    0x00000013, 0x00000012, 0x00000012, 0x00000000, 0x00000001, 0x00050041, 0x00000010, 0x00000015,
+    0x0000000d, 0x00000014, 0x0004003d, 0x0000000a, 0x00000016, 0x00000015, 0x0007004f, 0x00000007,
+    0x00000017, 0x00000016, 0x00000016, 0x00000000, 0x00000001, 0x00050051, 0x00000006, 0x0000001b,
+    0x00000013, 0x00000000, 0x00050051, 0x00000006, 0x0000001c, 0x00000013, 0x00000001, 0x00050051,
+    0x00000006, 0x0000001d, 0x00000017, 0x00000000, 0x00050051, 0x00000006, 0x0000001e, 0x00000017,
+    0x00000001, 0x00050050, 0x00000007, 0x0000001f, 0x0000001b, 0x0000001c, 0x00050050, 0x00000007,
+    0x00000020, 0x0000001d, 0x0000001e, 0x00050050, 0x00000018, 0x00000021, 0x0000001f, 0x00000020,
+    0x0004003d, 0x00000007, 0x00000024, 0x00000023, 0x00050091, 0x00000007, 0x00000025, 0x00000021,
+    0x00000024, 0x00060041, 0x00000028, 0x00000029, 0x0000000d, 0x0000000f, 0x00000027, 0x0004003d,
+    0x00000006, 0x0000002a, 0x00000029, 0x00060041, 0x00000028, 0x0000002b, 0x0000000d, 0x00000014,
+    0x00000027, 0x0004003d, 0x00000006, 0x0000002c, 0x0000002b, 0x00050050, 0x00000007, 0x0000002d,
+    0x0000002a, 0x0000002c, 0x00050081, 0x00000007, 0x0000002e, 0x00000025, 0x0000002d, 0x0003003e,
+    0x00000009, 0x0000002e, 0x0004003d, 0x00000007, 0x00000030, 0x00000009, 0x0005008e, 0x00000007,
+    0x00000032, 0x00000030, 0x00000031, 0x00050041, 0x00000010, 0x00000034, 0x0000000d, 0x00000033,
+    0x0004003d, 0x0000000a, 0x00000035, 0x00000034, 0x0007004f, 0x00000007, 0x00000036, 0x00000035,
+    0x00000035, 0x00000000, 0x00000001, 0x00050088, 0x00000007, 0x00000037, 0x00000032, 0x00000036,
+    0x0003003e, 0x0000002f, 0x00000037, 0x0004003d, 0x00000007, 0x0000003d, 0x0000002f, 0x00050051,
+    0x00000006, 0x0000003e, 0x0000003d, 0x00000000, 0x00050051, 0x00000006, 0x0000003f, 0x0000003d,
+    0x00000001, 0x00070050, 0x0000000a, 0x00000040, 0x0000003e, 0x0000003f, 0x0000001a, 0x00000019,
+    0x00050041, 0x00000041, 0x00000042, 0x0000003c, 0x0000000f, 0x0003003e, 0x00000042, 0x00000040,
+    0x0004003d, 0x00000007, 0x00000046, 0x00000045, 0x0003003e, 0x00000044, 0x00000046, 0x000100fd,
+    0x00010038,
 ];
 
-/// The solid-color fragment shader: out_color = push constant color.
+/// The M3c layer-texture fragment shader: sample the combined image sampler,
+/// scale the alpha by the layer alpha from the push constants; compiled with
+/// glslangValidator -V --target-env vulkan1.2 from shaders/texture.frag.
 #[rustfmt::skip]
-const SOLID_SPIRV: &[u32] = &[
-    0x07230203, 0x00010500, 0x0008000B, 0x00000012, 0x00000000, 0x00020011, 0x00000001, 0x0006000B,
-    0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E, 0x00000000, 0x0003000E, 0x00000000, 0x00000001,
-    0x0007000F, 0x00000004, 0x00000004, 0x6E69616D, 0x00000000, 0x00000009, 0x0000000C, 0x00030010,
-    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001C2, 0x00040005, 0x00000004, 0x6E69616D,
-    0x00000000, 0x00050005, 0x00000009, 0x5F74756F, 0x6F6C6F63, 0x00000072, 0x00050005, 0x0000000A,
-    0x68737550, 0x6F6C6F43, 0x00000072, 0x00050006, 0x0000000A, 0x00000000, 0x6F6C6F63, 0x00000072,
-    0x00030005, 0x0000000C, 0x00006370, 0x00040047, 0x00000009, 0x0000001E, 0x00000000, 0x00030047,
-    0x0000000A, 0x00000002, 0x00050048, 0x0000000A, 0x00000000, 0x00000023, 0x00000000, 0x00020013,
+const TEXTURE_SPIRV: &[u32] = &[
+    0x07230203, 0x00010500, 0x0008000b, 0x0000002b, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0009000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000011, 0x00000015,
+    0x00000020, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000d,
+    0x00786574, 0x00030005, 0x00000011, 0x00565576, 0x00050005, 0x00000015, 0x4374756f, 0x726f6c6f,
+    0x00000000, 0x00030005, 0x0000001e, 0x00004350, 0x00040006, 0x0000001e, 0x00000000, 0x0000306d,
+    0x00040006, 0x0000001e, 0x00000001, 0x0000316d, 0x00060006, 0x0000001e, 0x00000002, 0x77656976,
+    0x74726f70, 0x00000000, 0x00030005, 0x00000020, 0x00006370, 0x00040047, 0x0000000d, 0x00000021,
+    0x00000000, 0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e,
+    0x00000000, 0x00040047, 0x00000015, 0x0000001e, 0x00000000, 0x00030047, 0x0000001e, 0x00000002,
+    0x00050048, 0x0000001e, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000001e, 0x00000001,
+    0x00000023, 0x00000010, 0x00050048, 0x0000001e, 0x00000002, 0x00000023, 0x00000020, 0x00020013,
     0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
-    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000003, 0x00000007, 0x0004003B,
-    0x00000008, 0x00000009, 0x00000003, 0x0003001E, 0x0000000A, 0x00000007, 0x00040020, 0x0000000B,
-    0x00000009, 0x0000000A, 0x0004003B, 0x0000000B, 0x0000000C, 0x00000009, 0x00040015, 0x0000000D,
-    0x00000020, 0x00000001, 0x0004002B, 0x0000000D, 0x0000000E, 0x00000000, 0x00040020, 0x0000000F,
-    0x00000009, 0x00000007, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200F8,
-    0x00000005, 0x00050041, 0x0000000F, 0x00000010, 0x0000000C, 0x0000000E, 0x0004003D, 0x00000007,
-    0x00000011, 0x00000010, 0x0003003E, 0x00000009, 0x00000011, 0x000100FD, 0x00010038,
+    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00090019,
+    0x0000000a, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
+    0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b,
+    0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f, 0x00000006, 0x00000002, 0x00040020,
+    0x00000010, 0x00000001, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000001, 0x00040020,
+    0x00000014, 0x00000003, 0x00000007, 0x0004003b, 0x00000014, 0x00000015, 0x00000003, 0x00040017,
+    0x00000016, 0x00000006, 0x00000003, 0x00040015, 0x00000019, 0x00000020, 0x00000000, 0x0004002b,
+    0x00000019, 0x0000001a, 0x00000003, 0x00040020, 0x0000001b, 0x00000007, 0x00000006, 0x0005001e,
+    0x0000001e, 0x00000007, 0x00000007, 0x00000007, 0x00040020, 0x0000001f, 0x00000009, 0x0000001e,
+    0x0004003b, 0x0000001f, 0x00000020, 0x00000009, 0x00040015, 0x00000021, 0x00000020, 0x00000001,
+    0x0004002b, 0x00000021, 0x00000022, 0x00000001, 0x00040020, 0x00000023, 0x00000009, 0x00000006,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d,
+    0x0000000f, 0x00000012, 0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012,
+    0x0003003e, 0x00000009, 0x00000013, 0x0004003d, 0x00000007, 0x00000017, 0x00000009, 0x0008004f,
+    0x00000016, 0x00000018, 0x00000017, 0x00000017, 0x00000000, 0x00000001, 0x00000002, 0x00050041,
+    0x0000001b, 0x0000001c, 0x00000009, 0x0000001a, 0x0004003d, 0x00000006, 0x0000001d, 0x0000001c,
+    0x00060041, 0x00000023, 0x00000024, 0x00000020, 0x00000022, 0x0000001a, 0x0004003d, 0x00000006,
+    0x00000025, 0x00000024, 0x00050085, 0x00000006, 0x00000026, 0x0000001d, 0x00000025, 0x00050051,
+    0x00000006, 0x00000027, 0x00000018, 0x00000000, 0x00050051, 0x00000006, 0x00000028, 0x00000018,
+    0x00000001, 0x00050051, 0x00000006, 0x00000029, 0x00000018, 0x00000002, 0x00070050, 0x00000007,
+    0x0000002a, 0x00000027, 0x00000028, 0x00000029, 0x00000026, 0x0003003e, 0x00000015, 0x0000002a,
+    0x000100fd, 0x00010038,
+];
+
+/// The unit quad as two fan-ordered triangles: 6 vertices of
+/// (pos: vec2 in [-0.5, 0.5]², uv: vec2), matching the pipeline's vertex
+/// input (binding 0, stride 16). The order is [v0,v1,v2, v0,v2,v3], i.e.
+/// (pos -0.5,-0.5)(0.5,-0.5)(0.5,0.5) then (0.5,0.5)(-0.5,0.5)(-0.5,-0.5):
+/// with TRIANGLE_LIST the two primitives are (v0,v1,v2) and (v0,v2,v3),
+/// which together tile the quad's full area (the 4-vertex order
+/// (0,1,2)+(1,2,3) covers only the right half). The uv origin is the
+/// texture's top-left corner (row 0 = the top of the picture), which in
+/// scene space (+y down) is the smaller y — so v=0 sits at pos.y = -0.5
+/// and the image renders upright, not mirrored.
+const UNIT_QUAD: [f32; 24] = [
+    -0.5, -0.5, 0.0, 0.0, //
+    0.5, -0.5, 1.0, 0.0, //
+    0.5, 0.5, 1.0, 1.0, //
+    0.5, 0.5, 1.0, 1.0, //
+    -0.5, 0.5, 0.0, 1.0, //
+    -0.5, -0.5, 0.0, 0.0,
 ];
 
 #[cfg(test)]
@@ -858,20 +1421,123 @@ mod tests {
             eprintln!("isolated_draw: skipped (set KWE_TEST_DEVICE to run)");
             return;
         };
-        let mut renderer = ClearRenderer::new(Some(&binding), 64, 48).expect("create renderer");
-        let pixels = renderer.render([0.1, 0.2, 0.3, 1.0]).expect("render once");
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        // A 1x1 opaque red texture drawn fullscreen (scale 64x48, no offset):
+        // src-over over the clear gives the texture color exactly, since an
+        // opaque source fully replaces the destination.
+        renderer
+            .upload_layer(0, &[255, 0, 0, 255], 1, 1)
+            .expect("upload layer");
+        let draws = [LayerDraw {
+            layer_index: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+        }];
+        let pixels = renderer
+            .render([0.1, 0.2, 0.3, 1.0], &draws)
+            .expect("render once");
         assert_eq!(pixels.len(), 64 * 48 * 4);
-        // The fullscreen triangle covers the whole attachment with the push
-        // constant color (r=0.1, g=0.2, b=0.3, a=1.0). The B8G8R8A8 readback
-        // is already B,G,R,A in memory order, so the frame bytes are
-        // B=0.3*255, G=0.2*255, R=0.1*255, A=255 (rounding varies by driver).
+        // B8G8R8A8 readback is already B,G,R,A in memory order; premultiplied
+        // by the opaque alpha, so every pixel is exactly the red texture.
         for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel, &[0, 0, 255, 255]);
+        }
+        // A clear-only pass (no draws) shows the clear color: B=0.3*255,
+        // G=0.2*255, R=0.1*255, A=255 (rounding varies by driver).
+        let cleared = renderer
+            .render([0.1, 0.2, 0.3, 1.0], &[])
+            .expect("render clear");
+        for pixel in cleared.chunks_exact(4) {
             assert_eq!(pixel[3], 255);
             assert!((76..=77).contains(&pixel[0]), "B={}", pixel[0]);
             assert_eq!(pixel[1], 51);
             assert!((25..=26).contains(&pixel[2]), "R={}", pixel[2]);
         }
         // The drop must not fault: the renderer's entry keeps the loader
-        // mapped through the destroy calls.
+        // mapped through the destroy calls, and the uploaded texture's
+        // image/view/memory and descriptor pool are destroyed here.
+    }
+
+    /// Texture orientation through the real pipeline: a 2x2 texture with a
+    /// distinct color per corner, stretched over the full frame. The texture
+    /// top row (red, green) must land at the frame's top row (scene +y down)
+    /// and not come back mirrored — the vertex shader renders the scene
+    /// bottom-first on the attachment because OPTIMAL-tiling color images are
+    /// stored bottom-first in the readback, and this test pins the net result
+    /// (it is the M3c orientation contract with the protocol).
+    #[test]
+    fn quad_orientation() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("quad_orientation: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        // R8G8B8A8, rows top-to-bottom: red, green / blue, white.
+        let texture = [
+            255, 0, 0, 255, 0, 255, 0, 255, //
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        renderer
+            .upload_layer(0, &texture, 2, 2)
+            .expect("upload layer");
+        let draws = [LayerDraw {
+            layer_index: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .expect("render once");
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * 64 + x) * 4;
+            [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+        };
+        assert_eq!(at(8, 8), [0, 0, 255, 255], "top-left = texture top-left");
+        assert_eq!(at(56, 8), [0, 255, 0, 255], "top-right = texture top-right");
+        assert_eq!(
+            at(8, 40),
+            [255, 0, 0, 255],
+            "bottom-left = texture bottom-left"
+        );
+        assert_eq!(
+            at(56, 40),
+            [255, 255, 255, 255],
+            "bottom-right = texture bottom-right"
+        );
+    }
+
+    /// The src-over blend math end to end, byte-exact: an opaque
+    /// (64,103,142,255) texel drawn at layer alpha 191/255 over a fully
+    /// transparent black clear. The blend scales the straight source by the
+    /// fragment alpha — stored (48,77,106,191) — and the readback then
+    /// premultiplies by the stored alpha: R = 48*191/255 = 36,
+    /// G = 77*191/255 = 58, B = 106*191/255 = 79. The alpha channel blend
+    /// factor must be ONE (not SRC_ALPHA): scaling the source alpha by
+    /// itself would store 143 here and 143/255 opacity over an opaque
+    /// destination.
+    #[test]
+    fn blend_partial_alpha() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("blend_partial_alpha: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        renderer
+            .upload_layer(0, &[64, 103, 142, 255], 1, 1)
+            .expect("upload layer");
+        let draws = [LayerDraw {
+            layer_index: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 191.0 / 255.0,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 0.0], &draws)
+            .expect("render once");
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel, &[79, 58, 36, 191], "premultiplied BGRA");
+        }
     }
 }

@@ -25,10 +25,16 @@
 //                      worker reads it back after every update() and renders
 //                      that color; planned to move to thisScene.clearcolor)
 // plus `console.log/info/warn/error` (rate-bounded) and the classic entry
-// points `init()`, `update(dt)`, `resized(w, h)`. See the coverage matrix in
-// docs/SCENE_FORMAT_V1.md for what is implemented vs planned.
+// points `init()`, `update(dt)`, `resized(w, h)`. The M3c slice adds the
+// `Scene` object model (also exposed as `thisScene`):
+//   Scene.getLayer(name | index) -> Layer proxy or null (layers registered
+//       before init(); properties live on the Rust side, clamped on write)
+//   Scene.getLayerCount() -> number of registered image layers
+// with Layer.name/alpha/visible/angles/origin/scale/size. Changing a
+// layer's image at runtime is planned, not in M3c. See the coverage matrix
+// in docs/SCENE_FORMAT_V1.md for what is implemented vs planned.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +43,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rquickjs::{Context, Ctx, Error as JsError, Exception, Function, Object, Runtime};
 
+use crate::layers::{LayerState, clamp_layer_alpha, clamp_layer_scalar, clamp_layer_size};
 use crate::scene::SceneConfig;
 
 /// Heap cap for the per-worker QuickJS runtime.
@@ -322,6 +329,11 @@ pub struct ScriptEngine {
     height: u32,
     fps: u32,
     clear_color: [f32; 4],
+    /// Runtime layer states in scene.json object order (M3c). Built from the
+    /// parsed spec before the script loads, so init() sees the resolved
+    /// sizes; the worker reads them per frame for the draw list, and the
+    /// script mutates them through the Scene.getLayer proxies.
+    layers: Vec<Rc<RefCell<LayerState>>>,
     script_ok: bool,
     last_update: Option<Instant>,
     frames: u64,
@@ -393,6 +405,12 @@ impl ScriptEngine {
             }
         })?;
 
+        let layers = config
+            .layers
+            .iter()
+            .map(|spec| Rc::new(RefCell::new(LayerState::from_spec(spec))))
+            .collect();
+
         let mut engine = Self {
             runtime,
             context,
@@ -403,6 +421,7 @@ impl ScriptEngine {
             height,
             fps,
             clear_color: config.clear_color,
+            layers,
             script_ok: false,
             last_update: None,
             frames: 0,
@@ -427,6 +446,14 @@ impl ScriptEngine {
     /// The script is healthy and will be stepped every paced frame.
     pub fn script_ok(&self) -> bool {
         self.script_ok
+    }
+
+    /// The runtime layer states, in scene.json object order (M3c). The
+    /// worker builds the per-frame draw list from these; scripts mutate
+    /// them through the Scene.getLayer proxies, and every write is clamped
+    /// at the bridge.
+    pub fn layers(&self) -> Vec<Rc<RefCell<LayerState>>> {
+        self.layers.clone()
     }
 
     /// Register the `Engine` object, `console`, and their plumbing. Fatal
@@ -487,6 +514,147 @@ impl ScriptEngine {
 
             ctx.eval::<(), &str>(CONSOLE_BOOTSTRAP_JS)
                 .map_err(|e| EngineStartError::Bootstrap(format!("console bootstrap: {e}")))?;
+
+            // ---- M3c: the Scene object model. The layer state lives on the
+            // Rust side; the bootstrap JS defines Scene.getLayer proxies over
+            // these bridge functions (plain getters/setters rather than the
+            // rquickjs Property trait — bounded, and every write is clamped
+            // here). An out-of-range index is a no-op or a default value,
+            // never an error: the script cannot crash the renderer through a
+            // layer proxy.
+            let layers = self.layers.clone();
+
+            let count_fn = Function::new(ctx.clone(), move || layers.len() as i32)
+                .map_err(|e| EngineStartError::Bootstrap(format!("layer count fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneLayerCount", count_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneLayerCount: {e}"))
+                })?;
+
+            let find_layers = self.layers.clone();
+            let find_fn = Function::new(ctx.clone(), move |name: String| -> i32 {
+                find_layers
+                    .iter()
+                    .position(|layer| layer.borrow().name == name)
+                    .map_or(-1, |index| index as i32)
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("layer find fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneFindLayer", find_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneFindLayer: {e}"))
+                })?;
+
+            let name_layers = self.layers.clone();
+            let name_fn = Function::new(ctx.clone(), move |index: i32| -> String {
+                name_layers
+                    .get(index as usize)
+                    .map_or_else(String::new, |layer| layer.borrow().name.clone())
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("layer name fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneLayerName", name_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneLayerName: {e}"))
+                })?;
+
+            let scalar_layers = self.layers.clone();
+            let get_scalar = Function::new(ctx.clone(), move |index: i32, prop: String| -> f64 {
+                let Some(layer) = scalar_layers.get(index as usize) else {
+                    return 0.0;
+                };
+                let layer = layer.borrow();
+                match prop.as_str() {
+                    "alpha" => f64::from(layer.alpha),
+                    "visible" => f64::from(u8::from(layer.visible)),
+                    _ => 0.0,
+                }
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("layer scalar getter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneGetScalar", get_scalar)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneGetScalar: {e}"))
+                })?;
+
+            let set_scalar_layers = self.layers.clone();
+            let set_scalar =
+                Function::new(ctx.clone(), move |index: i32, prop: String, value: f64| {
+                    let Some(layer) = set_scalar_layers.get(index as usize) else {
+                        return;
+                    };
+                    let mut layer = layer.borrow_mut();
+                    match prop.as_str() {
+                        "alpha" => layer.alpha = clamp_layer_alpha(value),
+                        "visible" => layer.visible = value != 0.0,
+                        _ => {}
+                    }
+                })
+                .map_err(|e| EngineStartError::Bootstrap(format!("layer scalar setter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneSetScalar", set_scalar)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneSetScalar: {e}"))
+                })?;
+
+            let vec_layers = self.layers.clone();
+            let get_vec = Function::new(
+                ctx.clone(),
+                move |index: i32, prop: String, axis: String| -> f64 {
+                    let Some(layer) = vec_layers.get(index as usize) else {
+                        return 0.0;
+                    };
+                    let layer = layer.borrow();
+                    match (prop.as_str(), axis.as_str()) {
+                        ("angles", "x") => f64::from(layer.angles[0]),
+                        ("angles", "y") => f64::from(layer.angles[1]),
+                        ("angles", "z") => f64::from(layer.angles[2]),
+                        ("origin", "x") => f64::from(layer.origin[0]),
+                        ("origin", "y") => f64::from(layer.origin[1]),
+                        ("scale", "x") => f64::from(layer.scale[0]),
+                        ("scale", "y") => f64::from(layer.scale[1]),
+                        ("size", "x") => f64::from(layer.size[0]),
+                        ("size", "y") => f64::from(layer.size[1]),
+                        _ => 0.0,
+                    }
+                },
+            )
+            .map_err(|e| EngineStartError::Bootstrap(format!("layer vector getter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneGetVec", get_vec)
+                .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneGetVec: {e}")))?;
+
+            let set_vec_layers = self.layers.clone();
+            let set_vec = Function::new(
+                ctx.clone(),
+                move |index: i32, prop: String, axis: String, value: f64| {
+                    let Some(layer) = set_vec_layers.get(index as usize) else {
+                        return;
+                    };
+                    let mut layer = layer.borrow_mut();
+                    match (prop.as_str(), axis.as_str()) {
+                        ("angles", "x") => layer.angles[0] = clamp_layer_scalar(value),
+                        ("angles", "y") => layer.angles[1] = clamp_layer_scalar(value),
+                        ("angles", "z") => layer.angles[2] = clamp_layer_scalar(value),
+                        ("origin", "x") => layer.origin[0] = clamp_layer_scalar(value),
+                        ("origin", "y") => layer.origin[1] = clamp_layer_scalar(value),
+                        ("scale", "x") => layer.scale[0] = clamp_layer_scalar(value),
+                        ("scale", "y") => layer.scale[1] = clamp_layer_scalar(value),
+                        // Sizes are never negative; scale carries the mirror.
+                        ("size", "x") => layer.size[0] = clamp_layer_size(value),
+                        ("size", "y") => layer.size[1] = clamp_layer_size(value),
+                        _ => {}
+                    }
+                },
+            )
+            .map_err(|e| EngineStartError::Bootstrap(format!("layer vector setter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneSetVec", set_vec)
+                .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneSetVec: {e}")))?;
+
+            ctx.eval::<(), &str>(LAYER_BOOTSTRAP_JS)
+                .map_err(|e| EngineStartError::Bootstrap(format!("scene bootstrap: {e}")))?;
             Ok(())
         })
     }
@@ -795,6 +963,93 @@ const CONSOLE_BOOTSTRAP_JS: &str = r#"
 })();
 "#;
 
+/// M3c Scene object model. The layer properties are plain getters/setters
+/// (enumerable, like the wallpaper-engine API's fields); every access goes
+/// through the Rust bridge, so reads always reflect the clamped runtime
+/// state and writes are clamped the moment they land. Property names and
+/// units follow the researched API: origin/angles/scale/size are Vec
+/// objects with x/y(/z) components, angles in degrees, alpha in 0..=1,
+/// visible a boolean. getLayer accepts a name (string) or an index
+/// (number) and returns null when nothing matches; changing a layer's
+/// image at runtime is planned, not in M3c.
+const LAYER_BOOTSTRAP_JS: &str = r#"
+"use strict";
+(function () {
+  var indexByName = {};
+  var cache = [];
+  var count = kweSceneLayerCount();
+  for (var i = 0; i < count; i++) indexByName[kweSceneLayerName(i)] = i;
+
+  function findLayer(name) {
+    if (typeof name === "number") {
+      return (name >= 0 && name < count) ? name : -1;
+    }
+    var byName = indexByName[String(name)];
+    return typeof byName === "number" ? byName : -1;
+  }
+
+  function vectorProps(index, prop, axes) {
+    var v = {};
+    for (var i = 0; i < axes.length; i++) {
+      (function (axis) {
+        Object.defineProperty(v, axis, {
+          get: function () { return kweSceneGetVec(index, prop, axis); },
+          set: function (value) { kweSceneSetVec(index, prop, axis, value); },
+          enumerable: true
+        });
+      })(axes[i]);
+    }
+    return v;
+  }
+
+  function getLayer(name) {
+    var index = findLayer(name);
+    if (index < 0) return null;
+    if (cache[index]) return cache[index];
+    var layer = {};
+    Object.defineProperty(layer, "name", {
+      get: function () { return kweSceneLayerName(index); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "alpha", {
+      get: function () { return kweSceneGetScalar(index, "alpha"); },
+      set: function (value) { kweSceneSetScalar(index, "alpha", value); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "visible", {
+      get: function () { return kweSceneGetScalar(index, "visible") !== 0; },
+      set: function (value) { kweSceneSetScalar(index, "visible", value ? 1 : 0); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "angles", {
+      get: function () { return vectorProps(index, "angles", ["x", "y", "z"]); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "origin", {
+      get: function () { return vectorProps(index, "origin", ["x", "y"]); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "scale", {
+      get: function () { return vectorProps(index, "scale", ["x", "y"]); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "size", {
+      get: function () { return vectorProps(index, "size", ["x", "y"]); },
+      enumerable: true
+    });
+    cache[index] = layer;
+    return layer;
+  }
+
+  var Scene = {
+    getLayer: getLayer,
+    getLayerCount: function () { return kweSceneLayerCount(); }
+  };
+  globalThis.Scene = Scene;
+  globalThis.thisScene = Scene;
+})();
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,10 +1067,21 @@ mod tests {
     }
 
     fn config_with_script(dir: &Path, script: &str) -> SceneConfig {
+        config_with_layers(dir, script, "[]")
+    }
+
+    /// A scene whose `objects` array is `objects_json` (M3c). Image files
+    /// need not exist for the engine tests — resolution happens at load in
+    /// main.rs, not here.
+    fn config_with_layers(dir: &Path, script: &str, objects_json: &str) -> SceneConfig {
         let script_path = dir.join("main.js");
         fs::write(&script_path, script).unwrap();
         let scene = dir.join("scene.json");
-        fs::write(&scene, r#"{"general": {}}"#).unwrap();
+        fs::write(
+            &scene,
+            format!(r#"{{"general": {{}}, "objects": {objects_json}}}"#),
+        )
+        .unwrap();
         SceneConfig::parse(&scene).unwrap().with_script(script_path)
     }
 
@@ -1083,6 +1349,137 @@ mod tests {
         );
         let engine = ScriptEngine::new(&config, 320, 200, 30);
         assert!(matches!(engine, Err(EngineStartError::Allocation)));
+    }
+
+    // ---- M3c: Scene.getLayer ----
+
+    #[test]
+    fn layers_registered_before_script_load() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function init() {
+                // init() runs after registration: the layer is already here.
+                Engine.clearcolor = { r: Scene.getLayer("bg") !== null ? 0.5 : 0,
+                                      g: Scene.getLayerCount() === 2 ? 0.5 : 0,
+                                      b: 0, a: 1 };
+            }"#,
+            r#"[{"name": "bg", "image": "bg.png", "origin": "100 200 0",
+                 "angles": "0 0 1.57080", "scale": "2 2 2", "size": "64 32",
+                 "alpha": 0.5, "visible": false},
+                {"name": "fg", "image": "fg.png"}]"#,
+        );
+        let engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(engine.script_ok());
+        // Parsed state carried into the runtime (angles converted to
+        // degrees; defaults filled for the bare layer).
+        let layers = engine.layers();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].borrow().name, "bg");
+        assert_eq!(layers[0].borrow().origin, [100.0, 200.0]);
+        assert!((layers[0].borrow().angles[2] - 90.0).abs() < 0.001);
+        assert_eq!(layers[0].borrow().scale, [2.0, 2.0]);
+        assert_eq!(layers[0].borrow().size, [64.0, 32.0]);
+        assert_eq!(layers[0].borrow().alpha, 0.5);
+        assert!(!layers[0].borrow().visible);
+        assert_eq!(layers[1].borrow().scale, [1.0, 1.0]);
+        // init() saw both layers through the proxies.
+        assert_eq!(engine.clear_color(), [0.5, 0.5, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn script_layer_writes_are_clamped_on_the_rust_side() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var l = Scene.getLayer("fg");
+                l.alpha = 2;                       // -> 1
+                l.visible = 1;                     // truthy -> true
+                l.origin.x = 1e9;                  // -> 1e6
+                l.origin.y = NaN;                  // -> 0
+                l.angles.z = Infinity;             // -> 0
+                l.scale.x = -1e9;                  // -> -1e6
+                l.size.x = -5;                     // -> 0
+                Engine.clearcolor = {
+                    r: l.alpha === 1 ? 0.5 : 0,
+                    g: (l.visible === true && l.origin.x === 1e6 && l.origin.y === 0) ? 0.5 : 0,
+                    b: (l.angles.z === 0 && l.scale.x === -1e6 && l.size.x === 0) ? 0.5 : 0,
+                    a: 1
+                };
+            }"#,
+            r#"[{"name": "bg", "image": "bg.png"}, {"name": "fg", "image": "fg.png"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            matches!(engine.step(0.1), StepResult::NewFrame(color) if color == [0.5, 0.5, 0.5, 1.0])
+        );
+        // And the clamped values really landed on the Rust side.
+        let layer = engine.layers()[1].clone();
+        let state = layer.borrow();
+        assert_eq!(state.alpha, 1.0);
+        assert!(state.visible);
+        assert_eq!(state.origin, [1e6, 0.0]);
+        assert_eq!(state.angles, [0.0, 0.0, 0.0]);
+        assert_eq!(state.scale, [-1e6, 1.0]);
+        assert_eq!(state.size, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn get_layer_by_index_and_missing_returns_null() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function init() {
+                var a = Scene.getLayer("one");
+                var b = Scene.getLayer(1);
+                var c = Scene.getLayer(0);
+                Engine.clearcolor = {
+                    r: (a !== null && c === a) ? 0.5 : 0,
+                    g: (b !== null && b.name === "two") ? 0.5 : 0,
+                    b: (Scene.getLayer("missing") === null && Scene.getLayer(7) === null) ? 0.5 : 0,
+                    a: 1
+                };
+            }"#,
+            r#"[{"name": "one", "image": "one.png"}, {"name": "two", "image": "two.png"}]"#,
+        );
+        let engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert_eq!(engine.clear_color(), [0.5, 0.5, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn update_mutates_layer_state_frame_to_frame() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"var t = 0;
+            function update(dt) {
+                t += dt;
+                var l = Scene.getLayer("slide");
+                l.origin.x = t * 10;
+                l.alpha = 1 - t;
+                Engine.clearcolor = { r: l.origin.x, g: l.alpha, b: 0, a: 1 };
+            }"#,
+            r#"[{"name": "slide", "image": "slide.png"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(matches!(engine.step(0.5), StepResult::NewFrame(_)));
+        let layer = engine.layers()[0].clone();
+        // The borrow must end before the next step: update() writes the
+        // same layer through the proxy (RefCell).
+        {
+            let state = layer.borrow();
+            assert_eq!(state.origin[0], 5.0);
+            assert_eq!(state.alpha, 0.5);
+        }
+        // A second step moves the layer further; the state is shared with
+        // the worker, which reads it per frame for the draw list.
+        assert!(matches!(engine.step(0.5), StepResult::NewFrame(_)));
+        {
+            let state = layer.borrow();
+            assert_eq!(state.origin[0], 10.0);
+            assert_eq!(state.alpha, 0.0);
+        }
     }
 
     #[test]

@@ -186,7 +186,7 @@ entries:
     license_observed: MIT OR Apache-2.0
     use: dependency
     approved_for_code_use: true
-    notes: Decodes the BGRA frames the web renderer publishes from chromium CDP screencast events; exact transitive set pinned in Cargo.lock.
+    notes: Two consumers. (1) M2a: decodes the BGRA frames the web renderer publishes from chromium CDP screencast events. (2) M3c: bounded PNG/JPEG/WebP decoding for SceneScript image layers (crates/kwe-scene-renderer/src/textures.rs) — default-features off, only the png/jpeg/webp features enabled; decoded RGBA8 is uploaded as R8G8B8A8_UNORM (identity). Bounds: dimension 8192, pixel count 16_777_216, source and decoded allocation 64 MiB each, 256 MiB total across layers. Used only by the separate-process web/scene workers; never in plasmashell. Exact transitive set pinned in Cargo.lock.
 
   - id: quickjs-rquickjs
     project: QuickJS JavaScript engine via rquickjs (rquickjs/rquickjs-sys)

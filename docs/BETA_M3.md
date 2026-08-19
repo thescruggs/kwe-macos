@@ -9,9 +9,13 @@ bounded script engine, and the offscreen Vulkan compositor that clears a
 frame to the script-driven color and publishes it. M3b adds the original
 scene.pkg archive reader so packaged wallpapers (the Steam Workshop shape:
 all 60 corpus wallpapers are packages, none ship a bare scene.json) run
-end-to-end. The rest of the scene surface (layers, effects, text,
-particles, 3D, user properties — M3c–M3k) and any manager changes are
-deliberately out of scope.
+end-to-end. M3c adds 2D image layers: a textured-quad compositor (per-layer
+push-constant transforms, src-over blending, draw order = scene.json
+order), bounded image decoding from the content root or the package entry
+table, and the `Scene.getLayer` layer proxy so scripts can move, resize,
+rotate, fade, and hide layers at runtime. The rest of the scene surface
+(effects, text, particles, 3D, user properties — M3d–M3k) and any manager
+changes are deliberately out of scope.
 
 ## Goal
 
@@ -87,13 +91,84 @@ corpus-proven primary. Raw fallback policy: a payload that begins with the
 frame magic but does not decode as a frame is treated as raw (one bounded
 diagnostic line); an over-cap decompression is never downgraded.
 
+### M3c — 2D image layers
+
+An `objects` entry with an `image` property becomes a textured quad in the
+compositor's draw list, in scene.json order — later objects draw over
+earlier ones; no z-sorting, matching the original's array-order drawing.
+Each layer is a unit quad of 6 fan-ordered vertices
+`[v0,v1,v2, v0,v2,v3]` (v0=(-0.5,-0.5,0,0), v1=(0.5,-0.5,1,0),
+v2=(0.5,0.5,1,1), v3=(-0.5,0.5,0,1)) drawn as **two** 3-vertex
+`TRIANGLE_LIST` draws: a 4-vertex draw emits only the first triangle (the
+quad's right half) and empirically a single multi-primitive draw rasterizes
+only its first primitive on both llvmpipe and NVIDIA, so the split is
+required to tile the full quad. The vertex shader has **no y-flip**: scene
+y grows down while NDC y grows up, so scene y=0 maps to NDC y=-1, the
+framebuffer's bottom; `VK_IMAGE_TILING_OPTIMAL` color attachments come back
+bottom-first in the readback (row 0 = the scene's top row), so rendering
+the scene bottom-first delivers it upright — proven on both drivers with a
+shader that skipped the transform (the readback mirrored it).
+
+Per-layer push constants are 48 bytes: m0=(a,c,tx,0), m1=(b,d,ty,alpha),
+viewport=(w,h,0,0); `world = mat2(m0.xy, m1.xy) * pos + vec2(m0.z, m1.z)`
+maps a layer-local point through rotate × scale × size and the translation.
+The layer origin is the quad center (WE's "center" alignment), scene (0,0)
+is the frame center, +y down; angles are radians in the file and degrees
+in the `Scene.getLayer` API; `size` [0,0] defaults to the decoded texture
+dimensions. Each layer has its own descriptor set (combined image sampler,
+linear min/mag, clamp-to-edge) from a bounded pool of at most `MAX_LAYERS`
+(256) sets, so a runtime texture swap can land per layer later — planned,
+not implemented: the M3c `image` property is load-time only.
+
+Blending is src-over by default: color SRC_ALPHA / ONE_MINUS_SRC_ALPHA,
+alpha ONE / ONE_MINUS_SRC_ALPHA. The alpha factor must be ONE — SRC_ALPHA
+double-scaled the layer alpha (191/255 over an opaque destination produced
+143/255 instead of 191/255). The fragment shader multiplies the decoded
+alpha: `outColor = vec4(c.rgb, c.a * pc.m1.w)` (straight source). Oracle,
+byte-exact on both drivers: opaque texel (64,103,142,255) at layer alpha
+191/255 over a zero clear blends to stored (48,77,106,191), which the
+readback premultiply converts to BGRA (79,58,36,191). A non-default
+`blendMode` is parsed and, when it is not 0, emits one bounded diagnostic
+per scene; only src-over is rendered until M3d.
+
+Image sources resolve root-relative (symlink-escape-validated) from the
+content root, or by path from the package entry table. Decoding is bounded
+(`kwe-scene-renderer/src/textures.rs`, the `image` crate with png/jpeg/webp
+features only): dimension ≤ 8192, pixels ≤ 16_777_216, source bytes and
+decoded allocation ≤ 64 MiB each, ≤ 256 MiB total across all layers;
+RGBA8 → R8G8B8A8_UNORM is an identity mapping. A missing, unreadable, or
+undecodable image is **not fatal**: the layer is skipped with a bounded
+diagnostic (`event=renderer.scene.layer_skip layer=...`) and the rest of
+the scene renders. More than 256 image layers is a backend rejection:
+`scene.json "objects" has N image layers, over the 256 layer cap` → exit 73
+before the canary.
+
+`Scene.getLayer(name | index)` returns a Layer proxy or null for an
+unknown layer; `Scene.getLayerCount()` returns the image-layer count. The
+proxy exposes `name` (read-only), `alpha`, `visible`, `angles{x,y,z}`,
+`origin`, `scale{x,y}`, `size{x,y}` — all read/write, with the same clamp
+rules as `Engine.clearcolor`: non-finite → 0, alpha 0..=1, magnitude
+≤ 1e6, size ≥ 0, `visible = value != 0.0`. Proxies are rebuilt every
+`update()`, so scripted motion reapplies per frame while the image source
+itself stays load-time-only (planned slice).
+
+Corpus findings (60 real packages, 685 image-bearing objects): 432 carry a
+`colorBlendMode` — 410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 —
+all rendered as src-over until M3d. **All 685 image references point at
+model `.json` files** (WE's animated-model format, M3h), so no corpus
+wallpaper yet exercises the decoded-texture path. 46% of `alpha` and 43%
+of `visible` fields are property-wrapped; the M3c parser unwraps the
+`{"user": ..., "value": ...}` wrapper at load time for image-layer fields
+(user properties themselves are M3j), while the property-wrapped
+*clearcolor* form (1 of 60) remains rejected per the M3b finding.
+
 ## Run the suites
 
 ```sh
-scripts/smoke-scene.sh       # M3a + M3b: scene renderer through the daemon,
+scripts/smoke-scene.sh       # M3a..M3c: scene renderer through the daemon,
                              #   scripted-color oracle, containment, the
-                             #   scene.pkg lanes, plus a standalone llvmpipe
-                             #   lane
+                             #   scene.pkg lanes, the M3c image-layer cases
+                             #   (a)-(f), plus a standalone llvmpipe lane
 scripts/smoke-corpus-pkg.sh  # M3b evidence: preflight over real Workshop
                              #   scene packages (KWE_CORPUS_DIR); SKIPPED
                              #   with exit 0 when unset/missing
@@ -102,11 +177,11 @@ scripts/smoke-supervisor.sh  # unchanged (M1a regression lane)
 ```
 
 `smoke-scene.sh` builds the workspace, uses a private temporary
-socket/runtime/state tree, generates the scene.json + script.js fixtures at
-runtime (never committed), and removes everything on exit. It does not
-install a wallpaper or touch the running Plasma session; a `pgrep -x
-plasmashell` pid guard asserts the suite never touches an existing
-plasmashell.
+socket/runtime/state tree, generates the scene.json + script.js fixtures
+and the M3c solid-PNG images at runtime (never committed), and removes
+everything on exit. It does not install a wallpaper or touch the running
+Plasma session; a `pgrep -x plasmashell` pid guard asserts the suite never
+touches an existing plasmashell.
 
 ## Acceptance evidence
 
@@ -151,6 +226,23 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (oracle deviation 2 ≤ 4), `smoke-supervisor.sh` exit 0 |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 
+### M3c — image layers and Scene.getLayer (this commit)
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 335 tests pass, 81 in `kwe-scene-renderer` (6 layer-math + 5 texture-bounds + 37 scene-parse + 19 Layer-proxy + 14 earlier) |
+| device tests (both drivers) | `KWE_TEST_DEVICE`-gated renders: fullscreen red 1×1 (`isolated_draw`), 2×2 four-color orientation quad (`quad_orientation`), straight-alpha blend (`blend_partial_alpha`) | byte-exact on llvmpipe and NVIDIA RTX 3070: every pixel [0,0,255,255]; at(8,8)/(56,8)/(8,40)/(56,40) = blue/green/red/white; every pixel (79,58,36,191) |
+| smoke (a): two layers, scene order | red 64×64 then blue 32×32 centered; draw order = scene.json order | daemon lane: (90,55)=(0,0,255,255) red, (140,79)=(255,0,0,255) blue, (150,85)=(255,0,0,255) blue — byte-exact, tol 0 |
+| smoke (b): src-over blend | blue 64×64 at alpha 191/255 over the red layer | (80,45)=(79,58,36,191) tol 1 — the ONE-factor oracle |
+| smoke (c): reversed order | same scene with the objects array reversed | (140,79)=(0,0,255,255) — blue now on top, array order wins |
+| smoke (d): missing image | `image: "broken.png"` that does not exist | renderer stays `live`, sequence advances, stderr ring carries `event=renderer.scene.layer_skip layer=broken`; remaining layers render |
+| smoke (e): 257 layers | 257 image objects | `rolled_back`, `last_failure_detail` carries `exit_code_73` and `over the 256 layer cap`; pid unchanged from the previous worker — no bounce |
+| smoke (f): scripted move | script sets `mark.origin.x=60, origin.y=34, size 40×22` on the blue layer every frame | (140,79)=(255,0,0,255) blue (moved onto the red region), (158,85)=(255,0,0,255), (90,55)=(0,0,255,255) red — the proxy read/write + clamp round-trip |
+| layer cap / clamp units | 256 accepted, 257 rejected; clamps: non-finite→0, alpha 0..=1, \|v\| ≤ 1e6, size ≥ 0, `visible` boolean coercion | `exactly_256_image_layers_accepted`, `rejects_257th`; clamp tests in layers.rs + js.rs |
+| corpus stats | image-bearing objects, blendMode histogram, property-wrapping rates | 685 objects; 432 with `colorBlendMode` (410×0, 30×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12); **all 685 reference model `.json` files (M3h)**; 46% alpha / 43% visible property-wrapped |
+| regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4), `smoke-supervisor.sh` exit 0 |
+| plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
+
 ## Renderer exit codes
 
 | Code | Meaning | Supervisor mapping |
@@ -159,7 +251,7 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | 70 | `--exit-after` synthetic fault | `process_exit` failure |
 | 71 | memory denied (QuickJS heap cap hit, or `--memory-pressure-after`) | `resource_limit` failure (`memory_allocation_denied`), mapped unconditionally — any worker exiting 71 declares a resource limit, test fault or not |
 | 72 | memory-pressure allocation unexpectedly succeeded | `process_exit` failure |
-| 73 | backend rejection: scene parse (bad JSON, wrong shape — incl. the property-wrapped clearcolor form until M3c+, script non-string or over caps), pkg shape (no `scene.json` entry, several `scene.json` entries, **nested `scene.pkg`**), missing/unreadable script, Vulkan device/compositor unusable, sustained render failure streak | `exit_code_73` in `last_failure_detail` |
+| 73 | backend rejection: scene parse (bad JSON, wrong shape — incl. the property-wrapped clearcolor form until M3c+, script non-string or over caps, **more than 256 image layers — `over the 256 layer cap`**), pkg shape (no `scene.json` entry, several `scene.json` entries, **nested `scene.pkg`**), missing/unreadable script, Vulkan device/compositor unusable, sustained render failure streak | `exit_code_73` in `last_failure_detail` |
 | signal | killed (e.g. kill -9) | `process_exit` with `signal_9` |
 
 A script exception is *not* an exit path: the exception is caught, counted

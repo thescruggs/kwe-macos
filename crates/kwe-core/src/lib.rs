@@ -26,7 +26,7 @@ pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
 pub use pkg::{
     MAX_SCENE_JSON_BYTES, MAX_SCRIPT_BYTES, PkgEntry, PkgError, PkgErrorKind, PkgReader,
-    preflight_pkg, scene_json_entry, script_entry,
+    image_entry, preflight_pkg, scene_json_entry, script_entry,
 };
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
 pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};

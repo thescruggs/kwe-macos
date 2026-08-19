@@ -5,8 +5,10 @@
 // docs/SCENE_FORMAT_V1.md. Everything the engine needs is either in the JSON
 // (`general.clearcolor`) or referenced from it (`general.script`, resolved
 // relative to the scene's content root). Unknown keys are tolerated so that
-// real wallpaper packages never make the worker reject a scene; M3c+ slices
-// will interpret the `layers`/`effects`/`properties` sections.
+// real wallpaper packages never make the worker reject a scene; the M3c
+// slice interprets the root `objects` array as image layers (models,
+// particles, audio, text and the `effects`/`properties` sections stay
+// M3d+).
 //
 // Every read is bounded: the scene.json file is capped at 16 MiB (the daemon's
 // preflight uses the same bound) and the referenced script at 2 MiB.
@@ -17,6 +19,9 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
+
+use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
+use crate::textures::DecodedTexture;
 
 /// Cap on the raw scene.json bytes. Single source of truth in kwe-core
 /// (crates/kwe-core/src/pkg.rs), where pkg preflight enforces the same cap
@@ -100,6 +105,52 @@ pub struct SceneConfig {
     /// Optional `general.fps` hint (unused by the worker in M3a; the daemon
     /// owns the pacing).
     pub fps: Option<f32>,
+    /// The `objects` array interpreted as image layers, in scene.json
+    /// order (M3c). Every other object kind (models, particles, audio,
+    /// text — M3d+) is ignored. The loader resolves and decodes each
+    /// layer's `image` and fills `texture`.
+    pub layers: Vec<LayerSpec>,
+}
+
+/// One `objects` entry interpreted as an image layer (M3c). Parsed fields
+/// follow the researched wallpaper-engine schema (docs/SCENE_FORMAT_V1.md,
+/// M3c section): vectors may be the space-separated string form the editor
+/// writes or arrays; every numeric is finite and bounded to ±1e6.
+#[derive(Debug, Clone)]
+pub struct LayerSpec {
+    /// The script's identity for this layer (`Scene.getLayer(name)`).
+    pub name: String,
+    /// Raw `image` reference exactly as written: a path relative to the
+    /// content root (file scenes) or a package entry path (pkg scenes).
+    /// `None` when the field is present but not a string (a
+    /// property-wrapped `{"user": ..., "value": ...}` reference whose
+    /// value is not a string): the layer is still registered so the script
+    /// can reach it, but skipped at load with a bounded diagnostic.
+    pub image: Option<String>,
+    /// Position in scene units (pixels); (0,0) is the scene center, +y
+    /// down (researched WE origin semantics).
+    pub origin: [f32; 2],
+    /// Euler angles in **degrees** (the WE script API unit). The file
+    /// stores radians — the parse converts (corpus-verified: exact π
+    /// values, none at 90/180). Only z rotates 2D layers in M3c.
+    pub angles: [f32; 3],
+    /// Relative scale; 1.0 = original size (WE semantics).
+    pub scale: [f32; 2],
+    /// Size in scene units (pixels); [0, 0] (absent or zero) means "the
+    /// texture's decoded dimensions", substituted at load.
+    pub size: [f32; 2],
+    /// Straight alpha in 0..=1; default 1.0 (WE default).
+    pub alpha: f32,
+    /// Default true (WE default).
+    pub visible: bool,
+    /// `colorBlendMode` (the corpus key) or `blendMode` (the brief's key)
+    /// as written; only 0 (normal) is implemented — anything else is noted
+    /// once per layer and drawn src-over until M3d.
+    pub blend_mode: u32,
+    /// Decoded RGBA8 texture, filled by the loader; `None` when the image
+    /// is missing, unreadable, over budget, or not a decodable format. The
+    /// layer then stays registered (script-visible) but draws nothing.
+    pub texture: Option<DecodedTexture>,
 }
 
 impl SceneConfig {
@@ -174,6 +225,7 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
     let clear_color = parse_clear_color(general)?;
     let resolution = parse_resolution(general)?;
     let fps = parse_fps(general)?;
+    let layers = parse_objects(root_obj)?;
 
     let script_reference = match general.get("script") {
         None | Some(Value::Null) => None,
@@ -193,12 +245,316 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
         script_reference,
         resolution,
         fps,
+        layers,
     })
 }
 
+/// The `objects` array, interpreted as image layers in scene.json order
+/// (the compositor's draw order — the layer on top is drawn last, over the
+/// others). An object is an image layer exactly when it carries an `image`
+/// field; everything else (models, particles, audio, text — M3d+) is
+/// ignored. A reference that ends in `.json` is a model instance under the
+/// WE solid-model architecture (all 685 corpus image references point at
+/// model files) — skipped without a diagnostic, not counted toward the
+/// layer cap, until models arrive (M3h).
+fn parse_objects(root_obj: &serde_json::Map<String, Value>) -> Result<Vec<LayerSpec>, SceneError> {
+    let Some(value) = root_obj.get("objects") else {
+        return Ok(Vec::new());
+    };
+    let array = value.as_array().ok_or_else(|| {
+        SceneError::new(
+            SceneErrorKind::Shape,
+            "scene.json \"objects\" must be an array",
+        )
+    })?;
+    let mut layers = Vec::new();
+    for (index, entry) in array.iter().enumerate() {
+        let object = entry.as_object().ok_or_else(|| {
+            SceneError::new(
+                SceneErrorKind::Shape,
+                format!("scene.json \"objects[{index}]\" must be an object"),
+            )
+        })?;
+        if !object.contains_key("image") {
+            continue; // particles, audio, text, ... — M3d+
+        }
+        let layer = parse_image_layer(object, index)?;
+        if layer
+            .image
+            .as_deref()
+            .is_some_and(|image| image.to_ascii_lowercase().ends_with(".json"))
+        {
+            // A model instance: WE stores every visual (2D included) as a
+            // model; model layers are M3h. The scene renders without it.
+            continue;
+        }
+        layers.push(layer);
+    }
+    if layers.len() > MAX_LAYERS {
+        return Err(SceneError::new(
+            SceneErrorKind::Shape,
+            format!(
+                "scene.json \"objects\" has {} image layers, over the {MAX_LAYERS} layer cap",
+                layers.len()
+            ),
+        ));
+    }
+    Ok(layers)
+}
+
+/// One image layer entry. Numeric out-of-range values reject the whole
+/// scene (like clearcolor); an unresolvable image never does (the task's
+/// policy — a missing image skips the layer, not the scene).
+fn parse_image_layer(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<LayerSpec, SceneError> {
+    let name = match object.get("name") {
+        Some(Value::String(name)) => name.clone(),
+        None | Some(Value::Null) => {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!("scene.json \"objects[{index}].name\" is required for image layers"),
+            ));
+        }
+        Some(_) => {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!("scene.json \"objects[{index}].name\" must be a string"),
+            ));
+        }
+    };
+
+    // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
+    // editor serializes user-bindable fields — 46% of alpha and 43% of
+    // visible fields in the 60-scene corpus. The initial `value` is the
+    // behavior until user properties arrive (M3j); the wrapper is unwrapped
+    // here, and a wrapped scalar without a value rejects like any malformed
+    // scalar.
+    let image = match property_value(object.get("image").expect("caller checked")) {
+        Value::String(reference) => Some(reference.clone()),
+        _ => None,
+    };
+
+    let origin = match object.get("origin") {
+        None => [0.0, 0.0],
+        Some(value) => {
+            let vector = parse_vector(
+                property_value(value),
+                &field(index, "origin"),
+                &[2, 3],
+                false,
+            )?;
+            [vector[0], vector[1]] // z is unused by 2D rendering in M3c
+        }
+    };
+
+    // The file stores radians (corpus: exact π, none at 90/180); the script
+    // API speaks degrees, and so does the runtime model — convert here.
+    let angles = match object.get("angles") {
+        None => [0.0, 0.0, 0.0],
+        Some(value) => {
+            let mut vector = parse_vector(
+                property_value(value),
+                &field(index, "angles"),
+                &[2, 3],
+                false,
+            )?;
+            for angle in &mut vector {
+                *angle = angle.to_degrees();
+            }
+            match vector.as_slice() {
+                [x, y] => [*x, *y, 0.0],
+                [x, y, z] => [*x, *y, *z],
+                _ => unreachable!("parse_vector enforces the allowed lengths"),
+            }
+        }
+    };
+
+    let scale = match object.get("scale") {
+        None => [1.0, 1.0],
+        Some(value) => {
+            let vector = parse_vector(
+                property_value(value),
+                &field(index, "scale"),
+                &[2, 3],
+                false,
+            )?;
+            [vector[0], vector[1]]
+        }
+    };
+
+    let size = match object.get("size") {
+        None => [0.0, 0.0],
+        Some(value) => {
+            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
+            [vector[0], vector[1]]
+        }
+    };
+
+    let alpha = match object.get("alpha") {
+        None => 1.0,
+        Some(value) => {
+            let alpha = property_value(value).as_f64().ok_or_else(|| {
+                SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!("scene.json \"{}\" must be a float", field(index, "alpha")),
+                )
+            })?;
+            if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+                return Err(SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be between 0.0 and 1.0",
+                        field(index, "alpha")
+                    ),
+                ));
+            }
+            alpha as f32
+        }
+    };
+
+    let visible = match object.get("visible") {
+        None => true,
+        Some(value) => match property_value(value) {
+            Value::Bool(visible) => *visible,
+            _ => {
+                return Err(SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be a boolean",
+                        field(index, "visible")
+                    ),
+                ));
+            }
+        },
+    };
+
+    // `colorBlendMode` is the corpus key (all observed occurrences);
+    // `blendMode` is accepted as an alias. Only 0 (normal) renders in M3c;
+    // non-zero modes draw src-over with a one-time note.
+    let blend_mode = match object
+        .get("blendMode")
+        .or_else(|| object.get("colorBlendMode"))
+    {
+        None => 0,
+        Some(value) => match property_value(value).as_f64() {
+            Some(mode) if mode.is_finite() && mode >= 0.0 && mode <= f64::from(u32::MAX) => {
+                mode as u32
+            }
+            _ => 0, // not worth a rejection: the layer renders src-over
+        },
+    };
+
+    Ok(LayerSpec {
+        name,
+        image,
+        origin,
+        angles,
+        scale,
+        size,
+        alpha,
+        visible,
+        blend_mode,
+        texture: None,
+    })
+}
+
+fn field(index: usize, name: &str) -> String {
+    format!("objects[{index}].{name}")
+}
+
+/// Unwrap a property-wrapped value (`{"user": ..., "value": ...}`) to its
+/// `value`; anything else passes through unchanged.
+fn property_value(value: &Value) -> &Value {
+    match value.as_object().and_then(|object| object.get("value")) {
+        Some(inner) => inner,
+        None => value,
+    }
+}
+
+/// Parse a WE vector field: the space-separated string form the editor
+/// writes (`"1920.00000 1080.00000 0.00000"` — verified on the corpus) or
+/// an array of numbers. `allowed` lists the accepted component counts (the
+/// editor writes three; two is accepted, and the extra z is dropped by the
+/// caller). Every component must be finite and within ±1e6; `non_negative`
+/// additionally forbids negative values (sizes — a mirror goes through
+/// scale, per WE semantics).
+fn parse_vector(
+    value: &Value,
+    field: &str,
+    allowed: &[usize],
+    non_negative: bool,
+) -> Result<Vec<f32>, SceneError> {
+    let tokens: Vec<f64> = if let Some(text) = value.as_str() {
+        let mut out = Vec::new();
+        for token in text.split_whitespace() {
+            let number = token.parse::<f64>().map_err(|_| {
+                SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!("scene.json \"{field}\" must contain only floats, got \"{token}\""),
+                )
+            })?;
+            out.push(number);
+        }
+        out
+    } else if let Some(array) = value.as_array() {
+        array
+            .iter()
+            .map(|entry| {
+                entry.as_f64().ok_or_else(|| {
+                    SceneError::new(
+                        SceneErrorKind::Shape,
+                        format!("scene.json \"{field}\" entries must be floats"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<f64>, SceneError>>()?
+    } else {
+        return Err(SceneError::new(
+            SceneErrorKind::Shape,
+            format!(
+                "scene.json \"{field}\" must be an array of floats or a space-separated string"
+            ),
+        ));
+    };
+    if !allowed.contains(&tokens.len()) {
+        let accepted = allowed
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Err(SceneError::new(
+            SceneErrorKind::Shape,
+            format!(
+                "scene.json \"{field}\" must have {accepted} components, found {}",
+                tokens.len()
+            ),
+        ));
+    }
+    let mut out = Vec::with_capacity(tokens.len());
+    for (i, token) in tokens.iter().enumerate() {
+        if !token.is_finite() || token.abs() > MAX_LAYER_VALUE {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!("scene.json \"{field}[{i}]\" must be finite and within ±{MAX_LAYER_VALUE}"),
+            ));
+        }
+        if non_negative && *token < 0.0 {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!("scene.json \"{field}[{i}]\" must not be negative"),
+            ));
+        }
+        out.push(*token as f32);
+    }
+    Ok(out)
+}
+
 /// Canonicalized directory that contains `path`; the root every relative
-/// script reference is confined to.
-fn canonical_root(path: &Path) -> Result<PathBuf, SceneError> {
+/// script and image reference is confined to (the M3c image loader resolves
+/// against the same root so the two can never disagree).
+pub(crate) fn canonical_root(path: &Path) -> Result<PathBuf, SceneError> {
     let canonical = path.canonicalize().map_err(|e| {
         SceneError::new(
             SceneErrorKind::Read,
@@ -902,5 +1258,264 @@ mod tests {
             SceneConfig::parse(&scene).unwrap_err().kind,
             SceneErrorKind::Script
         );
+    }
+
+    // ---- M3c: objects / image layers ----
+
+    fn parse_objects_of(json: &str) -> Result<Vec<LayerSpec>, SceneError> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        let root = value.as_object().unwrap();
+        parse_objects(root)
+    }
+
+    #[test]
+    fn image_layers_parsed_in_order_with_defaults() {
+        // Corpus-style serialization: string vectors, three components.
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "bg", "image": "textures/bg.png",
+                 "origin": "1920.00000 1080.00000 0.00000",
+                 "angles": "0.00000 -0.00000 0.00000",
+                 "scale": "1.26081 1.26081 1.26081",
+                 "size": "3840.00000 2194.00000"},
+                {"name": "fg", "image": "textures/fg.png"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].name, "bg");
+        assert_eq!(layers[0].image.as_deref(), Some("textures/bg.png"));
+        assert_eq!(layers[0].origin, [1920.0, 1080.0]);
+        assert_eq!(layers[0].angles, [0.0, 0.0, 0.0]);
+        assert_eq!(layers[0].scale, [1.26081, 1.26081]);
+        assert_eq!(layers[0].size, [3840.0, 2194.0]);
+        assert_eq!(layers[0].alpha, 1.0);
+        assert!(layers[0].visible);
+        assert_eq!(layers[0].blend_mode, 0);
+        // Defaults for a bare layer.
+        assert_eq!(layers[1].origin, [0.0, 0.0]);
+        assert_eq!(layers[1].angles, [0.0, 0.0, 0.0]);
+        assert_eq!(layers[1].scale, [1.0, 1.0]);
+        assert_eq!(layers[1].size, [0.0, 0.0]);
+        assert_eq!(layers[1].alpha, 1.0);
+    }
+
+    #[test]
+    fn array_vector_form_accepted() {
+        let layers = parse_objects_of(
+            r#"{"objects": [{"name": "l", "image": "a.png",
+                             "origin": [10, 20], "size": [100, 50]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers[0].origin, [10.0, 20.0]);
+        assert_eq!(layers[0].size, [100.0, 50.0]);
+    }
+
+    #[test]
+    fn angles_converted_from_radians_to_degrees() {
+        // Corpus-verified: scene.json stores radians (exact π values seen,
+        // none at 90/180); the script API and runtime model use degrees.
+        let layers = parse_objects_of(
+            r#"{"objects": [{"name": "spin", "image": "a.png",
+                             "angles": "3.14159 0.00000 1.57080"}]}"#,
+        )
+        .unwrap();
+        assert!((layers[0].angles[0] - 180.0).abs() < 0.001);
+        assert_eq!(layers[0].angles[1], 0.0);
+        assert!((layers[0].angles[2] - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn property_wrapped_values_unwrapped() {
+        // The corpus's dominant serialization for user-bindable fields
+        // (46% of alpha, 43% of visible); the initial value is the
+        // behavior until user properties (M3j).
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "a", "image": "a.png",
+                 "alpha": {"user": "volume", "value": 0.5},
+                 "visible": {"user": "on", "value": false},
+                 "origin": {"user": "pos", "value": "5.00000 6.00000 0.00000"}},
+                {"name": "b", "image": {"user": "tex", "value": "b.png"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers[0].alpha, 0.5);
+        assert!(!layers[0].visible);
+        assert_eq!(layers[0].origin, [5.0, 6.0]);
+        assert_eq!(layers[1].image.as_deref(), Some("b.png"));
+    }
+
+    #[test]
+    fn non_string_image_registers_layer_without_reference() {
+        // A property-wrapped image whose value is not a string, or any
+        // other non-string image field: the layer stays registered (the
+        // script can still reach it) but is skipped at load.
+        let layers = parse_objects_of(r#"{"objects": [{"name": "x", "image": 42}]}"#).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert!(layers[0].image.is_none());
+    }
+
+    #[test]
+    fn objects_without_image_field_ignored() {
+        // Audio entries, particles, effects objects — nothing renders.
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "song.mp3", "audio": "song.mp3"},
+                {"name": "dust", "particle": "particles/dust.json"},
+                {"name": "bg", "image": "bg.png"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "bg");
+    }
+
+    #[test]
+    fn model_json_references_skipped_as_m3h() {
+        // All 685 corpus image references point at model .json files (WE's
+        // solid-model architecture): they are model layers, not textures —
+        // skipped, and not counted toward the layer cap.
+        let mut objects = r#"{"objects": ["#.to_string();
+        for i in 0..300 {
+            objects.push_str(&format!(
+                r#"{{"name": "m{i}", "image": "models/util/m{i}.json"}},"#
+            ));
+        }
+        objects.push_str(r#"{"name": "real", "image": "tex.png"}]}"#);
+        let layers = parse_objects_of(&objects).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "real");
+    }
+
+    #[test]
+    fn too_many_image_layers_rejected() {
+        let layers = (0..MAX_LAYERS + 1)
+            .map(|i| format!(r#"{{"name": "l{i}", "image": "t{i}.png"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let objects = format!(r#"{{"objects": [{layers}]}}"#);
+        let error = parse_objects_of(&objects).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        assert!(
+            error
+                .message
+                .contains(&format!("over the {MAX_LAYERS} layer cap")),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn exactly_256_image_layers_accepted() {
+        let layers = (0..MAX_LAYERS)
+            .map(|i| format!(r#"{{"name": "l{i}", "image": "t{i}.png"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let objects = format!(r#"{{"objects": [{layers}]}}"#);
+        assert_eq!(parse_objects_of(&objects).unwrap().len(), MAX_LAYERS);
+    }
+
+    #[test]
+    fn layer_out_of_range_values_rejected() {
+        let cases = [
+            (r#"{"name": "l", "image": "a.png", "alpha": 1.5}"#, "alpha"),
+            (
+                r#"{"name": "l", "image": "a.png", "origin": "0 0 x"}"#,
+                "origin",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "scale": "1000000000 1 1"}"#,
+                "scale",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "size": "-5 10"}"#,
+                "size",
+            ),
+            (r#"{"name": "l", "image": "a.png", "size": "10"}"#, "size"),
+            (
+                r#"{"name": "l", "image": "a.png", "angles": "90"}"#,
+                "angles",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "origin": [1, "x"]}"#,
+                "origin",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "visible": 1}"#,
+                "visible",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "origin": "1 2 3 4"}"#,
+                "origin",
+            ),
+            (
+                r#"{"name": "l", "image": "a.png", "alpha": {"user": "a"}}"#,
+                "alpha",
+            ),
+        ];
+        for (json, expected_field) in cases {
+            let error = parse_objects_of(&format!(r#"{{"objects": [{json}]}}"#)).unwrap_err();
+            assert_eq!(error.kind, SceneErrorKind::Shape, "{json}");
+            assert!(
+                error.message.contains(expected_field),
+                "expected a mention of {expected_field:?} in: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn image_layer_without_name_rejected() {
+        let error = parse_objects_of(r#"{"objects": [{"image": "a.png"}]}"#).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        assert!(error.message.contains("name"), "{}", error.message);
+        let error =
+            parse_objects_of(r#"{"objects": [{"name": 42, "image": "a.png"}]}"#).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    #[test]
+    fn objects_wrong_shape_rejected() {
+        for json in [r#"{"objects": 42}"#, r#"{"objects": [42]}"#] {
+            let error = parse_objects_of(json).unwrap_err();
+            assert_eq!(error.kind, SceneErrorKind::Shape, "{json}");
+        }
+    }
+
+    #[test]
+    fn blend_modes_recorded() {
+        // `colorBlendMode` is the corpus key; `blendMode` is the brief's
+        // alias. Only 0 renders in M3c; others draw src-over with a note.
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "a", "image": "a.png", "colorBlendMode": 24},
+                {"name": "b", "image": "b.png", "blendMode": 6},
+                {"name": "c", "image": "c.png", "colorBlendMode": 0},
+                {"name": "d", "image": "d.png", "blendMode": "weird"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers[0].blend_mode, 24);
+        assert_eq!(layers[1].blend_mode, 6);
+        assert_eq!(layers[2].blend_mode, 0);
+        // A non-numeric mode is tolerated (src-over + note), not a reject.
+        assert_eq!(layers[3].blend_mode, 0);
+    }
+
+    #[test]
+    fn pkg_scene_carries_image_layers() {
+        // The pkg lane parses the same `objects` array; image references
+        // resolve against the package table at load, not here.
+        let dir = tmpdir();
+        let scene_json = br#"{"objects": [{"name": "bg", "image": "textures/bg.png"}]}"#;
+        let entries = pkg_entries(
+            &dir,
+            &build_pkg(&[("scene.json", scene_json), ("textures/bg.png", b"TEXV0005")]),
+        );
+        let config = SceneConfig::parse_pkg(scene_json, &entries).unwrap();
+        assert_eq!(config.layers.len(), 1);
+        assert_eq!(config.layers[0].image.as_deref(), Some("textures/bg.png"));
+        assert!(config.layers[0].texture.is_none());
     }
 }
