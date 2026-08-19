@@ -27,13 +27,14 @@
 - 2026-08-19 — **Plan deviation (user-requested):** packaging pulled forward from M5 — the PKGBUILD now installs kwe-video-renderer, kwe-web-renderer, kwe-audio-worker so test builds can drive video/web wallpapers from the installed package. M5 keeps .SRCINFO regen + version bump + installed-layout smoke.
 - 2026-08-19 — **User regression: empty gallery → fixed** (`f9875a7`, `74ec846`, `7e68fa9`, merged ff; bug report `docs/bugs/GALLERY_EMPTY_DAEMON_DOWN.md`). Root cause: user daemon stopped at session teardown (`Restart=on-failure` misses clean stops) and the manager had NO activation path. Fix: DaemonActivator (liveness-probed activation via injectable `systemctl --user start kwe-daemon`, bounded attempts/backoff, actionable Failed state + QML retry), unit `Restart=always`, smoke daemon-down case. Two real bugs found along the way: the smoke stub's backgrounded daemon held the manager's stderr pipe open (`| tail` never got EOF — suite passed but hung, leaking daemons), and the first probe was existence-only (a StartLimitExceeded stale socket read as "running") → replaced by a liveness probe. Independent review: 1 must-fix + 2 recommended, all fixed; 11 activator unit tests.
 - 2026-08-19 — **M2c done** (`be3e1cd` + `0fdc231`, rebased ff onto the activation fix). grants.rs permissions-v1.json (bounded 256/1 MiB, patch semantics, quarantine + prune to newest 8), permissions.get/set/list, network grant → --allow-network argv, audio grant gates frame delivery (audio_grant_dropped counter), pointer default-on, manager PermissionsClient + QML toggles daemon-backed. Review: daemon side fully sound; 2 must-fix in the manager queue bookkeeping (dropped-op callback, pending-at-enqueue) + quarantine pruning + mirror staleness, all fixed. 215 tests, smoke-web 10/10.
+- 2026-08-19 — **M2d done** (`fa79096` + `2aa6194`). Compromise suite (4-attempt matrix × grant/no-grant with argv-level proof — stall-listener positive control, deterministic on any host), windowed WebPreview fixed, `kwe preflight --web`. Review found 2 HIGH: the preview could not reach ANY display (X11 socket shadowed by the tmpfs / Wayland under unbound /run — fixed with display-socket-only binds selected by env, never the whole runtime dir) and the grant relaunch was a silent no-op (kill()+start() on a running QProcess — fixed with a pending-relaunch state machine). Matrix row 2 relabeled honestly: the browser's file-scheme/CORS isolation is what that case tests; sandbox path containment is asserted by builder unit tests. 221 tests, ctest 7/7.
 
 ## Status at a glance
 
 | Milestone | Status |
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
-| BETA_M2 (web) | M2a–M2c done, M2d in_progress, M2e pending |
+| BETA_M2 (web) | M2a–M2d done, M2e in_progress |
 | BETA_M3 (scene, a–k) | pending |
 | BETA_M4 (live apply) | pending |
 | BETA_M5 (release) | pending |
