@@ -114,9 +114,21 @@ struct Arguments {
     /// Chromium needs more descriptors than the test renderer.
     #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(32..=4096))]
     renderer_web_open_files: u64,
-    /// UID-scoped process ceiling inherited by each renderer.
+    /// UID-scoped process ceiling inherited by each renderer. The kernel's
+    /// RLIMIT_NPROC check counts every thread of the uid (user->processes),
+    /// so this guards the whole desktop, not the worker (docs/BETA_M1.md
+    /// open risk 1): the video kind overrides it with
+    /// --renderer-video-processes, and every kind's per-renderer protection
+    /// comes from RLIMIT_AS plus the supervisor timeouts, not NPROC.
     #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(64..=32768))]
     renderer_processes: u64,
+    /// UID-scoped process ceiling for the video renderer kind only. A
+    /// desktop session commonly runs more threads than the global 1024
+    /// default (this machine measures ~1265), and libmpv fails to create
+    /// threads once RLIMIT_NPROC binds; 32768 is the top of the validated
+    /// range. Other kinds keep the global default.
+    #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
+    renderer_video_processes: u64,
     /// Enable synthetic hang/corruption/exit requests for development tests.
     #[arg(long)]
     allow_test_faults: bool,
@@ -229,19 +241,17 @@ fn main() -> Result<()> {
         processes: arguments.renderer_processes,
         core_dump_bytes: 0,
     };
-    let resource_limits_by_kind = BTreeMap::from([
-        (RendererKind::Test, global_limits),
-        (RendererKind::Video, global_limits),
-        (
-            RendererKind::Web,
-            RendererResourceLimits {
-                address_space_mib: arguments.renderer_web_address_space_mib,
-                open_files: arguments.renderer_web_open_files,
-                ..global_limits
-            },
-        ),
-        (RendererKind::Scene, global_limits),
-    ]);
+    let video_limits = RendererResourceLimits {
+        processes: arguments.renderer_video_processes,
+        ..global_limits
+    };
+    let web_limits = RendererResourceLimits {
+        address_space_mib: arguments.renderer_web_address_space_mib,
+        open_files: arguments.renderer_web_open_files,
+        ..global_limits
+    };
+    let resource_limits_by_kind =
+        resource_limits_for_kinds(global_limits, video_limits, web_limits);
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_paths,
         runtime_dir: renderer_runtime_dir,
@@ -970,6 +980,26 @@ const fn default_kind() -> RendererKind {
     RendererKind::Test
 }
 
+/// Per-kind pre-exec resource ceilings. The video kind carries its own
+/// UID-scoped process ceiling (`--renderer-video-processes`) because the
+/// kernel's RLIMIT_NPROC check counts every thread of the uid, so the
+/// global default guards the whole desktop rather than the worker
+/// (docs/BETA_M1.md open risk 1); the web kind keeps its separate
+/// address-space/descriptor budget. Pure so the defaults and the CLI
+/// override are unit-testable.
+fn resource_limits_for_kinds(
+    global: RendererResourceLimits,
+    video: RendererResourceLimits,
+    web: RendererResourceLimits,
+) -> BTreeMap<RendererKind, RendererResourceLimits> {
+    BTreeMap::from([
+        (RendererKind::Test, global),
+        (RendererKind::Video, video),
+        (RendererKind::Web, web),
+        (RendererKind::Scene, global),
+    ])
+}
+
 fn default_socket_path() -> Result<PathBuf> {
     let runtime =
         std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set; pass --socket")?;
@@ -1067,6 +1097,61 @@ mod tests {
 
     fn empty_catalog() -> Arc<RwLock<Catalog>> {
         Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())))
+    }
+
+    fn sample_limits(processes: u64) -> RendererResourceLimits {
+        RendererResourceLimits {
+            address_space_mib: 4096,
+            file_size_mib: 160,
+            open_files: 256,
+            processes,
+            core_dump_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn video_nproc_default_sits_above_the_desktop_thread_ceiling() {
+        // The CLI defaults are the contract: the video kind gets 32768 (top
+        // of the validated range) while every other kind keeps the global
+        // 1024. A desktop session commonly runs more than 1024 threads of
+        // the uid (this machine measures ~1265), and libmpv then fails to
+        // create threads — the smoke runs without any override as the proof.
+        let arguments = Arguments::parse_from(["kwe-daemon"]);
+        assert_eq!(arguments.renderer_processes, 1024);
+        assert_eq!(arguments.renderer_video_processes, 32768);
+    }
+
+    #[test]
+    fn per_kind_process_ceiling_applies_only_to_the_video_kind() {
+        let global = sample_limits(1024);
+        let video = sample_limits(32768);
+        let web = RendererResourceLimits {
+            address_space_mib: 16_384,
+            open_files: 1024,
+            ..global
+        };
+        let map = resource_limits_for_kinds(global, video, web);
+        assert_eq!(map[&RendererKind::Video].processes, 32768);
+        for kind in [RendererKind::Test, RendererKind::Web, RendererKind::Scene] {
+            assert_eq!(
+                map[&kind].processes,
+                1024,
+                "kind {} must keep the global process ceiling",
+                kind.as_str()
+            );
+        }
+        // The web budget is untouched by the video knob.
+        assert_eq!(map[&RendererKind::Web].address_space_mib, 16_384);
+        assert_eq!(map[&RendererKind::Web].open_files, 1024);
+        // The CLI override feeds the same helper: an explicit
+        // --renderer-video-processes replaces the 32768 default for video
+        // only, and a kind not overridden keeps the global default.
+        let overridden = sample_limits(4096);
+        let map = resource_limits_for_kinds(global, overridden, web);
+        assert_eq!(map[&RendererKind::Video].processes, 4096);
+        assert_eq!(map[&RendererKind::Test].processes, 1024);
+        assert_eq!(map[&RendererKind::Scene].processes, 1024);
+        assert_eq!(map[&RendererKind::Web].processes, 1024);
     }
 
     fn cache_for_tests() -> Arc<std::sync::Mutex<WorkshopCache>> {

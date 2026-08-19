@@ -11,10 +11,4 @@ clap.workspace = true
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
 libc.workspace = true
-# Pinned: safe wrapper used only for the client API-version diagnostic. The
-# libmpv render API cannot go through it (its builder initializes the core
-# before exposing the handle, which libmpv 0.41 aborts on when a render
-# context is created afterwards — see docs/BETA_M1.md), so the render API is
-# declared directly against the system libmpv in `mpv_ffi`.
-mpv = "0.2.3"
 serde_json.workspace = true

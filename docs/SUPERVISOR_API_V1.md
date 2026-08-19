@@ -265,10 +265,19 @@ Per-kind policies replace the alpha's single set: startup timeouts default to
 the global 3 s; resource limits default to the global budget
 (address-space 4096 MiB, file 160 MiB, 256 descriptors, 1024 processes) except
 web, which needs a 16384 MiB virtual address space and 1024 descriptors
-because V8 reserves a 4 GiB cage before `main`. The daemon flags
+because V8 reserves a 4 GiB cage before `main`, and video, which overrides the
+process ceiling with `--renderer-video-processes` (default 32768 — the top of
+the validated range). The video override exists because the kernel's
+`RLIMIT_NPROC` check counts every thread of the uid (`user->processes`), so the
+global 1024 ceiling guards the whole desktop, not the worker, and a normal
+desktop session commonly runs more than 1024 threads — libmpv's thread
+creation then fails with EAGAIN and `mpv_create` hangs in its failure path.
+Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
+(startup/frame/handoff), not from `NPROC`. The daemon flags
 `--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
-`--renderer-web-address-space-mib`, and `--renderer-web-open-files` tune these;
-frame timeouts and the canary stay global. Per-kind renderer binaries default
+`--renderer-web-address-space-mib`, `--renderer-web-open-files`, and
+`--renderer-video-processes` tune these; frame timeouts and the canary stay
+global. Per-kind renderer binaries default
 to `kwe-<kind>-renderer` beside the daemon executable (`--renderer-video`,
 `--renderer-web`, `--renderer-scene` override; `--renderer` keeps meaning the
 test kind).
@@ -298,9 +307,12 @@ depend on the live mmap.
 
 ## Current limits
 
-- The generated renderer is the only production-shaped worker exercised here;
-  video/web/scene binaries arrive in later milestones, and video content
-  validation is path-level only until M1c.
+- The generated and video renderers are the production-shaped workers
+  exercised here; web and scene binaries arrive in later milestones. Video
+  content validation is path-level in the daemon but decode-level in
+  `kwe-video-renderer` (exit 73 on unreadable media), and the video lane runs
+  end-to-end in `scripts/smoke-video.sh` including a deterministic pixel
+  oracle (docs/BETA_M1.md, M1e acceptance).
 - The packaged systemd unit bounds aggregate memory, swap, CPU, and task usage
   (raised in M1a to fit daemon + audio worker + Chromium);
   GPU-specific budgets and a stable seccomp allowlist remain later hardening

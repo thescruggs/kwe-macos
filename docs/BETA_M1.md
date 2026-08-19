@@ -7,7 +7,11 @@ contract (per-kind spawn, env allowlist, resource limits, bounded stderr
 ring, audio/media plumbing); M1b adds the libmpv video renderer itself; M1d
 adds the bounded PipeWire audio capture worker (`kwe-audio-worker`), the
 daemon-side capture management (`--audio-capture`, `audio.status`), and the
-real producer behind the `audio_bands` wire type.
+real producer behind the `audio_bands` wire type. M1e closes the milestone:
+the video kind gets its own process ceiling (the global `RLIMIT_NPROC`
+default cannot host a desktop session), the `mpv` crate is removed in favor
+of explicit FFI, the video lane gains a deterministic pixel oracle, and the
+M1 exit gate is evidenced.
 
 ## Goal
 
@@ -23,7 +27,8 @@ Nothing is loaded into plasmashell.
 ## Run the suites
 
 ```sh
-scripts/smoke-video.sh        # M1b: video renderer through the daemon
+scripts/smoke-video.sh        # M1b + M1e: video renderer through the daemon,
+                              #   incl. the deterministic pixel oracle
 scripts/smoke-supervisor.sh   # M1a: supervisor fault/recovery contract
 scripts/smoke-audio.sh        # M1d: bounded audio capture through the daemon
 ```
@@ -118,6 +123,27 @@ M1d gates: `cargo fmt --all -- --check`, `cargo clippy --workspace
 are clean (132 tests); `smoke-audio.sh` (5 cases) passes, and
 `smoke-video.sh` / `smoke-supervisor.sh` still pass.
 
+### M1e — close-out: per-kind NPROC, mpv crate removal, pixel oracle
+
+Validated on 2026-08-19 (mpv 1:0.41.0, libmpv.so.2.5.0, CachyOS).
+
+| Case | Expected | Result |
+|---|---|---|
+| per-kind process ceiling | `--renderer-video-processes` (default 32768) applies to the video kind only; test/web/scene keep the global 1024; CLI override respected | unit `per_kind_process_ceiling_applies_only_to_the_video_kind` (Video 32768, Test/Web/Scene 1024, override 4096 honored, web address-space 16384 preserved) and `video_nproc_default_sits_above_the_desktop_thread_ceiling` (defaults 1024/32768); `smoke-video.sh` runs with no `--renderer-processes` override — the video lane itself is the proof (open risk 1, resolved) |
+| mpv crate removal | no `mpv` dependency; API-version diagnostic unchanged; workspace builds and links | Cargo.toml drops `mpv 0.2.3`; Cargo.lock regenerated (201 deletions: mpv 0.2.3 and its 2016-era tree — num 0.1.43, rustc-serialize, rand 0.3, enum_primitive, log 0.3.9, num-bigint/complex/integer/iter/rational/traits); `mpv_client_api_version` declared in the same `extern "C"` block as the render API with `#[link(name = "mpv")]` explicit; `mpv_api=2.5` at renderer start unchanged (open risk 3, resolved) |
+| pixel oracle | deterministic solid-color mp4 (64x64, 5 s, `color=c=0x3366CC:s=64x64:r=30`) through the full daemon pipeline; shared frame file parsed per FRAME_PROTOCOL_V1.md (seqlock snapshot); 9 sampled pixels within a documented delta | `ORACLE-OK worst_channel_deviation=2 tolerance=4`; observed BGRA (expected `(0xCC, 0x66, 0x33, 0xFF)` for `#3366CC`): (80,45)=`cb 66 31 ff`, (40,22)=`ca 66 32 ff`, (120,67)=`cb 66 32 ff`, (120,22)=`ca 66 32 ff`, (40,67)=`cb 65 32 ff`, (36,1)=`ca 66 32 ff`, (123,88)=`cb 66 32 ff`, (36,88)=`cb 66 32 ff`, (123,1)=`cb 66 32 ff` (hex, BGRA order); worst per-channel deviation 2, tolerance 4; alpha exact 0xFF. Empirical: libmpv aspect-letterboxes the 1:1 fixture into the 16:9 (160x90) target — content region x∈[35,125), full height, black corners — so the oracle samples inside the fitted region (documented semantic difference in FEATURE_COMPATIBILITY.md) |
+| `--probe` | `kwe-video-renderer --probe` prints JSON and exits 0, no device needed | `{"backend":"libmpv","client_api_version":"2.5","libmpv_supports_sw_render":true}`, exit 0; `client_api_version` decodes via `MPV_MAKE_VERSION` (unit `api_version_decodes_like_the_removed_mpv_crate`); SW-render bound is libmpv ≥ 0.33 (unit `sw_render_support_bound_is_libmpv_033_or_newer`) |
+| `kwe diagnose` video lane | reports the backend beside the binary | `video backend: {"backend":"libmpv","client_api_version":"2.5","libmpv_supports_sw_render":true}`; missing binary degrades to a bounded note |
+| backend/hardware evidence | recorded | mpv 1:0.41.0; libmpv client API 2.5 (probe); `--hwdec=auto-safe` with one bounded retry with `--hwdec=no`; machine GPU lane from `kwe-vulkan --json`: NVIDIA GeForce RTX 3070 (discrete, Vulkan 1.4.341, logical device created, all external-memory/DMA-BUF extensions present), llvmpipe fallback, loader 1.4.357 |
+| M1 exit gate — corpus | 92-item catalog indexes without crash; malformed/missing projects surface as actionable errors | `kwe diagnose` with the real catalog: scene 60, video 20, web 9, unknown 3, invalid 0; subscribed 0, awaiting download 0; 0 global diagnostics; malformed/missing entries are actionable `invalid_params` failures (smoke-video cases: `garbage.mp4` → worker exit 73 → `rolled_back` with `exit_code_73`; `.bin` → preflight `invalid_params`; missing path → `invalid_params`, nothing spawned) |
+| M1 exit gate — UI | keyboard-usable gallery/detail actions | not in M1 scope: no gallery or detail surface exists in this milestone; carried forward to the M4 UI milestone honestly (gates, grants, C++/manager, and live Plasma are likewise out of scope here) |
+
+M1e gates: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, and `cargo test --workspace --all-targets`
+are clean (146 tests; kwe-video-renderer 10 in-crate, kwe-daemon 59);
+`smoke-video.sh` (11 cases, incl. the oracle) passes, and
+`smoke-supervisor.sh` (17 cases) / `smoke-audio.sh` (5 cases) still pass.
+
 ## Failure and recovery cases
 
 - **hwdec failure**: the session starts with `--hwdec=auto-safe`; an init or
@@ -157,6 +183,15 @@ are clean (132 tests); `smoke-audio.sh` (5 cases) passes, and
    `--renderer-processes 4096` for the video lane; the daemon's production
    default should be revisited (M1e) so video rendering works on any desktop
    session, not only ones with fewer than 1024 threads.
+
+   **M1e: resolved.** The video kind now carries its own process ceiling,
+   `--renderer-video-processes`, defaulting to 32768 (the top of the
+   validated range) and applied only to the video kind's rlimits; test, web,
+   and scene keep the global 1024 (docs/SUPERVISOR_API_V1.md, per-kind
+   limits). The `--renderer-processes 4096` workaround is gone from
+   `smoke-video.sh` — the lane running unmodified is the proof (M1e
+   acceptance, case 1). Per-renderer protection still comes from `RLIMIT_AS`
+   plus the supervisor timeouts, not from `NPROC`.
 2. **Address-space budget.** The test renderer's 384 MiB default kills
    libmpv silently (SIGSEGV from the nvidia VA-API mappings, which measure
    ~1–2 GiB of virtual address space). The video smoke uses 2048 MiB and the
@@ -171,6 +206,15 @@ are clean (132 tests); `smoke-audio.sh` (5 cases) passes, and
    `libmpv.so`; a distro without the SW render API (pre-0.33) fails closed
    with exit 73 rather than misbehaving. The crate is used only for the
    client API-version diagnostic (`mpv_api=2.5`).
+
+   **M1e: crate removed.** The `mpv` crate and its 2016-era dependency tree
+   (201 deletions from Cargo.lock: mpv 0.2.3, num 0.1.43, rustc-serialize,
+   rand 0.3, enum_primitive, log 0.3.9, num-bigint/complex/integer/iter/
+   rational/traits) are gone; the diagnostic is now `mpv_client_api_version`
+   declared in the same `extern "C"` block that binds the render API, with
+   `#[link(name = "mpv")]` carried explicitly (THIRD_PARTY.yml, libmpv
+   entry). Diagnostic behavior is unchanged: `mpv_api=2.5` at start, and the
+   new `--probe` report (M1e acceptance).
 4. **libmpv 0.41 `mpv_create` failure-path hang.** Independent of the NPROC
    trigger above, libmpv's shutdown loop can spin forever if
    `pthread_create` fails during client setup. The worker is safe only

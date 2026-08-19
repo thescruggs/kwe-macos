@@ -1,11 +1,11 @@
 # AI-Skills — Project Memory
 
-**Current as of:** 2026-08-18 (session 1). Read `INSTRUCTIONS.md` first; `BETA_PLAN.md` is the living plan.
+**Current as of:** 2026-08-19 (session 6). Read `INSTRUCTIONS.md` first; `BETA_PLAN.md` is the living plan.
 
 ## Current repo state
 
-- **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS.
-- **Branch:** `fix/qt611-gallery-delegates` (no upstream). HEAD `62bdbdc` — after `1833331` (Qt 6.11 fix) comes `db8563d` (AI-Skills setup), `77caf61` (plan mark-up), then **BETA_M1a**: `cd2d61e` (per-kind renderer contract) + `62bdbdc` (adversarial review fixes). Working tree clean.
+- **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS. **BETA_M1 work happens in worktrees**; never touch the source tree directly.
+- **Active worktree:** `/home/qcv123/gitProjects/kwe-m1e` — branch `beta-m1e-m1-evidence`, BETA_M1e close-out (commit `feat(m1e): video parity evidence, per-kind NPROC, and mpv crate removal` pending at session end). Upstream history: `cd2d61e`+`62bdbdc` (M1a), `7a2b402`+`3e83d2e` (M1b), `51cb469`+`219ebbd` (M1c), `b208465`+`2b2ebd8` (M1d) all ff-merged into `main`. M1e builds on `main` at M1d.
 - **Installed:** `kde-wallpaper-engine-0.1.0.alpha.1-1` built from local HEAD and installed on this CachyOS machine (2026-08-18). Alpha gallery works; Apply disabled; video/web/scene shown as "planned".
 - **Graphify:** `graphify-out/` knowledge graph rebuilt 2026-08-18 (1,497 nodes / 3,224 edges / 70 communities). Query with `graphify query "<question>"`. Known integrity notes: 180 dangling-endpoint edges, `metadata.json` produces zero AST nodes.
 
@@ -45,7 +45,7 @@ Qt is 6.11.1; `kwe-package-installer-test` needs `Qt6::Qml` linked (fixed in 183
 
 | Milestone | Status | Next slice |
 |---|---|---|
-| BETA_M1 — contract generalization + video renderer | pending | M1a (StartSpec kind/content, per-kind paths/limits/timeouts/env, stderr ring) |
+| BETA_M1 — contract generalization + video renderer | done (M1a–M1e, 2026-08-19) | M2a (CDP spike + kwe-cdp client) |
 | BETA_M2 — web renderer (Chromium+CDP) | pending | after M1 |
 | BETA_M3 — scene renderer (QuickJS + ash, slices a–k) | pending | after M2 |
 | BETA_M4 — live apply + manager UI | pending | after M3 |
@@ -57,7 +57,7 @@ Known code gaps the plan resolves (details in BETA_PLAN.md §Found gaps): render
 
 - **Daemon** (`crates/kwe-daemon`): JSON-RPC over Unix socket (`$XDG_RUNTIME_DIR/kwe/daemon-v1.sock`), one request per connection. Supervisor thread spawns ONE renderer binary per slot: argv `--output <frame.bin> --width --height --fps` (+fault flags), `env_clear()`, stdin=input pipe, stdout=ack pipe, stderr=/dev/null; pre-exec setpgid/PDEATHSIG/no_new_privs/rlimits. Canary = sequence≥3 & ≥1s → AwaitingAck (5s) → promote. Failures → rollback to last-good PPM → quarantine after 3 (key: `wallpaper_id:content_hash`).
 - **Frame protocol** (`crates/kwe-frame-protocol`): BGRA8888 premultiplied, 64-byte header `KWEFRM1`, 2-slot seqlock, file = 64+2·w·h·4 ≤512MiB. `SharedFrameWriter::create/publish/set_state`, `SharedFrameReader::snapshot`. C++ consumer `FrameItem` uses pread (no mmap), Frozen after 1.5s.
-- **Input protocol** (`crates/kwe-input-protocol`): NDJSON ≤4096B on stdin; `pointer_position` (phases, u16 coords, buttons), renderer acks `input_ack` on stdout; `audio_bands` (16|32|64 f32 bands) and `media_state` wire types exist but nothing sends them yet.
+- **Input protocol** (`crates/kwe-input-protocol`): NDJSON ≤4096B on stdin; `pointer_position` (phases, u16 coords, buttons), renderer acks `input_ack` on stdout; `audio_bands` (16|32|64 f32 bands) and `media_state` wire types exist; since M1d the daemon forwards `audio.forward`/`media.state` RPCs (generation-gated) and `kwe-audio-worker` is the real producer behind `audio_bands` (latest-wins, queue of 1).
 - **kwe-core**: `scan.rs` (ProjectKind + per-kind Compatibility — the "planned" strings live at scan.rs:393-411), `preflight_scene` (size/ext checks only), `webpreflight.rs`, `websandbox.rs` (bwrap command builder), `audio.rs` (`analyze_stereo`), `playlist.rs`, `policy.rs` (PermissionPolicy, unconsumed by daemon).
 - **kwe-test-renderer**: the contract reference — paced publish loop + InputChannel + fault flags (exit 70/71/72 semantics). New renderers copy it.
 - **Manager** (`apps/kwe-manager`): Qt6/QML; Apply hardcoded disabled (WallpaperDetail.qml:98-107); no C++ apply path. VideoPreview spawns mpv, WebPreview spawns bwrap+chromium (both unsandboxed-by-supervisor, both missing THIRD_PARTY entries).
@@ -70,3 +70,6 @@ Known code gaps the plan resolves (details in BETA_PLAN.md §Found gaps): render
 | 2026-08-16 | Qwen (prior) | Wrote fix/qt611-gallery-delegates: Qt 6.11 gallery/detail fix + uncommitted hardening changes | Uncommitted diff on branch |
 | 2026-08-18 | Claude (this) | Resumed the fix: fixed test target Qt6::Qml link, verified (check.sh, ctest, qmllint, smoke×3), committed `1833331`, built+installed alpha package. Authored beta plan with user decisions. Rebuilt graphify graph. Created AI-Skills setup per maintainer directive. | HEAD 1833331, alpha installed, beta plan pending |
 | 2026-08-18 | Claude + sub-agents | BETA_M1a orchestrated: sonnet sub-agent implemented the per-kind renderer contract in worktree `beta-m1a-renderer-contract`; separate Explore reviewer found 12 findings (5 must-fix); same implementer fixed all; verified 104 tests + 18 smoke cases; ff-merged as `cd2d61e`+`62bdbdc`. Key resulting contracts: StartSpec kind/content, per-kind paths/timeouts/limits, per-worker HOME (0700, `runtime/home-<serial>`), bounded stderr ring in status + exit-stderr in failure detail, `audio.forward`/`media.state` with generation-gated forwarding, kind-qualified quarantine identity with legacy migration, systemd 3G/400%/96. Next: BETA_M1b (`kwe-video-renderer`, libmpv). | HEAD 62bdbdc, M1a done |
+| 2026-08-18 | Claude + sub-agents | BETA_M1b done (`7a2b402`+`3e83d2e`): `kwe-video-renderer` (libmpv SW render API, bgr0→BGRA8888 premultiplied, paced publish, keepalive, media-state pause/seek, exit 70/71/72/73), smoke-video.sh through the daemon. Review: 3 must-fix + 4 recommended, all fixed; M1a bug surfaced (media/audio acks rejected) fixed with last-wins ack acceptance. | M1b done |
+| 2026-08-18/19 | Claude + sub-agents | BETA_M1c done (`51cb469`+`219ebbd`): static `preflight_video` (extension allowlist, ≤2 GiB, non-symlink), scan Video→RendererDependent, `kwe preflight --video`, smoke split (extension reject vs worker-side exit 73); 24 h duration bound implemented for real (fails open on unreadable). BETA_M1d done (`b208465`+`2b2ebd8`): `kwe-audio-worker` + daemon `--audio-capture`/`audio.status` (3 restarts/10 min, then disable), SO_PEERCRED silent-drop. Review: 2 HIGH fixed (nonblocking pw-dump read; ack ceiling max() never decreases). | M1c+M1d done |
+| 2026-08-19 | Claude (this session) | BETA_M1e close-out in worktree `kwe-m1e` (branch `beta-m1e-m1-evidence`): per-kind video NPROC knob `--renderer-video-processes` (default 32768, video kind only; smoke workaround removed); `mpv` crate dropped (explicit `extern "C"` + `#[link(name = "mpv")]`, Cargo.lock −201 lines, rust-mpv THIRD_PARTY entry removed); deterministic pixel oracle (solid `#3366CC` mp4 through the daemon, seqlock frame-file parse, 9 pixels within 2 of expected BGRA, tolerance 4; empirical: libmpv aspect-letterboxes); `--probe` → `{"backend":"libmpv","client_api_version":"2.5","libmpv_supports_sw_render":true}`; `kwe diagnose` video lane; FEATURE_COMPATIBILITY content.video implemented; M1 exit gate (92-item corpus clean, 0 global diagnostics); docs updated (SUPERVISOR_API_V1, BETA_M1, FEATURE_COMPATIBILITY, THIRD_PARTY). Gates: 146 tests, smoke-video 11 / supervisor 17 / audio 5. Commit `feat(m1e): ...` at session end. | BETA_M1 done; next BETA_M2a |

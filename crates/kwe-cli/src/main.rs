@@ -131,6 +131,17 @@ fn main() -> Result<()> {
                 catalog.stats.missing
             );
             println!("global diagnostics: {}", catalog.diagnostics.len());
+            // Video backend lane (M1e): invoke the video renderer's bounded
+            // --probe, mirroring the kwe-vulkan lane below. The probe only
+            // queries the loaded libmpv's client API version — no device,
+            // no media — so it works on any session.
+            match probe_video_backend() {
+                Some(report) => print!("video backend: {report}"),
+                None => println!(
+                    "video backend: kwe-video-renderer not found beside this binary; \
+                     run it with --probe manually"
+                ),
+            }
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
         Command::Preflight { path, video } => {
@@ -213,6 +224,45 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run the video renderer's `--probe` (resolved beside this binary) and
+/// return its JSON report. Bounded: the probe is a single libmpv version
+/// query, and a hung or missing binary yields `None` after a 10 s deadline
+/// instead of hanging the diagnostic.
+fn probe_video_backend() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let probe = directory.join("kwe-video-renderer");
+    if !probe.is_file() {
+        return None;
+    }
+    let mut child = std::process::Command::new(&probe)
+        .arg("--probe")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => break,
+            Some(_) => {
+                let _ = child.wait();
+                return None;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    // The report is a single small line; the pipe buffer is more than
+    // enough, so reading after exit cannot deadlock.
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    Some(stdout)
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {

@@ -17,6 +17,7 @@ fixture="$smoke_root/fixture.mp4"
 garbage="$smoke_root/garbage.mp4"
 bad_extension="$smoke_root/garbage.bin"
 long_duration="$smoke_root/long-duration.mp4"
+oracle="$smoke_root/oracle.mp4"
 daemon_pid=""
 
 cleanup() {
@@ -42,10 +43,11 @@ call_daemon() {
 # The address-space budget is 2048 MiB, not the test renderer's 384 MiB:
 # libmpv plus the nvidia VA-API mappings measured ~1-2 GiB of virtual address
 # space here, and a 384 MiB limit makes libmpv die silently (SIGSEGV).
-# The process ceiling is 4096, not the daemon's 1024 default: the kernel
-# RLIMIT_NPROC check counts every thread of the uid (user->processes), and a
-# desktop session commonly exceeds 1024 threads, so libmpv's pthread_create
-# fails with EAGAIN and mpv_create hangs in its failure path (docs/BETA_M1.md).
+# No process-ceiling override is passed: since M1e the video kind carries
+# its own --renderer-video-processes default (32768), because the kernel
+# RLIMIT_NPROC check counts every thread of the uid (user->processes) and a
+# desktop session commonly exceeds the global 1024 default — this lane
+# running without an override IS the proof (docs/BETA_M1.md risk 1).
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
         --socket "$socket" \
@@ -59,8 +61,7 @@ start_daemon() {
         --renderer-canary-ms 150 \
         --renderer-handoff-timeout-ms 1000 \
         --renderer-max-failures 3 \
-        --renderer-address-space-mib 2048 \
-        --renderer-processes 4096 >"$smoke_root/daemon.log" 2>&1 &
+        --renderer-address-space-mib 2048 >"$smoke_root/daemon.log" 2>&1 &
     daemon_pid=$!
     for _attempt in {1..100}; do
         [[ -S "$socket" ]] && return
@@ -116,6 +117,131 @@ media_state() {
 command -v jq >/dev/null
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
+command -v python3 >/dev/null
+
+# Bounded pixel oracle for the shared frame file (docs/FRAME_PROTOCOL_V1.md):
+# a 64-byte little-endian header, then two tightly packed BGRA8888 slots; the
+# active slot and dimensions come from the header. Samples a fixed set of
+# pixels from the active slot and compares each channel against the expected
+# BGRA of the flat fixture color within a small per-channel tolerance. Prints
+# every sampled pixel, so a drift records its exact observed values.
+#
+# The fixture is 64x64 (1:1) while the render target is 160x90 (16:9); libmpv
+# aspect-fits the video inside the target (observed empirically, verified
+# 2026-08-19 — see docs/BETA_M1.md), so the caller passes the fitted content
+# region [x0, x1) x [y0, y1) and only content-region pixels are sampled.
+# contain-fit math: scale = min(160/64, 90/64) = 1.40625 -> 90x90 centered.
+check_oracle() {
+    local frame_file="$1"
+    local delta="$2"
+    local region_x0="$3"
+    local region_y0="$4"
+    local region_x1="$5"
+    local region_y1="$6"
+    python3 - "$frame_file" "$delta" "$region_x0" "$region_y0" "$region_x1" "$region_y1" <<'PY'
+import struct
+import sys
+
+path, delta = sys.argv[1], int(sys.argv[2])
+x0, y0, x1, y1 = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+# BGRA8888 premultiplied bytes of the flat fixture color #3366CC: the
+# hex triplet is R=0x33, G=0x66, B=0xCC, so the BGRA byte order is
+# B=0xCC, G=0x66, R=0x33, A=0xFF.
+expected = (0xCC, 0x66, 0x33, 0xFF)
+f = open(path, "rb")
+try:
+    header = f.read(64)
+    if len(header) != 64:
+        sys.exit("short header")
+    magic = struct.unpack_from("<8s", header, 0)[0]
+    version = struct.unpack_from("<I", header, 8)[0]
+    header_bytes = struct.unpack_from("<I", header, 12)[0]
+    total = struct.unpack_from("<Q", header, 16)[0]
+    width = struct.unpack_from("<I", header, 24)[0]
+    height = struct.unpack_from("<I", header, 28)[0]
+    stride = struct.unpack_from("<I", header, 32)[0]
+    pixel_format = struct.unpack_from("<I", header, 36)[0]
+    slots = struct.unpack_from("<I", header, 40)[0]
+    active = struct.unpack_from("<I", header, 56)[0]
+    if magic != b"KWEFRM1\0":
+        sys.exit("bad magic")
+    if version != 1 or header_bytes != 64 or pixel_format != 1 or slots != 2:
+        sys.exit("bad header fields")
+    # Protocol bounds keep every offset arithmetic in range (frame protocol
+    # v1 caps dimensions at 8192 and the file at 512 MiB).
+    if not (1 <= width <= 8192 and 1 <= height <= 8192):
+        sys.exit("dimensions outside protocol bounds")
+    if active not in (0, 1) or stride != width * 4:
+        sys.exit("bad slot/stride")
+    if total != 64 + 2 * stride * height:
+        sys.exit("bad total size")
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        sys.exit("content region outside the frame")
+    samples = [
+        ((x0 + x1) // 2, (y0 + y1) // 2),
+        ((x0 + x1) // 4, (y0 + y1) // 4),
+        ((x0 + x1) * 3 // 4, (y0 + y1) * 3 // 4),
+        ((x0 + x1) * 3 // 4, (y0 + y1) // 4),
+        ((x0 + x1) // 4, (y0 + y1) * 3 // 4),
+        (x0 + 1, y0 + 1),
+        (x1 - 2, y1 - 2),
+        (x0 + 1, y1 - 2),
+        (x1 - 2, y0 + 1),
+    ]
+    # Snapshot algorithm (docs/FRAME_PROTOCOL_V1.md): the producer writes
+    # the inactive slot, flips the active-slot atomic, then bumps the
+    # generation to even. The consumer samples only at an even generation
+    # and accepts the pixels when the generation is unchanged afterwards;
+    # bounded retries cover the live producer's publishes. The whole header
+    # (including the active-slot atomic) is re-read per attempt, because
+    # the producer may flip the slot between attempts.
+    import time
+
+    worst = 0
+    accepted = False
+    for attempt in range(64):
+        f.seek(0)
+        header = f.read(64)
+        generation = struct.unpack_from("<Q", header, 48)[0]
+        active = struct.unpack_from("<I", header, 56)[0]
+        if generation % 2 != 0 or active not in (0, 1):
+            continue
+        pixels = []
+        for x, y in samples:
+            offset = 64 + active * stride * height + y * stride + x * 4
+            f.seek(offset)
+            bgra = f.read(4)
+            if len(bgra) != 4:
+                sys.exit("short pixel read")
+            pixels.append((x, y, bgra))
+        f.seek(48)
+        again = struct.unpack_from("<Q", f.read(8), 0)[0]
+        if again != generation:
+            time.sleep(0.001)
+            continue
+        accepted = True
+        break
+    if not accepted:
+        sys.exit("frame generation never stabilized")
+    for x, y, bgra in pixels:
+        deviation = max(
+            abs(bgra[0] - expected[0]),
+            abs(bgra[1] - expected[1]),
+            abs(bgra[2] - expected[2]),
+            abs(bgra[3] - expected[3]),
+        )
+        worst = max(worst, deviation)
+        print(
+            "oracle pixel (%d,%d) = BGRA %02x %02x %02x %02x (expected %02x %02x %02x %02x)"
+            % (x, y, bgra[0], bgra[1], bgra[2], bgra[3], *expected)
+        )
+finally:
+    f.close()
+if worst > delta:
+    sys.exit("pixel deviation %d exceeds tolerance %d" % (worst, delta))
+print("ORACLE-OK worst_channel_deviation=%d tolerance=%d" % (worst, delta))
+PY
+}
 
 # Case 1: runtime-generated synthetic fixture (never committed).
 ffmpeg -loglevel error -f lavfi -i "testsrc2=size=64x64:rate=30" -t 2 \
@@ -133,6 +259,11 @@ ffmpeg -loglevel error -f lavfi -i "testsrc2=size=64x64:rate=30" -frames:v 30 \
 long_duration_seconds="$(ffprobe -v error -show_entries format=duration \
     -of default=nw=1:nk=1 "$long_duration")"
 [[ "$(printf '%.0f' "$long_duration_seconds")" -gt 86400 ]]
+# Case 11 oracle fixture: a deterministic FLAT #3366CC frame, so every
+# decoded pixel must equal the expected BGRA (a flat frame survives
+# scaling and YUV round-trips without chroma-subsampling edge error).
+ffmpeg -loglevel error -f lavfi -i "color=c=0x3366CC:s=64x64:r=30" -t 5 \
+    -c:v libx264 -pix_fmt yuv420p "$oracle" -y
 echo "video smoke: fixture generated"
 
 cd "$project_root"
@@ -294,6 +425,27 @@ long_rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.last_failure_detail' <<<"$long_rollback_status")" == *"exceeds the 24 h bound"* ]]
 kill -0 "$base10_pid"
 echo "video smoke passed: >24 h duration content -> worker exit 73 -> rolled_back with duration diagnostic"
+
+# Case 11: pixel oracle — the solid-color fixture decoded by libmpv must
+# land in the shared frame file as the expected BGRA. Reads the active
+# worker's frame_file from renderer.status, validates the 64-byte header,
+# and samples nine fixed pixels from the active slot. The per-channel
+# tolerance covers libmpv's colorspace round-trip of the flat frame; the
+# exact observed values are recorded in docs/BETA_M1.md.
+oracle_params='{"wallpaper_id":"case11-oracle","content_hash":"hash-case11-oracle","width":160,"height":90,"fps":30,"kind":"video","content":"'"$oracle"'"}'
+call_daemon renderer.start "$oracle_params" >/dev/null
+oracle_live="$(wait_phase live)"
+oracle_first="$(jq -r '.result.sequence' <<<"$oracle_live")"
+sleep 1
+oracle_second="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+[[ "$oracle_second" -gt "$oracle_first" ]]
+oracle_frame_file="$(jq -r '.result.frame_file' <<<"$(call_daemon renderer.status)")"
+[[ -n "$oracle_frame_file" && -f "$oracle_frame_file" ]]
+# Fitted content region for the 64x64 fixture in the 160x90 target:
+# contain-fit scale 90/64 keeps the 1:1 aspect, giving 90x90 centered
+# horizontally (x from 35 to 125), full height.
+check_oracle "$oracle_frame_file" 4 35 0 125 90
+echo "video smoke passed: solid-color oracle matches expected BGRA within tolerance"
 
 # Final stop: the daemon stops the active worker and stays healthy. A
 # graceful stop records no failure (last_failure surfaces the *requested*

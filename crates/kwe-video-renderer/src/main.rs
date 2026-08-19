@@ -23,7 +23,7 @@
 // are rate-limited, input reads are nonblocking with a byte cap, and the
 // render framebuffer is fixed by the frame spec.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::exit;
@@ -78,10 +78,12 @@ const MAX_INPUT_READS_PER_POLL: usize = 16;
 /// The `mpv` crate cannot host it: `MpvHandlerBuilder::build()` runs
 /// `mpv_initialize` before exposing the handle, and libmpv aborts when a
 /// render context is created after initialization (empirically verified
-/// against 0.41 — see docs/BETA_M1.md). All render calls stay on this
+/// against 0.41 — see docs/BETA_M1.md). The crate is gone since M1e: the
+/// client API-version diagnostic is the FFI declaration below, so this
+/// module is the only linkage to libmpv. All render calls stay on this
 /// (main) thread, and the update callback only flips an atomic.
 mod mpv_ffi {
-    use super::{c_char, c_int, c_void};
+    use super::{c_char, c_int, c_ulong, c_void};
 
     pub const MPV_FORMAT_STRING: c_int = 1;
     pub const MPV_FORMAT_FLAG: c_int = 3;
@@ -129,7 +131,17 @@ mod mpv_ffi {
     pub type MpvHandle = c_void;
     pub type MpvRenderContext = c_void;
 
+    // Links the binary against the system libmpv. The removed `mpv` crate
+    // emitted this directive through its bindgen tree; with the crate gone
+    // the explicit declaration is the only linkage (THIRD_PARTY.yml, libmpv
+    // entry). The worker hard-requires libmpv.so — a distro without the SW
+    // render API fails closed with exit 73 rather than misbehaving.
+    #[link(name = "mpv")]
     unsafe extern "C" {
+        /// `unsigned long mpv_client_api_version(void)` (client.h): the
+        /// packed `MPV_MAKE_VERSION(major, minor)` this libmpv was built
+        /// with. Replaces the `mpv` crate's diagnostic entry point.
+        pub fn mpv_client_api_version() -> c_ulong;
         pub fn mpv_create() -> *mut MpvHandle;
         pub fn mpv_initialize(handle: *mut MpvHandle) -> c_int;
         pub fn mpv_terminate_destroy(handle: *mut MpvHandle);
@@ -173,6 +185,35 @@ mod mpv_ffi {
     }
 }
 
+/// Earliest libmpv client API version with the software render API
+/// (`MPV_RENDER_API_TYPE_SW`), added in libmpv 0.33.0 (client API 2.1).
+/// Older libmpv is rejected at runtime by this worker anyway (exit 73 on
+/// the backend reject path); the probe reports the same bound honestly.
+const SW_RENDER_MIN_API_VERSION: c_ulong = (2_u64 << 16 | 1) as c_ulong;
+
+/// Split the packed libmpv client API version (`MPV_MAKE_VERSION(major,
+/// minor)`) into `(major, minor)`, byte-for-byte the decoding the removed
+/// `mpv` crate used for the same diagnostic (docs/BETA_M1.md).
+fn decode_api_version(version: c_ulong) -> (u16, u16) {
+    ((version >> 16) as u16, (version & 0xFFFF) as u16)
+}
+
+/// One-line JSON backend report for `kwe diagnose`'s video lane. No device
+/// is created and no mpv handle is opened: only the version query runs, so
+/// the probe works without display, audio, or media access.
+fn print_probe_report() {
+    // SAFETY: mpv_client_api_version takes no arguments and returns a
+    // scalar; it cannot fault on any loaded libmpv.
+    let api_version = unsafe { mpv_ffi::mpv_client_api_version() };
+    let (major, minor) = decode_api_version(api_version);
+    let report = serde_json::json!({
+        "client_api_version": format!("{major}.{minor}"),
+        "libmpv_supports_sw_render": api_version >= SW_RENDER_MIN_API_VERSION,
+        "backend": "libmpv",
+    });
+    println!("{report}");
+}
+
 /// Async-signal-safe handler: SIGTERM only records the termination request.
 /// The loop observes it within MAX_WAIT and shuts down gracefully.
 extern "C" fn on_sigterm(_signal: c_int) {
@@ -198,9 +239,10 @@ fn install_term_handler(ignore: bool) {
 #[derive(Debug, Parser)]
 #[command(version, about = "Isolated KWE supervised video renderer")]
 struct Arguments {
-    /// Frame mapping file (validated and pre-opened by the daemon).
-    #[arg(long)]
-    output: PathBuf,
+    /// Frame mapping file (validated and pre-opened by the daemon). Only
+    /// `--probe` may omit it.
+    #[arg(long, required_unless_present = "probe")]
+    output: Option<PathBuf>,
     /// Frame width in pixels.
     #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u32).range(1..=8192))]
     width: u32,
@@ -210,9 +252,10 @@ struct Arguments {
     /// Publish pacing in frames per second.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
-    /// Video file to decode (daemon-validated before spawn).
-    #[arg(long)]
-    content: PathBuf,
+    /// Video file to decode (daemon-validated before spawn). Only `--probe`
+    /// may omit it.
+    #[arg(long, required_unless_present = "probe")]
+    content: Option<PathBuf>,
     /// Stall before creating the frame mapping (supervisor startup test).
     #[arg(long)]
     startup_hang: bool,
@@ -234,6 +277,11 @@ struct Arguments {
     /// Allocation size in MiB for the memory-pressure fault.
     #[arg(long)]
     memory_pressure_mib: Option<u64>,
+    /// Print a JSON backend report ({client_api_version,
+    /// libmpv_supports_sw_render, backend}) without creating a device or
+    /// an mpv handle, then exit 0. `kwe diagnose` runs this lane.
+    #[arg(long)]
+    probe: bool,
 }
 
 /// Synthetic fault exit codes, identical to the test renderer's contract
@@ -844,6 +892,9 @@ enum Playback {
 
 struct VideoWorker {
     arguments: Arguments,
+    /// Validated content path (unwrapped from the optional CLI form so
+    /// `--probe` can run without it).
+    content: PathBuf,
     spec: FrameSpec,
     writer: SharedFrameWriter,
     input: InputChannel,
@@ -902,7 +953,7 @@ impl VideoWorker {
         // handle (mpv can be initialized only once per handle).
         let mut session = MpvSession::create(hwdec, self.spec)?;
         session.initialize()?;
-        session.load_file(&self.arguments.content)?;
+        session.load_file(&self.content)?;
         // The duration bound is per-file, so both decode attempts reject an
         // overlong media identically; the retry costs one bounded re-load.
         wait_for_load(&mut session)?;
@@ -1040,6 +1091,10 @@ fn diag_invalid_frame(count: u64) {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    if arguments.probe {
+        print_probe_report();
+        return Ok(());
+    }
     if arguments.memory_pressure_after.is_some() != arguments.memory_pressure_mib.is_some() {
         bail!("--memory-pressure-after and --memory-pressure-mib must be supplied together");
     }
@@ -1049,23 +1104,30 @@ fn main() -> Result<()> {
         eprintln!("event=renderer.fault kind=startup_hang");
         park_forever();
     }
+    let output = arguments
+        .output
+        .clone()
+        .context("--output is required (--probe excepted)")?;
+    let content = arguments
+        .content
+        .clone()
+        .context("--content is required (--probe excepted)")?;
     let spec = FrameSpec::new(arguments.width, arguments.height)?;
-    let writer = SharedFrameWriter::create(&arguments.output, spec).with_context(|| {
-        format!(
-            "create frame mapping {}",
-            arguments.output.to_string_lossy()
-        )
-    })?;
+    let writer = SharedFrameWriter::create(&output, spec)
+        .with_context(|| format!("create frame mapping {}", output.to_string_lossy()))?;
     let mut worker = VideoWorker {
         arguments,
+        content,
         spec,
         writer,
         input,
         published: 0,
     };
-    // libmpv client API version diagnostic (reported through the pinned mpv
-    // crate; the render API itself is bound directly — docs/BETA_M1.md).
-    let (major, minor) = mpv::client_api_version();
+    // libmpv client API version diagnostic through the same FFI module as
+    // the render API (the `mpv` crate was removed in M1e — docs/BETA_M1.md).
+    // SAFETY: mpv_client_api_version takes no arguments and returns a
+    // scalar; it cannot fault on any loaded libmpv.
+    let (major, minor) = decode_api_version(unsafe { mpv_ffi::mpv_client_api_version() });
     eprintln!("event=renderer.video.start mpv_api={major}.{minor}");
     worker.run()
 }
@@ -1143,6 +1205,37 @@ mod tests {
         assert_eq!(media_command_for("paused"), Some(MediaCommand::Pause));
         assert_eq!(media_command_for("stopped"), Some(MediaCommand::Stop));
         assert_eq!(media_command_for("junk"), None);
+    }
+
+    #[test]
+    fn api_version_decodes_like_the_removed_mpv_crate() {
+        // The crate returned (major, minor) from MPV_MAKE_VERSION: high 16
+        // bits, low 16 bits. The diagnostic output must not change.
+        assert_eq!(decode_api_version(0x0002_0005), (2, 5));
+        assert_eq!(decode_api_version(0x0001_0000), (1, 0));
+        assert_eq!(decode_api_version(0x0002_0001), (2, 1));
+        // Truncation on exotic high versions is the crate's old behavior;
+        // the report is diagnostic only.
+        assert_eq!(decode_api_version(0x0003_FFFF), (3, 65_535));
+    }
+
+    #[test]
+    fn sw_render_support_bound_is_libmpv_033_or_newer() {
+        // The software render API (MPV_RENDER_API_TYPE_SW) shipped in
+        // libmpv 0.33.0 = client API 2.1; the probe reports pre-0.33
+        // (API 2.0) as unsupported, matching the worker's exit-73 reject.
+        let cases = [
+            (0x0002_0000, false), // API 2.0: pre-0.33, no SW render API
+            (0x0002_0001, true),  // API 2.1: first SW API release
+            (0x0002_0005, true),  // API 2.5: installed libmpv 0.41
+        ];
+        for (version, expect) in cases {
+            assert_eq!(
+                version >= SW_RENDER_MIN_API_VERSION,
+                expect,
+                "api 0x{version:08x}"
+            );
+        }
     }
 
     #[test]
