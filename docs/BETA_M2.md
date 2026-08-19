@@ -112,7 +112,7 @@ Page.startScreencast {format:"jpeg",quality:80,
   session. With per-frame acks the stream runs indefinitely (~30 fps,
   33 ms cadence measured on the 780x437 page; ~14 ms at 160x90 — the
   compositor delivers faster than the nominal cadence on tiny viewports).
-- A late ack after silence resumes capture (measured).
+- A late ack after silence resumes capture (observed during development, not re-verified by the smoke).
 - **Deviation from the M2a task text**: the spec assumed "frames stop (≤1
   additional)" after acks cease. The measured and source-verified behavior is
   **exactly 3 additional frames** (2 in flight + 1 being produced).
@@ -128,7 +128,7 @@ Page.startScreencast {format:"jpeg",quality:80,
 | jpeg size, 160x90 q80 (dark animated page) | 464–469 B (552–558 B current fixture) |
 | full wire envelope per frame event | ~913 B (466 B jpeg + JSON + base64 overhead) |
 | unacked frames before stall | exactly 3 (both cold start and mid-stream) |
-| pipe close -> chromium exit | rc=0 within ~50 ms |
+| pipe close -> chromium exit | rc=0, prompt (observed ~50 ms during development) |
 
 ### 1.8 Quirks and pitfalls (all measured)
 
@@ -142,8 +142,8 @@ Page.startScreencast {format:"jpeg",quality:80,
 3. **Pre-navigation target**: getTargets at T+0.19 s catches a newtab target;
    poll until the fixture URL appears (or a lone page target).
 4. **GCM noise on stderr** ("DEPRECATED_ENDPOINT") is harmless.
-5. Closing the client's pipe ends is the teardown signal (exit rc=0, ~50 ms);
-   no CDP "close" message exists.
+5. Closing the client's pipe ends is the teardown signal (exit rc=0, prompt;
+   ~50 ms observed during development); no CDP "close" message exists.
 6. `--headless=new` is required (old headless lacks the pipe path).
 
 ## 2. Pinned contract for M2b (the renderer will assert this)
@@ -160,7 +160,7 @@ frames: Page.screencastFrame events in the attached session; ack each with
         Page.screencastFrameAck{sessionId:<params.sessionId>} or the stream
         hard-stalls after exactly 3 frames
 timing: first frame < 10 s after spawn (measured: < 700 ms)
-teardown: close both pipe ends; chromium exits rc=0 within ~50 ms
+teardown: close both pipe ends; chromium exits rc=0 promptly (~50 ms observed)
 ```
 
 ## 3. crates/kwe-cdp
@@ -171,7 +171,7 @@ library. Modules: `codec` (ASCIIZ framing + 4 MiB bound decoder), `transport`
 `connection` (id correlation, monotonic u32 ids, bounded event queue 64
 drop-oldest with a drop counter), `client` (request_browser/request_session,
 5 s default timeout). Errors: `Timeout`, `ParseError`, `OversizedMessage`,
-`Io`. All 35 unit tests run against in-memory socketpair fake peers — no
+`Io`. All 38 unit tests run against in-memory socketpair fake peers — no
 browser needed. The spike example drives real chromium and prints a JSON
 summary; the smoke script asserts on it.
 
@@ -181,8 +181,8 @@ summary; the smoke script asserts on it.
 | --- | --- | --- |
 | fmt | `cargo fmt --all -- --check` | pass |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| test | `cargo test --workspace --all-targets` | pass (35 kwe-cdp) |
-| smoke | `./scripts/smoke-cdp.sh` | pass (5 assertions) |
+| test | `cargo test --workspace --all-targets` | pass (38 kwe-cdp) |
+| smoke | `./scripts/smoke-cdp.sh` | pass (7 jq assertions) |
 
 Smoke evidence (2026-08-19 run):
 `stall_frames=3, silence_confirmed=true` (phase A);

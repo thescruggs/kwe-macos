@@ -67,7 +67,7 @@ echo "cdp smoke passed: the stall is hard silence (no late frames in the window)
 # Phase B: with a per-frame ack the stream flows, the first frame arrives
 # well inside the 10 s bound, and the jpegs are real and small.
 jq -e '.phase_b.frames >= 5' <<<"$summary" >/dev/null
-jq -e '.phase_b.first_frame_after_start_ms < 10000' <<<"$summary" >/dev/null
+jq -e '.phase_b.first_frame_after_start_ms < 3000' <<<"$summary" >/dev/null
 jq -e '.phase_b.bytes_per_frame_avg > 100 and .phase_b.bytes_per_frame_avg < 5000' <<<"$summary" >/dev/null
 echo "cdp smoke passed: >=5 acked frames, first frame <10 s after startScreencast, sane jpeg size"
 

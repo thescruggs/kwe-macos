@@ -88,10 +88,11 @@ impl PipeTransport {
     }
 
     /// Send one message body (framed with its NUL terminator). Bounded by
-    /// the per-message bound and the write-backlog bound; never blocks —
-    /// unwritten bytes wait in the backlog until the next `poll`.
+    /// the per-message bound (body + NUL must fit, mirroring the decoder's
+    /// bound) and the write-backlog bound; never blocks — unwritten bytes
+    /// wait in the backlog until the next `poll`.
     pub fn send(&mut self, body: &[u8]) -> Result<(), Error> {
-        if body.len() > self.max_message_bytes {
+        if body.len() + 1 > self.max_message_bytes {
             return Err(Error::OversizedMessage(self.max_message_bytes));
         }
         let pending = self.write_backlog.len() - self.write_offset;
@@ -152,10 +153,17 @@ impl PipeTransport {
             match err.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    if !blocking || Instant::now() >= deadline {
-                        // Nothing to poll for: either a deliberate zero
-                        // timeout (defer) or the deadline ran out (wedged).
+                    if !blocking {
+                        // Deliberate zero timeout: defer the backlog to the
+                        // next poll instead of blocking.
                         return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        // The peer never drained within the window: wedged.
+                        return Err(Error::Io(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "CDP peer is not draining the pipe within the deadline",
+                        )));
                     }
                     self.poll_fd(self.write_fd, libc::POLLOUT, deadline)?;
                 }
@@ -413,6 +421,37 @@ mod tests {
         // some bytes must actually have accumulated.
         assert!(transport.pending_write_bytes() <= MAX_WRITE_BACKLOG_BYTES);
         assert!(transport.pending_write_bytes() > 0);
+    }
+
+    #[test]
+    fn wedged_peer_blocking_poll_surfaces_wouldblock() {
+        // Regression: a positive-timeout poll whose writes cannot drain must
+        // report the wedged peer (docs promise Error::Io(WouldBlock)), not
+        // return clean forever.
+        let (mut transport, _peer) = FakePeer::new();
+        let body = vec![b'x'; 64 * 1024];
+        while transport.send(&body).is_ok() {}
+        assert!(transport.pending_write_bytes() > 0);
+        let started = Instant::now();
+        let err = transport.poll(Duration::from_millis(100)).unwrap_err();
+        assert!(matches!(err, Error::Io(ref e) if e.kind() == io::ErrorKind::WouldBlock));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "must have waited"
+        );
+    }
+
+    #[test]
+    fn send_enforces_the_wire_bound_including_the_nul() {
+        let (mut transport, peer) = FakePeer::new();
+        // A body of exactly max bytes cannot fit with its NUL terminator:
+        // the wire message would exceed the decoder's own bound.
+        let max = transport.max_message_bytes();
+        let err = transport.send(&vec![b'x'; max]).unwrap_err();
+        assert!(matches!(err, Error::OversizedMessage(_)));
+        // max - 1 bytes plus the NUL fits exactly.
+        transport.send(&vec![b'x'; max - 1]).unwrap();
+        drop(peer);
     }
 
     #[test]

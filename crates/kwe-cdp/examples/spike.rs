@@ -79,6 +79,9 @@ struct PhaseStats {
     stall_frames: Option<usize>,
     /// True when no frame arrived during the post-stall silence window.
     silence_confirmed: bool,
+    /// Events dropped because the bounded client queue overflowed (silent
+    /// frame losses must be visible in the summary).
+    events_dropped: u64,
 }
 
 fn main() -> Result<()> {
@@ -105,6 +108,7 @@ fn main() -> Result<()> {
         "stall_frames": phase_a.stall_frames,
         "silence_confirmed": phase_a.silence_confirmed,
         "first_frame_after_spawn_ms": phase_a.first_frame_after_spawn_ms,
+        "events_dropped": phase_a.events_dropped,
     });
 
     // Phase B: fresh instance, ack every frame -> >= min_frames, then stop
@@ -118,6 +122,7 @@ fn main() -> Result<()> {
         "cadence_ms_avg": average(&phase_b.cadence_gaps_ms),
         "additional_after_ack_stop": phase_b.stall_frames,
         "silence_confirmed": phase_b.silence_confirmed,
+        "events_dropped": phase_b.events_dropped,
     });
 
     // Best-effort cleanup of the throwaway profiles.
@@ -156,6 +161,7 @@ fn run_phase(args: &Args, label: &str, user_data_dir: &Path, ack: bool) -> Resul
             started_at,
         };
         collect_frames(&mut ctx, ack, &mut stats)?;
+        stats.events_dropped = ctx.client.events_dropped();
         Ok(stats)
     })();
 
@@ -403,27 +409,40 @@ fn spawn_chromium(args: &Args, user_data_dir: &Path) -> Result<(Child, RawFd, Ra
         .stderr(Stdio::piped());
     unsafe {
         command.pre_exec(move || {
-            // Move the socketpair ends onto the fds chromium inspects before
-            // exec; drop the duplicate ends (guarded against aliasing when
-            // the socketpair already handed us 3/4). dup2(old, old) is a
-            // no-op that does NOT clear FD_CLOEXEC, so the targets get an
-            // explicit FD_CLOEXEC clear: chromium checks fcntl(3/4, F_GETFL)
-            // at startup and would bail on closed descriptors.
-            if libc::dup2(browser_read, CHROMIUM_READ_FD) < 0 {
+            // Order-independent fd setup: the socketpair ends may themselves
+            // sit at fd 3 or fd 4, and a direct dup2(old, 3) could clobber
+            // the other end before its turn. Duplicate both ends to temp
+            // fds (>= 5) first, then move the temps onto 3/4; temps that
+            // high make every dup2 a real dup, which also clears
+            // FD_CLOEXEC (chromium checks fcntl(3/4, F_GETFL) at startup and
+            // bails on closed descriptors). Finally close temps and the
+            // originals.
+            let temp_read = libc::fcntl(browser_read, libc::F_DUPFD_CLOEXEC, 5);
+            if temp_read < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::dup2(browser_write, CHROMIUM_WRITE_FD) < 0 {
+            let temp_write = libc::fcntl(browser_write, libc::F_DUPFD_CLOEXEC, 5);
+            if temp_write < 0 {
+                libc::close(temp_read);
                 return Err(io::Error::last_os_error());
             }
-            for fd in [CHROMIUM_READ_FD, CHROMIUM_WRITE_FD] {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
+            if libc::dup2(temp_read, CHROMIUM_READ_FD) < 0 {
+                libc::close(temp_read);
+                libc::close(temp_write);
+                return Err(io::Error::last_os_error());
             }
+            if libc::dup2(temp_write, CHROMIUM_WRITE_FD) < 0 {
+                libc::close(temp_read);
+                libc::close(temp_write);
+                return Err(io::Error::last_os_error());
+            }
+            libc::close(temp_read);
+            libc::close(temp_write);
+            // A browser end that already sits at fd 3 or fd 4 IS the
+            // descriptor chromium now runs on: closing it would sever the
+            // pipe (chromium checks fcntl(3/4, F_GETFL) at startup and bails
+            // on a missing descriptor). Close only the non-aliased
+            // originals; an aliased one was replaced by its own dup2.
             if browser_read != CHROMIUM_READ_FD && browser_read != CHROMIUM_WRITE_FD {
                 libc::close(browser_read);
             }
@@ -436,6 +455,19 @@ fn spawn_chromium(args: &Args, user_data_dir: &Path) -> Result<(Child, RawFd, Ra
     let child = command
         .spawn()
         .with_context(|| format!("spawning {}", args.chromium))?;
+    // The parent must not keep the browser's ends: the dup2'd copies in the
+    // child keep the pipes alive, and a stray parent reference to the write
+    // end would mask EOF on the client's read side (the teardown signal).
+    // Guarded against aliasing: a browser end that shares a number with a
+    // client end must survive, or the client transport would lose the pipe.
+    unsafe {
+        if browser_read != client_read && browser_read != client_write {
+            libc::close(browser_read);
+        }
+        if browser_write != client_read && browser_write != client_write {
+            libc::close(browser_write);
+        }
+    }
     Ok((child, client_read, client_write))
 }
 

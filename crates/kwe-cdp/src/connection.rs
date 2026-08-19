@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::RawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -57,13 +57,23 @@ pub struct Event {
     pub session_id: Option<String>,
 }
 
+/// One in-flight request: the id we handed out, the session it was sent to
+/// (matching is id + session, so a response cannot be correlated across
+/// sessions), and the response once it arrives.
+#[derive(Debug)]
+struct PendingRequest {
+    id: u32,
+    session_id: Option<String>,
+    response: Option<Response>,
+}
+
 /// Correlates requests and responses over a [`PipeTransport`] and routes
 /// events into a bounded queue.
 #[derive(Debug)]
 pub struct Connection {
     transport: PipeTransport,
     next_id: u32,
-    pending: Vec<(u32, Instant, Option<Response>)>,
+    pending: Vec<PendingRequest>,
     events: VecDeque<Event>,
     events_dropped: u64,
 }
@@ -102,7 +112,11 @@ impl Connection {
         }
         let body = serde_json::to_vec(&request).map_err(|e| Error::ParseError(e.to_string()))?;
         self.transport.send(&body)?;
-        self.pending.push((id, Instant::now(), None));
+        self.pending.push(PendingRequest {
+            id,
+            session_id: session_id.map(str::to_owned),
+            response: None,
+        });
         Ok(id)
     }
 
@@ -119,23 +133,16 @@ impl Connection {
     /// response has actually arrived. Returns `None` while the response is
     /// still in flight, leaving the slot in place.
     pub fn take_response(&mut self, id: u32) -> Option<Response> {
-        let index = self
-            .pending
-            .iter()
-            .position(|(pending_id, _, _)| *pending_id == id)?;
-        self.pending[index].2.as_ref()?;
-        let (_, _, response) = self.pending.swap_remove(index);
-        response
+        let index = self.pending.iter().position(|pending| pending.id == id)?;
+        self.pending[index].response.as_ref()?;
+        let pending = self.pending.swap_remove(index);
+        pending.response
     }
 
     /// Forget a pending request without awaiting its response (timeout
     /// path). The slot's eventual response, if any, is dropped by routing.
     pub fn discard_pending(&mut self, id: u32) {
-        if let Some(index) = self
-            .pending
-            .iter()
-            .position(|(pending_id, _, _)| *pending_id == id)
-        {
+        if let Some(index) = self.pending.iter().position(|pending| pending.id == id) {
             self.pending.swap_remove(index);
         }
     }
@@ -185,20 +192,19 @@ impl Connection {
                     .ok_or_else(|| Error::ParseError("response id is not an integer".into()))?,
             )
             .map_err(|_| Error::ParseError("response id out of range".into()))?;
-            if let Some(slot) = self
-                .pending
-                .iter_mut()
-                .find(|(pending_id, _, _)| *pending_id == id)
-            {
-                slot.2 = Some(Response {
+            // A response only matches its pending slot when both the id and
+            // the session agree; anything else is unsolicited chatter
+            // (dropped, bounded by construction).
+            if let Some(slot) = self.pending.iter_mut().find(|pending| {
+                pending.id == id && pending.session_id.as_deref() == session_id.as_deref()
+            }) {
+                slot.response = Some(Response {
                     id,
                     session_id,
                     result: value.get("result").cloned(),
                     error: value.get("error").cloned(),
                 });
             }
-            // Unknown id: unsolicited response (peer chatter after our
-            // timeout); dropped, bounded by construction.
         } else {
             let method = value
                 .get("method")
@@ -228,6 +234,7 @@ impl Connection {
 mod tests {
     use super::*;
     use crate::testutil::socket_pair;
+    use std::time::Instant;
 
     struct FakePeer {
         read_fd: RawFd,
@@ -422,6 +429,35 @@ mod tests {
         });
         let response = response.expect("session response");
         assert_eq!(response.session_id.as_deref(), Some("SESSION-1"));
+    }
+
+    #[test]
+    fn responses_must_match_the_request_session() {
+        // Regression: a response with the right id but a different session
+        // must not be correlated (the pending slot stays put).
+        let (mut connection, peer) = FakePeer::new();
+        let id = connection
+            .send_request("Page.enable", &json!({}), Some("SESSION-1"))
+            .unwrap();
+        peer.respond(id, Some("SESSION-2"), false);
+        connection.poll(Duration::from_millis(200)).unwrap();
+        assert_eq!(
+            connection.in_flight(),
+            1,
+            "wrong-session response must not match"
+        );
+        assert!(connection.take_response(id).is_none());
+        assert_eq!(connection.in_flight(), 1);
+        // The correct session does match.
+        peer.respond(id, Some("SESSION-1"), false);
+        let mut response = None;
+        pump_until(&mut connection, Duration::from_secs(5), |connection| {
+            if response.is_none() {
+                response = connection.take_response(id);
+            }
+            response.is_some()
+        });
+        assert_eq!(response.unwrap().session_id.as_deref(), Some("SESSION-1"));
     }
 
     #[test]
