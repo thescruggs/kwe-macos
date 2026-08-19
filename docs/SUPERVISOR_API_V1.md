@@ -277,7 +277,9 @@ Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
 `--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
 `--renderer-web-address-space-mib`, `--renderer-web-open-files`, and
 `--renderer-video-processes` tune these; frame timeouts and the canary stay
-global. Per-kind renderer binaries default
+global. The web kind currently keeps the global 1024-process ceiling and is
+expected to need its own knob when the Chromium worker lands (M2) — Chromium
+spawns a process tree, and the same uid-wide `RLIMIT_NPROC` math applies. Per-kind renderer binaries default
 to `kwe-<kind>-renderer` beside the daemon executable (`--renderer-video`,
 `--renderer-web`, `--renderer-scene` override; `--renderer` keeps meaning the
 test kind).

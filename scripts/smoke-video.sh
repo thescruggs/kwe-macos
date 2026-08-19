@@ -122,15 +122,23 @@ command -v python3 >/dev/null
 # Bounded pixel oracle for the shared frame file (docs/FRAME_PROTOCOL_V1.md):
 # a 64-byte little-endian header, then two tightly packed BGRA8888 slots; the
 # active slot and dimensions come from the header. Samples a fixed set of
-# pixels from the active slot and compares each channel against the expected
-# BGRA of the flat fixture color within a small per-channel tolerance. Prints
-# every sampled pixel, so a drift records its exact observed values.
+# pixels from the active slot and compares each channel against its expected
+# BGRA within a small per-channel tolerance. Prints every sampled pixel, so a
+# drift records its exact observed values.
 #
 # The fixture is 64x64 (1:1) while the render target is 160x90 (16:9); libmpv
 # aspect-fits the video inside the target (observed empirically, verified
 # 2026-08-19 — see docs/BETA_M1.md), so the caller passes the fitted content
-# region [x0, x1) x [y0, y1) and only content-region pixels are sampled.
-# contain-fit math: scale = min(160/64, 90/64) = 1.40625 -> 90x90 centered.
+# region [x0, x1) x [y0, y1) and content-region pixels are sampled against
+# the flat fixture color. contain-fit math: scale = min(160/64, 90/64) =
+# 1.40625 -> 90x90 centered, letterbox bars on both sides.
+#
+# The two letterbox bars are also sampled, deep inside the bars ((2,2) and
+# (width-3, height-2), 33 px / 32 px from the content edge, far from any
+# chroma bleed at the boundary) and must be black (0,0,0,0xFF). This closes
+# the stretch-mode blind spot: a regression that rendered the video full-
+# bleed would paint those coordinates with content color and fail, while a
+# content-only oracle would still pass.
 check_oracle() {
     local frame_file="$1"
     local delta="$2"
@@ -147,7 +155,8 @@ x0, y0, x1, y1 = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.a
 # BGRA8888 premultiplied bytes of the flat fixture color #3366CC: the
 # hex triplet is R=0x33, G=0x66, B=0xCC, so the BGRA byte order is
 # B=0xCC, G=0x66, R=0x33, A=0xFF.
-expected = (0xCC, 0x66, 0x33, 0xFF)
+content_expected = (0xCC, 0x66, 0x33, 0xFF)
+bar_expected = (0x00, 0x00, 0x00, 0xFF)
 f = open(path, "rb")
 try:
     header = f.read(64)
@@ -177,17 +186,27 @@ try:
         sys.exit("bad total size")
     if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
         sys.exit("content region outside the frame")
+    # Content samples expect the flat fixture color; the letterbox bar
+    # samples expect black. The oracle lane always runs aspect-mismatched
+    # (bars present), so the bar points are derived from the frame size and
+    # must be inside a bar: keep them on the far side of the region, and
+    # bail loudly if a future target change would put them in content.
     samples = [
-        ((x0 + x1) // 2, (y0 + y1) // 2),
-        ((x0 + x1) // 4, (y0 + y1) // 4),
-        ((x0 + x1) * 3 // 4, (y0 + y1) * 3 // 4),
-        ((x0 + x1) * 3 // 4, (y0 + y1) // 4),
-        ((x0 + x1) // 4, (y0 + y1) * 3 // 4),
-        (x0 + 1, y0 + 1),
-        (x1 - 2, y1 - 2),
-        (x0 + 1, y1 - 2),
-        (x1 - 2, y0 + 1),
+        ((x0 + x1) // 2, (y0 + y1) // 2, content_expected),
+        ((x0 + x1) // 4, (y0 + y1) // 4, content_expected),
+        ((x0 + x1) * 3 // 4, (y0 + y1) * 3 // 4, content_expected),
+        ((x0 + x1) * 3 // 4, (y0 + y1) // 4, content_expected),
+        ((x0 + x1) // 4, (y0 + y1) * 3 // 4, content_expected),
+        (x0 + 1, y0 + 1, content_expected),
+        (x1 - 2, y1 - 2, content_expected),
+        (x0 + 1, y1 - 2, content_expected),
+        (x1 - 2, y0 + 1, content_expected),
+        (2, 2, bar_expected),
+        (width - 3, height - 2, bar_expected),
     ]
+    for x, y, _ in samples[9:]:
+        if x0 <= x < x1 and y0 <= y < y1:
+            sys.exit("letterbox sample inside the content region")
     # Snapshot algorithm (docs/FRAME_PROTOCOL_V1.md): the producer writes
     # the inactive slot, flips the active-slot atomic, then bumps the
     # generation to even. The consumer samples only at an even generation
@@ -207,13 +226,13 @@ try:
         if generation % 2 != 0 or active not in (0, 1):
             continue
         pixels = []
-        for x, y in samples:
+        for x, y, expected in samples:
             offset = 64 + active * stride * height + y * stride + x * 4
             f.seek(offset)
             bgra = f.read(4)
             if len(bgra) != 4:
                 sys.exit("short pixel read")
-            pixels.append((x, y, bgra))
+            pixels.append((x, y, bgra, expected))
         f.seek(48)
         again = struct.unpack_from("<Q", f.read(8), 0)[0]
         if again != generation:
@@ -223,7 +242,7 @@ try:
         break
     if not accepted:
         sys.exit("frame generation never stabilized")
-    for x, y, bgra in pixels:
+    for x, y, bgra, expected in pixels:
         deviation = max(
             abs(bgra[0] - expected[0]),
             abs(bgra[1] - expected[1]),
@@ -443,9 +462,10 @@ oracle_frame_file="$(jq -r '.result.frame_file' <<<"$(call_daemon renderer.statu
 [[ -n "$oracle_frame_file" && -f "$oracle_frame_file" ]]
 # Fitted content region for the 64x64 fixture in the 160x90 target:
 # contain-fit scale 90/64 keeps the 1:1 aspect, giving 90x90 centered
-# horizontally (x from 35 to 125), full height.
+# horizontally (x from 35 to 125), full height. The oracle additionally
+# samples the letterbox bars at (2,2) and (157,88) and requires black.
 check_oracle "$oracle_frame_file" 4 35 0 125 90
-echo "video smoke passed: solid-color oracle matches expected BGRA within tolerance"
+echo "video smoke passed: solid-color oracle matches expected BGRA within tolerance (content + black letterbox bars)"
 
 # Final stop: the daemon stops the active worker and stays healthy. A
 # graceful stop records no failure (last_failure surfaces the *requested*

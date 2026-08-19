@@ -136,10 +136,18 @@ fn main() -> Result<()> {
             // queries the loaded libmpv's client API version — no device,
             // no media — so it works on any session.
             match probe_video_backend() {
-                Some(report) => print!("video backend: {report}"),
-                None => println!(
+                VideoProbeOutcome::Report(report) => print!("video backend: {report}"),
+                VideoProbeOutcome::Missing => println!(
                     "video backend: kwe-video-renderer not found beside this binary; \
                      run it with --probe manually"
+                ),
+                VideoProbeOutcome::Failed { exit, reason } => println!(
+                    "video backend: kwe-video-renderer --probe failed ({reason}, exit {})",
+                    exit.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                ),
+                VideoProbeOutcome::Hung => println!(
+                    "video backend: kwe-video-renderer --probe did not finish within 10 s; \
+                     killed"
                 ),
             }
             println!("Run `kwe-vulkan --json` for renderer capability details.");
@@ -226,43 +234,103 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Outcome of the video backend probe lane; each failure mode prints a
+/// distinct diagnostic instead of a blanket "not found".
+enum VideoProbeOutcome {
+    /// The probe's JSON report (single line).
+    Report(String),
+    /// No `kwe-video-renderer` binary beside this one.
+    Missing,
+    /// Spawn failed, or the probe exited nonzero (its own bounded stderr
+    /// diagnostic appears above).
+    Failed { exit: Option<i32>, reason: String },
+    /// The probe did not finish within the deadline and was killed.
+    Hung,
+}
+
 /// Run the video renderer's `--probe` (resolved beside this binary) and
 /// return its JSON report. Bounded: the probe is a single libmpv version
-/// query, and a hung or missing binary yields `None` after a 10 s deadline
-/// instead of hanging the diagnostic.
-fn probe_video_backend() -> Option<String> {
-    let executable = std::env::current_exe().ok()?;
-    let directory = executable.parent()?;
+/// query, and a hung probe is killed after a 10 s deadline instead of
+/// hanging the diagnostic.
+fn probe_video_backend() -> VideoProbeOutcome {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return VideoProbeOutcome::Failed {
+                exit: None,
+                reason: error.to_string(),
+            };
+        }
+    };
+    let directory = match executable.parent() {
+        Some(path) => path,
+        None => {
+            return VideoProbeOutcome::Failed {
+                exit: None,
+                reason: "no parent directory for this binary".to_string(),
+            };
+        }
+    };
     let probe = directory.join("kwe-video-renderer");
     if !probe.is_file() {
-        return None;
+        return VideoProbeOutcome::Missing;
     }
-    let mut child = std::process::Command::new(&probe)
+    let mut child = match std::process::Command::new(&probe)
         .arg("--probe")
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return VideoProbeOutcome::Failed {
+                exit: None,
+                reason: error.to_string(),
+            };
+        }
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        match child.try_wait().ok()? {
-            Some(status) if status.success() => break,
-            Some(_) => {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(status)) => {
                 let _ = child.wait();
-                return None;
+                return VideoProbeOutcome::Failed {
+                    exit: status.code(),
+                    reason: "probe exited nonzero".to_string(),
+                };
             }
-            None if std::time::Instant::now() >= deadline => {
+            Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return VideoProbeOutcome::Hung;
             }
-            None => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return VideoProbeOutcome::Failed {
+                    exit: None,
+                    reason: error.to_string(),
+                };
+            }
         }
     }
     // The report is a single small line; the pipe buffer is more than
     // enough, so reading after exit cannot deadlock.
     let mut stdout = String::new();
-    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
-    Some(stdout)
+    match child.stdout.take() {
+        Some(mut pipe) => match pipe.read_to_string(&mut stdout) {
+            Ok(_) => VideoProbeOutcome::Report(stdout),
+            Err(error) => VideoProbeOutcome::Failed {
+                exit: None,
+                reason: error.to_string(),
+            },
+        },
+        None => VideoProbeOutcome::Failed {
+            exit: None,
+            reason: "probe stdout was not captured".to_string(),
+        },
+    }
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
