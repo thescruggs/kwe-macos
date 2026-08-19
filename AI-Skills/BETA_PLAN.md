@@ -14,12 +14,13 @@
 - 2026-08-18 — **BETA_M1b started** (branch `beta-m1a-renderer-contract` done; worktree for `beta-m1b-video-renderer`). **Plan deviation (provenance rule):** mpv/libmpv + `mpv`-crate THIRD_PARTY entries move from M1e **into M1b** — PROVENANCE.md requires ledger entries *before* dependent code merges, and M1b merges libmpv code. Environment verified: mpv 1:0.41.0, libmpv.so.2, ffmpeg present; smoke fixtures are runtime-generated per existing script pattern.
 - 2026-08-18 — **M1b review findings recorded (M1e scope additions):** (a) RLIMIT_NPROC is uid-wide (counts all session threads), so the renderer NPROC limit guards the whole desktop, not the worker — add a **per-kind video NPROC knob (default 32768)** in M1e, keep 1024 for other kinds, and rely on RLIMIT_AS + supervisor timeouts for per-renderer protection (the M1b smoke's `--renderer-processes 4096` workaround is temporary). (b) In M1e, **drop the `mpv` crate** (used only for a one-line API-version diagnostic) in favor of one more `extern "C"` in the worker's FFI module — removes a 2016-era dep tree (rustc-serialize 0.3, rand 0.3, num 0.1).
 - 2026-08-18 — **BETA_M1b done** (`7a2b402` feat + `3e83d2e` review fixes, rebased ff into main). Review found 3 must-fix (memory-pressure exit 72 parity, unbounded InputChannel::pending, SW_STRIDE c_int) + 4 recommended (smoke ack/stopped/SIGTERM assertions, deterministic quarantine loop, doc overclaims), all fixed. **M1a bug surfaced by M1b smoke:** the daemon never recorded `input_sequence` for media/audio forwards, so every media/audio ack was rejected as a protocol error — fixed with last-wins ack acceptance (media sequence is the display generation, so repeats are legal). Worker always requests bgr0; other format arms are defensive. Exit codes: 0 normal / 70 exit-after / 71-72 resource / 73 backend_reject.
+- 2026-08-18 — **M1c + M1d started in PARALLEL** (disjoint files: M1c = kwe-core preflight.rs + supervisor.rs + kwe-cli; M1d = new kwe-audio-worker crate + daemon main.rs/audio.rs). **Plan deviation (provenance rule):** PipeWire tools (pw-record/pw-dump, separate-process-backend) THIRD_PARTY entries move from M1e **into M1d** — same before-merge rule as the mpv entries. M1d audio capture is gated by daemon `--audio-capture` flag + active renderer (per-wallpaper audio grants land in M2c). M1e then absorbs the recorded review items: per-kind video NPROC knob (32768) and dropping the `mpv` crate.
 
 ## Status at a glance
 
 | Milestone | Status |
 |---|---|
-| BETA_M1 (contract + video) | M1a done, M1b done (`7a2b402`, `3e83d2e`), M1c–M1e pending |
+| BETA_M1 (contract + video) | M1a done, M1b done (`7a2b402`, `3e83d2e`), M1c+M1d in_progress (parallel), M1e pending |
 | BETA_M2 (web) | pending |
 | BETA_M3 (scene, a–k) | pending |
 | BETA_M4 (live apply) | pending |
