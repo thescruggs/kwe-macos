@@ -70,17 +70,21 @@ The supervisor writes the versioned `audio_bands` and `media_state` wire types
 (see `docs/SUPERVISOR_API_V1.md` for the daemon API that feeds them) through
 the same nonblocking, latest-wins path as pointer input — one pending frame
 per stream, replaced rather than queued under backpressure, never parsed as
-commands. Renderers that cannot handle a message type ignore it at the framing
-boundary.
+commands. `audio_bands` carries exactly 16, 32, or 64 `f32` bands per channel
+(values finite, `0..=1`). Renderers that cannot handle a message type ignore
+it at the framing boundary.
 
 ```json
-{"version":1,"type":"audio_bands","sequence":4,"left":[0.1,0.2],"right":[0.1,0.2]}
+{"version":1,"type":"audio_bands","sequence":4,"left":[0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1],"right":[0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1]}
 {"version":1,"type":"media_state","sequence":4,"playback":"paused","title":"Track"}
 ```
 
-The wire `sequence` carries the display generation the state was captured
-under; the supervisor rejects stale generations before writing, exactly like
-pointer input.
+The wire `sequence` carries the daemon's promoted display generation — NOT an
+input-protocol monotonic sequence. Renderers must not validate these fields
+for monotonicity or ordering (a later capture can legitimately carry a lower
+`sequence` after a rollback), and must not reject an `audio_bands` /
+`media_state` message whose `sequence` is lower than the previous one:
+staleness is enforced daemon-side before writing, exactly like pointer input.
 
 ## Display behavior
 

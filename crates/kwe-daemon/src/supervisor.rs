@@ -10,7 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read},
     os::unix::{
-        fs::OpenOptionsExt,
+        fs::{OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         process::{CommandExt, ExitStatusExt},
     },
@@ -46,7 +46,10 @@ const MAX_ACK_READ_BYTES_PER_TICK: usize = 4096;
 /// Bounded diagnostics: 64 complete lines or 16 KiB, whichever binds first.
 const STDERR_RING_LINES: usize = 64;
 const STDERR_RING_BYTES: usize = 16 * 1024;
-const STDERR_READ_BYTES_PER_TICK: usize = 8 * 1024;
+/// Per-tick drain budget equals the pipe capacity (64 KiB) so a chatty
+/// renderer's write(2) never blocks on our reader and trips frame_timeout;
+/// the ring still bounds memory regardless of how much is drained.
+const STDERR_READ_BYTES_PER_TICK: usize = 64 * 1024;
 
 /// Renderer binary families the supervisor can launch. Each kind carries its
 /// own binary path, startup timeout, and resource budget so the heavy web
@@ -259,7 +262,7 @@ impl StartSpec {
             (RendererKind::Video, Some(ContentSpec::Video { path })) => {
                 // TODO(m1c): full video preflight (container, codec, probes)
                 // lands in M1c; path-level checks are temporary.
-                validate_video_path(path)?
+                validate_video_path(path)?;
             }
             (RendererKind::Web, Some(ContentSpec::Web { root })) => {
                 // No permission grants yet: the empty list keeps network
@@ -291,13 +294,45 @@ impl StartSpec {
         Ok(())
     }
 
+    /// Kind-qualified quarantine identity: a failing video renderer must not
+    /// quarantine the same id/hash under web or scene, and vice versa.
     fn identity(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.wallpaper_id,
+            self.content_hash,
+            self.kind.as_str()
+        )
+    }
+
+    /// Pre-M1a record key (no kind). Old supervisor-v1.json records persist
+    /// under `id:hash`; lookups fall back to this key so a previously
+    /// quarantined identity keeps its quarantine, and the next failure
+    /// migrates the record onto the kind-qualified key.
+    fn legacy_identity(&self) -> String {
         format!("{}:{}", self.wallpaper_id, self.content_hash)
+    }
+
+    /// Validate and return the spec with content paths resolved in place.
+    /// Called exactly once per start (in the RPC layer); the supervisor
+    /// event loop consumes the result without re-running preflight, which
+    /// can read up to 16 MiB of scene/web content.
+    pub fn into_validated(mut self) -> Result<Self> {
+        if self.kind == RendererKind::Video
+            && let Some(ContentSpec::Video { path }) = &self.content
+        {
+            let canonical = validate_video_path(path)?;
+            self.content = Some(ContentSpec::Video { path: canonical });
+        }
+        self.validate()?;
+        Ok(self)
     }
 }
 
 /// Temporary path-level video validation; superseded by preflight_video in M1c.
-fn validate_video_path(path: &Path) -> Result<()> {
+/// Returns the canonicalized path so spawn passes the resolved file rather
+/// than the caller-supplied path (which could be re-pointed between checks).
+fn validate_video_path(path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("stat video content {}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -306,8 +341,7 @@ fn validate_video_path(path: &Path) -> Result<()> {
     if !metadata.is_file() {
         bail!("video content is not a regular file: {}", path.display());
     }
-    fs::canonicalize(path).with_context(|| format!("resolve video content {}", path.display()))?;
-    Ok(())
+    fs::canonicalize(path).with_context(|| format!("resolve video content {}", path.display()))
 }
 
 #[derive(Debug, Clone)]
@@ -812,7 +846,9 @@ impl SupervisorRuntime {
     }
 
     fn start_selected(&mut self, spec: StartSpec, clear_failure: bool) -> Result<WorkerStatus> {
-        spec.validate()?;
+        // The RPC layer validated this spec once (StartSpec::into_validated);
+        // preflight must not run again here because it blocks the single
+        // supervisor thread on up to 16 MiB of scene/web content reads.
         if self.retired.is_some() {
             bail!("display handoff is still awaiting acknowledgement");
         }
@@ -821,13 +857,16 @@ impl SupervisorRuntime {
         self.restart_count = 0;
         self.last_failure = None;
         let identity = spec.identity();
+        let legacy = spec.legacy_identity();
         if clear_failure {
             self.persisted.records.remove(&identity);
+            self.persisted.records.remove(&legacy);
             self.store.save(&self.persisted)?;
         } else if self
             .persisted
             .records
             .get(&identity)
+            .or_else(|| self.persisted.records.get(&legacy))
             .is_some_and(|record| record.quarantined)
         {
             self.requested = Some(spec);
@@ -899,6 +938,17 @@ impl SupervisorRuntime {
             std::process::id(),
             self.launch_serial
         ));
+        // Private per-worker HOME, chmod 0700: Chromium-style web renderers
+        // take a profile lock under $HOME, so a shared HOME would let the
+        // canary and the active worker contend on it during handoff.
+        let home_dir = self
+            .config
+            .runtime_dir
+            .join(format!("home-{}", self.launch_serial));
+        fs::create_dir_all(&home_dir)
+            .with_context(|| format!("create renderer home {}", home_dir.display()))?;
+        fs::set_permissions(&home_dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("protect renderer home {}", home_dir.display()))?;
         let mut command = ProcessCommand::new(&renderer_path);
         command
             .arg("--output")
@@ -924,7 +974,7 @@ impl SupervisorRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .envs(env_allowlist(spec.kind));
+            .envs(env_allowlist(spec.kind, &home_dir));
         if let Some(fault) = &spec.test_fault {
             match fault {
                 TestFault::StartupHang => {
@@ -1348,6 +1398,14 @@ impl SupervisorRuntime {
 
     fn record_failure(&mut self, kind: FailureKind, detail: &str, spec: &StartSpec) -> bool {
         let identity = spec.identity();
+        // Migrate a pre-M1a `id:hash` record onto the kind-qualified key so
+        // its failure history (and quarantine state) carries over instead of
+        // restarting; from here on each kind is tracked independently.
+        if let Some(record) = self.persisted.records.remove(&spec.legacy_identity())
+            && !self.persisted.records.contains_key(&identity)
+        {
+            self.persisted.records.insert(identity.clone(), record);
+        }
         if !self.persisted.records.contains_key(&identity)
             && self.persisted.records.len() >= MAX_RECORDS
             && let Some(oldest) = self
@@ -1418,6 +1476,7 @@ impl SupervisorRuntime {
 
     fn clear_success_record(&mut self, spec: &StartSpec) {
         self.persisted.records.remove(&spec.identity());
+        self.persisted.records.remove(&spec.legacy_identity());
         self.last_failure = None;
         if let Err(error) = self.store.save(&self.persisted) {
             eprintln!("event=renderer.state_save_error detail={error}");
@@ -1482,11 +1541,20 @@ impl SupervisorRuntime {
         let active = self.active.as_ref();
         let requested = self.requested.as_ref();
         let candidate = self.candidate.as_ref();
-        let record = requested.and_then(|spec| self.persisted.records.get(&spec.identity()));
+        let record = requested.and_then(|spec| {
+            self.persisted
+                .records
+                .get(&spec.identity())
+                .or_else(|| self.persisted.records.get(&spec.legacy_identity()))
+        });
         // The active worker is the supervised process, so its kind names the
-        // limits that were actually applied; idle falls back to the requested
-        // kind, then to the test budget as the former single global policy.
-        let status_kind = active.map_or(RendererKind::Test, |worker| worker.spec.kind);
+        // limits that were actually applied; idle/quarantined falls back to
+        // the requested kind so the reported budget matches what will be
+        // applied, then to the test budget as the former single policy.
+        let status_kind = active
+            .map(|worker| worker.spec.kind)
+            .or_else(|| requested.map(|spec| spec.kind))
+            .unwrap_or(RendererKind::Test);
         WorkerStatus {
             phase: self.phase,
             kind: status_kind,
@@ -1576,6 +1644,9 @@ fn inspect_worker(
             } else {
                 "unknown_exit".to_string()
             };
+            // Fold the drained ring tail into the detail so crash diagnostics
+            // survive the worker drop and reach status()/quarantine records.
+            let detail = append_stderr_tail(&detail, worker);
             return Some(WorkerObservation::Failure(FailureKind::ProcessExit, detail));
         }
         Ok(None) => {}
@@ -1583,7 +1654,7 @@ fn inspect_worker(
             drain_stderr(worker, STDERR_READ_BYTES_PER_TICK);
             return Some(WorkerObservation::Failure(
                 FailureKind::ProcessExit,
-                format!("wait_error:{error}"),
+                append_stderr_tail(&format!("wait_error:{error}"), worker),
             ));
         }
     }
@@ -1766,20 +1837,24 @@ fn flush_pending(
     }
 }
 
-/// Per-kind environment allowlist. All renderers get a private HOME and a
-/// fixed PATH; Web additionally inherits the daemon's XDG_RUNTIME_DIR because
-/// Chromium needs it for session plumbing. It is deliberately not granted to
-/// the video/scene/test kinds.
-fn env_allowlist(kind: RendererKind) -> Vec<(String, String)> {
-    env_allowlist_with_runtime(kind, std::env::var_os("XDG_RUNTIME_DIR"))
+/// Per-kind environment allowlist. Every worker gets its own private HOME
+/// (created per launch under the daemon runtime dir — web renderers hold a
+/// profile lock in $HOME, so a shared HOME would make concurrent workers
+/// contend during canary handoff) and a fixed PATH; Web additionally
+/// inherits the daemon's XDG_RUNTIME_DIR because Chromium needs it for
+/// session plumbing. It is deliberately not granted to the video/scene/test
+/// kinds.
+fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
+    env_allowlist_with_runtime(kind, home, std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
 fn env_allowlist_with_runtime(
     kind: RendererKind,
+    home: &Path,
     runtime_dir: Option<OsString>,
 ) -> Vec<(String, String)> {
     let mut entries = vec![
-        ("HOME".to_string(), "/tmp".to_string()),
+        ("HOME".to_string(), home.to_string_lossy().into_owned()),
         ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
     ];
     if kind == RendererKind::Web
@@ -1797,6 +1872,9 @@ fn env_allowlist_with_runtime(
 /// evicted (their bytes counted as dropped) whenever the 64-line or 16 KiB
 /// budget binds; a single unterminated line that passes the byte budget is
 /// dropped whole. Contents are advisory only and never parsed as commands.
+/// Note `tail_bytes` counts post-newline-strip, lossy-conversion bytes, so it
+/// is a diagnostics counter, not a wire-accurate mirror of the pipe: the
+/// memory bound it enforces is unaffected by that accounting.
 #[derive(Debug, Default)]
 struct StderrRing {
     tail: Vec<String>,
@@ -1838,6 +1916,26 @@ impl StderrRing {
             self.dropped_bytes = self.dropped_bytes.saturating_add(evicted.len() as u64);
         }
     }
+}
+
+/// Fold the drained stderr ring tail into a failure detail: bounded to the
+/// last 8 lines and the shared 256-char detail budget, newest line last.
+/// Called on the exit path, where the ring would otherwise die with the
+/// dropped ActiveWorker before status() could ever surface it.
+fn append_stderr_tail(detail: &str, worker: &ActiveWorker) -> String {
+    if worker.stderr_ring.tail.is_empty() {
+        return detail.to_string();
+    }
+    let tail: Vec<&str> = worker
+        .stderr_ring
+        .tail
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    format!("{detail} stderr=[{}]", truncate_detail(&tail.join(" | ")))
 }
 
 /// Nonblocking drain of worker stderr into the bounded ring. `budget` limits
@@ -2226,25 +2324,178 @@ mod tests {
 
     #[test]
     fn env_allowlist_keeps_home_and_path_and_grants_runtime_only_to_web() {
+        let home = Path::new("/run/kwe/home-7");
         let expected_base = vec![
-            ("HOME".to_string(), "/tmp".to_string()),
+            ("HOME".to_string(), home.to_string_lossy().into_owned()),
             ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
         ];
         for kind in [RendererKind::Test, RendererKind::Video, RendererKind::Scene] {
             assert_eq!(
-                env_allowlist_with_runtime(kind, Some("/run/user/1000".into())),
+                env_allowlist_with_runtime(kind, home, Some("/run/user/1000".into())),
                 expected_base,
                 "kind {} must not inherit XDG_RUNTIME_DIR",
                 kind.as_str()
             );
         }
         assert_eq!(
-            env_allowlist_with_runtime(RendererKind::Web, None),
+            env_allowlist_with_runtime(RendererKind::Web, home, None),
             expected_base
         );
-        let web = env_allowlist_with_runtime(RendererKind::Web, Some("/run/user/1000".into()));
+        let web =
+            env_allowlist_with_runtime(RendererKind::Web, home, Some("/run/user/1000".into()));
         assert_eq!(web.len(), 3);
         assert!(web.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())));
+    }
+
+    #[test]
+    fn spawn_creates_a_private_home_per_launch_and_surfaces_exit_stderr_in_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("stderr-exit");
+        fs::create_dir_all(&root).unwrap();
+        // A renderer that writes diagnostics and dies: the failure detail
+        // must carry the stderr lines that were drained at exit.
+        let script = root.join("stderr-renderer");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho diagnostic-line-1 >&2\necho diagnostic-line-2 >&2\nexit 3\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
+        let config = config.validate().unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(config, store, state);
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+        };
+        let mut worker = runtime.spawn_worker(spec).unwrap();
+        // Each launch gets its own 0700 HOME under the daemon runtime dir.
+        let home = root.join("runtime").join("home-1");
+        let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o700,
+            "renderer home must be private: {}",
+            home.display()
+        );
+        let mut observation = None;
+        for _ in 0..200 {
+            if let Some(found) = inspect_worker(&mut worker, &runtime.config) {
+                observation = Some(found);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (kind, detail) = match observation {
+            Some(WorkerObservation::Failure(kind, detail)) => (kind, detail),
+            _ => panic!("expected an exit failure observation"),
+        };
+        assert_eq!(kind, FailureKind::ProcessExit);
+        assert!(
+            detail.contains("exit_code_3"),
+            "unexpected detail: {detail}"
+        );
+        assert!(
+            detail.contains("diagnostic-line-1") && detail.contains("diagnostic-line-2"),
+            "exit stderr must be folded into the failure detail: {detail}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_is_kind_qualified_and_migrates_legacy_records() {
+        let root = temporary_directory("identity");
+        fs::create_dir_all(&root).unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(validated_config(&root), store, state);
+        let base = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 960,
+            height: 540,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+        };
+        let video = StartSpec {
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video {
+                path: std::env::temp_dir().join("kwe-any.mp4"),
+            }),
+            ..base.clone()
+        };
+        assert_eq!(base.identity(), "431960-123:abc123:test");
+        assert_eq!(video.identity(), "431960-123:abc123:video");
+        assert_eq!(base.legacy_identity(), "431960-123:abc123");
+        assert_ne!(base.identity(), video.identity());
+        // A pre-M1a id:hash record (as persisted in old supervisor-v1.json
+        // files) migrates onto the kind-qualified key, carrying its history.
+        runtime.persisted.records.insert(
+            base.legacy_identity(),
+            FailureRecord {
+                wallpaper_id: "431960-123".into(),
+                content_hash: "abc123".into(),
+                failures: 2,
+                quarantined: false,
+                last_failure: FailureKind::ProcessExit,
+                last_detail: "legacy".into(),
+                updated_unix_seconds: 1,
+            },
+        );
+        let quarantined = runtime.record_failure(FailureKind::ProcessExit, "boom", &base);
+        assert!(quarantined, "inherited failures must still quarantine");
+        assert_eq!(runtime.persisted.records.len(), 1);
+        let record = runtime
+            .persisted
+            .records
+            .get(&base.identity())
+            .expect("record must live under the kind-qualified key");
+        assert_eq!(record.failures, 3);
+        assert!(
+            !runtime
+                .persisted
+                .records
+                .contains_key(&base.legacy_identity())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn into_validated_canonicalizes_the_video_content_path() {
+        let root = temporary_directory("video-canonical");
+        fs::create_dir_all(&root).unwrap();
+        let real = root.join("real.mp4");
+        fs::write(&real, b"not a real video").unwrap();
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 960,
+            height: 540,
+            fps: 30,
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video { path: real.clone() }),
+            test_fault: None,
+            stderr_lines: None,
+        };
+        let validated = spec.into_validated().unwrap();
+        let path = match validated.content.expect("video content kept") {
+            ContentSpec::Video { path } => path,
+            _ => panic!("expected video content"),
+        };
+        assert_eq!(path, fs::canonicalize(&real).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

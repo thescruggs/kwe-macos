@@ -150,13 +150,13 @@ daemon watches frame progression even when no client is connected.
 
 *(BETA_M1a: daemon-side producers/forwarders for the two media wire types.)*
 
-`audio.forward` accepts `generation` and a stereo `frame` of 64 `f32` bands per
-channel:
+`audio.forward` accepts `generation` and a stereo `frame` of `f32` bands per
+channel. Band counts must be exactly 16, 32, or 64 (values finite, `0..=1`):
 
 ```json
 {
   "generation": 4,
-  "frame": {"left": [0.1, 0.2], "right": [0.1, 0.2]}
+  "frame": {"left": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], "right": [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]}
 }
 ```
 
@@ -176,12 +176,14 @@ channel:
 Both are encoded through the versioned protocol types in
 `docs/INPUT_PROTOCOL_V1.md` — band counts and value ranges are rejected by the
 protocol constructors before any worker message exists. The generation must
-match the current promoted display generation exactly (like pointer input),
-and with no active renderer the request errors with `supervisor_failed` /
-`no_active_renderer` (the `error` field carries the detail). Each stream is
-latest-wins: one pending frame per stream, replaced — not queued — when the
-worker pipe is under backpressure, counting into `audio_coalesced` /
-`media_coalesced`.
+match the current promoted display generation exactly (like pointer input).
+A stale generation or an absent promoted renderer fails the request with
+`{"error": "supervisor_failed", "detail": ...}` (the `detail` names the
+reason, e.g. `audio frame display generation is stale or invalid`); retry
+only after re-reading `renderer.status` for the current `display_generation`.
+Each stream is latest-wins: one pending frame per stream, replaced — not
+queued — when the worker pipe is under backpressure, counting into
+`audio_coalesced` / `media_coalesced`.
 
 ## Lifecycle and recovery
 
@@ -191,11 +193,17 @@ for the requested kind — a missing kind binary fails the launch closed rather
 than falling back to another renderer — and passes bounded arguments directly.
 *(M1a: `--content <path>` follows `--fps` for kinds with content.)* The
 inherited environment is replaced by a per-kind allowlist: every renderer gets
-`HOME=/tmp` and `PATH=/usr/bin:/usr/sbin:/bin`; the web kind additionally
-inherits the daemon's `XDG_RUNTIME_DIR` (Chromium needs it; video/scene/test
-deliberately do not get it). Renderer stderr is piped into a bounded ring (64
+`PATH=/usr/bin:/usr/sbin:/bin` and its own private `HOME` at
+`<daemon runtime dir>/home-<launch_serial>` (created chmod 0700 per launch —
+web renderers hold a profile lock under `$HOME`, so a shared `HOME` would
+make the canary and active worker contend during handoff); the web kind
+additionally inherits the daemon's `XDG_RUNTIME_DIR` (Chromium needs it;
+video/scene/test deliberately do not get it). Renderer stderr is piped into a
+bounded ring (64
 lines / 16 KiB, drained nonblocking per supervisor tick and once more after
-exit) and surfaced through `renderer.status`; it cannot grow logs or feed the
+exit) and surfaced through `renderer.status`; on an unexpected exit the
+drained tail (last 8 lines) is folded into the failure `detail` so crash
+diagnostics survive the worker teardown. It cannot grow logs or feed the
 control stream. Before exec it also applies finite address-space, output-file,
 descriptor, and UID-scoped process ceilings and disables core dumps. Any
 failure to install the policy fails the launch.
@@ -225,7 +233,11 @@ Automatic restarts use a bounded delay and failure count. The default third
 equivalent failure persists a quarantine record and prevents another launch.
 
 The state file is `supervisor-v1.json`, capped at 1 MiB and 256 identities in a
-private state directory. The latest acknowledged stable BGRA frame is converted to a bounded
+private state directory. *(M1a: identity keys are kind-qualified
+`wallpaper_id:content_hash:kind` so a failing video cannot quarantine the same
+id/hash under web or scene; pre-M1a records keyed `wallpaper_id:content_hash`
+still match on lookup and migrate onto the qualified key on the next failure.)*
+The latest acknowledged stable BGRA frame is converted to a bounded
 P6 PPM still and atomically stored in alternating `last-good-a.ppm` and
 `last-good-b.ppm` slots. The JSON state pointer changes only after the inactive
 slot is complete, so the previously acknowledged still survives an interrupted

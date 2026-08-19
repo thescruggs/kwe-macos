@@ -751,8 +751,9 @@ impl TryFrom<RendererStartParams> for StartSpec {
             test_fault,
             stderr_lines: params.stderr_lines,
         };
-        spec.validate()?;
-        Ok(spec)
+        // Single validation point per start: the supervisor event loop no
+        // longer re-validates, so content preflight cannot block it twice.
+        spec.into_validated()
     }
 }
 
