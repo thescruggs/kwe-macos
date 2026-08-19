@@ -9,12 +9,13 @@
 ## Change log
 
 - 2026-08-18 — Plan authored (user decisions locked: full SceneScript engine; Chromium+CDP web; live apply authorized). Moved from `docs/BETA_PLAN.md` to `AI-Skills/BETA_PLAN.md` as the living plan. No slices started.
+- 2026-08-18 — AI-Skills setup committed (`db8563d`). **BETA_M1a started** on branch `beta-m1a-renderer-contract` (worktree `/home/qcv123/gitProjects/kwe-m1a`), implemented by a sub-agent under orchestration; review agent pass follows. Scope note for M1a: `preflight_video` stays deferred to M1c — video content validation in M1a is path-level only (exists, regular, non-symlink), documented as temporary.
 
 ## Status at a glance
 
 | Milestone | Status |
 |---|---|
-| BETA_M1 (contract + video) | pending |
+| BETA_M1 (contract + video) | M1a in_progress, M1b–M1e pending |
 | BETA_M2 (web) | pending |
 | BETA_M3 (scene, a–k) | pending |
 | BETA_M4 (live apply) | pending |
