@@ -224,6 +224,11 @@ fn resolve_capture_target() -> Result<Option<String>> {
         .stdout
         .take()
         .context("pw-dump stdout pipe unavailable")?;
+    // Nonblocking reads are what arm the deadline and WouldBlock arms below:
+    // on a blocking fd a wedged pw-dump would hang the read forever, the
+    // resolution would never time out, and the daemon's restart budget would
+    // never fire.
+    set_nonblocking(stdout.as_raw_fd()).context("configure pw-dump stdout")?;
     let deadline = Instant::now() + PW_DUMP_TIMEOUT;
     let mut chunk = [0_u8; 4096];
     loop {
@@ -256,9 +261,9 @@ fn resolve_capture_target() -> Result<Option<String>> {
         }
     }
     let deadline = Instant::now() + PW_DUMP_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -270,6 +275,16 @@ fn resolve_capture_target() -> Result<Option<String>> {
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(error) => bail!("wait pw-dump: {error}"),
         }
+    };
+    if !status.success() {
+        let detail = if let Some(code) = status.code() {
+            format!("exit_code_{code}")
+        } else if let Some(signal) = status.signal() {
+            format!("signal_{signal}")
+        } else {
+            "unknown_exit".to_string()
+        };
+        bail!("pw-dump exited unsuccessfully: {detail}");
     }
     parse_sink_target(&output).map_err(|error| anyhow!("parse pw-dump output: {error}"))
 }
@@ -402,6 +417,13 @@ struct Capture {
     window_samples: usize,
     stderr: std::process::ChildStderr,
     stderr_ring: StderrRing,
+    /// Set when a non-finite sample was dropped without its pair partner in
+    /// the same chunk; the first sample of the next chunk is its partner and
+    /// is dropped too, so the L/R interleave never desyncs.
+    drop_next_sample: bool,
+    /// Non-finite samples (and their dropped pair partners) seen so far;
+    /// surfaced for diagnostics so a pathological capture is visible.
+    non_finite_dropped: u64,
 }
 
 impl Capture {
@@ -463,6 +485,8 @@ impl Capture {
             window_samples: arguments.window_samples,
             stderr,
             stderr_ring: StderrRing::default(),
+            drop_next_sample: false,
+            non_finite_dropped: 0,
         })
     }
 
@@ -496,7 +520,11 @@ impl Capture {
         Ok(())
     }
 
-    /// Append raw bytes to the ring, converting complete f32 samples.
+    /// Append raw bytes to the ring, converting complete f32 samples. A
+    /// non-finite sample would desync the L/R interleave if dropped alone
+    /// (every later sample shifts to the other channel), so it is dropped
+    /// together with its pair partner; alignment is preserved and the loss
+    /// is counted.
     fn push_bytes(&mut self, bytes: &[u8]) {
         self.byte_tail.extend_from_slice(bytes);
         let mut offset = 0;
@@ -508,8 +536,18 @@ impl Capture {
                 self.byte_tail[offset + 3],
             ]);
             offset += 4;
+            if self.drop_next_sample {
+                // Pair partner of a non-finite sample dropped in a previous
+                // chunk; the partner is dropped unconditionally.
+                self.drop_next_sample = false;
+                self.non_finite_dropped = self.non_finite_dropped.saturating_add(1);
+                continue;
+            }
             if sample.is_finite() {
                 self.samples.push(sample);
+            } else {
+                self.drop_next_sample = true;
+                self.non_finite_dropped = self.non_finite_dropped.saturating_add(1);
             }
         }
         if offset > 0 {
@@ -521,6 +559,14 @@ impl Capture {
         if self.samples.len() > cap {
             self.samples.drain(..self.samples.len() - cap);
         }
+    }
+
+    /// Drain the counter of non-finite samples (and dropped partners) since
+    /// the last poll; the caller logs it through the rate-limited diagnostic.
+    fn take_non_finite_dropped(&mut self) -> u64 {
+        let dropped = self.non_finite_dropped;
+        self.non_finite_dropped = 0;
+        dropped
     }
 
     /// Deinterleaved latest window when at least one full window is buffered.
@@ -544,9 +590,11 @@ impl Capture {
         Some((left, right))
     }
 
+    /// Bounded stderr drain (16 reads of 512 B = 8 KiB per tick) so a chatty
+    /// pw-record cannot starve the capture loop and break graceful SIGTERM.
     fn drain_stderr(&mut self) {
         let mut chunk = [0_u8; 512];
-        loop {
+        for _ in 0..16 {
             let read = unsafe {
                 libc::read(
                     self.stderr.as_raw_fd(),
@@ -816,21 +864,33 @@ impl WorkerState {
         let previous = self.generation;
         self.request_serial = self.request_serial.wrapping_add(1);
         match fetch_display_generation(&self.arguments.socket, self.request_serial) {
-            Ok(generation) if generation != 0 => {
-                if generation != previous {
-                    self.diag.log(
-                        "event=audio.worker.generation_refresh",
-                        &format!("from={previous} to={generation}"),
-                    );
-                }
+            Ok(generation) => {
+                // Record the fetched generation unconditionally: a 0 (no
+                // promoted renderer) must switch the main loop back to the
+                // poll path instead of emitting against a stale generation.
                 self.generation = generation;
-                self.backoff = RECONNECT_BASE;
-                self.next_emit = Instant::now() + self.emit_interval();
+                if generation != 0 {
+                    if generation != previous {
+                        self.diag.log(
+                            "event=audio.worker.generation_refresh",
+                            &format!("from={previous} to={generation}"),
+                        );
+                    }
+                    self.backoff = RECONNECT_BASE;
+                    self.next_emit = Instant::now() + self.emit_interval();
+                } else {
+                    // Nothing promoted yet: poll again after GENERATION_POLL
+                    // rather than busy-looping.
+                    self.next_generation_poll = Instant::now() + GENERATION_POLL;
+                }
             }
-            Ok(_) => self.next_generation_poll = Instant::now() + GENERATION_POLL,
-            Err(error) => self
-                .diag
-                .log("event=audio.worker.status_error", &error.to_string()),
+            Err(error) => {
+                self.diag
+                    .log("event=audio.worker.status_error", &error.to_string());
+                // A failed probe must not busy-loop either: keep the same
+                // reschedule as the no-renderer arm.
+                self.next_generation_poll = Instant::now() + GENERATION_POLL;
+            }
         }
     }
 
@@ -918,7 +978,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
         if let Err(error) = state.capture.poll() {
-            eprintln!("event=audio.worker.capture_read_error detail={error}");
+            // Rate-limited: a wedged pw-record must not flood the supervisor
+            // log at one line per loop tick.
+            state
+                .diag
+                .log("event=audio.worker.capture_read_error", &error.to_string());
         }
         match state.capture.child.try_wait() {
             Ok(Some(status)) => {
@@ -943,6 +1007,13 @@ fn main() -> Result<()> {
         }
         while let Some((left, right)) = state.capture.take_window() {
             state.analyze(&left, &right);
+        }
+        let non_finite = state.capture.take_non_finite_dropped();
+        if non_finite > 0 {
+            state.diag.log(
+                "event=audio.worker.non_finite_samples",
+                &format!("dropped={non_finite}"),
+            );
         }
         let now = Instant::now();
         if state.generation == 0 {
@@ -1120,6 +1191,8 @@ mod tests {
                     window_samples: 2048,
                     stderr,
                     stderr_ring: StderrRing::default(),
+                    drop_next_sample: false,
+                    non_finite_dropped: 0,
                 }
             },
             pending: None,
@@ -1172,6 +1245,8 @@ mod tests {
                     .unwrap()
             },
             stderr_ring: StderrRing::default(),
+            drop_next_sample: false,
+            non_finite_dropped: 0,
         };
         // Push 32 interleaved frames (16 windows of 8) in one byte chunk.
         let samples: Vec<f32> = (0..64).map(|index| index as f32).collect();
@@ -1189,6 +1264,70 @@ mod tests {
         assert_eq!(left[7], 62.0);
         assert_eq!(right[7], 63.0);
         assert!(capture.take_window().is_none());
+    }
+
+    #[test]
+    fn non_finite_samples_drop_their_pair_and_keep_interleave_aligned() {
+        let mut capture = Capture {
+            child: Command::new("true").spawn().unwrap(),
+            stdout: {
+                let mut command = Command::new("true");
+                command
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+                    .stdout
+                    .take()
+                    .unwrap()
+            },
+            samples: vec![],
+            byte_tail: vec![],
+            window_samples: 8,
+            stderr: {
+                let mut command = Command::new("true");
+                command
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+                    .stderr
+                    .take()
+                    .unwrap()
+            },
+            stderr_ring: StderrRing::default(),
+            drop_next_sample: false,
+            non_finite_dropped: 0,
+        };
+        // Interleaved frames [L0 R0] [L1 R1] ... [L8 R8] with L0 = NaN.
+        // NaN drops L0 and its partner R0; every later sample must keep its
+        // original channel (no interleave shift), leaving exactly 8 frames.
+        let bytes: Vec<u8> = [
+            f32::NAN,
+            2.0,
+            4.0,
+            6.0,
+            8.0,
+            10.0,
+            12.0,
+            14.0,
+            16.0,
+            18.0,
+            20.0,
+            22.0,
+            24.0,
+            26.0,
+            28.0,
+            30.0,
+            32.0,
+            34.0,
+        ]
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes())
+        .collect();
+        capture.push_bytes(&bytes);
+        assert_eq!(capture.take_non_finite_dropped(), 2);
+        let (left, right) = capture.take_window().unwrap();
+        assert_eq!(left, vec![4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0]);
+        assert_eq!(right, vec![6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 34.0]);
     }
 
     #[test]

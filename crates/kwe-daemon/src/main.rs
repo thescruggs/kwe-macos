@@ -421,10 +421,11 @@ fn handle_client(
         bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
     }
     // Peer credential identification: the daemon's own audio worker is
-    // recognized by pid so its no-active-renderer rejections can be dropped
-    // silently instead of erroring the caller's connection. SO_PEERCRED is
-    // read directly because std's peer_cred() is still feature-gated.
-    let peer_pid = peer_pid(&stream);
+    // recognized by pid and uid so its no-active-renderer rejections can be
+    // dropped silently instead of erroring the caller's connection.
+    // SO_PEERCRED is read directly because std's peer_cred() is still
+    // feature-gated.
+    let peer = peer_cred(&stream);
     let (ok, result) = process_request(
         &request,
         catalog,
@@ -433,7 +434,7 @@ fn handle_client(
         Some(playlist),
         workshop_cache,
         Some(audio),
-        peer_pid,
+        peer,
         worker_pid,
         allow_test_faults,
     )?;
@@ -460,7 +461,7 @@ fn process_request(
     playlist: Option<&PlaylistSessionHandle>,
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     audio: Option<&AudioCaptureHandle>,
-    peer_pid: u32,
+    peer: PeerCred,
     worker_pid: &Arc<AtomicU32>,
     allow_test_faults: bool,
 ) -> Result<(bool, Value)> {
@@ -604,7 +605,7 @@ fn process_request(
                                 // The daemon's own worker drops its frames
                                 // latest-wins while no renderer is active;
                                 // external callers still see the error.
-                                match classify_audio_error(peer_pid, worker_pid, &result) {
+                                match classify_audio_error(peer, worker_pid, &result) {
                                     Some(dropped) => dropped,
                                     None => result,
                                 }
@@ -845,18 +846,24 @@ fn log_audio_drop() {
 }
 
 /// `Some({"status": "dropped"})` exactly when the request came from the
-/// daemon's own audio worker (identified by pid) and the supervisor rejected
-/// it only because no renderer is currently promoted. Everything else
-/// (stale generations, other callers, unknown errors) returns `None` and the
-/// original error result is surfaced.
+/// daemon's own audio worker (identified by pid and uid) and the supervisor
+/// rejected it only because no renderer is currently promoted. Everything
+/// else (stale generations, other callers, unknown credentials) returns
+/// `None` and the original error result is surfaced.
 fn classify_audio_error(
-    peer_pid: u32,
+    peer: PeerCred,
     worker_pid: &Arc<AtomicU32>,
     result: &Value,
 ) -> Option<Value> {
-    let is_managed_worker = worker_pid.load(Ordering::Acquire) != 0
-        && peer_pid != 0
-        && peer_pid == worker_pid.load(Ordering::Acquire);
+    let managed_pid = worker_pid.load(Ordering::Acquire);
+    // Same pid AND same user: a pid alone can be recycled after the worker
+    // exits, so a later connection reusing that pid must not be mistaken
+    // for our worker (pid-reuse hardening). geteuid never fails; it returns
+    // the real effective uid of this process.
+    // SAFETY: geteuid takes no arguments and cannot fault.
+    let effective_uid = unsafe { libc::geteuid() };
+    let is_managed_worker =
+        managed_pid != 0 && peer.pid != 0 && peer.pid == managed_pid && peer.uid == effective_uid;
     if !is_managed_worker {
         return None;
     }
@@ -1009,9 +1016,18 @@ fn unix_ms() -> u128 {
         .as_millis()
 }
 
-/// Peer process id of a Unix stream connection, or 0 when the credential
-/// query fails (which also makes the no-renderer drop never apply).
-fn peer_pid(stream: &UnixStream) -> u32 {
+/// Peer credentials of a Unix stream connection. `pid == 0` when the
+/// credential query fails, which also makes the no-renderer drop never
+/// apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PeerCred {
+    pid: u32,
+    uid: u32,
+}
+
+/// Peer credentials of a Unix stream connection. SO_PEERCRED is read
+/// directly because std's peer_cred() is still feature-gated.
+fn peer_cred(stream: &UnixStream) -> PeerCred {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: `cred` is a valid mutable ucred buffer and `len` its bound;
@@ -1025,7 +1041,14 @@ fn peer_pid(stream: &UnixStream) -> u32 {
             &mut len,
         )
     };
-    if rc == 0 { cred.pid as u32 } else { 0 }
+    if rc == 0 {
+        PeerCred {
+            pid: cred.pid as u32,
+            uid: cred.uid,
+        }
+    } else {
+        PeerCred::default()
+    }
 }
 
 fn validate_socket_parent(socket: &Path) -> Result<()> {
@@ -1089,7 +1112,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )
@@ -1112,7 +1135,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )
@@ -1136,7 +1159,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )
@@ -1159,7 +1182,7 @@ mod tests {
             playlist,
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             true,
         )
@@ -1287,7 +1310,7 @@ mod tests {
             Some(&handle),
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )
@@ -1480,9 +1503,14 @@ mod tests {
             "error": "supervisor_failed",
             "detail": "no promoted renderer is available for audio forwarding"
         });
-        // The daemon's own worker with the no-promoted-renderer rejection:
-        // silent latest-wins drop.
-        let dropped = classify_audio_error(4321, &worker_pid, &no_renderer);
+        // The daemon's own worker (matching pid AND uid) with the
+        // no-promoted-renderer rejection: silent latest-wins drop.
+        let own_worker = PeerCred {
+            pid: 4321,
+            // SAFETY: geteuid takes no arguments and cannot fault.
+            uid: unsafe { libc::geteuid() },
+        };
+        let dropped = classify_audio_error(own_worker, &worker_pid, &no_renderer);
         assert_eq!(dropped, Some(json!({"status": "dropped"})));
         // Stale-generation rejections still surface unchanged: the worker
         // refreshes its display generation on them.
@@ -1490,18 +1518,43 @@ mod tests {
             "error": "supervisor_failed",
             "detail": "audio frame display generation is stale or invalid"
         });
-        assert_eq!(classify_audio_error(4321, &worker_pid, &stale), None);
+        assert_eq!(classify_audio_error(own_worker, &worker_pid, &stale), None);
+        // Same pid but a different user is not our worker: pids can be
+        // recycled after the worker exits (pid-reuse hardening).
+        let recycled_pid_other_user = PeerCred {
+            pid: 4321,
+            // SAFETY: geteuid takes no arguments and cannot fault.
+            uid: unsafe { libc::geteuid() }.wrapping_add(1),
+        };
+        assert_eq!(
+            classify_audio_error(recycled_pid_other_user, &worker_pid, &no_renderer),
+            None
+        );
         // Other callers, unknown credentials, and a worker that never
         // spawned keep the original error.
-        assert_eq!(classify_audio_error(9999, &worker_pid, &no_renderer), None);
-        assert_eq!(classify_audio_error(0, &worker_pid, &no_renderer), None);
+        let other_pid = PeerCred {
+            pid: 9999,
+            // SAFETY: geteuid takes no arguments and cannot fault.
+            uid: unsafe { libc::geteuid() },
+        };
         assert_eq!(
-            classify_audio_error(4321, &Arc::new(AtomicU32::new(0)), &no_renderer),
+            classify_audio_error(other_pid, &worker_pid, &no_renderer),
+            None
+        );
+        assert_eq!(
+            classify_audio_error(PeerCred::default(), &worker_pid, &no_renderer),
+            None
+        );
+        assert_eq!(
+            classify_audio_error(own_worker, &Arc::new(AtomicU32::new(0)), &no_renderer),
             None
         );
         // Non-supervisor failures are never dropped.
         let invalid = json!({"error": "invalid_params", "detail": "x"});
-        assert_eq!(classify_audio_error(4321, &worker_pid, &invalid), None);
+        assert_eq!(
+            classify_audio_error(own_worker, &worker_pid, &invalid),
+            None
+        );
     }
 
     #[test]
@@ -1525,7 +1578,7 @@ mod tests {
             None,
             &cache_for_tests(),
             Some(&handle),
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )
@@ -1544,7 +1597,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
-            0,
+            PeerCred::default(),
             &empty_worker_pid(),
             false,
         )

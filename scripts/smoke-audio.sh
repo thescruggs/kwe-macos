@@ -5,8 +5,9 @@
 # bounded supervisor timings, and jq assertions on the local JSON API. Audio
 # capture is directed at a freshly created null sink (pactl module-null-sink
 # or pw-cli adapter node) via --audio-capture-node so the worker never touches
-# the user's real default sink. If no PipeWire control tool or pw-record is
-# available the suite prints SKIPPED and exits 0.
+# the user's real default sink. If no PipeWire control tool, no pw-record/
+# pw-dump, or no reachable PipeWire session is available, the suite prints
+# SKIPPED and exits 0.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,11 +36,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-command -v jq >/dev/null
-command -v pw-record >/dev/null
+command -v jq >/dev/null || {
+    echo "SKIPPED: jq is not installed"
+    exit 0
+}
+if ! command -v pw-record >/dev/null || ! command -v pw-dump >/dev/null; then
+    echo "SKIPPED: pw-record/pw-dump are not installed (bounded PipeWire capture needs them)"
+    exit 0
+fi
 if ! command -v pactl >/dev/null && ! command -v pw-cli >/dev/null; then
     echo "SKIPPED: no pactl/pw-cli (cannot create an isolated null sink)"
     exit 0
+fi
+# Session probe: tools present but no reachable PipeWire session (headless
+# container, missing user session) must skip rather than fail.
+if command -v pactl >/dev/null; then
+    pactl info >/dev/null 2>&1 || {
+        echo "SKIPPED: pactl cannot reach a PipeWire session"
+        exit 0
+    }
+else
+    pw-cli info >/dev/null 2>&1 || {
+        echo "SKIPPED: pw-cli cannot reach a PipeWire session"
+        exit 0
+    }
 fi
 
 # Isolated capture target: a null sink named kwe_smoke, owned by this script.
@@ -176,6 +196,28 @@ done
 [[ "$ack_b" -ge "$generation_b" ]]
 [[ "$(jq -r '.result.input_protocol_errors' <<<"$(call_daemon renderer.status)")" == "0" ]]
 echo "audio smoke passed: audio_bands acked at the promoted generation, input_protocol_errors 0"
+
+# Case 2b: with audio frames still flowing, pointer input must be acked at
+# its own (higher) sequence. The audio wire carries the display generation,
+# which sits below the pointer sequence, so the ack ceiling must never be
+# lowered by audio frames (regression: a ceiling reset rejected in-flight
+# pointer acks as protocol errors).
+pointer_last="0"
+for phase in enter move move move move leave; do
+    pointer_input="$(call_daemon renderer.input "{\"generation\":$generation_b,\"phase\":\"$phase\",\"x\":0.5,\"y\":0.5}")"
+    pointer_last="$(jq -r '.result.input_sequence' <<<"$pointer_input")"
+    [[ -n "$pointer_last" && "$pointer_last" != "null" ]]
+done
+[[ "$pointer_last" -gt "$generation_b" ]]
+ack_pointer="0"
+for _attempt in {1..500}; do
+    ack_pointer="$(jq -r '.result.input_ack_sequence' <<<"$(call_daemon renderer.status)")"
+    [[ "$ack_pointer" -ge "$pointer_last" ]] && break
+    sleep 0.02
+done
+[[ "$ack_pointer" -ge "$pointer_last" ]]
+[[ "$(jq -r '.result.input_protocol_errors' <<<"$(call_daemon renderer.status)")" == "0" ]]
+echo "audio smoke passed: pointer input acked past the display generation with 0 protocol errors"
 
 # Case 3: with no renderer promoted, the daemon's own worker is dropped
 # silently (latest-wins) instead of erroring: no client_error storm, and the

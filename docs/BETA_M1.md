@@ -34,7 +34,9 @@ remove everything on exit. They do not install a wallpaper or touch the
 running Plasma session. `smoke-audio.sh` additionally creates an isolated
 null sink (pactl module-null-sink or pw-cli adapter node) and directs the
 capture worker at it, so the user's real default sink is never touched; it
-prints `SKIPPED` and exits 0 when no PipeWire control tool is available.
+prints `SKIPPED` and exits 0 when pw-record/pw-dump are missing, no PipeWire
+control tool is available, or no reachable PipeWire session exists (checked
+with a `pactl info` / `pw-cli info` probe).
 
 ## Acceptance evidence
 

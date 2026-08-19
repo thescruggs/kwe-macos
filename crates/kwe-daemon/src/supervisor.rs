@@ -1136,10 +1136,10 @@ impl SupervisorRuntime {
             &mut worker.pending_audio,
             &mut worker.audio_coalesced,
         )?;
-        // The wire sequence carries the display generation by design; record
-        // it so the worker's echoed ack passes the acceptance ceiling below
+        // The wire sequence carries the display generation by design; raise
+        // the acceptance ceiling so the worker's echoed ack passes below
         // (mirrors the pointer path's bookkeeping).
-        worker.input_sequence = generation;
+        raise_ack_ceiling(worker, generation);
         Ok(self.status())
     }
 
@@ -1158,10 +1158,10 @@ impl SupervisorRuntime {
             &mut worker.pending_media,
             &mut worker.media_coalesced,
         )?;
-        // The wire sequence carries the display generation by design; record
-        // it so the worker's echoed ack passes the acceptance ceiling below
+        // The wire sequence carries the display generation by design; raise
+        // the acceptance ceiling so the worker's echoed ack passes below
         // (mirrors the pointer path's bookkeeping).
-        worker.input_sequence = generation;
+        raise_ack_ceiling(worker, generation);
         Ok(self.status())
     }
 
@@ -1753,6 +1753,16 @@ fn try_write_input(input: &ChildStdin, bytes: &[u8]) -> io::Result<PipeWrite> {
     ))
 }
 
+/// Raise the ack acceptance ceiling without ever lowering it. Audio and
+/// media wire sequences carry the display generation (a promotion counter
+/// that routinely sits below the pointer sequence), so a plain assignment
+/// would DECREASE the ceiling and reject in-flight pointer acks as protocol
+/// errors. The pointer path increments the sequence per message; this helper
+/// only ever lifts it.
+fn raise_ack_ceiling(worker: &mut ActiveWorker, sequence: u64) {
+    worker.input_sequence = worker.input_sequence.max(sequence);
+}
+
 fn drain_input_acks(worker: &mut ActiveWorker) {
     let mut total = 0_usize;
     while total < MAX_ACK_READ_BYTES_PER_TICK {
@@ -2077,6 +2087,9 @@ fn truncate_detail(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+
+    use kwe_input_protocol::{InputAck, encode_ack_line};
 
     fn temporary_directory(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2674,5 +2687,109 @@ mod tests {
         assert_eq!(read, second.len() as isize);
         assert_eq!(received, second);
         assert_eq!(errors, 0);
+    }
+
+    #[test]
+    fn ack_ceiling_never_decreases_so_in_flight_pointer_acks_pass() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::io::FromRawFd;
+
+        // Synthetic worker: every pipe end is real so drain_input_acks
+        // exercises the actual read loop, but no process participates.
+        let mut ack_fds = [0_i32; 2];
+        // SAFETY: ack_fds is a valid writable pair buffer for a fresh pipe.
+        assert_eq!(unsafe { libc::pipe(ack_fds.as_mut_ptr()) }, 0);
+        set_nonblocking(ack_fds[0]).unwrap();
+        let input_ack = ChildStdout::from(unsafe { OwnedFd::from_raw_fd(ack_fds[0]) });
+        let ack_writer = unsafe { fs::File::from_raw_fd(ack_fds[1]) };
+
+        let mut input_fds = [0_i32; 2];
+        // SAFETY: input_fds is a valid writable pair buffer for a fresh pipe.
+        assert_eq!(unsafe { libc::pipe(input_fds.as_mut_ptr()) }, 0);
+        let input = ChildStdin::from(unsafe { OwnedFd::from_raw_fd(input_fds[1]) });
+        let _input_read_end = unsafe { fs::File::from_raw_fd(input_fds[0]) };
+
+        let mut child = Command::new("true").spawn().unwrap();
+        let _ = child.wait();
+        let mut stderr_command = Command::new("true");
+        stderr_command.stderr(Stdio::piped());
+        let mut stderr_child = stderr_command.spawn().unwrap();
+        let _ = stderr_child.wait();
+        let stderr = stderr_child.stderr.take().unwrap();
+
+        let mut worker = ActiveWorker {
+            spec: StartSpec {
+                wallpaper_id: "431960-123".into(),
+                content_hash: "abc123".into(),
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                kind: RendererKind::Test,
+                content: None,
+                test_fault: None,
+                stderr_lines: None,
+            },
+            child,
+            frame_path: PathBuf::new(),
+            reader: None,
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            last_snapshot_saved: None,
+            sequence: 0,
+            input,
+            input_ack,
+            input_ack_buffer: Vec::new(),
+            input_sequence: 0,
+            input_ack_sequence: 0,
+            pending_input: None,
+            input_coalesced: 0,
+            input_protocol_errors: 0,
+            pointer_inside: false,
+            pointer_x: 0,
+            pointer_y: 0,
+            pending_audio: None,
+            audio_coalesced: 0,
+            pending_media: None,
+            media_coalesced: 0,
+            stderr,
+            stderr_ring: StderrRing::default(),
+        };
+        let write_ack = |sequence: u64, writer: &fs::File| {
+            let line = encode_ack_line(&InputAck::new(sequence).unwrap()).unwrap();
+            // SAFETY: line is a valid readable buffer and the pipe write end
+            // is open; the daemon treats a short write as a protocol error.
+            let written = unsafe {
+                libc::write(
+                    writer.as_raw_fd(),
+                    line.as_ptr().cast::<libc::c_void>(),
+                    line.len(),
+                )
+            };
+            assert_eq!(written, line.len() as isize);
+        };
+
+        // The pointer path advances the sequence per message.
+        for _ in 0..5 {
+            worker.input_sequence = worker.input_sequence.checked_add(1).unwrap();
+        }
+        // An audio frame carries the display generation (1), far below the
+        // pointer sequence; the ceiling must NOT drop to it.
+        raise_ack_ceiling(&mut worker, 1);
+        assert_eq!(worker.input_sequence, 5);
+        // The in-flight ack for pointer message 5 passes the raised ceiling.
+        write_ack(5, &ack_writer);
+        drain_input_acks(&mut worker);
+        assert_eq!(worker.input_ack_sequence, 5);
+        assert_eq!(worker.input_protocol_errors, 0);
+
+        // Counterfactual: the pre-fix plain assignment (`input_sequence =
+        // generation`) would reject the very same ack as a protocol error.
+        worker.input_ack_sequence = 0;
+        worker.input_protocol_errors = 0;
+        worker.input_sequence = 1; // old buggy assignment
+        write_ack(5, &ack_writer);
+        drain_input_acks(&mut worker);
+        assert_eq!(worker.input_ack_sequence, 0);
+        assert_eq!(worker.input_protocol_errors, 1);
     }
 }
