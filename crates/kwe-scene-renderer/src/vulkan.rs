@@ -205,6 +205,11 @@ pub struct LayerRenderer {
     /// Uploaded textures per layer index; None = skipped at load or failed
     /// upload.
     textures: Vec<Option<LayerTexture>>,
+    /// Number of currently live layer textures (image + atlas). Re-uploads
+    /// replace in place, so this only grows with distinct layer indices —
+    /// the drop-accounting assertion backing the device test for the M3e
+    /// atlas-rebuild leak.
+    live_uploads: usize,
     command_pool: vk::CommandPool,
     /// Per-frame command buffer.
     command_buffer: vk::CommandBuffer,
@@ -475,6 +480,11 @@ impl LayerRenderer {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(MAX_LAYERS as u32);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
+            // FREE_DESCRIPTOR_SET: M3e re-uploads a text layer's atlas in
+            // place on rebuild, freeing the previous set — without the
+            // flag, vkFreeDescriptorSets is a no-op and the bounded pool
+            // (MAX_LAYERS sets) would exhaust after MAX_LAYERS rebuilds.
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(MAX_LAYERS as u32)
             .pool_sizes(std::slice::from_ref(&pool_size));
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
@@ -625,6 +635,7 @@ impl LayerRenderer {
             descriptor_pool,
             descriptor_sets: Vec::new(),
             textures: Vec::new(),
+            live_uploads: 0,
             text_vertex_buffers: Vec::new(),
             command_pool,
             command_buffer,
@@ -921,12 +932,36 @@ impl LayerRenderer {
             self.textures.push(None);
             self.descriptor_sets.push(None);
         }
+        // Replace-in-place: M3e re-uploads a text layer's atlas on every
+        // rebuild, so the previous image/view/memory and its descriptor
+        // set are destroyed here — a leaked set would exhaust the bounded
+        // pool (MAX_LAYERS sets) after MAX_LAYERS rebuilds and silently
+        // kill every later texture upload. A failed upload earlier in this
+        // function returns before reaching this point, so the old texture
+        // stays valid on failure (the layer keeps rendering the old
+        // content).
+        if let Some(old) = self.textures[index].take() {
+            unsafe {
+                self.device.destroy_image_view(old.view, None);
+                self.device.destroy_image(old.image, None);
+                self.device.free_memory(old.memory, None);
+            }
+            self.live_uploads -= 1;
+        }
+        if let Some(old_set) = self.descriptor_sets[index].take() {
+            unsafe {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, std::slice::from_ref(&old_set))
+                    .expect("free_descriptor_sets: the pool has FREE_DESCRIPTOR_SET");
+            }
+        }
         self.textures[index] = Some(LayerTexture {
             image: image.expect("upload succeeded"),
             memory: image_memory.expect("upload succeeded"),
             view: view.expect("upload succeeded"),
         });
         self.descriptor_sets[index] = set;
+        self.live_uploads += 1;
         Ok(())
     }
 
@@ -1796,6 +1831,42 @@ mod tests {
             [255, 255, 255, 255],
             "bottom-right = texture bottom-right"
         );
+    }
+
+    /// The M3e atlas-rebuild leak regression: re-uploading the same layer
+    /// index must replace in place, never accumulate. Without the
+    /// destroy-before-overwrite fix, every rebuild allocated a NEW
+    /// descriptor set from the bounded pool (MAX_LAYERS sets) plus a new
+    /// image — after MAX_LAYERS re-uploads the pool was exhausted and
+    /// every later upload failed, silently killing text layers (a
+    /// ~240-image-layer scene left 16 sets and died on the first rebuild).
+    /// With the fix all re-uploads succeed, the pool never grows, and the
+    /// drop-accounting counter stays at the live entry count.
+    #[test]
+    fn texture_reuploads_replace_in_place_without_exhausting_the_pool() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("texture_reuploads_replace_in_place: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        let rgba = [255u8, 0, 0, 255];
+        // 320 re-uploads of one index — more than the 256-set pool, so a
+        // leaked set per rebuild would exhaust the pool mid-loop and the
+        // expect() below would fail.
+        for _ in 0..MAX_LAYERS + 64 {
+            renderer
+                .upload_layer(0, &rgba, 1, 1)
+                .expect("re-upload must not exhaust the descriptor pool");
+        }
+        assert_eq!(
+            renderer.live_uploads, 1,
+            "re-uploads replace in place, never accumulate"
+        );
+        // Fresh indices still allocate: the freed sets were not hoarded.
+        renderer
+            .upload_layer(7, &rgba, 1, 1)
+            .expect("fresh index allocates");
+        assert_eq!(renderer.live_uploads, 2);
     }
 
     /// The src-over blend math end to end, byte-exact: an opaque

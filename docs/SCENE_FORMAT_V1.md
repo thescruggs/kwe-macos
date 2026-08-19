@@ -282,6 +282,17 @@ determinism. Resolution:
    family matches. Verified via the vendored stb_truetype name records
    (decoded by the C shim: Windows/Unicode records are UTF-16BE, Mac
    records single-byte), bounded to 32 opens (`MAX_FAMILY_VERIFY`).
+
+stb_truetype does no range checking of its own, so every candidate file
+is **sfnt pre-flight validated by the shim before any stb call**: the
+offset table (tag, table count) and each table record's `offset+length`
+must lie inside the file (u64 math), ttc collection offsets must
+resolve inside the buffer, and where cheap (`maxp`/`loca`/`glyf`) the
+glyph ranges are checked before outline rasterization — hostile or
+truncated fonts are rejected at open (`Font::open` → None), never
+parsed. (Because the directory collection stops at a per-directory cap
+before opening anything, a pathological font directory cannot force a
+huge allocation either.)
 2. **Basename** — the first unverified basename-prefix candidate in
    sorted order (WE-style basename matching; may be a CJK or condensed
    variant).
@@ -319,30 +330,45 @@ lanes (`--font-dir`, unit tests) drive the order above end-to-end.
   the text color riding the draw's tint slot — **zero shader changes**:
   the M3d fragment shader multiplies the sampled RGB by the tint and the
   alpha by the layer alpha, so glyph interiors land exactly in the text
-  color and antialiased edges blend toward the background. An overflow
+  color and antialiased edges blend toward the background. Glyph quads
+  span the unpadded metric box while their UVs are inset by the 1 px
+  atlas pad, so glyph texels map 1:1 onto the quad. An overflow
   triggers a clear+repack, rate-limited to 2/s
-  (`event=renderer.scene.text_atlas_rebuild_rate_limited`); a glyph
+  (`event=renderer.scene.text_atlas_rebuild_rate_limited`); font and
+  pointsize changes run the same clear+repack **through the same
+  budget** — a change that lands inside the 2/s window applies on the
+  next sync with the previous atlas and geometry kept consistent
+  meanwhile, so a 60 fps pointsize toggle cannot force a full repack
+  per frame (only the initial load bypasses the budget); a glyph
   larger than 520 px is skipped
   (`event=renderer.scene.text_glyph_too_large`). Each text layer draws as
   one `DrawKind::Text` — `vertex_count` vertices (6 per glyph quad), one
   TRIANGLE_LIST draw — through a per-layer host-visible vertex buffer
   (created or grown, max 393 216 bytes). The atlas uploads through the
-  existing image upload path; dirty state is synced before the initial
-  render and each NewFrame, regenerating geometry only on text /
+  existing image upload path and is **counted in the shared 256 MiB
+  texture budget** at upload (16 MiB per layer; 16 text layers = the
+  cap, first-come-first-served with image textures; one bounded
+  `text_atlas_budget_skip` when the budget is already exhausted, with a
+  byte refund if the upload fails); dirty state is synced before the
+  initial render and each NewFrame, regenerating geometry only on text /
   alignment / font-size change.
 - **JS surface** (`Scene.getLayer` on a text layer): read/write `text`
   (string; a write truncates to 4096 chars with
   `event=renderer.scene.text_truncated` and rebuilds the geometry),
   `pointsize` (clamped 4..=512 px; non-finite/≤0 → the default 12 pt →
   48 px), `horizontalAlign` / `verticalAlign` (0/1/2 = left|top /
-  center / right|bottom, clamped), `color` (read-only `{r,g,b,a}` 0..=1
-  per component — the scene.json color; script color writes are not
-  exposed in M3e), plus all common layer properties. Text-only properties
-  are only defined on text layers: on image layers they read `undefined`
-  and writes reach no renderer state — never shared state.
+  center / right|bottom, clamped), `color` (read/write `{r,g,b,a}`
+  0..=1 per component — the scene.json color, writable through
+  `layer.color.r = x` style sub-property writes, clamped per component
+  like every other write path and tinting the glyphs; alpha folds into
+  the layer alpha), plus all common layer properties. Text-only
+  properties are only defined on text layers: on image layers they read
+  `undefined` and writes reach no renderer state — never shared state.
 - **Diagnostics** (one per layer, bounded): `text_font_fallback`,
-  `text_font_none`, `text_truncated`, `text_atlas_rebuild_rate_limited`,
-  `text_glyph_too_large`.
+  `text_font_none`, `text_truncated`, `text_atlas_rebuild_rate_limited`
+  and `text_glyph_too_large` (each printed once per layer), and
+  `text_atlas_budget_skip` (once per worker when the shared texture
+  budget is exhausted at upload time).
 
 ### Bounds
 
@@ -352,11 +378,13 @@ lanes (`--font-dir`, unit tests) drive the order above end-to-end.
 | text length | 4096 chars (`MAX_TEXT_CHARS`) | script writes truncate; scene.json longer strings truncate with the same diagnostic |
 | font size | 4..=512 px (`MIN_FONT_PX`..`MAX_FONT_PX`), default 12 pt × 4 = 48 px | out-of-range and non-finite clamp to the default at the parse |
 | point→px | × 4.0 (`POINT_TO_PX`, the researched WE multiplier) | rounded, then clamped |
-| atlas | 2048² RGBA8 per layer, shelf-packed | clear+repack rate-limited to 2/s on overflow |
+| atlas | 2048² RGBA8 per layer, shelf-packed; each 16 MiB counts in the shared 256 MiB texture budget (first-come-first-served with image textures) | clear+repack rate-limited to 2/s — overflow and font/pointsize changes alike; one bounded `text_atlas_budget_skip` when the shared budget is exhausted |
 | glyph bitmap | ≤ 520×520 px | larger glyphs are skipped per layer, never fatal |
 | font file | 64 MiB | over-budget files are skipped by the resolver |
-| font scan | 16 dirs, depth 4, 4096 files/dir, 16384 files | deterministic (sorted) |
-| family verify | 32 opens (`MAX_FAMILY_VERIFY`) | the Exact step never walks the whole corpus |
+| font scan | 16 dirs, depth 4, 4096 files/dir, 16384 files | deterministic (sorted); directory entries are collected with an early stop at the per-dir cap, before any file is opened |
+| family verify | 32 opens (`MAX_FAMILY_VERIFY`) | the Exact step never walks the whole corpus; past it, the Basename step returns the first candidate **unverified** — a family served by many files (CJK or condensed variants) can win over the regular face when the regular face sorts late |
+| sfnt pre-flight | offset table, table records, ttc offsets, and (where cheap) maxp/loca/glyf ranges validated in the shim before any stb call | hostile or truncated fonts are rejected at open (`Font::open` → None), never parsed |
+| atlas rebuild budget | 2/s (`ATLAS_REBUILDS_PER_SECOND`), 1 s window | overflow and font/pointsize changes all ride the budget; the initial load is the only unbounded path |
 
 ## Image sources (M3c)
 
@@ -579,7 +607,7 @@ image compositing in M3a.
 | `Layer.text` | **implemented (M3e)** | read/write string; a write truncates to 4096 chars (one bounded `text_truncated` diagnostic per layer) and rebuilds the geometry |
 | `Layer.pointsize` | **implemented (M3e)** | points ×4 → px (the researched WE multiplier), clamped 4..=512; non-finite/≤0 → the default 12 pt (48 px) |
 | `Layer.horizontalAlign` / `verticalAlign` | **implemented (M3e)** | 0/1/2 = left\|top / center / right\|bottom, clamped; the parse defaults to center/center (the OWE `horizontalalign` → `alignment` → center chain) |
-| `Layer.color` | **implemented (M3e)** | read-only `{r, g, b, a}` 0..=1 per component (clamped at the parse); RGB implies alpha 1; the alpha folds into the layer alpha (M3d policy), the RGB rides the draw's tint slot |
+| `Layer.color` | **implemented (M3e)** | read/write `{r, g, b, a}` 0..=1 per component (clamped at the parse and on every script write; RGB implies alpha 1); the alpha folds into the layer alpha (M3d policy), the RGB rides the draw's tint slot |
 | font resolution | **implemented (M3e)** | the Exact → Basename → fallback chain → Any → None order documented in "Text layers (M3e)" above; fallback/none reported once per layer (`text_font_fallback`, `text_font_none`) |
 | glyph atlas | **implemented (M3e)** | 2048² per layer, white glyphs with coverage in alpha — zero shader changes; overflow clear+repack rate-limited to 2/s |
 | `Layer.size` on a text layer | ignored | text size is automatic (layout pixels map 1:1 to scene units); the write is counted (`text_size_ignored`), resizing goes through `scale` |

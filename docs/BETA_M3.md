@@ -262,16 +262,25 @@ shader changes**, and the M3d alpha policy applies to the text color's
 alpha unchanged. Geometry is regenerated only on text / alignment /
 font-size change (dirty state synced before the initial render and each
 NewFrame); the font is resolved once per layer and cached per normalized
-family.
+family. Glyph quads span the unpadded metric box while their UVs are
+inset by the atlas pad, so glyph texels map 1:1 onto the quad.
 
-Font rasterization is the vendored stb_truetype.h (public domain, pinned
-revision 6e9f34d5; a THIRD_PARTY.yml entry covers the header and the
-researched-but-unused redox-os crate) behind an opaque C shim
+Font rasterization is the vendored stb_truetype.h (public domain or MIT,
+dual licensed upstream; pinned revision 6e9f34d5; a THIRD_PARTY.yml entry
+covers the header and the researched-but-unused redox-os crate) behind an
+opaque C shim
 (`vendor/stb/stb_shim.c`, built by a cc build.rs): the Rust side never
 sees stb's struct layout. The shim decodes the name-table records for
 family matching — Windows/Unicode records are UTF-16BE (the ASCII family
 names arrive as "N\0o\0t\0o\0..."), Mac records single-byte — and
-refuses outlines over 65 536 vertices. `font` accepts a family name, a
+refuses outlines over 65 536 vertices. stb_truetype does no range
+checking of its own, so **every candidate file is sfnt pre-flight
+validated in the shim before any stb call**: the offset table (tag,
+table count) and each table record's `offset+length` must lie inside
+the file, ttc collection offsets must resolve inside the buffer, and
+where cheap (`maxp`/`loca`/`glyf`) glyph ranges are checked before
+outline rasterization — hostile or truncated fonts are rejected at
+open (`Font::open` → None), never parsed. `font` accepts a family name, a
 `systemfont_` alias (prefix stripped), or a path; the resolution order is
 Exact (name-table-verified, bounded to 32 opens) → Basename (first
 unverified prefix match) → the fallback chain ["Noto Sans", "DejaVu
@@ -295,10 +304,17 @@ ignored with a one-time count; `scale` does the resizing). The JS proxy
 adds read/write `text` (a write truncates to 4096 chars with a bounded
 `text_truncated` diagnostic and rebuilds the geometry), `pointsize`
 (clamped 4..=512, non-finite/≤0 → the default 12 pt → 48 px),
-`horizontalAlign`/`verticalAlign` (0/1/2, clamped) and a read-only
-`color` (`{r,g,b,a}` 0..=1 from the scene.json; alpha folds into the
-layer alpha). Atlas overflow clears and repacks, rate-limited to 2/s; a
-glyph over 520 px is skipped per layer — neither is ever fatal.
+`horizontalAlign`/`verticalAlign` (0/1/2, clamped) and a read/write
+`color` (`{r,g,b,a}` 0..=1 per component — `layer.color.r = x` style
+sub-property writes are clamped per component and tint the glyphs;
+alpha folds into the layer alpha). Font and pointsize changes run the
+clear+repack **through the same 2/s rebuild budget** as overflow: a
+change that lands inside the budget window applies on the next sync,
+keeping the previous atlas and geometry consistent meanwhile, so a 60
+fps pointsize toggle cannot force a full repack per frame (only the
+initial load bypasses the budget). Atlas overflow clears and repacks,
+rate-limited to 2/s; a glyph over 520 px is skipped per layer — neither
+is ever fatal.
 
 **Corpus fact**: the corpus carries **zero textures and zero known text
 layers** — no real wallpaper exercises text — so M3e is validated with
@@ -309,17 +325,20 @@ never committed) and unit tests over synthetic font directories.
 
 | Case | Expected containment | Result |
 |---|---|---|
-| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 369 tests pass (115 in `kwe-scene-renderer`) |
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 373 tests pass (119 in `kwe-scene-renderer`) |
 | font resolution order | synthetic font dirs via `--font-dir` / `KWE_FONT_DIRS`: explicit dirs win, then basename, then the fallback chain | `resolution_order_prefers_explicit_dirs_then_family`, `resolver_bounds` (16 dirs / depth 4 / 4096 per dir / 16384 files / 64 MiB), `font_open_rejects_garbage` |
+| hostile fonts | adversarial fixtures rejected in the shim's sfnt pre-flight, before any stb call | `hostile_font_stubs_are_rejected` (12-byte ttcf with numFonts=0xFFFFFFFF, ttcf offset past end, sfnt table count past the buffer, hmtx record offset = u32::MAX, loca past glyf, hmtx claimed length too short for numGlyphs — all open → None); `crafted_minimal_font_opens_and_renders_empty` (a minimal 7-table sfnt opens and renders an empty glyph) |
 | glyph rasterization | stb path through the shim: 1-byte coverage, bounded box, refuse-oversize | `system_font_layout_and_rasterization` (rasterizes a real system font and counts covered pixels), `alignment_parsing` |
-| quad layout math | 6 vertices per glyph, winding, bounds | `vertex_bytes_match_unit_quad_winding` |
-| atlas bounds | shelf packing, clear+repack on overflow, rebuilds rate-limited to 2/s | `atlas_packs_and_evicts_with_rate_limit`, `atlas_rate_limits_rebuilds`, `atlas_overflow_repacks` |
+| quad layout math | 6 vertices per glyph, winding, bounds, UVs inset by the atlas pad | `vertex_bytes_match_unit_quad_winding` (UV expectations include the `ATLAS_PAD` inset) |
+| atlas bounds | shelf packing, clear+repack on overflow, rebuilds rate-limited to 2/s — font/pointsize changes ride the same budget | `atlas_packs_and_evicts_with_rate_limit`, `atlas_rate_limits_rebuilds`, `atlas_overflow_repacks`, `atlas_rebuild_budget_covers_font_and_scale_changes` |
+| atlas memory budget | each layer's 16 MiB atlas counts in the shared 256 MiB texture budget at upload; 16 text layers = the cap, first-come-first-served with image textures | one bounded `event=renderer.scene.text_atlas_budget_skip layer=...` when the budget is already exhausted; the byte count is refunded when an upload fails (atlas_bytes_used / budget_counted) |
+| device pool reuse | re-uploading a layer destroys the replaced image/view/memory and frees its descriptor set — 320 re-uploads must not exhaust the 256-set pool | `KWE_TEST_DEVICE`-gated `texture_reuploads_replace_in_place_without_exhausting_the_pool`: `live_uploads` stays 1 after 320 re-uploads of index 0, then 2 when index 7 is uploaded |
 | scene.json parse | defaults (12 pt → 48 px, center/center, opaque white), property-wrapped `text`/`font`, pointsize clamp 4..=512, alignment fallback like OWE, common props match image layers, 16-text-layer cap | `text_layers_parsed_with_defaults`, `text_layer_fields_parsed`, `text_pointsize_clamped_and_tolerant`, `text_alignment_falls_back_like_owe`, `text_common_props_match_image_layers`, `text_layer_caps_and_counts` |
 | JS proxy | text/pointsize/align/color reads + clamped writes, truncation, dirty-rebuild | `text_layer_proxy_exposes_and_clamps_text_properties`, `text_proxy_writes_are_bounded`, `over_long_text_writes_are_truncated`, `text_writes_mark_dirty_and_rebuild_each_step` |
-| smoke (a) llvmpipe lane | fixed string "SMOKE" + `font: "Noto Sans"` over the fullscreen blue clear — region oracle: text-colored pixels ≥ 300, pixels differing from the bg ≥ 400, mean-of-differing R-dominant | **foreground=606, differing=1788, mean=(R 234.0, G 0.0, B 128.9)** — the antialiased edges lean toward the blue background (documented in the script); glyph interiors are pure text color |
-| smoke (b) daemon lane | script swaps `layer.text` at t ≥ 3.0 — two stable frames differ, foreground collapses to ~¼ after the swap (long "WWWW" → single "W") | polled c1=630, then changed=1914 ≥ 150, foreground 630 → 180 (≤ c1/2) |
+| smoke (a) llvmpipe lane | fixed string "SMOKE" + `font: "Noto Sans"` over the fullscreen blue clear — region oracle: text-colored pixels ≥ 300, pixels differing from the bg ≥ 400, mean-of-differing R-dominant | **foreground=742, differing=1983, mean=(R 245.4, G 0.0, B 120.2)** — the antialiased edges lean toward the blue background (documented in the script); glyph interiors are pure text color |
+| smoke (b) daemon lane | script swaps `layer.text` at t ≥ 3.0 — two stable frames differ, foreground collapses to ~¼ after the swap (long "WWWW" → single "W") | polled c1=744, then changed=2000 ≥ 150, foreground 744 → 191 (≤ c1/2) |
 | smoke (c) daemon lane | pointsize clamped at the parse and on script writes | stderr ring: `M3E-POINTSIZE-JSON 512` (JSON 9999), `M3E-POINTSIZE-SET 512` (script 9999), `M3E-POINTSIZE-NEG 4` (−5 → MIN_FONT_PX) |
-| smoke (d) daemon lane | `font: "DefinitelyNotAFontFamily_M3E"` → fallback chain resolves, layer renders, the diagnostic names the request | **foreground=1516, differing=1820, mean=(R 234.2, G 234.2, B 255.0)** (white text over red clear); `event=renderer.scene.text_font_fallback layer=txt requested=DefinitelyNotAFontFamily_M3E` in the ring; SKIP-with-message when the host has no system fonts |
+| smoke (d) daemon lane | `font: "DefinitelyNotAFontFamily_M3E"` → fallback chain resolves, layer renders, the diagnostic names the request | **foreground=1820, differing=2016, mean=(R 245.9, G 245.9, B 255.0)** (white text over red clear); `event=renderer.scene.text_font_fallback layer=txt requested=DefinitelyNotAFontFamily_M3E` in the ring; SKIP-with-message when the host has no system fonts |
 | corpus honesty | text layers in the corpus | **zero textures, zero known text layers** — synthetic fixtures only |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
