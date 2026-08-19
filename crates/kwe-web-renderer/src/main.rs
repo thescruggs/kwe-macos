@@ -297,11 +297,11 @@ struct Arguments {
     /// interval without an answer) before the worker exits 73.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
     web_heartbeat_max_failures: u32,
-    /// Test hook: request the shared network namespace for the sandboxed
-    /// browser (omit --unshare-net) instead of always isolating. Network
-    /// grants for wallpapers land in M2c; this flag exists for the
-    /// sandbox smoke-test positive control, which must reach a loopback
-    /// listener from inside the sandbox.
+    /// BETA_M2c production network grant channel: request the shared
+    /// network namespace for the sandboxed browser (omit bwrap's
+    /// --unshare-net) instead of always isolating. The daemon appends this
+    /// flag only for a wallpaper whose stored grant record allows network;
+    /// clients never pass it themselves.
     #[arg(long)]
     allow_network: bool,
 }

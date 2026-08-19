@@ -3,6 +3,7 @@
 //! bounded and versioned so the UI never parses Workshop content itself.
 
 mod audio;
+mod grants;
 mod persist;
 mod playlist_session;
 mod supervisor;
@@ -26,6 +27,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use audio::{AudioCaptureConfig, AudioCaptureHandle, AudioCaptureService};
 use clap::Parser;
+use grants::GrantPatch;
 use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
 use kwe_input_protocol::{AudioFrame, MediaState, PointerButton, PointerPhase};
 use playlist_session::{
@@ -36,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supervisor::{
     ContentSpec, RendererKind, RendererResourceLimits, StartSpec, SupervisorConfig,
-    SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
+    SupervisorHandle, SupervisorService, TestFault, WorkerStatus, validate_identity_part,
 };
 use workshop_cache::WorkshopCache;
 
@@ -659,6 +661,60 @@ fn process_request(
                 }
             }
             "audio.status" => audio_call(audio, |handle| handle.status()),
+            "permissions.get" => {
+                match serde_json::from_value::<PermissionsGetParams>(request.params.clone()) {
+                    Ok(params)
+                        if validate_identity_part("wallpaper_id", &params.wallpaper_id)
+                            .is_err() =>
+                    {
+                        json!({
+                            "error": "invalid_params",
+                            "detail": "wallpaper_id must be 1..=128 ASCII letters, digits, '.', '_', or '-'"
+                        })
+                    }
+                    Ok(params) => permissions_call(supervisor, |handle| {
+                        handle
+                            .permissions_get(params.wallpaper_id)
+                            .map(|grant| json!({"granted": grant}))
+                    }),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "permissions.set" => {
+                match serde_json::from_value::<PermissionsSetParams>(request.params.clone()) {
+                    Ok(params)
+                        if validate_identity_part("wallpaper_id", &params.wallpaper_id)
+                            .is_err() =>
+                    {
+                        json!({
+                            "error": "invalid_params",
+                            "detail": "wallpaper_id must be 1..=128 ASCII letters, digits, '.', '_', or '-'"
+                        })
+                    }
+                    Ok(params) => permissions_call(supervisor, |handle| {
+                        handle
+                            .permissions_set(
+                                params.wallpaper_id,
+                                GrantPatch {
+                                    network: params.network,
+                                    audio: params.audio,
+                                    pointer: params.pointer,
+                                },
+                            )
+                            .map(|grant| json!({"granted": grant}))
+                    }),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "permissions.list" => permissions_call(supervisor, |handle| {
+                handle
+                    .permissions_list()
+                    .map(|grants| json!({"grants": grants}))
+            }),
             "media.state" => {
                 match serde_json::from_value::<MediaStateParams>(request.params.clone()) {
                     Ok(params) => match MediaState::new(
@@ -686,9 +742,7 @@ fn process_request(
                 let parsed = serde_json::from_value::<RendererStartParams>(request.params.clone());
                 match parsed {
                     Ok(params)
-                        if (params.test_fault.is_some()
-                            || params.stderr_lines.is_some()
-                            || params.allow_network)
+                        if (params.test_fault.is_some() || params.stderr_lines.is_some())
                             && !allow_test_faults =>
                     {
                         json!({
@@ -735,11 +789,6 @@ struct RendererStartParams {
     test_fault: Option<TestFaultParams>,
     /// Development-only: ask the test renderer for this many stderr lines.
     stderr_lines: Option<u32>,
-    /// Test hook: grant the web sandbox host-loopback network access for the
-    /// sandbox-integrity smoke's positive control. Rejected unless the daemon
-    /// runs with --allow-test-faults; production grants land in M2c.
-    #[serde(default)]
-    allow_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -790,6 +839,26 @@ struct MediaStateParams {
     album: Option<String>,
     position_seconds: Option<f64>,
     duration_seconds: Option<f64>,
+}
+
+/// `permissions.get` params (BETA_M2c): read the effective grant record for
+/// one wallpaper.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionsGetParams {
+    wallpaper_id: String,
+}
+
+/// `permissions.set` params (BETA_M2c): patch the stored record. Provided
+/// fields replace their current values; omitted fields keep them. Unknown
+/// fields are rejected so a typo cannot silently change policy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionsSetParams {
+    wallpaper_id: String,
+    network: Option<bool>,
+    audio: Option<bool>,
+    pointer: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -861,7 +930,6 @@ impl TryFrom<RendererStartParams> for StartSpec {
             content,
             test_fault,
             stderr_lines: params.stderr_lines,
-            allow_network: params.allow_network,
         };
         // Single validation point per start: the supervisor event loop no
         // longer re-validates, so content preflight cannot block it twice.
@@ -935,6 +1003,24 @@ fn audio_call(
             |error| json!({"error": "serialization_failed", "detail": error.to_string()}),
         ),
         Err(error) => json!({"error": "audio_failed", "detail": error.to_string()}),
+    }
+}
+
+/// Permission grant RPC helper (BETA_M2c): serializes the effective record or
+/// surfaces the failure as `permissions_failed` (bounds, identity errors, and
+/// a full store all land here).
+fn permissions_call<T: Serialize>(
+    supervisor: Option<&SupervisorHandle>,
+    call: impl FnOnce(&SupervisorHandle) -> Result<T>,
+) -> Value {
+    let Some(supervisor) = supervisor else {
+        return json!({"error": "permissions_unavailable"});
+    };
+    match call(supervisor) {
+        Ok(value) => serde_json::to_value(value).unwrap_or_else(
+            |error| json!({"error": "serialization_failed", "detail": error.to_string()}),
+        ),
+        Err(error) => json!({"error": "permissions_failed", "detail": error.to_string()}),
     }
 }
 
@@ -1223,6 +1309,56 @@ mod tests {
         Arc::new(std::sync::Mutex::new(WorkshopCache::open(&dir)))
     }
 
+    /// A real supervisor service (grants store included) for the
+    /// permissions.* round trips; the test binary is a valid renderer path
+    /// and no worker is ever launched by these tests.
+    fn supervisor_service() -> SupervisorService {
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-daemon-api-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let limits = RendererResourceLimits {
+            address_space_mib: 4096,
+            file_size_mib: 160,
+            open_files: 256,
+            processes: 1024,
+            core_dump_bytes: 0,
+        };
+        SupervisorService::start(SupervisorConfig {
+            renderer_paths: BTreeMap::from([(
+                RendererKind::Test,
+                std::env::current_exe().unwrap(),
+            )]),
+            runtime_dir: dir.join("runtime"),
+            state_dir: dir.join("state"),
+            startup_timeout_ms_by_kind: BTreeMap::from([
+                (RendererKind::Test, 3000),
+                (RendererKind::Video, 6000),
+                (RendererKind::Web, 10_000),
+                (RendererKind::Scene, 3000),
+            ]),
+            frame_timeout: Duration::from_secs(2),
+            stop_grace: Duration::from_millis(500),
+            restart_delay: Duration::from_millis(250),
+            canary_duration: Duration::from_secs(1),
+            handoff_timeout: Duration::from_secs(5),
+            max_failures: 3,
+            web_heartbeat_ms: 5000,
+            web_heartbeat_max_failures: 3,
+            resource_limits_by_kind: BTreeMap::from([
+                (RendererKind::Test, limits),
+                (RendererKind::Video, limits),
+                (RendererKind::Web, limits),
+                (RendererKind::Scene, limits),
+            ]),
+        })
+        .unwrap()
+    }
+
     fn session_service() -> PlaylistSessionService {
         let dir = std::env::temp_dir().join(format!(
             "kwe-daemon-api-{}-{}",
@@ -1309,6 +1445,134 @@ mod tests {
         assert_eq!(result["error"], "test_faults_disabled");
     }
 
+    #[test]
+    fn renderer_start_rejects_the_removed_network_hook_param() {
+        // M2c removed the per-request allow_network test hook: the grant
+        // store is the only network path, and the unknown field must fail
+        // closed at the params boundary.
+        let catalog = empty_catalog();
+        let request: Request = serde_json::from_str(
+            r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"web-1","content_hash":"abc","kind":"web","content":"/tmp","allow_network":true}}"#,
+        )
+        .unwrap();
+        let (ok, result) = process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            None,
+            PeerCred::default(),
+            &empty_worker_pid(),
+            false,
+        )
+        .unwrap();
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+    }
+
+    #[test]
+    fn permissions_get_returns_the_documented_defaults_without_a_record() {
+        let service = supervisor_service();
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"permissions.get","params":{"wallpaper_id":"431960-123"}}"#,
+            &service.handle(),
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["granted"]["network"], false);
+        assert_eq!(result["granted"]["audio"], false);
+        assert_eq!(result["granted"]["pointer"], true);
+    }
+
+    #[test]
+    fn permissions_set_patches_and_round_trips_through_get_and_list() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"permissions.set","params":{"wallpaper_id":"431960-123","network":true}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["granted"]["network"], true);
+        assert_eq!(result["granted"]["audio"], false);
+        assert_eq!(result["granted"]["pointer"], true);
+        // A partial set keeps the stored network grant.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"permissions.set","params":{"wallpaper_id":"431960-123","audio":true}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["granted"]["network"], true);
+        assert_eq!(result["granted"]["audio"], true);
+        // get returns the patched effective record.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"permissions.get","params":{"wallpaper_id":"431960-123"}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["granted"]["network"], true);
+        assert_eq!(result["granted"]["audio"], true);
+        // list returns every stored record, bounded by the store.
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"permissions.list"}"#, &handle);
+        assert!(ok, "{result}");
+        let grants = result["grants"].as_object().unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants["431960-123"]["network"], true);
+        assert_eq!(grants["431960-123"]["audio"], true);
+    }
+
+    #[test]
+    fn permissions_reject_unknown_fields_and_invalid_wallpaper_ids() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        for bad in [
+            r#"{"version":1,"method":"permissions.set","params":{"wallpaper_id":"431960-123","bogus":true}}"#,
+            r#"{"version":1,"method":"permissions.set","params":{"wallpaper_id":"../escape","network":true}}"#,
+            r#"{"version":1,"method":"permissions.set","params":{"network":true}}"#,
+            r#"{"version":1,"method":"permissions.get","params":{"wallpaper_id":""}}"#,
+            r#"{"version":1,"method":"permissions.get","params":{"wallpaper_id":"../escape"}}"#,
+            r#"{"version":1,"method":"permissions.get","params":{"bogus":1}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+        // None of the rejected sets stored anything.
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"permissions.list"}"#, &handle);
+        assert!(ok, "{result}");
+        assert!(result["grants"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn permissions_are_bounded_to_256_records() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        for index in 0..256 {
+            let (ok, result) = process_with_supervisor(
+                &format!(
+                    r#"{{"version":1,"method":"permissions.set","params":{{"wallpaper_id":"wallpaper-{index:03}"}}}}"#
+                ),
+                &handle,
+            );
+            assert!(ok, "set {index}: {result}");
+        }
+        // The 257th record is rejected without touching the store.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"permissions.set","params":{"wallpaper_id":"wallpaper-256"}}"#,
+            &handle,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "permissions_failed");
+        assert!(result["detail"].as_str().unwrap().contains("safety limit"));
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"permissions.list"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["grants"].as_object().unwrap().len(), 256);
+    }
+
     fn process(
         request_json: &str,
         catalog: &Arc<RwLock<Catalog>>,
@@ -1321,6 +1585,24 @@ mod tests {
             &[],
             None,
             playlist,
+            &cache_for_tests(),
+            None,
+            PeerCred::default(),
+            &empty_worker_pid(),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn process_with_supervisor(request_json: &str, handle: &SupervisorHandle) -> (bool, Value) {
+        let catalog = empty_catalog();
+        let request: Request = serde_json::from_str(request_json).unwrap();
+        process_request(
+            &request,
+            &catalog,
+            &[],
+            Some(handle),
+            None,
             &cache_for_tests(),
             None,
             PeerCred::default(),

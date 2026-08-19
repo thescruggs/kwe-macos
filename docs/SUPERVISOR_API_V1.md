@@ -19,6 +19,9 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `audio.forward` *(BETA_M1a)*
 - `media.state` *(BETA_M1a)*
 - `audio.status` *(BETA_M1d)*
+- `permissions.get` *(BETA_M2c)*
+- `permissions.set` *(BETA_M2c)*
+- `permissions.list` *(BETA_M2c)*
 
 ## Start and retry
 
@@ -46,7 +49,9 @@ rejected. Content is validated before launch: video runs the static
 `mp4|webm|mkv|mov|avi|wmv|flv|m4v|ogv`, ≤ 2 GiB), and its rejection reasons
 propagate as the `invalid_params` detail; web runs `preflight_web` with no
 permission grants (network stays disabled); scene keeps its existing
-`preflight_scene`. Decode failures and a known duration over 24 h are the
+`preflight_scene`. *(M2c: the web preflight does not consider grants — the
+per-wallpaper network grant is applied at spawn, see [Permission
+grants](#permission-grants).)* Decode failures and a known duration over 24 h are the
 worker's job: `kwe-video-renderer` rejects them with exit 73, folded into the
 failure record as `exit_code_73` (an unreadable duration fails open).
 
@@ -104,7 +109,9 @@ names the supervised renderer family. `stderr_tail` holds at most the newest
 `stderr_dropped_bytes` counts bytes evicted from that ring — diagnostics only,
 never parsed as commands. `audio_pending`, `audio_coalesced`, `media_pending`,
 and `media_coalesced` mirror the pointer counters for the two control streams
-below.
+below. *(M2c: `audio_grant_dropped` counts audio frames silently dropped
+because the active wallpaper has no audio grant — see Permission grants; it is
+a lifetime counter, reset on daemon restart, not per worker.)*
 
 Phases are `idle`, `starting`, `canary`, `live`, `restarting`, `awaiting_ack`,
 `rolled_back`, `stopped`, and `quarantined`. Stable failure classes are
@@ -151,6 +158,54 @@ coordinates are the quantized unsigned 16-bit values. See
 The status path is diagnostic, not a heartbeat from the display client. The
 daemon watches frame progression even when no client is connected.
 
+## Permission grants
+
+*(BETA_M2c: daemon-owned per-wallpaper permission grants.)*
+
+The daemon owns each wallpaper's permission record in `permissions-v1.json`,
+stored in the private state directory beside `supervisor-v1.json`. A record
+grants or denies three capabilities — `network`, `audio`, and `pointer` — as
+booleans, all three stored. The file is bounded (≤ 256 records, 1 MiB) and
+written atomically; a corrupt file is renamed aside
+(`permissions-v1.json.invalid-<unix_seconds>-<unix_nanos>`) and the store
+starts empty with a one-time log. Identity keys follow the same rule as
+`renderer.start` (1–128 ASCII letters, digits, `.`, `_`, `-`).
+
+The effective record defaults to the documented policy for every wallpaper
+without a record: **network off, audio off, pointer on**. Pointer stays on
+because interactivity is core wallpaper behavior; the pointer grant exists for
+future stricter modes and is not enforced yet.
+
+- `permissions.get` `{"wallpaper_id": "..."}` → the effective record,
+  `{"granted": {"network": false, "audio": false, "pointer": true}}`
+  (defaults when no record exists). An invalid `wallpaper_id` fails with
+  `invalid_params`.
+- `permissions.set` `{"wallpaper_id": "...", "network": true}` → patch
+  semantics: only the provided fields change, the rest keep their current
+  values (or the defaults); the answer is the new effective record,
+  `{"granted": {...}}`. Unknown fields are rejected, and the store is bounded:
+  the 257th record fails with `permissions_failed` naming the safety limit.
+- `permissions.list` → `{"grants": {"<wallpaper_id>": {...}}}` — every stored
+  record (≤ 256).
+
+### Enforcement
+
+- **Network**: the per-wallpaper network grant is the only path to
+  `--allow-network` for the web worker — the M2b per-request `allow_network`
+  test hook is removed (the parameter is now rejected as an unknown field). At
+  spawn the supervisor appends `--allow-network` only when the wallpaper's
+  grant record allows it; without the grant the bwrap sandbox runs
+  `--unshare-net` (no access to the network namespace, not even loopback).
+  Revocation takes effect on the next `renderer.start` for that identity.
+- **Audio**: capture is global — `kwe-audio-worker` keeps running and
+  capturing — but the grant gates *delivery*: `audio.forward` frames for the
+  active worker's wallpaper without the audio grant are dropped silently
+  (latest-wins, bounded-rate logging) and counted in `audio_grant_dropped`
+  (see Status). Granting audio resumes delivery immediately; no worker
+  restart is needed.
+- **Pointer**: pass-through stays enabled by default; the pointer grant is
+  reserved for future stricter modes and is not enforced yet.
+
 ## Audio and media control
 
 *(BETA_M1a: daemon-side producers/forwarders for the two media wire types.)*
@@ -189,6 +244,11 @@ only after re-reading `renderer.status` for the current `display_generation`.
 Each stream is latest-wins: one pending frame per stream, replaced — not
 queued — when the worker pipe is under backpressure, counting into
 `audio_coalesced` / `media_coalesced`.
+
+*(M2c: the audio grant gates delivery — see Permission grants. Frames for a
+wallpaper whose record denies audio are dropped before they reach the worker
+pipe, counted in `audio_grant_dropped`; the worker itself keeps running, and
+the ack protocol is unaffected.)*
 
 ### BETA_M1d: the daemon's audio capture producer
 

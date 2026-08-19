@@ -62,8 +62,6 @@ public:
     QHash<int, QByteArray> roleNames() const override;
     void replaceFromCatalog(const QJsonObject &catalog);
     Q_INVOKABLE void toggleFavorite(const QString &workshopId);
-    Q_INVOKABLE void togglePermission(const QString &workshopId, const QString &permission);
-    Q_INVOKABLE bool isPermissionGranted(const QString &workshopId, const QString &permission) const;
     bool isFavorite(const QString &workshopId) const;
 
     int sceneCount() const { return m_sceneCount; }

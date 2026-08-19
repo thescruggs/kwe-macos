@@ -16,11 +16,15 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
+use crate::grants::{Grant, GrantPatch, GrantStore};
 #[cfg(test)]
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
@@ -36,6 +40,20 @@ use serde::{Deserialize, Serialize};
 
 const COMMAND_CAPACITY: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded-rate log for grant-gated audio drops: first 5, then every
+/// thousandth, so an ungranted wallpaper's capture stream cannot flood the
+/// daemon log (mirrors the renderer-less drop counter in main.rs).
+const AUDIO_GRANT_DROP_LOG_EVERY: u64 = 1000;
+static AUDIO_GRANT_DROP_LOGS: AtomicU64 = AtomicU64::new(0);
+
+fn log_audio_grant_drop() {
+    let calls = AUDIO_GRANT_DROP_LOGS.fetch_add(1, Ordering::Relaxed);
+    if calls < 5 || calls.is_multiple_of(AUDIO_GRANT_DROP_LOG_EVERY) {
+        eprintln!(
+            "event=audio.forward.grant_drop detail=wallpaper has no audio grant, frames dropped latest-wins"
+        );
+    }
+}
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_RECORDS: usize = 256;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
@@ -246,12 +264,6 @@ pub struct StartSpec {
     pub test_fault: Option<TestFault>,
     /// Development-only: ask the test renderer for this many stderr lines.
     pub stderr_lines: Option<u32>,
-    /// Test hook (gated behind `--allow-test-faults` at the API boundary):
-    /// grant the web sandbox host-loopback network access so the
-    /// sandbox-integrity smoke's positive control can paint its marker.
-    /// Production wallpapers get per-wallpaper grants in M2c; this hook is
-    /// how the sandbox smoke proves its negative case discriminates.
-    pub allow_network: bool,
 }
 
 impl StartSpec {
@@ -270,9 +282,6 @@ impl StartSpec {
         }
         if self.stderr_lines.is_some() && self.kind != RendererKind::Test {
             bail!("stderr_lines is only available to the test renderer kind");
-        }
-        if self.allow_network && self.kind != RendererKind::Web {
-            bail!("allow_network is only available to the web renderer kind");
         }
         if let Some(count) = self.stderr_lines
             && !(1..=4096).contains(&count)
@@ -443,6 +452,10 @@ pub struct WorkerStatus {
     pub pointer_y: u16,
     pub audio_pending: bool,
     pub audio_coalesced: u64,
+    /// Frames silently dropped latest-wins because the active worker's
+    /// wallpaper lacks the audio grant (BETA_M2c). The capture worker keeps
+    /// running — capture is global, grants gate delivery.
+    pub audio_grant_dropped: u64,
     pub media_pending: bool,
     pub media_coalesced: u64,
     /// Bounded stderr diagnostics, newest last. Content is advisory only and
@@ -588,6 +601,13 @@ enum ControlCommand {
         state: MediaState,
         reply: mpsc::Sender<Result<WorkerStatus>>,
     },
+    PermissionsGet(String, mpsc::Sender<Result<Grant>>),
+    PermissionsSet {
+        wallpaper_id: String,
+        patch: GrantPatch,
+        reply: mpsc::Sender<Result<Grant>>,
+    },
+    PermissionsList(mpsc::Sender<Result<BTreeMap<String, Grant>>>),
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
@@ -652,6 +672,27 @@ impl SupervisorHandle {
         })
     }
 
+    /// Returns the effective grant record for a wallpaper (documented
+    /// defaults when none exists).
+    pub fn permissions_get(&self, wallpaper_id: String) -> Result<Grant> {
+        self.request_value(|reply| ControlCommand::PermissionsGet(wallpaper_id, reply))
+    }
+
+    /// Patches the stored grant record and persists it atomically; returns
+    /// the new effective record.
+    pub fn permissions_set(&self, wallpaper_id: String, patch: GrantPatch) -> Result<Grant> {
+        self.request_value(|reply| ControlCommand::PermissionsSet {
+            wallpaper_id,
+            patch,
+            reply,
+        })
+    }
+
+    /// Every stored grant record (bounded by `MAX_GRANTS`).
+    pub fn permissions_list(&self) -> Result<BTreeMap<String, Grant>> {
+        self.request_value(ControlCommand::PermissionsList)
+    }
+
     /// Returns the wallpaper IDs with at least one quarantined failure record.
     /// Used by the playlist session to skip quarantined content. The caller
     /// chooses the deadline so frequent pollers can fall back to a cached
@@ -672,6 +713,16 @@ impl SupervisorHandle {
         &self,
         make: impl FnOnce(mpsc::Sender<Result<WorkerStatus>>) -> ControlCommand,
     ) -> Result<WorkerStatus> {
+        self.request_value(make)
+    }
+
+    /// Generic reply-channel round trip, shared by every command: enqueue
+    /// the command (bounded queue, bounded timeout), then wait for the
+    /// supervisor thread's reply.
+    fn request_value<T>(
+        &self,
+        make: impl FnOnce(mpsc::Sender<Result<T>>) -> ControlCommand,
+    ) -> Result<T> {
         let (sender, receiver) = mpsc::channel();
         match self.sender.try_send(make(sender)) {
             Ok(()) => {}
@@ -693,10 +744,13 @@ impl SupervisorService {
     pub fn start(config: SupervisorConfig) -> Result<Self> {
         let config = config.validate()?;
         let (store, state) = StateStore::open(config.state_dir.clone())?;
+        let grant_store = GrantStore::open(&config.state_dir)?;
         let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let thread = thread::Builder::new()
             .name("kwe-renderer-supervisor".into())
-            .spawn(move || SupervisorRuntime::new(config, store, state).run(receiver))?;
+            .spawn(move || {
+                SupervisorRuntime::new(config, store, state, grant_store).run(receiver)
+            })?;
         Ok(Self {
             handle: SupervisorHandle { sender },
             thread: Some(thread),
@@ -763,6 +817,14 @@ struct SupervisorRuntime {
     config: SupervisorConfig,
     store: StateStore,
     persisted: PersistedState,
+    /// Daemon-owned per-wallpaper permission grants (BETA_M2c): the network
+    /// grant gates `--allow-network` on web launches and the audio grant
+    /// gates `audio.forward` delivery. Grants re-read per spawn, so a
+    /// revocation takes effect on the next `renderer.start`.
+    grant_store: GrantStore,
+    /// Lifetime count of frames dropped because the active wallpaper lacks
+    /// the audio grant; surfaced through `WorkerStatus::audio_grant_dropped`.
+    audio_grant_dropped: u64,
     active: Option<ActiveWorker>,
     candidate: Option<ActiveWorker>,
     retired: Option<RetiredWorker>,
@@ -776,11 +838,18 @@ struct SupervisorRuntime {
 }
 
 impl SupervisorRuntime {
-    fn new(config: SupervisorConfig, store: StateStore, persisted: PersistedState) -> Self {
+    fn new(
+        config: SupervisorConfig,
+        store: StateStore,
+        persisted: PersistedState,
+        grant_store: GrantStore,
+    ) -> Self {
         Self {
             config,
             store,
             persisted,
+            grant_store,
+            audio_grant_dropped: 0,
             active: None,
             candidate: None,
             retired: None,
@@ -842,6 +911,20 @@ impl SupervisorRuntime {
                 }) => {
                     let result = self.forward_media_state(generation, state);
                     let _ = reply.send(result);
+                }
+                Ok(ControlCommand::PermissionsGet(wallpaper_id, reply)) => {
+                    let _ = reply.send(Ok(self.grant_store.grant(&wallpaper_id)));
+                }
+                Ok(ControlCommand::PermissionsSet {
+                    wallpaper_id,
+                    patch,
+                    reply,
+                }) => {
+                    let result = self.grant_store.set(&wallpaper_id, patch);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::PermissionsList(reply)) => {
+                    let _ = reply.send(Ok(self.grant_store.all().clone()));
                 }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
                     let ids = self
@@ -996,11 +1079,12 @@ impl SupervisorRuntime {
                 .arg(self.config.web_heartbeat_ms.to_string())
                 .arg("--web-heartbeat-max-failures")
                 .arg(self.config.web_heartbeat_max_failures.to_string());
-            if spec.allow_network {
-                // Test hook (--allow-test-faults gate at the API boundary):
-                // drop the netns isolation so the sandbox-integrity positive
-                // control can reach the host-loopback probe server. Grants
-                // land per-wallpaper in M2c.
+            // BETA_M2c: the per-wallpaper network grant is the only path to
+            // --allow-network (the M2b per-request test hook is removed).
+            // The record is re-read at every spawn, so a revocation makes
+            // the next launch build the bwrap sandbox with --unshare-net
+            // again; every ungranted worker keeps the netns isolation.
+            if self.grant_store.grant(&spec.wallpaper_id).network {
                 command.arg("--allow-network");
             }
         }
@@ -1168,6 +1252,15 @@ impl SupervisorRuntime {
             .active
             .as_mut()
             .context("no promoted renderer is available for audio forwarding")?;
+        // BETA_M2c: the audio grant gates delivery, not capture — the
+        // capture worker keeps running (capture is global) and frames for a
+        // wallpaper without the audio grant are dropped silently latest-wins,
+        // counted in status and logged at a bounded rate.
+        if !self.grant_store.grant(&worker.spec.wallpaper_id).audio {
+            self.audio_grant_dropped = self.audio_grant_dropped.saturating_add(1);
+            log_audio_grant_drop();
+            return Ok(self.status());
+        }
         let bytes = encode_audio_frame(&frame)?;
         queue_control_message(
             &worker.input,
@@ -1642,6 +1735,7 @@ impl SupervisorRuntime {
             pointer_y: active.map_or(0, |worker| worker.pointer_y),
             audio_pending: active.is_some_and(|worker| worker.pending_audio.is_some()),
             audio_coalesced: active.map_or(0, |worker| worker.audio_coalesced),
+            audio_grant_dropped: self.audio_grant_dropped,
             media_pending: active.is_some_and(|worker| worker.pending_media.is_some()),
             media_coalesced: active.map_or(0, |worker| worker.media_coalesced),
             stderr_tail: active.map_or_else(Vec::new, |worker| worker.stderr_ring.tail.clone()),
@@ -2111,7 +2205,7 @@ fn encode_ppm(snapshot: &FrameSnapshot) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-fn validate_identity_part(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_identity_part(name: &str, value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
         || !value
@@ -2154,7 +2248,6 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         assert!(valid.validate().is_ok());
         let mut invalid = valid.clone();
@@ -2179,7 +2272,6 @@ mod tests {
             }),
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         assert!(invalid_scene.validate().is_err());
         invalid_scene.kind = RendererKind::Test;
@@ -2199,7 +2291,6 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         // Test takes no content.
         let mut mismatched = base.clone();
@@ -2475,7 +2566,12 @@ mod tests {
         config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
         let config = config.validate().unwrap();
         let (store, state) = StateStore::open(root.join("state")).unwrap();
-        let mut runtime = SupervisorRuntime::new(config, store, state);
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        );
         let spec = StartSpec {
             wallpaper_id: "431960-123".into(),
             content_hash: "abc123".into(),
@@ -2486,7 +2582,6 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         let mut worker = runtime.spawn_worker(spec).unwrap();
         // Each launch gets its own 0700 HOME under the daemon runtime dir.
@@ -2527,7 +2622,12 @@ mod tests {
         let root = temporary_directory("identity");
         fs::create_dir_all(&root).unwrap();
         let (store, state) = StateStore::open(root.join("state")).unwrap();
-        let mut runtime = SupervisorRuntime::new(validated_config(&root), store, state);
+        let mut runtime = SupervisorRuntime::new(
+            validated_config(&root),
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        );
         let base = StartSpec {
             wallpaper_id: "431960-123".into(),
             content_hash: "abc123".into(),
@@ -2538,7 +2638,6 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         let video = StartSpec {
             kind: RendererKind::Video,
@@ -2599,7 +2698,6 @@ mod tests {
             content: Some(ContentSpec::Video { path: real.clone() }),
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         let validated = spec.into_validated().unwrap();
         let path = match validated.content.expect("video content kept") {
@@ -2687,7 +2785,12 @@ mod tests {
             "unexpected error: {error}"
         );
         let (store, state) = StateStore::open(root.join("state")).unwrap();
-        let mut runtime = SupervisorRuntime::new(config, store, state);
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        );
         let spec = StartSpec {
             wallpaper_id: "431960-123".into(),
             content_hash: "abc123".into(),
@@ -2698,7 +2801,6 @@ mod tests {
             content: Some(ContentSpec::Web { root: root.clone() }),
             test_fault: None,
             stderr_lines: None,
-            allow_network: false,
         };
         let error = runtime
             .spawn_worker(spec)
@@ -2806,7 +2908,6 @@ mod tests {
                 content: None,
                 test_fault: None,
                 stderr_lines: None,
-                allow_network: false,
             },
             child,
             frame_path: PathBuf::new(),
@@ -2870,5 +2971,205 @@ mod tests {
         drain_input_acks(&mut worker);
         assert_eq!(worker.input_ack_sequence, 0);
         assert_eq!(worker.input_protocol_errors, 1);
+    }
+
+    #[test]
+    fn the_network_grant_appends_allow_network_and_revocation_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("network-grant");
+        fs::create_dir_all(&root).unwrap();
+        // A fake web renderer that records its argv; HOME is the only
+        // per-launch writable env the supervisor allowlist passes.
+        let script = root.join("web-renderer");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/argv.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Web, script.clone())]);
+        let config = config.validate().unwrap();
+        let mut grant_store = GrantStore::open(&root.join("state")).unwrap();
+        grant_store
+            .set(
+                "431960-123",
+                GrantPatch {
+                    network: Some(true),
+                    ..GrantPatch::default()
+                },
+            )
+            .unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(config, store, state, grant_store);
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Web,
+            content: Some(ContentSpec::Web { root: root.clone() }),
+            test_fault: None,
+            stderr_lines: None,
+        };
+        // The fake renderer records its argv asynchronously; poll for it
+        // within a bounded window (the script writes before it exits).
+        let read_argv = |home: &Path| {
+            let path = home.join("argv.txt");
+            for _ in 0..200 {
+                if let Ok(argv) = fs::read_to_string(&path) {
+                    return argv;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "fake renderer never recorded its argv at {}",
+                path.display()
+            );
+        };
+        // Granted: the spawned web worker's argv carries --allow-network.
+        let mut worker = runtime.spawn_worker(spec.clone()).unwrap();
+        let argv = read_argv(&root.join("runtime/home-1"));
+        assert!(
+            argv.contains("--allow-network"),
+            "granted web worker argv must carry --allow-network: {argv}"
+        );
+        let _ = inspect_worker(&mut worker, &runtime.config);
+        // Revocation: the next spawn re-reads the store and drops the flag,
+        // so the bwrap sandbox gets --unshare-net again (the M2b negative).
+        runtime
+            .grant_store
+            .set(
+                "431960-123",
+                GrantPatch {
+                    network: Some(false),
+                    ..GrantPatch::default()
+                },
+            )
+            .unwrap();
+        let mut worker = runtime.spawn_worker(spec).unwrap();
+        let argv = read_argv(&root.join("runtime/home-2"));
+        assert!(
+            !argv.contains("--allow-network"),
+            "revoked web worker argv must not carry --allow-network: {argv}"
+        );
+        let _ = inspect_worker(&mut worker, &runtime.config);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_frames_drop_latest_wins_without_the_audio_grant_and_deliver_with_it() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::io::FromRawFd;
+
+        let root = temporary_directory("audio-grant");
+        fs::create_dir_all(&root).unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(
+            validated_config(&root),
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        );
+        runtime.display_generation = 1;
+        // Synthetic worker with real pipe ends (mirrors the ack-ceiling test).
+        let mut input_fds = [0_i32; 2];
+        // SAFETY: input_fds is a valid writable pair buffer for a fresh pipe.
+        assert_eq!(unsafe { libc::pipe(input_fds.as_mut_ptr()) }, 0);
+        let input = ChildStdin::from(unsafe { OwnedFd::from_raw_fd(input_fds[1]) });
+        let _input_read_end = unsafe { fs::File::from_raw_fd(input_fds[0]) };
+        let mut ack_fds = [0_i32; 2];
+        // SAFETY: ack_fds is a valid writable pair buffer for a fresh pipe.
+        assert_eq!(unsafe { libc::pipe(ack_fds.as_mut_ptr()) }, 0);
+        set_nonblocking(ack_fds[0]).unwrap();
+        let input_ack = ChildStdout::from(unsafe { OwnedFd::from_raw_fd(ack_fds[0]) });
+        let _ack_writer = unsafe { fs::File::from_raw_fd(ack_fds[1]) };
+        let mut child = Command::new("true").spawn().unwrap();
+        let _ = child.wait();
+        let mut stderr_command = Command::new("true");
+        stderr_command.stderr(Stdio::piped());
+        let mut stderr_child = stderr_command.spawn().unwrap();
+        let _ = stderr_child.wait();
+        let stderr = stderr_child.stderr.take().unwrap();
+        let worker = ActiveWorker {
+            spec: StartSpec {
+                wallpaper_id: "431960-123".into(),
+                content_hash: "abc123".into(),
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                kind: RendererKind::Test,
+                content: None,
+                test_fault: None,
+                stderr_lines: None,
+            },
+            child,
+            frame_path: PathBuf::new(),
+            reader: None,
+            started: Instant::now(),
+            last_progress: Instant::now(),
+            last_snapshot_saved: None,
+            sequence: 0,
+            input,
+            input_ack,
+            input_ack_buffer: Vec::new(),
+            input_sequence: 0,
+            input_ack_sequence: 0,
+            pending_input: None,
+            input_coalesced: 0,
+            input_protocol_errors: 0,
+            pointer_inside: false,
+            pointer_x: 0,
+            pointer_y: 0,
+            pending_audio: None,
+            audio_coalesced: 0,
+            pending_media: None,
+            media_coalesced: 0,
+            stderr,
+            stderr_ring: StderrRing::default(),
+        };
+        runtime.active = Some(worker);
+        // No record yet: the defaults (audio off) gate delivery.
+        let frame = AudioFrame::new(1, vec![0.5; 16], vec![0.5; 16]).unwrap();
+        let status = runtime.forward_audio_frame(1, frame.clone()).unwrap();
+        assert_eq!(
+            status.audio_grant_dropped, 1,
+            "the first ungranted frame must count a grant drop"
+        );
+        assert!(
+            runtime.active.as_ref().unwrap().pending_audio.is_none(),
+            "an ungranted frame must never reach the worker pipe"
+        );
+        assert_eq!(runtime.active.as_ref().unwrap().audio_coalesced, 0);
+        // Grant audio: the next frame must be delivered to the worker.
+        runtime
+            .grant_store
+            .set(
+                "431960-123",
+                GrantPatch {
+                    audio: Some(true),
+                    ..GrantPatch::default()
+                },
+            )
+            .unwrap();
+        let status = runtime.forward_audio_frame(1, frame.clone()).unwrap();
+        assert_eq!(
+            status.audio_grant_dropped, 1,
+            "a granted frame must not count another drop"
+        );
+        let expected = encode_audio_frame(&frame).unwrap();
+        let mut received = vec![0_u8; expected.len()];
+        let read = unsafe {
+            libc::read(
+                input_fds[0],
+                received.as_mut_ptr().cast::<libc::c_void>(),
+                received.len(),
+            )
+        };
+        assert_eq!(read, expected.len() as isize);
+        assert_eq!(&received[..read as usize], &expected[..]);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -3,6 +3,7 @@
 #include "catalogmodel.h"
 #include "daemonactivator.h"
 #include "packageinstaller.h"
+#include "permissionsclient.h"
 #include "workshopclient.h"
 #include "videopreview.h"
 #include "rendererstatus.h"
@@ -124,6 +125,9 @@ int main(int argc, char *argv[]) {
     WallpaperFilterModel workshopFiltered;
     workshopFiltered.setSourceModel(client.sourceModel());
     workshopFiltered.setWorkshopView(true);
+    // BETA_M2c: daemon-owned per-wallpaper permission grants. Grant state
+    // comes from the daemon (permissions-v1.json), never from local settings.
+    PermissionsClient permissionsClient(socketPath);
 
     QQmlApplicationEngine engine;
     // Once the activated daemon socket appears, refresh the catalog right
@@ -134,6 +138,7 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("wallpaperModel"), &filtered);
     engine.rootContext()->setContextProperty(QStringLiteral("workshopModel"), &workshopFiltered);
     engine.rootContext()->setContextProperty(QStringLiteral("catalogStats"), client.sourceModel());
+    engine.rootContext()->setContextProperty(QStringLiteral("permissionsClient"), &permissionsClient);
     engine.rootContext()->setContextProperty(QStringLiteral("packageInstaller"), &packageInstaller);
     engine.rootContext()->setContextProperty(QStringLiteral("packageSource"), packageSource);
     engine.rootContext()->setContextProperty(QStringLiteral("workshopClient"), &workshopClient);

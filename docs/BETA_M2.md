@@ -1,7 +1,8 @@
 # BETA_M2 — Wallpaper renderer (CDP) milestone report
 
 Status: **M2a complete** (spike + client + smoke); **M2b complete** (sandboxed
-web renderer worker + supervision + smoke).
+web renderer worker + supervision + smoke); **M2c complete** (daemon-owned
+permission grants + manager wiring + smoke).
 
 ## M2a goal
 
@@ -419,3 +420,75 @@ identical and alive before and after the suite.
 - **Decode budget**: worst-case 960x540 decode ≈1.4 ms is fine at 30 fps;
   a future 4K spec (3840x2160) would cost ~20 ms/frame in software decode —
   the caps keep it bounded, but the pacing budget shrinks.
+
+## 6. M2c: daemon-owned permission grants
+
+### 6.1 Goal
+
+Move per-wallpaper capability decisions (network, audio, pointer) from the
+M2b per-request test hook into a daemon-owned, persisted, bounded grant
+store, and wire it through the manager UI. Grants are the production
+mechanism: a wallpaper's record in `permissions-v1.json` decides whether
+`kwe-web-renderer` spawns with `--allow-network` and whether forwarded
+audio reaches the worker. The M2b `allow_network` hook is removed — the
+parameter is now rejected as an unknown field, the daemon no longer runs
+with `--allow-test-faults` in the smoke lane, and `smoke-web.sh` proves the
+positive and negative controls through the grant path alone.
+
+### 6.2 Design
+
+- **Store** (`crates/kwe-daemon/src/grants.rs`): `permissions-v1.json` in
+  the private state directory beside `supervisor-v1.json` —
+  `{"schema_version": 1, "grants": {"<wallpaper_id>": {"network": bool,
+  "audio": bool, "pointer": bool}}}`. Bounded (≤ 256 records, 1 MiB),
+  written atomically through `persist.rs::atomic_write`, loaded with
+  `deny_unknown_fields`; a corrupt file is renamed aside
+  (`permissions-v1.json.invalid-<seconds>-<nanos>`) and the store starts
+  fresh with a one-time log. Wallpaper ids follow the identity rule (1–128
+  ASCII letters, digits, `.`, `_`, `-`).
+- **Default policy**: network off, audio off, **pointer on** (interactivity
+  is core; the pointer grant is reserved for future stricter modes and is
+  not enforced yet).
+- **RPC** (one request per connection, through the supervisor's bounded
+  command channel): `permissions.get` → the effective record (defaults when
+  no record exists); `permissions.set` → patch semantics, the answer is the
+  new effective record; `permissions.list` → all records. Unknown fields
+  and out-of-bounds ids are rejected (`invalid_params`); the 257th record
+  fails (`permissions_failed` naming the safety limit).
+- **Enforcement**:
+  - *Network*: at spawn the supervisor appends `--allow-network` to the web
+    worker argv only when the wallpaper's grant record allows it; otherwise
+    bwrap runs `--unshare-net`. Revocation takes effect on the next
+    `renderer.start` for that identity.
+  - *Audio*: capture stays global (`kwe-audio-worker` keeps running), but
+    the grant gates delivery — `audio.forward` frames for a wallpaper
+    without the audio grant are dropped silently (latest-wins,
+    bounded-rate logging), counted in `audio_grant_dropped`
+    (renderer.status).
+  - *Pointer*: pass-through stays enabled by default; not enforced yet.
+- **Manager** (`apps/kwe-manager`): `PermissionsClient`
+  (`permissionsclient.{h,cpp}`) mirrors the CatalogClient/PlaylistClient
+  QLocalSocket pattern with a bounded retrying queue and per-id pending
+  state; `WallpaperDetail.qml` toggles read and write the daemon record
+  through it. The QML-local QSettings permission state in CatalogModel is
+  removed (catalog stats stay).
+
+### 6.3 Acceptance
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| fmt | `cargo fmt --all -- --check` | pass |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| test | `cargo test --workspace --all-targets` | pass (214 tests, 0 failures) |
+| cmake | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | pass |
+| ctest | `cd build/cmake && ctest --output-on-failure` | pass (5/5, incl. `kwe-permissions-client-test`) |
+| qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | pass |
+| smoke-web | `./scripts/smoke-web.sh` | pass (grants lane: defaults asserted, grant paints red, revocation restores the sandbox) |
+| smoke-video | `./scripts/smoke-video.sh` | pass (regression) |
+| smoke-supervisor | `./scripts/smoke-supervisor.sh` | pass (regression) |
+
+The M2b §5.6 evidence above describes the hook-era positive control and
+stays as history; the grants lane (`smoke-web.sh` case 1b) now drives the
+same fixture through `permissions.set` → `renderer.start` (marker paints
+red) and revocation → restart (marker stays away while the probe server
+still runs — the grant, not connectivity, is the discriminator).

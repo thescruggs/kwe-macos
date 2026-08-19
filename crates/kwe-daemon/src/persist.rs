@@ -73,15 +73,19 @@ pub(crate) fn unix_seconds() -> u64 {
         .as_secs()
 }
 
-/// Moves an invalid state file to a `.invalid-<unix>` sibling so the data is
-/// preserved for diagnosis while the service restarts fresh. Best-effort.
+/// Moves an invalid state file to a `.invalid-<unix>-<nanos>` sibling so the
+/// data is preserved for diagnosis while the service restarts fresh. The
+/// nanosecond suffix keeps repeated quarantines within the same second from
+/// colliding (a best-effort rename to an existing name would silently drop
+/// the second file). Best-effort.
 pub(crate) fn quarantine_invalid_state(path: &Path) {
     let quarantined = path.with_file_name(format!(
-        "{}.invalid-{}",
+        "{}.invalid-{}-{}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("state"),
-        unix_seconds()
+        unix_seconds(),
+        unix_nanos()
     ));
     if let Err(error) = fs::rename(path, &quarantined) {
         eprintln!(

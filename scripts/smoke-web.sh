@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Supervised sandboxed-web-renderer smoke suite (BETA_M2b).
+# Supervised sandboxed-web-renderer smoke suite (BETA_M2b; grants lane
+# BETA_M2c).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. The web
 # fixtures (animated dot, static page, pointer oracle, busy loop) are
@@ -23,9 +24,10 @@ fixture_busy="$smoke_root/fixtures/busy"
 fixture_wedge="$smoke_root/fixtures/wedge"
 # Port for the sandbox-integrity probe. Negative case: --unshare-net removes
 # the sandbox's own loopback, so 127.0.0.1:$probe_port is unreachable and the
-# fetch fails fast. Positive case: a local python http.server binds it on the
-# host loopback and the allow_network test hook shares the netns, so the
-# fetch resolves.
+# fetch fails fast. Positive case (BETA_M2c): a local python http.server
+# binds it on the host loopback and the per-wallpaper network grant (set
+# through permissions.set) makes the daemon append --allow-network to the
+# worker's argv, so the fetch resolves.
 probe_port=$((18080 + ($$ % 2000)))
 daemon_pid=""
 probe_server_pid=""
@@ -75,7 +77,7 @@ start_daemon() {
         --renderer-max-failures 3 \
         --renderer-web-heartbeat-ms 1000 \
         --renderer-web-heartbeat-max-failures 2 \
-        --allow-test-faults >"$smoke_root/daemon.log" 2>&1 &
+        >"$smoke_root/daemon.log" 2>&1 &
     daemon_pid=$!
     for _attempt in {1..100}; do
         [[ -S "$socket" ]] && return
@@ -383,20 +385,28 @@ last_good_file="$(jq -r '.last_good.file' "$state_dir/supervisor-v1.json")"
 head -c 2 "$state_dir/$last_good_file" | cmp -s - <(printf 'P6')
 echo "web smoke passed: canary promote kind=web, sequence advances, sandbox holds, last-good P6"
 
-# Case 1b (sandbox positive control): the same animated fixture started
-# through the daemon with the per-request allow_network test hook (gated
-# behind --allow-test-faults, so production cannot grant it) and a loopback
-# http server serving the probe. The marker must paint red: this proves the
-# case-1 negative comes from the network isolation, not from a fixture that
-# could never paint. The server adds Access-Control-Allow-Origin because a
-# file:// page has an opaque ("null") origin: a plain python http.server
-# answers the request but the fetch would reject on CORS, masking the network
-# result. The marker is persistent (repainted every frame once the fetch
-# resolves), so the probe hits a solidly red box instead of racing a
-# one-frame repaint; and it runs supervised rather than as a direct spawn
-# because the frame file is created by the supervisor (SharedFrameWriter
-# create_new) and the daemon path is the path the sandbox actually runs
-# under.
+# Case 1b (grants lane, BETA_M2c): the per-wallpaper network grant is the
+# ONLY path to --allow-network — the M2b per-request allow_network test hook
+# is removed (its param is now rejected as an unknown field), and the daemon
+# runs without --allow-test-faults in this lane. Assert the documented
+# defaults through permissions.get first (a wallpaper without a record has
+# network off, audio off, pointer on), then grant network for a fresh
+# identity (permissions.set patches only the provided field; the answer is
+# the new effective record) and start the same animated fixture supervised:
+# the marker must paint red through the real grant mechanism. Then revoke
+# (network false) and restart the same identity: the marker must stay away
+# while the probe server keeps running — connectivity is unchanged, so the
+# grant alone is the discriminator. The marker is painted only while the
+# page-side __kwe_net flag is set (set by the resolved fetch), so "no red"
+# is the observable for "no __kwe_net". The server adds
+# Access-Control-Allow-Origin because a file:// page has an opaque ("null")
+# origin: a plain python http.server answers the request but the fetch
+# would reject on CORS, masking the network result. The marker is
+# persistent (repainted every frame once the fetch resolves), so the probe
+# hits a solidly red box instead of racing a one-frame repaint; and it runs
+# supervised rather than as a direct spawn because the frame file is
+# created by the supervisor (SharedFrameWriter create_new) and the daemon
+# path is the path the sandbox actually runs under.
 python3 - "$probe_port" "$smoke_root" <<'PY' >"$smoke_root/http-server.log" 2>&1 &
 import http.server
 import sys
@@ -423,26 +433,57 @@ kill -0 "$probe_server_pid" || {
     sed -n '1,40p' "$smoke_root/http-server.log" >&2
     exit 1
 }
-positive_params='{"wallpaper_id":"web-pos","content_hash":"hash-web-pos","width":160,"height":90,"fps":30,"kind":"web","content":"'"$fixture_animated"'","allow_network":true}'
-call_daemon renderer.start "$positive_params" >/dev/null
-positive_status="$(wait_phase live)"
-positive_frame="$(jq -r '.result.frame_file' <<<"$positive_status")"
-[[ -n "$positive_frame" && -f "$positive_frame" ]]
-positive_painted=1
+# No record exists for the case-1 identity, so the effective record is the
+# documented default policy: network off, audio off, pointer on.
+defaults_status="$(call_daemon permissions.get '{"wallpaper_id":"web"}')"
+[[ "$(jq -r '.result.granted.network' <<<"$defaults_status")" == "false" ]]
+[[ "$(jq -r '.result.granted.audio' <<<"$defaults_status")" == "false" ]]
+[[ "$(jq -r '.result.granted.pointer' <<<"$defaults_status")" == "true" ]]
+# Grant network for a fresh identity; the unset fields keep their defaults.
+grant_status="$(call_daemon permissions.set '{"wallpaper_id":"web-grant","network":true}')"
+[[ "$(jq -r '.result.granted.network' <<<"$grant_status")" == "true" ]]
+[[ "$(jq -r '.result.granted.audio' <<<"$grant_status")" == "false" ]]
+[[ "$(jq -r '.result.granted.pointer' <<<"$grant_status")" == "true" ]]
+granted_params='{"wallpaper_id":"web-grant","content_hash":"hash-web-grant","width":160,"height":90,"fps":30,"kind":"web","content":"'"$fixture_animated"'"}'
+call_daemon renderer.start "$granted_params" >/dev/null
+granted_status="$(wait_phase live)"
+granted_frame="$(jq -r '.result.frame_file' <<<"$granted_status")"
+[[ -n "$granted_frame" && -f "$granted_frame" ]]
+granted_painted=1
 for _attempt in {1..60}; do
-    if probe_frame "$positive_frame" 10 10 4 4 255 0 0 60; then
-        positive_painted=0
+    if probe_frame "$granted_frame" 10 10 4 4 255 0 0 60; then
+        granted_painted=0
         break
     fi
     sleep 0.25
 done
-[[ "$positive_painted" == "0" ]]
+[[ "$granted_painted" == "0" ]]
+call_daemon renderer.stop >/dev/null
+wait_phase stopped >/dev/null
+# Revocation takes effect on the next renderer.start: the restarted worker
+# must spawn with --unshare-net again. The probe server is still up, so a
+# red marker here could only mean the revocation did not reach the argv.
+revoke_status="$(call_daemon permissions.set '{"wallpaper_id":"web-grant","network":false}')"
+[[ "$(jq -r '.result.granted.network' <<<"$revoke_status")" == "false" ]]
+call_daemon renderer.start "$granted_params" >/dev/null
+wait_phase live >/dev/null
+revoked_clean=1
+for _attempt in {1..12}; do
+    revoked_frame="$(jq -r '.result.frame_file' <<<"$(call_daemon renderer.status)")"
+    if [[ -n "$revoked_frame" && -f "$revoked_frame" ]] \
+        && probe_frame "$revoked_frame" 10 10 4 4 255 0 0 60; then
+        revoked_clean=0
+        break
+    fi
+    sleep 0.25
+done
+[[ "$revoked_clean" == "1" ]]
 call_daemon renderer.stop >/dev/null
 wait_phase stopped >/dev/null
 kill "$probe_server_pid"
 wait "$probe_server_pid" 2>/dev/null || true
 probe_server_pid=""
-echo "web smoke passed: network marker paints red with the allow_network grant (positive control)"
+echo "web smoke passed: network grant paints red through the daemon; revocation restores the sandbox"
 
 # Case 2: a static page paints once and then produces no screencast frames;
 # the keepalive re-publication must keep the sequence advancing over 1.5 s
@@ -504,10 +545,15 @@ done
 echo "web smoke passed: pointer oracle paints the dot at the normalized position, acked"
 
 # Case 4: audio injection without --audio-capture. Forward 64-band frames via
-# the direct audio.forward daemon-call; the worker acks each one with the wire
-# sequence (the display generation), so input_ack_sequence must advance to the
-# live generation with zero protocol errors and no evaluate diagnostics. Runs
-# on a fresh worker so the ack counter starts at 0.
+# the direct audio.forward daemon-call. BETA_M2c: delivery is gated by the
+# per-wallpaper audio grant — without it frames are dropped silently
+# (latest-wins, counted in audio_grant_dropped, bounded-rate log) and the
+# worker never acks; with the grant the worker acks each frame with the wire
+# sequence (the display generation). The case asserts both sides: the
+# ungranted drop first (ack sequence unmoved, drop counter advanced), then a
+# live grant — no worker restart — and acks advancing to the live generation
+# with zero protocol errors and no evaluate diagnostics. Runs on a fresh
+# worker so the ack counter starts at 0.
 call_daemon renderer.stop >/dev/null
 wait_phase stopped >/dev/null
 audio_params='{"wallpaper_id":"web-audio","content_hash":"hash-web-audio","width":160,"height":90,"fps":30,"kind":"web","content":"'"$fixture_animated"'"}'
@@ -515,8 +561,22 @@ call_daemon renderer.start "$audio_params" >/dev/null
 audio_status="$(wait_phase live)"
 audio_generation="$(jq -r '.result.display_generation' <<<"$audio_status")"
 [[ "$audio_generation" != "0" ]]
-audio_frame="$(jq -r '.result.frame_file' <<<"$audio_status")"
 ack_before="$(jq -r '.result.input_ack_sequence' <<<"$audio_status")"
+dropped_before="$(jq -r '.result.audio_grant_dropped' <<<"$audio_status")"
+# No audio grant yet: the daemon drops the frames before they reach the
+# worker pipe, so the acks cannot move and the drop counter must advance.
+for _i in 1 2 3; do
+    call_daemon audio.forward \
+        "$(jq -cn --argjson g "$audio_generation" \
+            '{generation:$g,frame:{left:[range(64)|0.5],right:[range(64)|0.25]}}')" >/dev/null
+    sleep 0.3
+done
+dropped_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.input_ack_sequence' <<<"$dropped_status")" == "$ack_before" ]]
+[[ "$(jq -r '.result.audio_grant_dropped' <<<"$dropped_status")" -gt "$dropped_before" ]]
+# Grant audio: delivery resumes immediately (no restart) and the worker acks
+# each forwarded frame with the wire sequence (the display generation).
+call_daemon permissions.set '{"wallpaper_id":"web-audio","audio":true}' >/dev/null
 for _i in 1 2 3; do
     call_daemon audio.forward \
         "$(jq -cn --argjson g "$audio_generation" \
@@ -529,7 +589,7 @@ audio_after="$(jq -r '.result.input_ack_sequence' <<<"$(call_daemon renderer.sta
 [[ "$(jq -r '.result.input_protocol_errors' <<<"$(call_daemon renderer.status)")" == "0" ]]
 audio_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
 [[ "$audio_tail" != *"audio_evaluate_error"* ]]
-echo "web smoke passed: audio.forward acks advance to the display generation, zero protocol errors"
+echo "web smoke passed: audio grant gates delivery (dropped without, acks advance with), zero protocol errors"
 
 # Case 5: kill -9 the active worker; the daemon records one failure during the
 # restart window and auto-restarts. The last-good still image survives the

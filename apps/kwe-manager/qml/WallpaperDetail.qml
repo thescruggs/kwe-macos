@@ -15,6 +15,26 @@ Kirigami.ScrollablePage {
     visible: detailPage.detailsVisible
     title: qsTr("Wallpaper Details")
 
+    // Mirror the selected wallpaper's daemon-held grant record whenever the
+    // details pane appears or the selection changes.
+    function refreshPermissions() {
+        if (WallpaperSelection.selectedId !== "")
+            permissionsClient.requestPermissions(WallpaperSelection.selectedId);
+    }
+
+    onVisibleChanged: {
+        if (visible)
+            refreshPermissions();
+    }
+
+    Connections {
+        target: WallpaperSelection
+        function onSelectedIdChanged() {
+            if (detailPage.visible)
+                refreshPermissions();
+        }
+    }
+
     ColumnLayout {
         width: parent.width
         spacing: Kirigami.Units.largeSpacing
@@ -49,6 +69,10 @@ Kirigami.ScrollablePage {
             opacity: 0.75
             wrapMode: Text.Wrap
         }
+        // BETA_M2c: the daemon owns each wallpaper's grant record
+        // (permissions-v1.json); the toggles below read and write it through
+        // permissionsClient, so grant state survives restarts and is shared
+        // with every other client of the wallpaper service.
         Flow {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== "" && WallpaperSelection.selectedPermissions.length > 0
@@ -57,22 +81,37 @@ Kirigami.ScrollablePage {
                 model: WallpaperSelection.selectedPermissions
                 delegate: Controls.Button {
                     required property string modelData
-                    readonly property bool granted: catalogStats.isPermissionGranted(WallpaperSelection.selectedId, modelData)
-                    text: granted
-                        ? qsTr("%1 granted").arg(modelData)
-                        : qsTr("Grant %1").arg(modelData)
+                    readonly property bool granted: permissionsClient.isGranted(WallpaperSelection.selectedId, modelData)
+                    readonly property bool pending: permissionsClient.isPending(WallpaperSelection.selectedId)
+                    // Every state is carried by the text so screen readers see
+                    // the same meaning as sighted users (never color alone).
+                    text: pending
+                        ? qsTr("Updating %1…").arg(modelData)
+                        : granted
+                            ? qsTr("%1 granted").arg(modelData)
+                            : qsTr("Grant %1").arg(modelData)
                     icon.name: granted
                         ? "dialog-ok-apply-symbolic" : "dialog-cancel-symbolic"
-                    onClicked: catalogStats.togglePermission(WallpaperSelection.selectedId, modelData)
+                    enabled: !pending
+                    Accessible.description: pending
+                        ? qsTr("The %1 permission is being updated in the wallpaper service").arg(modelData)
+                        : text
+                    onClicked: permissionsClient.setPermission(WallpaperSelection.selectedId, modelData, !granted)
                 }
             }
         }
         Controls.Label {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== "" && WallpaperSelection.selectedPermissions.length > 0
-            text: qsTr("Requested permissions: %1 (not granted in this alpha)").arg(WallpaperSelection.selectedPermissions.join(", "))
-            color: Kirigami.Theme.neutralTextColor
+            text: qsTr("Requested permissions: %1").arg(WallpaperSelection.selectedPermissions.join(", "))
+            opacity: 0.75
             wrapMode: Text.Wrap
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: permissionsClient.errorMessage !== ""
+            type: Kirigami.MessageType.Error
+            text: qsTr("Permission grants: %1").arg(permissionsClient.errorMessage)
         }
         Controls.Label {
             Layout.fillWidth: true

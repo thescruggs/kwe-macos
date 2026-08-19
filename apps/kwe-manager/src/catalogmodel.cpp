@@ -146,19 +146,6 @@ void CatalogModel::toggleFavorite(const QString &workshopId) {
     emit favoritesChanged();
 }
 
-bool CatalogModel::isPermissionGranted(const QString &workshopId, const QString &permission) const {
-    QSettings settings;
-    return settings.value(QStringLiteral("permissions/%1/%2").arg(workshopId, permission), false).toBool();
-}
-
-void CatalogModel::togglePermission(const QString &workshopId, const QString &permission) {
-    if (workshopId.isEmpty() || !QStringList{QStringLiteral("network"), QStringLiteral("pointer"), QStringLiteral("audio")}.contains(permission)) return;
-    QSettings settings;
-    const auto key = QStringLiteral("permissions/%1/%2").arg(workshopId, permission);
-    settings.setValue(key, !settings.value(key, false).toBool());
-    emit favoritesChanged();
-}
-
 WallpaperFilterModel::WallpaperFilterModel(QObject *parent) : QSortFilterProxyModel(parent) {
     setDynamicSortFilter(true);
     setSortCaseSensitivity(Qt::CaseInsensitive);
