@@ -67,7 +67,7 @@ Validated on 2026-08-18 (mpv 1:0.41.0, libmpv.so.2.5.0, CachyOS).
 | graceful SIGTERM | stop without restart | standalone: exit 0, `producer_state` `Stopping` (the daemon records no failure on graceful stops, so `last_failure` is not smoke-assertable); smoke: phase `stopped`, no worker, daemon healthy |
 | input channel | decode + ack | `pointer_position`, `media_state`, `audio_bands` acked on stdout; malformed/junk lines ignored silently |
 | media-state mapping | pause/seek | `paused`→pause, `playing`→pause=false, `stopped`→pause + seek 0 |
-| unit tests | 7 in-crate | rgb24→BGRA exact bytes, keepalive decision, media mapping, fault-flag exit table |
+| unit tests | 8 in-crate | rgb24→BGRA exact bytes, keepalive decision, media mapping, fault-flag exit table, duration-bound decision (M1c) |
 
 ### M1c — static video preflight + catalog compatibility flip
 
@@ -82,11 +82,12 @@ Validated on 2026-08-18 (mpv 1:0.41.0, libmpv.so.2.5.0, CachyOS).
 | canonicalized spawn path | `into_validated` stores the resolved path | M1a TOCTOU fix preserved (supervisor unit test) |
 | catalog video row | `planned` → renderer-dependent | `RendererDependent` + "libmpv worker with software fallback; static video preflight"; scan unit test added |
 | CLI `kwe preflight --video` | JSON report, exit 2 on unsafe | mirrors `--path`; exactly one of `--path`/`--video` required |
-| smoke split | extension reject vs garbage-content exit 73 | case 8 renamed to `garbage.mp4` → worker exit 73 → `rolled_back`; new case 9 `.bin` → `invalid_params` with preflight reason |
+| smoke split | extension reject vs worker-side rejection | case 8 renamed to `garbage.mp4` → worker exit 73 → `rolled_back`; case 9 `.bin` → `invalid_params` with preflight reason; case 10 `long-duration.mp4` (>24 h, generated with a `setpts` retimestamp) → worker exit 73 → `rolled_back` |
+| duration bound | known duration over 24 h rejected by the worker | unit `duration_decision` (24 h passes, 24 h + 1 s rejected, unknown fails open); smoke case 10 asserts `last_failure_detail` names both `exit_code_73` and the 24 h diagnostic |
 
 Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, and `cargo test --workspace
---all-targets` are clean (117 tests); `smoke-video.sh` (9 cases) and
+--all-targets` are clean (119 tests); `smoke-video.sh` (10 cases) and
 `smoke-supervisor.sh` (15 cases) both pass.
 
 ## Failure and recovery cases
@@ -155,10 +156,15 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 6. **M1c boundary — resolved.** M1b's temporary path-level content check
    was replaced in M1c by the static `preflight_video` (regular non-symlink
    file, allowlisted container extension, ≤ 2 GiB). Decode and duration
-   bounds remain the worker's job: a corrupt file inside an allowlisted
-   extension still reaches the worker and fails closed with exit 73 (smoke
-   case 8, `garbage.mp4`), while a disallowed extension is now rejected
-   before any worker spawns (smoke case 9).
+   bounds are the worker's job: after the file loads, the renderer reads the
+   mpv `duration` property (bounded `MPV_EVENT_FILE_LOADED` wait) and
+   rejects a known duration over 24 h with a bounded stderr diagnostic and
+   exit 73, failing open when the duration is unreadable (some containers).
+   A corrupt file inside an allowlisted extension therefore still reaches
+   the worker and fails closed with exit 73 (smoke case 8, `garbage.mp4`);
+   media with a known duration over 24 h does the same (smoke case 10,
+   `long-duration.mp4`), while a disallowed extension is now rejected before
+   any worker spawns (smoke case 9).
 
 ## Renderer exit codes
 
@@ -168,5 +174,5 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 | 70 | `--exit-after` synthetic fault | `process_exit` failure |
 | 71 | `--memory-pressure-after` allocation denied | `process_exit` failure |
 | 72 | memory-pressure allocation unexpectedly succeeded | `process_exit` failure |
-| 73 | backend rejection (decode/render unusable, incl. after `--hwdec=no` retry) | `exit_code_73` in `last_failure_detail` |
+| 73 | backend rejection (decode/render unusable, incl. after `--hwdec=no` retry, or a known duration over 24 h) | `exit_code_73` in `last_failure_detail` |
 | signal | killed (e.g. kill -9) | `process_exit` with `signal_9` |

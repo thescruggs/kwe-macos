@@ -94,11 +94,12 @@ pub fn preflight_scene(path: &Path) -> ScenePreflight {
 }
 
 /// Static video-entry preflight: the path must be a regular non-symlink
-/// file with an allowlisted container extension, bounded to 2 GiB. Decode
-/// and duration bounds are the worker's job (mpv open + duration ≤ 24 h
-/// fails closed with exit 73); this preflight never opens or probes media
-/// content, so a corrupt file inside an allowlisted extension still passes
-/// here and is rejected by the worker instead.
+/// file with an allowlisted container extension, bounded to 2 GiB. This
+/// preflight never opens or probes media content; decode and duration
+/// bounds are the worker's job — the video renderer rejects a backend
+/// decode failure AND a known duration over 24 h with exit 73, while an
+/// unreadable duration fails open. A corrupt file inside an allowlisted
+/// extension therefore still passes here and is rejected by the worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VideoPreflight {
     pub path: PathBuf,
@@ -255,24 +256,58 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_video_entries_via_sparse_file() {
+    fn accepts_video_entries_at_the_exact_size_bound() {
         let root =
             std::env::temp_dir().join(format!("kwe-preflight-video-size-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         // A sparse file carries the size in its metadata without allocating.
-        let path = root.join("big.mp4");
-        fs::File::create(&path)
+        let exact = root.join("exact.mp4");
+        fs::File::create(&exact)
+            .unwrap()
+            .set_len(MAX_VIDEO_BYTES)
+            .unwrap();
+        let report = preflight_video(&exact);
+        assert!(
+            report.safe,
+            "exactly {MAX_VIDEO_BYTES} bytes must pass: {:?}",
+            report.reasons
+        );
+        let oversized = root.join("big.mp4");
+        fs::File::create(&oversized)
             .unwrap()
             .set_len(MAX_VIDEO_BYTES + 1)
             .unwrap();
-        let report = preflight_video(&path);
+        let report = preflight_video(&oversized);
         assert!(!report.safe);
         assert!(
             report
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("byte limit")),
+            "unexpected reasons: {:?}",
+            report.reasons
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_trailing_dot_extension_video_entries() {
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-video-trdot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // A trailing dot leaves no extension; the path must not sneak past
+        // the allowlist as if it were an mp4.
+        let path = root.join("clip.mp4.");
+        fs::write(&path, b"not a real video").unwrap();
+        let report = preflight_video(&path);
+        assert!(!report.safe);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unsupported video extension")),
             "unexpected reasons: {:?}",
             report.reasons
         );

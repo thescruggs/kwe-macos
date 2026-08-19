@@ -16,7 +16,8 @@
 //   70 --exit-after fired
 //   71 --memory-pressure-after allocation denied
 //   72 --memory-pressure-after allocation unexpectedly succeeded
-//   73 backend rejection: decode/render unusable even with --hwdec=no
+//   73 backend rejection: decode/render unusable even with --hwdec=no, or a
+//      known duration over the 24 h bound (an unreadable duration fails open)
 //
 // Everything that could produce unbounded output is bounded: stderr lines
 // are rate-limited, input reads are nonblocking with a byte cap, and the
@@ -50,6 +51,17 @@ const SOFTWARE_DECODE: &str = "no";
 /// Longest single mpv wait; bounds event latency and the pacing timer.
 const MAX_WAIT: Duration = Duration::from_millis(50);
 
+/// Media with a known duration above this bound is a backend rejection
+/// (exit 73): the static preflight never opens media, so the 24 h cap is
+/// enforced here, against the mpv `duration` property.
+const MAX_VIDEO_DURATION_SECONDS: f64 = 24.0 * 3600.0;
+
+/// Bounded polls (50 ms each) waiting for MPV_EVENT_FILE_LOADED before
+/// the duration property is readable; a load that never reports loaded
+/// proceeds anyway — the play loop still observes real load failures and
+/// the duration check fails open on an unknown value.
+const MAX_LOAD_WAIT_POLLS: usize = 100;
+
 /// Cap on drained events per loop iteration (mpv's queue is bounded, but a
 /// hard cap keeps a pathological peer from starving the pacing timer).
 const MAX_EVENTS_PER_TICK: usize = 256;
@@ -73,9 +85,11 @@ mod mpv_ffi {
 
     pub const MPV_FORMAT_STRING: c_int = 1;
     pub const MPV_FORMAT_FLAG: c_int = 3;
+    pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
     pub const MPV_EVENT_SHUTDOWN: c_int = 1;
     pub const MPV_EVENT_END_FILE: c_int = 7;
+    pub const MPV_EVENT_FILE_LOADED: c_int = 8;
     pub const MPV_END_FILE_REASON_EOF: c_int = 0;
 
     pub const MPV_RENDER_PARAM_INVALID: c_int = 0;
@@ -130,6 +144,12 @@ mod mpv_ffi {
             name: *const c_char,
             format: c_int,
             data: *const c_void,
+        ) -> c_int;
+        pub fn mpv_get_property(
+            handle: *mut MpvHandle,
+            name: *const c_char,
+            format: c_int,
+            data: *mut c_void,
         ) -> c_int;
         pub fn mpv_command(handle: *mut MpvHandle, args: *const *const c_char) -> c_int;
         pub fn mpv_wait_event(handle: *mut MpvHandle, timeout: f64) -> *mut mpv_event;
@@ -579,6 +599,26 @@ impl MpvSession {
         self.command(&["loadfile", path])
     }
 
+    /// Current value of the `duration` property in seconds, or None when it
+    /// is unknown or not yet readable. Metadata-less containers and races
+    /// with metadata loading report unavailable, which fails the duration
+    /// bound open by contract.
+    fn duration_seconds(&mut self) -> Option<f64> {
+        let name = CString::new("duration").ok()?;
+        let mut seconds = 0.0_f64;
+        // SAFETY: MPV_FORMAT_DOUBLE writes exactly one f64 into `seconds`;
+        // the handle is valid for the session lifetime.
+        let code = unsafe {
+            mpv_ffi::mpv_get_property(
+                self.handle,
+                name.as_ptr(),
+                mpv_ffi::MPV_FORMAT_DOUBLE,
+                (&mut seconds as *mut f64).cast(),
+            )
+        };
+        (code >= 0).then_some(seconds)
+    }
+
     /// One nonblocking event, copied into a local enum (the pointer is only
     /// valid until the next mpv_wait_event call). Ok(None) on timeout.
     fn wait_event(&mut self, timeout: f64) -> Result<Option<Event>> {
@@ -596,6 +636,7 @@ impl MpvSession {
                 Event::EndFile { reason: end.reason }
             }
             mpv_ffi::MPV_EVENT_SHUTDOWN => Event::Shutdown,
+            mpv_ffi::MPV_EVENT_FILE_LOADED => Event::FileLoaded,
             _ => Event::Ignored,
         };
         Ok(Some(kind))
@@ -620,7 +661,7 @@ impl MpvSession {
                     // gap until the first frame of the next pass.
                 }
                 Event::Shutdown => bail!("libmpv core shutdown"),
-                Event::Ignored => {}
+                Event::FileLoaded | Event::Ignored => {}
             }
         }
         Ok(())
@@ -711,6 +752,7 @@ impl Drop for MpvSession {
 enum Event {
     EndFile { reason: c_int },
     Shutdown,
+    FileLoaded,
     Ignored,
 }
 
@@ -724,6 +766,39 @@ fn check_mpv(code: c_int, action: &str) -> Result<()> {
         .to_string_lossy()
         .into_owned();
     Err(anyhow::anyhow!("{action} failed: {message}"))
+}
+
+/// Bounded wait for MPV_EVENT_FILE_LOADED so the `duration` property is
+/// readable before the bound check. A load failure surfaces here exactly
+/// as in the play loop (non-EOF end_file or shutdown). If the file never
+/// reports loaded within the poll bound, proceed: the play loop still
+/// observes real load failures, and the duration check fails open.
+fn wait_for_load(session: &mut MpvSession) -> Result<()> {
+    for _ in 0..MAX_LOAD_WAIT_POLLS {
+        match session.wait_event(MAX_WAIT.as_secs_f64())? {
+            Some(Event::FileLoaded) => return Ok(()),
+            Some(Event::EndFile { reason }) if reason != mpv_ffi::MPV_END_FILE_REASON_EOF => {
+                bail!("libmpv end_file reason {reason}");
+            }
+            Some(Event::Shutdown) => bail!("libmpv core shutdown"),
+            Some(Event::EndFile { .. }) | Some(Event::Ignored) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Duration-bound decision: a known duration above 24 h is rejected
+/// (bubbles up to a backend rejection, exit 73); an unknown duration
+/// (metadata-less container) fails open. Pure so the bound is
+/// unit-testable without a media file.
+fn duration_decision(seconds: Option<f64>) -> Result<()> {
+    match seconds {
+        None => Ok(()),
+        Some(seconds) if seconds > MAX_VIDEO_DURATION_SECONDS => {
+            bail!("media duration {seconds:.1}s exceeds the 24 h bound")
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +903,10 @@ impl VideoWorker {
         let mut session = MpvSession::create(hwdec, self.spec)?;
         session.initialize()?;
         session.load_file(&self.arguments.content)?;
+        // The duration bound is per-file, so both decode attempts reject an
+        // overlong media identically; the retry costs one bounded re-load.
+        wait_for_load(&mut session)?;
+        duration_decision(session.duration_seconds())?;
         self.play_loop(&mut session, hwdec)
     }
 
@@ -1072,5 +1151,20 @@ mod tests {
         assert_eq!(EXIT_MEMORY_DENIED, 71);
         assert_eq!(EXIT_MEMORY_UNEXPECTED, 72);
         assert_eq!(EXIT_BACKEND_REJECT, 73);
+    }
+
+    #[test]
+    fn duration_bound_rejects_over_24h_and_fails_open_on_unknown() {
+        // At or below the 24 h cap the media is accepted.
+        assert!(duration_decision(Some(23.0 * 3600.0)).is_ok());
+        assert!(duration_decision(Some(24.0 * 3600.0)).is_ok());
+        // Above the cap the rejection names the bound.
+        let error = format!(
+            "{}",
+            duration_decision(Some(24.0 * 3600.0 + 1.0)).unwrap_err()
+        );
+        assert!(error.contains("24 h"), "unexpected error: {error}");
+        // An unknown duration (metadata-less container) fails open.
+        assert!(duration_decision(None).is_ok());
     }
 }

@@ -40,10 +40,14 @@ the renderer family — `test`, `video`, `web`, or `scene` — and defaults to
 `test`. `content` is the validated content path: a video file for `video`, a
 directory with an `index.html` for `web`, and a scene file for `scene`. Test
 takes no content; every other kind requires it, and a kind/content mismatch is
-rejected. Content is validated before launch: video gets path-level checks
-(exists, regular file, not a symlink) until the full `preflight_video` lands in
-M1c; web runs `preflight_web` with no permission grants (network stays
-disabled); scene keeps its existing `preflight_scene`.
+rejected. Content is validated before launch: video runs the static
+`preflight_video` (regular non-symlink file, allowlisted container extension
+`mp4|webm|mkv|mov|avi|wmv|flv|m4v|ogv`, ≤ 2 GiB), and its rejection reasons
+propagate as the `invalid_params` detail; web runs `preflight_web` with no
+permission grants (network stays disabled); scene keeps its existing
+`preflight_scene`. Decode failures and a known duration over 24 h are the
+worker's job: `kwe-video-renderer` rejects them with exit 73, folded into the
+failure record as `exit_code_73` (an unreadable duration fails open).
 
 Identity components are restricted to 1–128 ASCII letters, digits, `.`, `_`,
 and `-`. Frame protocol v1 bounds dimensions and allocation size; FPS is

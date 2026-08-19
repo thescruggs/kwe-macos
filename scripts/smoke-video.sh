@@ -16,6 +16,7 @@ state_dir="$smoke_root/state"
 fixture="$smoke_root/fixture.mp4"
 garbage="$smoke_root/garbage.mp4"
 bad_extension="$smoke_root/garbage.bin"
+long_duration="$smoke_root/long-duration.mp4"
 daemon_pid=""
 
 cleanup() {
@@ -114,12 +115,24 @@ media_state() {
 
 command -v jq >/dev/null
 command -v ffmpeg >/dev/null
+command -v ffprobe >/dev/null
 
 # Case 1: runtime-generated synthetic fixture (never committed).
 ffmpeg -loglevel error -f lavfi -i "testsrc2=size=64x64:rate=30" -t 2 \
     -pix_fmt yuv420p "$fixture" -y
 head -c 65536 /dev/urandom >"$garbage"
 head -c 65536 /dev/urandom >"$bad_extension"
+# A >24 h fixture: 30 frames re-timestamped so PTS = real PTS * 90000 (the
+# last frame lands at 87000 s). Tiny file, sub-second to generate; the
+# worker's duration bound must reject it before the canary. The ffprobe
+# guard asserts the fixture really reports >24 h, so the case cannot silently
+# regress into a fail-open.
+ffmpeg -loglevel error -f lavfi -i "testsrc2=size=64x64:rate=30" -frames:v 30 \
+    -vf "setpts=PTS*90000" -fps_mode vfr -c:v libx264 -pix_fmt yuv420p \
+    "$long_duration" -y
+long_duration_seconds="$(ffprobe -v error -show_entries format=duration \
+    -of default=nw=1:nk=1 "$long_duration")"
+[[ "$(printf '%.0f' "$long_duration_seconds")" -gt 86400 ]]
 echo "video smoke: fixture generated"
 
 cd "$project_root"
@@ -263,6 +276,24 @@ fi
 [[ "$rejected" == *"video preflight rejected"* ]]
 [[ "$rejected" == *"unsupported video extension"* ]]
 echo "video smoke passed: .bin extension rejected by preflight with reason"
+
+# Case 10: media with a known duration over 24 h passes the static preflight
+# but the worker rejects the backend duration bound (exit 73) before the
+# canary; the active base worker stays live and the failure detail names
+# exit_code_73 and the duration diagnostic.
+base10_params='{"wallpaper_id":"case10-base","content_hash":"hash-case10-base","width":160,"height":90,"fps":30,"kind":"video","content":"'"$fixture"'"}'
+call_daemon renderer.start "$base10_params" >/dev/null
+base10_status="$(wait_phase live)"
+base10_pid="$(jq -r '.result.pid' <<<"$base10_status")"
+long_params='{"wallpaper_id":"case10-long","content_hash":"hash-case10-long","width":160,"height":90,"fps":30,"kind":"video","content":"'"$long_duration"'"}'
+call_daemon renderer.start "$long_params" >/dev/null
+long_rollback_status="$(wait_phase rolled_back)"
+[[ "$(jq -r '.result.pid' <<<"$long_rollback_status")" == "$base10_pid" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$long_rollback_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$long_rollback_status")" == *"exit_code_73"* ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$long_rollback_status")" == *"exceeds the 24 h bound"* ]]
+kill -0 "$base10_pid"
+echo "video smoke passed: >24 h duration content -> worker exit 73 -> rolled_back with duration diagnostic"
 
 # Final stop: the daemon stops the active worker and stays healthy. A
 # graceful stop records no failure (last_failure surfaces the *requested*
