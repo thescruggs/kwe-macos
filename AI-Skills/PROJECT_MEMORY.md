@@ -4,8 +4,8 @@
 
 ## Current repo state
 
-- **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS. **BETA_M1 work happens in worktrees**; never touch the source tree directly.
-- **Active worktree:** `/home/qcv123/gitProjects/kwe-m1e` — branch `beta-m1e-m1-evidence`, BETA_M1e close-out (commit `feat(m1e): video parity evidence, per-kind NPROC, and mpv crate removal` pending at session end). Upstream history: `cd2d61e`+`62bdbdc` (M1a), `7a2b402`+`3e83d2e` (M1b), `51cb469`+`219ebbd` (M1c), `b208465`+`2b2ebd8` (M1d) all ff-merged into `main`. M1e builds on `main` at M1d.
+- **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS. **Beta work happens in per-slice worktrees** (`/home/qcv123/gitProjects/kwe-*`, deleted after merge); the trunk branch is `fix/qt611-gallery-delegates` (no upstream).
+- **History (all ff-merged into the trunk):** `1833331` Qt 6.11 fix → `db8563d` AI-Skills → M1a `cd2d61e`+`62bdbdc` → M1b `7a2b402`+`3e83d2e` → M1c `51cb469`+`219ebbd` → M1d `b208465`+`2b2ebd8` → M1e `36c7856`+`ba0a288`. HEAD = `ba0a288`; working tree clean; no active worktree right now.
 - **Installed:** `kde-wallpaper-engine-0.1.0.alpha.1-1` built from local HEAD and installed on this CachyOS machine (2026-08-18). Alpha gallery works; Apply disabled; video/web/scene shown as "planned".
 - **Graphify:** `graphify-out/` knowledge graph rebuilt 2026-08-18 (1,497 nodes / 3,224 edges / 70 communities). Query with `graphify query "<question>"`. Known integrity notes: 180 dangling-endpoint edges, `metadata.json` produces zero AST nodes.
 
