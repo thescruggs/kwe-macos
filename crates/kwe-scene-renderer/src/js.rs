@@ -30,9 +30,16 @@
 //   Scene.getLayer(name | index) -> Layer proxy or null (layers registered
 //       before init(); properties live on the Rust side, clamped on write)
 //   Scene.getLayerCount() -> number of registered image layers
-// with Layer.name/alpha/visible/angles/origin/scale/size. Changing a
-// layer's image at runtime is planned, not in M3c. See the coverage matrix
-// in docs/SCENE_FORMAT_V1.md for what is implemented vs planned.
+// with Layer.name/alpha/visible/angles/origin/scale/size. The M3d slice
+// adds the per-layer blend mode and color effects:
+//   Layer.blendMode   number  the WE colorBlendMode, clamped to the
+//                             implemented set (0/1/6/7/9); a write of an
+//                             unimplemented value clamps to 0 with a
+//                             bounded one-time diagnostic
+//   Layer.brightness  number  RGB multiplier, 0..=10, default 1
+//   Layer.tint        {r,g,b,a} RGBA multiplier, 0..=1, default 1s
+// Changing a layer's image at runtime is planned, not in M3c. See the
+// coverage matrix in docs/SCENE_FORMAT_V1.md for implemented vs planned.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -43,7 +50,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rquickjs::{Context, Ctx, Error as JsError, Exception, Function, Object, Runtime};
 
-use crate::layers::{LayerState, clamp_layer_alpha, clamp_layer_scalar, clamp_layer_size};
+use crate::layers::{
+    BlendMode, LayerState, clamp_layer_alpha, clamp_layer_brightness, clamp_layer_scalar,
+    clamp_layer_size, clamp_layer_tint,
+};
 use crate::scene::SceneConfig;
 
 /// Heap cap for the per-worker QuickJS runtime.
@@ -334,6 +344,9 @@ pub struct ScriptEngine {
     /// sizes; the worker reads them per frame for the draw list, and the
     /// script mutates them through the Scene.getLayer proxies.
     layers: Vec<Rc<RefCell<LayerState>>>,
+    /// Bounded one-time diagnostic for script writes of an unimplemented
+    /// blendMode (the flag lives here so the bridge closure can share it).
+    blend_mode_diag: Rc<Cell<bool>>,
     script_ok: bool,
     last_update: Option<Instant>,
     frames: u64,
@@ -422,6 +435,7 @@ impl ScriptEngine {
             fps,
             clear_color: config.clear_color,
             layers,
+            blend_mode_diag: Rc::new(Cell::new(false)),
             script_ok: false,
             last_update: None,
             frames: 0,
@@ -568,6 +582,8 @@ impl ScriptEngine {
                 match prop.as_str() {
                     "alpha" => f64::from(layer.alpha),
                     "visible" => f64::from(u8::from(layer.visible)),
+                    "blendMode" => f64::from(layer.blend_mode.as_u32()),
+                    "brightness" => f64::from(layer.brightness),
                     _ => 0.0,
                 }
             })
@@ -579,6 +595,7 @@ impl ScriptEngine {
                 })?;
 
             let set_scalar_layers = self.layers.clone();
+            let set_blend_mode_diag = Rc::clone(&self.blend_mode_diag);
             let set_scalar =
                 Function::new(ctx.clone(), move |index: i32, prop: String, value: f64| {
                     let Some(layer) = set_scalar_layers.get(index as usize) else {
@@ -588,6 +605,31 @@ impl ScriptEngine {
                     match prop.as_str() {
                         "alpha" => layer.alpha = clamp_layer_alpha(value),
                         "visible" => layer.visible = value != 0.0,
+                        // M3d: the blend mode clamps to the implemented set
+                        // (0/1/6/7/9); an unimplemented write clamps to 0
+                        // with a bounded one-time diagnostic (both the
+                        // known corpus values 11/12/24/30 and unknown
+                        // values are contained — the script can never push
+                        // a mode the renderer has no pipeline for).
+                        "blendMode" => {
+                            let raw = if value.is_finite()
+                                && value >= 0.0
+                                && value <= f64::from(u32::MAX)
+                            {
+                                value as u32
+                            } else {
+                                0
+                            };
+                            let mode = BlendMode::clamp(raw);
+                            if mode.as_u32() != raw && !set_blend_mode_diag.replace(true) {
+                                eprintln!(
+                                    "event=renderer.scene.blend_mode_clamped layer={} mode={} note=not-fixed-function-clamped-to-normal",
+                                    layer.name, raw
+                                );
+                            }
+                            layer.blend_mode = mode;
+                        }
+                        "brightness" => layer.brightness = clamp_layer_brightness(value),
                         _ => {}
                     }
                 })
@@ -616,6 +658,10 @@ impl ScriptEngine {
                         ("scale", "y") => f64::from(layer.scale[1]),
                         ("size", "x") => f64::from(layer.size[0]),
                         ("size", "y") => f64::from(layer.size[1]),
+                        ("tint", "r") => f64::from(layer.tint[0]),
+                        ("tint", "g") => f64::from(layer.tint[1]),
+                        ("tint", "b") => f64::from(layer.tint[2]),
+                        ("tint", "a") => f64::from(layer.tint[3]),
                         _ => 0.0,
                     }
                 },
@@ -644,6 +690,12 @@ impl ScriptEngine {
                         // Sizes are never negative; scale carries the mirror.
                         ("size", "x") => layer.size[0] = clamp_layer_size(value),
                         ("size", "y") => layer.size[1] = clamp_layer_size(value),
+                        // M3d: the tint clamps per component (0..=1,
+                        // non-finite → 1.0 — the identity multiplier).
+                        ("tint", "r") => layer.tint[0] = clamp_layer_tint(value),
+                        ("tint", "g") => layer.tint[1] = clamp_layer_tint(value),
+                        ("tint", "b") => layer.tint[2] = clamp_layer_tint(value),
+                        ("tint", "a") => layer.tint[3] = clamp_layer_tint(value),
                         _ => {}
                     }
                 },
@@ -1021,6 +1073,16 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
       set: function (value) { kweSceneSetScalar(index, "visible", value ? 1 : 0); },
       enumerable: true
     });
+    Object.defineProperty(layer, "blendMode", {
+      get: function () { return kweSceneGetScalar(index, "blendMode"); },
+      set: function (value) { kweSceneSetScalar(index, "blendMode", value); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "brightness", {
+      get: function () { return kweSceneGetScalar(index, "brightness"); },
+      set: function (value) { kweSceneSetScalar(index, "brightness", value); },
+      enumerable: true
+    });
     Object.defineProperty(layer, "angles", {
       get: function () { return vectorProps(index, "angles", ["x", "y", "z"]); },
       enumerable: true
@@ -1035,6 +1097,10 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
     });
     Object.defineProperty(layer, "size", {
       get: function () { return vectorProps(index, "size", ["x", "y"]); },
+      enumerable: true
+    });
+    Object.defineProperty(layer, "tint", {
+      get: function () { return vectorProps(index, "tint", ["r", "g", "b", "a"]); },
       enumerable: true
     });
     cache[index] = layer;
@@ -1423,6 +1489,55 @@ mod tests {
         assert_eq!(state.angles, [0.0, 0.0, 0.0]);
         assert_eq!(state.scale, [-1e6, 1.0]);
         assert_eq!(state.size, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn blend_mode_and_effects_writes_clamp_on_the_rust_side() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var l = Scene.getLayer("fg");
+                l.blendMode = 6;                 // add — implemented, stays
+                l.blendMode = 11;                // known-unimplemented -> 0
+                l.blendMode = 12345;             // unknown -> 0
+                l.brightness = 50;               // -> 10
+                l.brightness = -1;               // -> 0
+                l.tint.r = 2;                    // -> 1
+                l.tint.g = NaN;                  // -> 1 (identity)
+                l.tint.b = 0.5;                  // -> 0.5
+                l.tint.a = 0.25;                 // -> 0.25
+                Engine.clearcolor = {
+                    r: (l.blendMode === 0 && l.brightness === 0) ? 0.5 : 0,
+                    g: (l.tint.r === 1 && l.tint.g === 1 && l.tint.b === 0.5 && l.tint.a === 0.25) ? 0.5 : 0,
+                    b: 0, a: 1
+                };
+            }"#,
+            r#"[{"name": "bg", "image": "bg.png"}, {"name": "fg", "image": "fg.png",
+                 "colorBlendMode": 7}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            matches!(engine.step(0.1), StepResult::NewFrame(color) if color == [0.5, 0.5, 0.0, 1.0])
+        );
+        // The parsed blend mode (7 = screen) survived into the runtime, and
+        // the script's writes landed clamped on the Rust side.
+        let layer = engine.layers()[1].clone();
+        let state = layer.borrow();
+        assert_eq!(
+            state.blend_mode,
+            BlendMode::Normal,
+            "11 then 12345 clamp to 0"
+        );
+        assert_eq!(state.brightness, 0.0);
+        assert_eq!(state.tint, [1.0, 1.0, 0.5, 0.25]);
+        // The first layer kept its parsed default (mode 0, brightness 1,
+        // identity tint).
+        let bg = engine.layers()[0].clone();
+        let state = bg.borrow();
+        assert_eq!(state.blend_mode, BlendMode::Normal);
+        assert_eq!(state.brightness, 1.0);
+        assert_eq!(state.tint, [1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

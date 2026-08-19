@@ -53,7 +53,7 @@ use std::fmt;
 use ash::vk;
 use ash::{Device, Entry, Instance};
 
-use crate::layers::{LayerDraw, MAX_LAYERS};
+use crate::layers::{BlendMode, LayerDraw, MAX_LAYERS};
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
 /// backend failure by the caller.
@@ -172,7 +172,10 @@ pub struct LayerRenderer {
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+    /// One pipeline per implemented blend mode (M3d), indexed by
+    /// BlendMode::variant_index — all sharing this layout, the render pass,
+    /// and the descriptor sets; only the blend attachment state differs.
+    pipelines: Vec<vk::Pipeline>,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
     /// Unit quad: 6 × (pos vec2, uv vec2) — see UNIT_QUAD.
@@ -462,14 +465,21 @@ impl LayerRenderer {
             .pool_sizes(std::slice::from_ref(&pool_size));
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
 
-        // 48 bytes of per-draw push constants shared by both stages:
-        //   m0 = (a, c, tx, 0)          column 0 + translate x
-        //   m1 = (b, d, ty, alpha)      column 1 + translate y + alpha
-        //   viewport = (w, h, 0, 0)     scene size in pixels
+        // 64 bytes of per-draw push constants shared by both stages. The
+        // layout grew from 48 to 64 bytes for M3d; the first 48 bytes are
+        // unchanged (the vertex shader reads only m0/m1/viewport, so
+        // quad.vert is untouched) and a new `effects` vec4 lands at offset
+        // 48, read by the fragment shader:
+        //   m0 = (a, c, tx, 0)              column 0 + translate x
+        //   m1 = (b, d, ty, alpha·tint.a)   column 1 + translate y + the
+        //                                   layer alpha folded with the
+        //                                   tint alpha (M3d)
+        //   viewport = (w, h, 0, 0)         scene size in pixels
+        //   effects = (brightness, tint.r, tint.g, tint.b)  (M3d)
         let push_constant = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(48);
+            .size(64);
         let layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant));
@@ -529,56 +539,37 @@ impl LayerRenderer {
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-        // src-over blending: the M3c default (blend modes are M3d). The
-        // blend runs on the fragment's float alpha (the layer alpha from
-        // the push constants), which is what the smoke oracle computes
-        // against. The fragment shader outputs STRAIGHT color, and the
-        // color factors are ONE / ONE_MINUS_SRC_ALPHA — the attachment
-        // stores src + dst·(1 - src.a), still straight. The protocol
-        // wants premultiplied BGRA, and bgra_premultiplied is the ONE
-        // premultiplication, applied at the readback boundary. Using
-        // SRC_ALPHA here would store an already-premultiplied composite
-        // and the readback would premultiply AGAIN, darkening translucent
-        // pixels by alpha/255 (the (79,58,36,191) double-premultiplied
-        // oracle vs the correct (106,77,48,191)). The ALPHA channel uses
-        // ONE / ONE_MINUS_SRC_ALPHA — scaling the source alpha by itself
-        // (SRC_ALPHA) would double-scale it (a 191/255 layer over an
-        // opaque dst would land at 143/255 instead of staying opaque).
-        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .alpha_blend_op(vk::BlendOp::ADD)
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B
-                    | vk::ColorComponentFlags::A,
-            );
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(std::slice::from_ref(&blend_attachment));
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
-        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .color_blend_state(&color_blend)
-            .layout(pipeline_layout)
-            .render_pass(render_pass)
-            .subpass(0)
-            .depth_stencil_state(&depth_stencil);
-        let pipeline = match unsafe {
-            device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        } {
-            Ok(pipelines) => pipelines[0],
-            Err((_, result)) => return Err(result.into()),
-        };
+
+        // M3d: one pipeline per implemented blend mode, sharing the layout,
+        // the render pass, and every other state — only the blend
+        // attachment differs (see blend_attachment_for). The draw loop
+        // binds the variant of the layer's (clamped) blend_mode.
+        let mut pipelines = Vec::with_capacity(BlendMode::ALL.len());
+        for mode in BlendMode::ALL {
+            let blend_attachment = blend_attachment_for(mode);
+            let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .color_blend_state(&color_blend)
+                .layout(pipeline_layout)
+                .render_pass(render_pass)
+                .subpass(0)
+                .depth_stencil_state(&depth_stencil);
+            let pipeline = match unsafe {
+                device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            } {
+                Ok(pipelines) => pipelines[0],
+                Err((_, result)) => return Err(result.into()),
+            };
+            pipelines.push(pipeline);
+        }
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
@@ -610,7 +601,7 @@ impl LayerRenderer {
             render_pass,
             framebuffer,
             pipeline_layout,
-            pipeline,
+            pipelines,
             vertex_module,
             fragment_module,
             vertex_buffer,
@@ -937,14 +928,7 @@ impl LayerRenderer {
                 .begin_command_buffer(self.command_buffer, &begin_info)
         }?;
 
-        // The draw consults the bound pipeline; without this every frame
-        // faults the device (missing-pipeline-bind VUID).
         unsafe {
-            self.device.cmd_bind_pipeline(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline,
-            );
             self.device.cmd_bind_vertex_buffers(
                 self.command_buffer,
                 0,
@@ -987,10 +971,27 @@ impl LayerRenderer {
             else {
                 continue;
             };
-            // The push constant layout (shared by both stages, 48 bytes):
-            // m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha),
-            // viewport = (w, h, 0, 0) — see the vertex shader's PC block.
-            let push: [f32; 12] = [
+            // M3d: the draw's pipeline variant — the layer's blend mode
+            // (clamped to the implemented set at every boundary, so the
+            // variant index is always in range). Binding inside the pass
+            // per draw is what makes per-layer blend modes work.
+            let variant = draw.blend_mode.variant_index();
+            unsafe {
+                self.device.cmd_bind_pipeline(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipelines[variant],
+                );
+            }
+            // The push constant layout (shared by both stages, 64 bytes):
+            // m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha·tint.a),
+            // viewport = (w, h, 0, 0), effects = (brightness, tint.rgb) —
+            // see the vertex shader's PC block and the layout comment in
+            // `new`. The tint alpha is folded into m1.w so the fragment
+            // shader's single alpha scale covers the layer alpha and the
+            // tint alpha together (multiplication is commutative, so the
+            // math is exact).
+            let push: [f32; 16] = [
                 draw.m[0][0],
                 draw.m[1][0],
                 draw.t[0],
@@ -998,13 +999,17 @@ impl LayerRenderer {
                 draw.m[0][1],
                 draw.m[1][1],
                 draw.t[1],
-                draw.alpha,
+                draw.alpha * draw.tint[3],
                 self.width as f32,
                 self.height as f32,
                 0.0,
                 0.0,
+                draw.brightness,
+                draw.tint[0],
+                draw.tint[1],
+                draw.tint[2],
             ];
-            let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 48) };
+            let push_bytes = unsafe { std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 64) };
             unsafe {
                 self.device.cmd_push_constants(
                     self.command_buffer,
@@ -1110,13 +1115,109 @@ impl LayerRenderer {
     }
 }
 
+/// The blend attachment state for one implemented blend mode (M3d). The
+/// per-mode factors/ops implement the researched WE semantics
+/// (docs/SCENE_FORMAT_V1.md, M3d section): WE applies its modes as
+/// Photoshop-style color operations (ApplyBlending) with the layer's own
+/// alpha passing through, and each mode below is the fixed-function
+/// realization of its formula:
+///
+/// * Normal (src-over): src + dst·(1 − src.a) — the M3c default. The blend
+///   runs on the fragment's float alpha (the layer alpha from the push
+///   constants), which is what the smoke oracle computes against. The
+///   fragment shader outputs STRAIGHT color, and the color factors are
+///   ONE / ONE_MINUS_SRC_ALPHA — the attachment stores src + dst·(1 -
+///   src.a), still straight. The protocol wants premultiplied BGRA, and
+///   bgra_premultiplied is the ONE premultiplication, applied at the
+///   readback boundary. Using SRC_ALPHA here would store an
+///   already-premultiplied composite and the readback would premultiply
+///   AGAIN, darkening translucent pixels by alpha/255 (the (79,58,36,191)
+///   double-premultiplied oracle vs the correct (106,77,48,191)). The
+///   ALPHA channel uses ONE / ONE_MINUS_SRC_ALPHA — scaling the source
+///   alpha by itself (SRC_ALPHA) would double-scale it (a 191/255 layer
+///   over an opaque dst would land at 143/255 instead of staying opaque).
+/// * Multiply (texel × background): color DST_COLOR / ZERO, ADD. The
+///   alpha channel keeps the destination's (ZERO / ONE): the multiply
+///   result's coverage is the background's — over an opaque background
+///   the composite stays opaque.
+/// * Add (texel + background, saturating): ONE / ONE, ADD, both channels.
+/// * Screen (255−(255−texel)(255−background)/255, i.e.
+///   texel·(1−background) + background): color ONE_MINUS_DST_COLOR / ONE,
+///   ADD (the factors are NOT symmetric — (ONE, ONE_MINUS_DST_COLOR)
+///   would compute texel + background·(1−background), which a device
+///   oracle caught); the alpha channel mirrors the color formula.
+/// * Subtract (max(0, background − texel), Photoshop's base − blend —
+///   the spec's `max(0, c2−c1)` with c1 = texel, c2 = background):
+///   REVERSE_SUBTRACT with ONE / ONE — dst − src, clamped to 0 by the
+///   operation — and alpha ONE / ZERO, ADD (the layer's alpha passes
+///   through untouched; subtract is a color operation).
+fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentState {
+    let write_mask = vk::ColorComponentFlags::R
+        | vk::ColorComponentFlags::G
+        | vk::ColorComponentFlags::B
+        | vk::ColorComponentFlags::A;
+    let (src_color, dst_color, color_op, src_alpha, dst_alpha, alpha_op) = match mode {
+        BlendMode::Normal => (
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            vk::BlendOp::ADD,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            vk::BlendOp::ADD,
+        ),
+        BlendMode::Multiply => (
+            vk::BlendFactor::DST_COLOR,
+            vk::BlendFactor::ZERO,
+            vk::BlendOp::ADD,
+            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+        ),
+        BlendMode::Add => (
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+        ),
+        BlendMode::Screen => (
+            vk::BlendFactor::ONE_MINUS_DST_COLOR,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+            vk::BlendFactor::ONE_MINUS_DST_COLOR,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::ADD,
+        ),
+        BlendMode::Subtract => (
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE,
+            vk::BlendOp::REVERSE_SUBTRACT,
+            vk::BlendFactor::ONE,
+            vk::BlendFactor::ZERO,
+            vk::BlendOp::ADD,
+        ),
+    };
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(src_color)
+        .dst_color_blend_factor(dst_color)
+        .color_blend_op(color_op)
+        .src_alpha_blend_factor(src_alpha)
+        .dst_alpha_blend_factor(dst_alpha)
+        .alpha_blend_op(alpha_op)
+        .color_write_mask(write_mask)
+}
+
 impl Drop for LayerRenderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            self.device.destroy_pipeline(self.pipeline, None);
+            for pipeline in &self.pipelines {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
             // The descriptor pool frees the sets; the layout outlives the
             // pool so the sets never reference a destroyed layout.
             self.device
@@ -1357,48 +1458,71 @@ const QUAD_SPIRV: &[u32] = &[
     0x00010038,
 ];
 
-/// The M3c layer-texture fragment shader: sample the combined image sampler,
-/// scale the alpha by the layer alpha from the push constants; compiled with
+/// The M3c+M3d layer-texture fragment shader: sample the combined image
+/// sampler, apply the M3d color effects (brightness × tint rgb on the
+/// sampled RGB, alpha scaled by the effective layer alpha from m1.w), and
+/// output straight color; compiled with
 /// glslangValidator -V --target-env vulkan1.2 from shaders/texture.frag.
 #[rustfmt::skip]
 const TEXTURE_SPIRV: &[u32] = &[
-    0x07230203, 0x00010500, 0x0008000b, 0x0000002b, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x07230203, 0x00010500, 0x0008000b, 0x00000047, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0009000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000011, 0x00000015,
-    0x00000020, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
+    0x0009000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000011, 0x00000016,
+    0x00000039, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2, 0x00040005,
     0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005, 0x0000000d,
-    0x00786574, 0x00030005, 0x00000011, 0x00565576, 0x00050005, 0x00000015, 0x4374756f, 0x726f6c6f,
-    0x00000000, 0x00030005, 0x0000001e, 0x00004350, 0x00040006, 0x0000001e, 0x00000000, 0x0000306d,
-    0x00040006, 0x0000001e, 0x00000001, 0x0000316d, 0x00060006, 0x0000001e, 0x00000002, 0x77656976,
-    0x74726f70, 0x00000000, 0x00030005, 0x00000020, 0x00006370, 0x00040047, 0x0000000d, 0x00000021,
-    0x00000000, 0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e,
-    0x00000000, 0x00040047, 0x00000015, 0x0000001e, 0x00000000, 0x00030047, 0x0000001e, 0x00000002,
-    0x00050048, 0x0000001e, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000001e, 0x00000001,
-    0x00000023, 0x00000010, 0x00050048, 0x0000001e, 0x00000002, 0x00000023, 0x00000020, 0x00020013,
-    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006, 0x00000020, 0x00040017,
-    0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007, 0x00000007, 0x00090019,
-    0x0000000a, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
-    0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000, 0x0000000b, 0x0004003b,
-    0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f, 0x00000006, 0x00000002, 0x00040020,
-    0x00000010, 0x00000001, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011, 0x00000001, 0x00040020,
-    0x00000014, 0x00000003, 0x00000007, 0x0004003b, 0x00000014, 0x00000015, 0x00000003, 0x00040017,
-    0x00000016, 0x00000006, 0x00000003, 0x00040015, 0x00000019, 0x00000020, 0x00000000, 0x0004002b,
-    0x00000019, 0x0000001a, 0x00000003, 0x00040020, 0x0000001b, 0x00000007, 0x00000006, 0x0005001e,
-    0x0000001e, 0x00000007, 0x00000007, 0x00000007, 0x00040020, 0x0000001f, 0x00000009, 0x0000001e,
-    0x0004003b, 0x0000001f, 0x00000020, 0x00000009, 0x00040015, 0x00000021, 0x00000020, 0x00000001,
-    0x0004002b, 0x00000021, 0x00000022, 0x00000001, 0x00040020, 0x00000023, 0x00000009, 0x00000006,
-    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
-    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d,
-    0x0000000f, 0x00000012, 0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012,
-    0x0003003e, 0x00000009, 0x00000013, 0x0004003d, 0x00000007, 0x00000017, 0x00000009, 0x0008004f,
-    0x00000016, 0x00000018, 0x00000017, 0x00000017, 0x00000000, 0x00000001, 0x00000002, 0x00050041,
-    0x0000001b, 0x0000001c, 0x00000009, 0x0000001a, 0x0004003d, 0x00000006, 0x0000001d, 0x0000001c,
-    0x00060041, 0x00000023, 0x00000024, 0x00000020, 0x00000022, 0x0000001a, 0x0004003d, 0x00000006,
-    0x00000025, 0x00000024, 0x00050085, 0x00000006, 0x00000026, 0x0000001d, 0x00000025, 0x00050051,
-    0x00000006, 0x00000027, 0x00000018, 0x00000000, 0x00050051, 0x00000006, 0x00000028, 0x00000018,
-    0x00000001, 0x00050051, 0x00000006, 0x00000029, 0x00000018, 0x00000002, 0x00070050, 0x00000007,
-    0x0000002a, 0x00000027, 0x00000028, 0x00000029, 0x00000026, 0x0003003e, 0x00000015, 0x0000002a,
-    0x000100fd, 0x00010038,
+    0x00786574, 0x00030005, 0x00000011, 0x00565576, 0x00030005, 0x00000014, 0x00004350, 0x00040006,
+    0x00000014, 0x00000000, 0x0000306d, 0x00040006, 0x00000014, 0x00000001, 0x0000316d, 0x00060006,
+    0x00000014, 0x00000002, 0x77656976, 0x74726f70, 0x00000000, 0x00050006, 0x00000014, 0x00000003,
+    0x65666665, 0x00737463, 0x00030005, 0x00000016, 0x00006370, 0x00050005, 0x00000039, 0x4374756f,
+    0x726f6c6f, 0x00000000, 0x00040047, 0x0000000d, 0x00000021, 0x00000000, 0x00040047, 0x0000000d,
+    0x00000022, 0x00000000, 0x00040047, 0x00000011, 0x0000001e, 0x00000000, 0x00030047, 0x00000014,
+    0x00000002, 0x00050048, 0x00000014, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000014,
+    0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x00000014, 0x00000002, 0x00000023, 0x00000020,
+    0x00050048, 0x00000014, 0x00000003, 0x00000023, 0x00000030, 0x00040047, 0x00000039, 0x0000001e,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016, 0x00000006,
+    0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008, 0x00000007,
+    0x00000007, 0x00090019, 0x0000000a, 0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000,
+    0x00000001, 0x00000000, 0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c, 0x00000000,
+    0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f, 0x00000006,
+    0x00000002, 0x00040020, 0x00000010, 0x00000001, 0x0000000f, 0x0004003b, 0x00000010, 0x00000011,
+    0x00000001, 0x0006001e, 0x00000014, 0x00000007, 0x00000007, 0x00000007, 0x00000007, 0x00040020,
+    0x00000015, 0x00000009, 0x00000014, 0x0004003b, 0x00000015, 0x00000016, 0x00000009, 0x00040015,
+    0x00000017, 0x00000020, 0x00000001, 0x0004002b, 0x00000017, 0x00000018, 0x00000003, 0x00040015,
+    0x00000019, 0x00000020, 0x00000000, 0x0004002b, 0x00000019, 0x0000001a, 0x00000000, 0x00040020,
+    0x0000001b, 0x00000009, 0x00000006, 0x00040017, 0x0000001e, 0x00000006, 0x00000003, 0x00040020,
+    0x00000022, 0x00000007, 0x00000006, 0x0004002b, 0x00000019, 0x00000025, 0x00000001, 0x0004002b,
+    0x00000019, 0x00000028, 0x00000002, 0x00040020, 0x0000002b, 0x00000009, 0x00000007, 0x00040020,
+    0x00000038, 0x00000003, 0x00000007, 0x0004003b, 0x00000038, 0x00000039, 0x00000003, 0x0004002b,
+    0x00000019, 0x0000003c, 0x00000003, 0x0004002b, 0x00000017, 0x0000003f, 0x00000001, 0x00050036,
+    0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008,
+    0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d, 0x0000000f,
+    0x00000012, 0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012, 0x0003003e,
+    0x00000009, 0x00000013, 0x00060041, 0x0000001b, 0x0000001c, 0x00000016, 0x00000018, 0x0000001a,
+    0x0004003d, 0x00000006, 0x0000001d, 0x0000001c, 0x0004003d, 0x00000007, 0x0000001f, 0x00000009,
+    0x0008004f, 0x0000001e, 0x00000020, 0x0000001f, 0x0000001f, 0x00000000, 0x00000001, 0x00000002,
+    0x0005008e, 0x0000001e, 0x00000021, 0x00000020, 0x0000001d, 0x00050041, 0x00000022, 0x00000023,
+    0x00000009, 0x0000001a, 0x00050051, 0x00000006, 0x00000024, 0x00000021, 0x00000000, 0x0003003e,
+    0x00000023, 0x00000024, 0x00050041, 0x00000022, 0x00000026, 0x00000009, 0x00000025, 0x00050051,
+    0x00000006, 0x00000027, 0x00000021, 0x00000001, 0x0003003e, 0x00000026, 0x00000027, 0x00050041,
+    0x00000022, 0x00000029, 0x00000009, 0x00000028, 0x00050051, 0x00000006, 0x0000002a, 0x00000021,
+    0x00000002, 0x0003003e, 0x00000029, 0x0000002a, 0x00050041, 0x0000002b, 0x0000002c, 0x00000016,
+    0x00000018, 0x0004003d, 0x00000007, 0x0000002d, 0x0000002c, 0x0008004f, 0x0000001e, 0x0000002e,
+    0x0000002d, 0x0000002d, 0x00000001, 0x00000002, 0x00000003, 0x0004003d, 0x00000007, 0x0000002f,
+    0x00000009, 0x0008004f, 0x0000001e, 0x00000030, 0x0000002f, 0x0000002f, 0x00000000, 0x00000001,
+    0x00000002, 0x00050085, 0x0000001e, 0x00000031, 0x00000030, 0x0000002e, 0x00050041, 0x00000022,
+    0x00000032, 0x00000009, 0x0000001a, 0x00050051, 0x00000006, 0x00000033, 0x00000031, 0x00000000,
+    0x0003003e, 0x00000032, 0x00000033, 0x00050041, 0x00000022, 0x00000034, 0x00000009, 0x00000025,
+    0x00050051, 0x00000006, 0x00000035, 0x00000031, 0x00000001, 0x0003003e, 0x00000034, 0x00000035,
+    0x00050041, 0x00000022, 0x00000036, 0x00000009, 0x00000028, 0x00050051, 0x00000006, 0x00000037,
+    0x00000031, 0x00000002, 0x0003003e, 0x00000036, 0x00000037, 0x0004003d, 0x00000007, 0x0000003a,
+    0x00000009, 0x0008004f, 0x0000001e, 0x0000003b, 0x0000003a, 0x0000003a, 0x00000000, 0x00000001,
+    0x00000002, 0x00050041, 0x00000022, 0x0000003d, 0x00000009, 0x0000003c, 0x0004003d, 0x00000006,
+    0x0000003e, 0x0000003d, 0x00060041, 0x0000001b, 0x00000040, 0x00000016, 0x0000003f, 0x0000003c,
+    0x0004003d, 0x00000006, 0x00000041, 0x00000040, 0x00050085, 0x00000006, 0x00000042, 0x0000003e,
+    0x00000041, 0x00050051, 0x00000006, 0x00000043, 0x0000003b, 0x00000000, 0x00050051, 0x00000006,
+    0x00000044, 0x0000003b, 0x00000001, 0x00050051, 0x00000006, 0x00000045, 0x0000003b, 0x00000002,
+    0x00070050, 0x00000007, 0x00000046, 0x00000043, 0x00000044, 0x00000045, 0x00000042, 0x0003003e,
+    0x00000039, 0x00000046, 0x000100fd, 0x00010038,
 ];
 
 /// The unit quad as two fan-ordered triangles: 6 vertices of
@@ -1491,6 +1615,9 @@ mod tests {
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
         }];
         let pixels = renderer
             .render([0.1, 0.2, 0.3, 1.0], &draws)
@@ -1544,6 +1671,9 @@ mod tests {
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
         }];
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 1.0], &draws)
@@ -1590,6 +1720,9 @@ mod tests {
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 191.0 / 255.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
         }];
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 0.0], &draws)
@@ -1601,6 +1734,204 @@ mod tests {
         // double-premultiplied value (blend factor SRC_ALPHA + readback).
         for pixel in pixels.chunks_exact(4) {
             assert_eq!(pixel, &[106, 77, 48, 191], "premultiplied BGRA");
+        }
+    }
+
+    /// The M3d blend-state table, pure: each implemented mode maps to the
+    /// fixed-function factors/ops the researched WE semantics require
+    /// (docs/SCENE_FORMAT_V1.md, M3d section).
+    #[test]
+    fn blend_attachment_table_matches_the_researched_we_semantics() {
+        let normal = blend_attachment_for(BlendMode::Normal);
+        assert_eq!(normal.src_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(
+            normal.dst_color_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
+        assert_eq!(normal.color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(
+            normal.dst_alpha_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
+
+        // Multiply: texel × background (color), background alpha kept.
+        let multiply = blend_attachment_for(BlendMode::Multiply);
+        assert_eq!(multiply.src_color_blend_factor, vk::BlendFactor::DST_COLOR);
+        assert_eq!(multiply.dst_color_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(multiply.color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(multiply.src_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(multiply.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+
+        // Add: texel + background, both channels.
+        let add = blend_attachment_for(BlendMode::Add);
+        assert_eq!(add.src_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(add.dst_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(add.color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(add.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(add.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+
+        // Screen: 255-(255-texel)(255-background)/255 =
+        // texel·(1−background) + background — the src factor is
+        // ONE_MINUS_DST_COLOR, the dst factor ONE (the device oracle
+        // pinned the direction).
+        let screen = blend_attachment_for(BlendMode::Screen);
+        assert_eq!(
+            screen.src_color_blend_factor,
+            vk::BlendFactor::ONE_MINUS_DST_COLOR
+        );
+        assert_eq!(screen.dst_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(screen.color_blend_op, vk::BlendOp::ADD);
+
+        // Subtract: max(0, background − texel) — REVERSE_SUBTRACT computes
+        // dst − src with the texel as src; the alpha passes through.
+        let subtract = blend_attachment_for(BlendMode::Subtract);
+        assert_eq!(subtract.src_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(subtract.dst_color_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(subtract.color_blend_op, vk::BlendOp::REVERSE_SUBTRACT);
+        assert_eq!(subtract.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(subtract.dst_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(subtract.alpha_blend_op, vk::BlendOp::ADD);
+
+        for mode in BlendMode::ALL {
+            let state = blend_attachment_for(mode);
+            assert_eq!(state.blend_enable, vk::TRUE);
+            assert_eq!(
+                state.color_write_mask,
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A
+            );
+        }
+    }
+
+    /// The M3d fragment-shader math in pure Rust — the oracle the
+    /// byte-exact smoke cases and the unit tests compute against. The
+    /// effects (brightness × tint) apply to the sampled texel BEFORE
+    /// blending: RGB scale by brightness and the tint rgb, alpha by the
+    /// pushed effective alpha (layer alpha × tint alpha, folded
+    /// host-side).
+    fn apply_color_effects(
+        texel: [f32; 4],
+        brightness: f32,
+        tint: [f32; 4],
+        layer_alpha: f32,
+    ) -> [f32; 4] {
+        [
+            texel[0] * brightness * tint[0],
+            texel[1] * brightness * tint[1],
+            texel[2] * brightness * tint[2],
+            texel[3] * layer_alpha * tint[3],
+        ]
+    }
+
+    #[test]
+    fn color_effects_math_matches_the_shader() {
+        // The identity effects leave the texel and the layer alpha alone.
+        let texel = [64.0 / 255.0, 103.0 / 255.0, 142.0 / 255.0, 1.0];
+        assert_eq!(
+            apply_color_effects(texel, 1.0, [1.0, 1.0, 1.0, 1.0], 1.0),
+            texel
+        );
+        // Brightness scales RGB only; the alpha stays the sampled alpha.
+        let bright = apply_color_effects(texel, 2.0, [1.0, 1.0, 1.0, 1.0], 1.0);
+        assert_eq!(bright[0], texel[0] * 2.0);
+        assert_eq!(bright[3], texel[3]);
+        // Tint scales RGB and alpha; the tint alpha folds with the layer
+        // alpha (multiplication is commutative — the host-side fold is
+        // exact).
+        let tinted = apply_color_effects(texel, 1.0, [0.5, 1.0, 0.25, 0.5], 0.5);
+        assert_eq!(tinted, [texel[0] * 0.5, texel[1], texel[2] * 0.25, 0.25]);
+        // Everything at once, matching the push-constant construction.
+        let all = apply_color_effects(texel, 2.0, [0.5, 0.75, 1.0, 0.5], 0.5);
+        assert_eq!(
+            all,
+            [texel[0], texel[1] * 1.5, texel[2] * 2.0, texel[3] * 0.25]
+        );
+    }
+
+    /// Every implemented blend mode through the real pipeline, byte-exact
+    /// over an opaque clear: an opaque (64,103,142) texel fullscreen over
+    /// an opaque (102,64,26) background. The hand-computed per-mode
+    /// composites (premultiplied readback is the identity at alpha 255):
+    ///   normal:   the texel            -> (64, 103, 142)
+    ///   multiply: texel·bg/255         -> (26, 26, 14)
+    ///   add:      min(255, texel+bg)   -> (166, 167, 168)
+    ///   screen:   255-(255-t)(255-b)/255 -> (140, 141, 154)
+    ///   subtract: max(0, bg−texel)     -> (38, 0, 0)
+    /// (R, G, B) — BGRA readback reverses each quadruple.
+    #[test]
+    fn blend_modes_composite_byte_exact() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("blend_modes_composite_byte_exact: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        renderer
+            .upload_layer(0, &[64, 103, 142, 255], 1, 1)
+            .expect("upload layer");
+        let cases: [(BlendMode, [u8; 4]); 5] = [
+            (BlendMode::Normal, [142, 103, 64, 255]),
+            (BlendMode::Multiply, [14, 26, 26, 255]),
+            (BlendMode::Add, [168, 167, 166, 255]),
+            (BlendMode::Screen, [154, 141, 140, 255]),
+            (BlendMode::Subtract, [0, 0, 38, 255]),
+        ];
+        for (mode, expected) in cases {
+            let draws = [LayerDraw {
+                layer_index: 0,
+                m: [[64.0, 0.0], [0.0, 48.0]],
+                t: [0.0, 0.0],
+                alpha: 1.0,
+                blend_mode: mode,
+                brightness: 1.0,
+                tint: [1.0, 1.0, 1.0, 1.0],
+            }];
+            let pixels = renderer
+                .render([0.4, 0.25, 0.1, 1.0], &draws)
+                .expect("render once");
+            for pixel in pixels.chunks_exact(4) {
+                assert_eq!(pixel, &expected, "mode {mode:?}: BGRA");
+            }
+        }
+    }
+
+    /// The brightness and tint effects through the real pipeline, byte
+    /// exact: the effects apply to the sampled texel before blending, so
+    /// over an opaque background with an opaque texel the composite is the
+    /// effect-scaled texel. brightness 2.0 and tint (1, 0.25, 0.5) on a
+    /// (64,103,142) texel: R = 128, G = 103·0.5 = 51.5 → 52 by the UNORM
+    /// round-to-nearest (the driver's tie behavior is pinned as 51 or 52),
+    /// B = 142 (exact).
+    #[test]
+    fn color_effects_composite_byte_exact() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("color_effects_composite_byte_exact: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        renderer
+            .upload_layer(0, &[64, 103, 142, 255], 1, 1)
+            .expect("upload layer");
+        let draws = [LayerDraw {
+            layer_index: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 2.0,
+            tint: [1.0, 0.25, 0.5, 1.0],
+        }];
+        let pixels = renderer
+            .render([0.4, 0.25, 0.1, 1.0], &draws)
+            .expect("render once");
+        let g = pixels[1];
+        assert!(g == 51 || g == 52, "G={g} (51.5 → round-to-nearest)");
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel[0], 142, "B = 142·2·0.5");
+            assert_eq!(pixel[1], g, "G = 103·2·0.25 = 51.5");
+            assert_eq!(pixel[2], 128, "R = 64·2·1");
+            assert_eq!(pixel[3], 255, "A stays opaque");
         }
     }
 }

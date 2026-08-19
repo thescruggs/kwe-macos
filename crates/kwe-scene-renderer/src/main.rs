@@ -793,21 +793,28 @@ fn resolve_layer_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> 
 /// skipped with a bounded one-time diagnostic and stays registered but
 /// textureless; a layer with `size` [0, 0] takes the texture's decoded
 /// dimensions (WE semantics: absent size = the image's own size), so the
-/// script's init() always sees the real size. Non-normal blend modes are
-/// noted once per layer (src-over until M3d).
+/// script's init() always sees the real size. A `colorBlendMode` outside
+/// the implemented fixed-function set (the researched corpus values
+/// 11/12/24/30 — see docs/SCENE_FORMAT_V1.md) is clamped to normal at the
+/// layer boundary and noted ONCE per scene; unknown values are tolerated
+/// silently (the M3c behavior, still src-over).
 fn load_layer_textures(
     layers: &mut [scene::LayerSpec],
     mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
 ) {
     let mut used_bytes: u64 = 0;
+    let mut blend_diag_emitted = false;
     for layer in layers {
         let Some(reference) = layer.image.as_deref() else {
             continue; // no image reference (model/particle objects or a
             // non-string image field): nothing to load
         };
-        if layer.blend_mode != 0 {
+        if !blend_diag_emitted
+            && crate::layers::BLEND_MODE_UNIMPLEMENTED.contains(&layer.blend_mode)
+        {
+            blend_diag_emitted = true;
             eprintln!(
-                "event=renderer.scene.blend_mode layer={} mode={} note=src-over-until-M3d",
+                "event=renderer.scene.blend_mode_clamped layer={} mode={} note=not-fixed-function-clamped-to-normal",
                 layer.name, layer.blend_mode
             );
         }
@@ -1099,6 +1106,8 @@ mod tests {
             alpha: 1.0,
             visible: true,
             blend_mode: 0,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
             texture: None,
         }
     }

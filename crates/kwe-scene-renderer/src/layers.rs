@@ -29,6 +29,97 @@ pub const MAX_LAYERS: usize = 256;
 /// enforced at parse): non-finite values clamp to 0, magnitudes to ±1e6.
 pub const MAX_LAYER_VALUE: f64 = 1e6;
 
+/// The WE `colorBlendMode` values this engine renders, per the researched
+/// mapping (docs/SCENE_FORMAT_V1.md, M3d section). Wallpaper Engine does not
+/// publish an integer table: the value selects a shader combo ("imageblending"
+/// type with `ui_editor_properties_blend_mode`) whose behavior WE implements
+/// in its proprietary ApplyBlending; the editor dropdown exposes exactly the
+/// five modes here (verified on the WE editor localization dump), and the
+/// 2017 Steam patch note describes them as "the standard Photoshop blend
+/// modes". 0 = Normal is verified from the editor default and the corpus
+/// histogram (410 of 432 carriers use 0); the pairs 1=Multiply, 6=Add,
+/// 7=Screen, 9=Subtract are decoded from that five-mode set against the
+/// corpus histogram values (11/30/6/24/1/7/9/12) — the exact integers are
+/// recorded as decoded, not independently verifiable from public sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    /// src-over (the M3c default; WE 0).
+    Normal,
+    /// Multiply: texel × background (WE 1).
+    Multiply,
+    /// Add: texel + background, saturating (WE 6).
+    Add,
+    /// Screen: 255-(255-texel)(255-background)/255 (WE 7).
+    Screen,
+    /// Subtract: max(0, background − texel), Photoshop's base−blend (WE 9).
+    Subtract,
+}
+
+impl BlendMode {
+    /// The implemented set, in variant-index order (the renderer's pipeline
+    /// table is indexed by this order, so it must stay stable).
+    pub const ALL: [BlendMode; 5] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Add,
+        BlendMode::Screen,
+        BlendMode::Subtract,
+    ];
+
+    /// The WE `colorBlendMode` integer (0/1/6/7/9).
+    pub fn as_u32(self) -> u32 {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Add => 6,
+            BlendMode::Screen => 7,
+            BlendMode::Subtract => 9,
+        }
+    }
+
+    /// `Some` for the implemented WE values, `None` for everything else
+    /// (including the known-unimplemented corpus values 11/12/24/30).
+    pub fn from_u32(value: u32) -> Option<BlendMode> {
+        match value {
+            0 => Some(BlendMode::Normal),
+            1 => Some(BlendMode::Multiply),
+            6 => Some(BlendMode::Add),
+            7 => Some(BlendMode::Screen),
+            9 => Some(BlendMode::Subtract),
+            _ => None,
+        }
+    }
+
+    /// Clamp any WE value to the implemented set: unimplemented values
+    /// (known or unknown) fall back to src-over. The caller decides whether
+    /// the fallback is worth a bounded diagnostic.
+    pub fn clamp(value: u32) -> BlendMode {
+        BlendMode::from_u32(value).unwrap_or(BlendMode::Normal)
+    }
+
+    /// Index into [`BlendMode::ALL`] — the renderer's pipeline-variant
+    /// table. Implemented values only: clamp before calling.
+    pub fn variant_index(self) -> usize {
+        match self {
+            BlendMode::Normal => 0,
+            BlendMode::Multiply => 1,
+            BlendMode::Add => 2,
+            BlendMode::Screen => 3,
+            BlendMode::Subtract => 4,
+        }
+    }
+}
+
+/// Known-unimplemented corpus `colorBlendMode` values: non-fixed-function WE
+/// modes (undecoded — no public mapping exists) that clamp to Normal with a
+/// bounded one-time diagnostic. Corpus histogram: 6×11, 6×30, 2×24, 1×12.
+/// Unknown values outside this set are tolerated silently (the M3c parse
+/// behavior), still rendering src-over.
+pub const BLEND_MODE_UNIMPLEMENTED: [u32; 4] = [11, 12, 24, 30];
+
+/// Upper bound on `brightness` (WE default 1.0; the spec's 0..=10 range).
+pub const MAX_LAYER_BRIGHTNESS: f32 = 10.0;
+
 /// The per-layer runtime state the script sees and the compositor draws.
 /// Scripts mutate it through the Scene.getLayer proxies (js.rs); the worker
 /// borrows it per frame to build the draw list. Everything here is a plain
@@ -52,6 +143,14 @@ pub struct LayerState {
     /// parse default) is replaced by the decoded texture dimensions at
     /// load, so init() always sees the real size.
     pub size: [f32; 2],
+    /// WE `colorBlendMode` clamped to the implemented set at every boundary
+    /// (parse, script write) — the renderer's per-draw pipeline variant.
+    pub blend_mode: BlendMode,
+    /// Brightness multiplier on the sampled RGB (M3d): 0..=10, default 1.
+    pub brightness: f32,
+    /// Tint multiplier on the sampled RGBA (M3d): 0..=1 per component,
+    /// default [1, 1, 1, 1].
+    pub tint: [f32; 4],
 }
 
 impl LayerState {
@@ -64,6 +163,11 @@ impl LayerState {
             origin: spec.origin,
             scale: spec.scale,
             size: spec.size,
+            // The spec's raw value may be unimplemented (11/12/24/30 or an
+            // unknown); the worker noted it once per scene at load.
+            blend_mode: BlendMode::clamp(spec.blend_mode),
+            brightness: spec.brightness,
+            tint: spec.tint,
         }
     }
 }
@@ -97,6 +201,27 @@ pub fn clamp_layer_size(value: f64) -> f32 {
     }
 }
 
+/// Clamp a brightness the script wrote (M3d): non-finite → 1.0 (the
+/// identity — a NaN brightness must not silently blacken the layer),
+/// otherwise 0..=10.
+pub fn clamp_layer_brightness(value: f64) -> f32 {
+    if value.is_finite() {
+        (value as f32).clamp(0.0, MAX_LAYER_BRIGHTNESS)
+    } else {
+        1.0
+    }
+}
+
+/// Clamp one tint component the script wrote (M3d): non-finite → 1.0 (the
+/// identity), otherwise 0..=1.
+pub fn clamp_layer_tint(value: f64) -> f32 {
+    if value.is_finite() {
+        (value as f32).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
 /// One layer's draw command for one frame. `m` and `t` are the model
 /// transform in row-major form: world = m·pos + t for pos ∈ [-0.5, 0.5]².
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,8 +233,17 @@ pub struct LayerDraw {
     pub m: [[f32; 2]; 2],
     /// Translation in scene units: the layer's origin.
     pub t: [f32; 2],
-    /// Straight alpha in 0..=1, pushed into the fragment shader.
+    /// Straight alpha in 0..=1, pushed into the fragment shader (folded
+    /// with the tint alpha in m1.w).
     pub alpha: f32,
+    /// The layer's blend-mode pipeline variant (clamped to the implemented
+    /// set; the renderer indexes its pipeline table by variant_index).
+    pub blend_mode: BlendMode,
+    /// RGB brightness multiplier (M3d), pushed into the effects vec.
+    pub brightness: f32,
+    /// RGBA tint multiplier (M3d): rgb pushed into the effects vec, the
+    /// alpha folded into the pushed layer alpha (m1.w = alpha · tint.a).
+    pub tint: [f32; 4],
 }
 
 /// The model transform for one 2D layer: R(θ)·S(scale)·diag(size), about
@@ -144,6 +278,9 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
                 m,
                 t,
                 alpha: state.alpha,
+                blend_mode: state.blend_mode,
+                brightness: state.brightness,
+                tint: state.tint,
             })
         })
         .collect()
@@ -162,7 +299,75 @@ mod tests {
             origin: [0.0, 0.0],
             scale: [1.0, 1.0],
             size: [10.0, 20.0],
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
         }))
+    }
+
+    #[test]
+    fn blend_mode_table_matches_the_researched_we_mapping() {
+        // The researched WE colorBlendMode table (docs/SCENE_FORMAT_V1.md,
+        // M3d section): 0 = Normal (verified from the editor default and
+        // the corpus histogram); 1/6/7/9 decoded from the editor's
+        // five-mode set (Normal, Multiply, Add, Screen, Subtract). The
+        // variant order is the renderer's pipeline table and must stay
+        // stable.
+        assert_eq!(
+            BlendMode::ALL
+                .iter()
+                .map(|mode| mode.as_u32())
+                .collect::<Vec<_>>(),
+            [0, 1, 6, 7, 9]
+        );
+        for (value, expected) in [
+            (0, BlendMode::Normal),
+            (1, BlendMode::Multiply),
+            (6, BlendMode::Add),
+            (7, BlendMode::Screen),
+            (9, BlendMode::Subtract),
+        ] {
+            assert_eq!(BlendMode::from_u32(value), Some(expected));
+        }
+        // Variant indices: the pipeline table order.
+        assert_eq!(BlendMode::Normal.variant_index(), 0);
+        assert_eq!(BlendMode::Multiply.variant_index(), 1);
+        assert_eq!(BlendMode::Add.variant_index(), 2);
+        assert_eq!(BlendMode::Screen.variant_index(), 3);
+        assert_eq!(BlendMode::Subtract.variant_index(), 4);
+    }
+
+    #[test]
+    fn blend_mode_clamp_falls_back_to_normal_for_unknown_values() {
+        // The known-unimplemented corpus values (11/12/24/30 — recorded
+        // undecoded non-fixed-function modes) and any unknown value clamp
+        // to Normal; implemented values pass through.
+        for value in [11, 12, 24, 30, 2, 5, 8, 100, u32::MAX] {
+            assert_eq!(BlendMode::clamp(value), BlendMode::Normal, "value {value}");
+            assert!(BlendMode::from_u32(value).is_none(), "value {value}");
+        }
+        for value in [0, 1, 6, 7, 9] {
+            assert_eq!(BlendMode::clamp(value), BlendMode::from_u32(value).unwrap());
+        }
+        assert_eq!(BLEND_MODE_UNIMPLEMENTED, [11, 12, 24, 30]);
+    }
+
+    #[test]
+    fn brightness_and_tint_clamps_are_bounded() {
+        // Brightness: non-finite → 1.0 (identity), otherwise 0..=10.
+        assert_eq!(clamp_layer_brightness(50.0), 10.0);
+        assert_eq!(clamp_layer_brightness(-1.0), 0.0);
+        assert_eq!(clamp_layer_brightness(2.5), 2.5);
+        assert_eq!(clamp_layer_brightness(f64::NAN), 1.0);
+        assert_eq!(clamp_layer_brightness(f64::INFINITY), 1.0);
+        assert_eq!(clamp_layer_brightness(f64::NEG_INFINITY), 1.0);
+        // Tint: non-finite → 1.0, otherwise 0..=1.
+        assert_eq!(clamp_layer_tint(2.0), 1.0);
+        assert_eq!(clamp_layer_tint(-1.0), 0.0);
+        assert_eq!(clamp_layer_tint(0.5), 0.5);
+        assert_eq!(clamp_layer_tint(f64::NAN), 1.0);
+        assert_eq!(clamp_layer_tint(f64::INFINITY), 1.0);
+        assert_eq!(clamp_layer_tint(f64::NEG_INFINITY), 1.0);
     }
 
     #[test]
@@ -259,11 +464,18 @@ mod tests {
             state.origin = [40.0, 8.0];
             state.scale = [2.0, 1.0];
             state.size = [16.0, 16.0];
+            // M3d: the effects and blend mode ride along into the draw.
+            state.blend_mode = BlendMode::Screen;
+            state.brightness = 2.0;
+            state.tint = [0.5, 1.0, 0.25, 0.75];
         }
         let draws = frame_draws(&[layer], &[true]);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].alpha, 0.25);
         assert_eq!(draws[0].t, [40.0, 8.0]);
+        assert_eq!(draws[0].blend_mode, BlendMode::Screen);
+        assert_eq!(draws[0].brightness, 2.0);
+        assert_eq!(draws[0].tint, [0.5, 1.0, 0.25, 0.75]);
         // sx = 2·16 = 32, sy = 1·16 = 16, rotated 90°:
         // x = -1·16·y, y = 1·32·x (the off-diagonal cos terms are ~1e-6).
         let m = draws[0].m;

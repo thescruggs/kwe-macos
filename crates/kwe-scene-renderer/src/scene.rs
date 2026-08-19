@@ -144,9 +144,20 @@ pub struct LayerSpec {
     /// Default true (WE default).
     pub visible: bool,
     /// `colorBlendMode` (the corpus key) or `blendMode` (the brief's key)
-    /// as written; only 0 (normal) is implemented — anything else is noted
-    /// once per layer and drawn src-over until M3d.
+    /// exactly as written, pre-clamp. The runtime layer clamps it to the
+    /// implemented set (layers.rs); the known-unimplemented corpus values
+    /// (11/12/24/30) get a bounded one-time diagnostic from the worker at
+    /// load; anything else is tolerated silently (rendering src-over, the
+    /// M3c behavior).
     pub blend_mode: u32,
+    /// Brightness multiplier on the sampled RGB (M3d): 0..=10, default 1.0
+    /// (the WE default, verified on the OWE WPImageObject parse).
+    pub brightness: f32,
+    /// Tint multiplier on the sampled RGBA (M3d): 0..=1 per component,
+    /// default [1, 1, 1, 1]. The WE file key is `color` (a vec3 — alpha
+    /// defaults to 1); the brief's `tint` (3 or 4 components) takes
+    /// precedence when both are present.
+    pub tint: [f32; 4],
     /// Decoded RGBA8 texture, filled by the loader; `None` when the image
     /// is missing, unreadable, over budget, or not a decodable format. The
     /// layer then stays registered (script-visible) but draws nothing.
@@ -436,8 +447,10 @@ fn parse_image_layer(
     };
 
     // `colorBlendMode` is the corpus key (all observed occurrences);
-    // `blendMode` is accepted as an alias. Only 0 (normal) renders in M3c;
-    // non-zero modes draw src-over with a one-time note.
+    // `blendMode` is accepted as an alias. The raw value is kept for the
+    // worker's bounded diagnostic; the runtime clamps to the implemented
+    // set (layers.rs BlendMode). Malformed values are tolerated as 0 — not
+    // worth a rejection: the layer renders src-over.
     let blend_mode = match object
         .get("blendMode")
         .or_else(|| object.get("colorBlendMode"))
@@ -447,8 +460,45 @@ fn parse_image_layer(
             Some(mode) if mode.is_finite() && mode >= 0.0 && mode <= f64::from(u32::MAX) => {
                 mode as u32
             }
-            _ => 0, // not worth a rejection: the layer renders src-over
+            _ => 0,
         },
+    };
+
+    // M3d color effects, both property-wrapped like the M3c scalars. WE
+    // writes `brightness` as a plain float (default 1.0) — parsed with the
+    // same clamps as the script-side writes (0..=10, non-finite → 1.0); a
+    // malformed type rejects like alpha. Brightness beyond the range is
+    // clamped, not rejected (a >10 boost is not worth failing the scene).
+    let brightness = match object.get("brightness") {
+        None => 1.0,
+        Some(value) => {
+            let brightness = property_value(value).as_f64().ok_or_else(|| {
+                SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be a float",
+                        field(index, "brightness")
+                    ),
+                )
+            })?;
+            crate::layers::clamp_layer_brightness(brightness)
+        }
+    };
+
+    // `tint` (the brief's key, 3 or 4 components) takes precedence over
+    // `color` (the WE file key, a vec3 — its alpha is implied 1.0, the
+    // g_Color4 semantics of WE's shader library). Components clamp 0..=1.
+    let tint = match object.get("tint").or_else(|| object.get("color")) {
+        None => [1.0, 1.0, 1.0, 1.0],
+        Some(value) => {
+            let vector =
+                parse_vector(property_value(value), &field(index, "tint"), &[3, 4], false)?;
+            let mut tint = [1.0, 1.0, 1.0, 1.0];
+            for (slot, component) in tint.iter_mut().zip(vector.iter()) {
+                *slot = crate::layers::clamp_layer_tint(f64::from(*component));
+            }
+            tint
+        }
     };
 
     Ok(LayerSpec {
@@ -461,6 +511,8 @@ fn parse_image_layer(
         alpha,
         visible,
         blend_mode,
+        brightness,
+        tint,
         texture: None,
     })
 }
@@ -1506,21 +1558,69 @@ mod tests {
     #[test]
     fn blend_modes_recorded() {
         // `colorBlendMode` is the corpus key; `blendMode` is the brief's
-        // alias. Only 0 renders in M3c; others draw src-over with a note.
+        // alias. The raw value is recorded pre-clamp for the worker's
+        // bounded diagnostic; the runtime clamps to the implemented set
+        // (M3d: 0/1/6/7/9 render; 11/12/24/30 note once; anything else is
+        // tolerated silently). A property-wrapped value is unwrapped.
         let layers = parse_objects_of(
             r#"{"objects": [
                 {"name": "a", "image": "a.png", "colorBlendMode": 24},
                 {"name": "b", "image": "b.png", "blendMode": 6},
                 {"name": "c", "image": "c.png", "colorBlendMode": 0},
-                {"name": "d", "image": "d.png", "blendMode": "weird"}
+                {"name": "d", "image": "d.png", "blendMode": "weird"},
+                {"name": "e", "image": "e.png",
+                 "colorBlendMode": {"user": "blend", "value": 7}}
             ]}"#,
         )
         .unwrap();
         assert_eq!(layers[0].blend_mode, 24);
         assert_eq!(layers[1].blend_mode, 6);
         assert_eq!(layers[2].blend_mode, 0);
-        // A non-numeric mode is tolerated (src-over + note), not a reject.
+        // A non-numeric mode is tolerated (src-over), not a reject.
         assert_eq!(layers[3].blend_mode, 0);
+        // Property-wrapped modes are unwrapped like every other scalar.
+        assert_eq!(layers[4].blend_mode, 7);
+    }
+
+    #[test]
+    fn brightness_and_tint_parsed_with_clamps() {
+        // Defaults: brightness 1.0, tint all-ones (WE `color` default
+        // {1,1,1}, alpha implied 1 — the g_Color4 semantics).
+        let layers = parse_objects_of(r#"{"objects": [{"name": "l", "image": "a.png"}]}"#).unwrap();
+        assert_eq!(layers[0].brightness, 1.0);
+        assert_eq!(layers[0].tint, [1.0, 1.0, 1.0, 1.0]);
+
+        // The WE file key is `color` (vec3); the brief's `tint` takes
+        // precedence, accepts 3 or 4 components, and both are
+        // property-wrapped like the M3c scalars. Out-of-range values clamp
+        // (0..=10 brightness, 0..=1 tint); non-finite becomes the identity.
+        let layers = parse_objects_of(
+            r#"{"objects": [
+                {"name": "a", "image": "a.png", "color": "0.5 1.0 0.25"},
+                {"name": "b", "image": "b.png",
+                 "tint": {"user": "tint", "value": "0 1 2 0.5"}},
+                {"name": "c", "image": "c.png", "brightness": 50},
+                {"name": "d", "image": "d.png",
+                 "color": [9, 9, 9], "tint": [0.25, 0.5, 0.75, 1]},
+                {"name": "e", "image": "e.png", "brightness": -3}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers[0].tint, [0.5, 1.0, 0.25, 1.0]);
+        assert_eq!(layers[0].brightness, 1.0);
+        // tint clamps to 0..=1; brightness clamps to 0..=10.
+        assert_eq!(layers[1].tint, [0.0, 1.0, 1.0, 0.5]);
+        assert_eq!(layers[2].brightness, 10.0);
+        // `tint` wins over `color`; 4 components are honored as RGBA.
+        assert_eq!(layers[3].tint, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(layers[4].brightness, 0.0);
+
+        // A malformed brightness is a shape rejection, like alpha.
+        let error = parse_objects_of(
+            r#"{"objects": [{"name": "l", "image": "a.png", "brightness": "bright"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
     }
 
     #[test]

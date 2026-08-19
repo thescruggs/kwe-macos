@@ -59,7 +59,7 @@ never fails the parse.
 
 `objects` is an array of layer objects drawn in **scene.json order** — the
 compositor's draw order: the layer listed last draws on top, src-over
-blending (blend modes are M3d). An object is an image layer exactly when
+blending by default with per-layer blend modes (M3d). An object is an image layer exactly when
 it carries an `image` field; everything else (particles, audio, text —
 M3d+) is ignored. A reference ending in `.json` is a model instance under
 the WE solid-model architecture — **620 of the 685 corpus image
@@ -93,7 +93,9 @@ with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
 | `size` | `[w, h]` (exactly 2 entries) | `[0, 0]` | the size in scene units the texture is drawn at; `[0, 0]` (absent) takes the decoded texture's own dimensions at load |
 | `alpha` | float in `0.0..=1.0` | `1.0` | straight layer alpha; out-of-range or non-finite rejects the scene (like clearcolor) |
 | `visible` | boolean | `true` | an invisible layer draws nothing |
-| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key (all observed occurrences). Only `0` (normal) renders in M3c — a non-zero mode draws src-over with a bounded one-time note (`event=renderer.scene.blend_mode`) until M3d; a non-numeric value is tolerated (src-over), never a rejection. Corpus (re-scan): 432 of 685 image-bearing objects carry it — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 (sums to 432) — the rest omit it |
+| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key; a per-layer blend mode from the researched table in "Blend modes and color effects (M3d)" below. Corpus (re-scan): 432 of 685 image-bearing objects carry it — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 (sums to 432) — the rest omit it (normal). A non-numeric value is tolerated (normal), never a rejection; an undecodable but numeric value clamps to normal with a bounded one-time diagnostic |
+| `brightness` | float in `0.0..=10.0` | `1.0` | multiplies the sampled RGB before blending (see M3d); out-of-range and non-finite values are clamped (negative → 0, >10 → 10, non-finite → 1.0), never a rejection |
+| `tint` | `[r, g, b]` or `[r, g, b, a]` of floats in `0.0..=1.0` (alias `color` — the WE file key, vec3 or vec4; `tint` takes precedence when both are present) | `[1, 1, 1, 1]` | multiplied onto the sampled RGBA before blending (see M3d); a 3-component value implies alpha 1; per-component clamped (non-finite → 1.0), never a rejection |
 
 Property-wrapped values (`{"user": ..., "value": ...}` — how the editor
 serializes user-bindable fields; corpus re-scan: **70% (315/447) of image
@@ -109,21 +111,108 @@ tile the full quad). Per layer:
 `world = R(θz)·diag(scale·size)·pos + origin` for `pos ∈ [-0.5, 0.5]²` —
 rotation and scale happen about the origin, in that order; the z-angle
 rotates 2D layers (radians in the file, degrees in the API). The
-compositor pushes 48 bytes per layer: m0 = (a, c, tx, 0),
-m1 = (b, d, ty, alpha), viewport = (w, h, 0, 0), with
-`world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)` and the fragment shader
-multiplying the texture's alpha by the layer alpha. Blending is src-over:
-color ONE / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA — the
-fragment shader outputs straight color, so the attachment stores the
-straight composite and the readback's premultiplication is applied exactly
-once, at the protocol boundary (see Output); the source alpha is never
-scaled by itself (a 191/255 layer over an opaque destination stays
-191/255, not 143/255, and a translucent layer is not darkened by a second
-alpha multiply). Blend oracle, byte-exact on both drivers: opaque texel
+compositor pushes 64 bytes per layer (M3d grew the block from 48 to 64):
+m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha·tint.a), viewport = (w, h, 0, 0),
+effects = (brightness, tint.r, tint.g, tint.b). The first 48 bytes are
+byte-identical to the M3c layout, so the vertex shader reads the same
+offsets; `world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)`, and the fragment
+shader multiplies the texture's alpha by m1.w (the layer alpha folded with
+the tint alpha host-side) and the sampled RGB by the effects vector,
+**before** blending.
+
+Blending is src-over by default (the Normal variant): color
+ONE / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA — the fragment
+shader outputs straight color, so the attachment stores the straight
+composite and the readback's premultiplication is applied exactly once, at
+the protocol boundary (see Output); the source alpha is never scaled by
+itself (a 191/255 layer over an opaque destination stays 191/255, not
+143/255, and a translucent layer is not darkened by a second alpha
+multiply). Blend oracle, byte-exact on both drivers: opaque texel
 (64,103,142,255) at layer alpha 191/255 over a zero clear is delivered as
-premultiplied BGRA (106,77,48,191). The model math is byte-tested:
-identity exact, quarter-turn axis mapping, corner positions for known
-inputs.
+premultiplied BGRA (106,77,48,191). A non-default `colorBlendMode` selects
+one of the fixed-function variants in "Blend modes and color effects
+(M3d)" below. The model math is byte-tested: identity exact, quarter-turn
+axis mapping, corner positions for known inputs.
+
+## Blend modes and color effects (M3d)
+
+Per-layer color blending in the Wallpaper Engine sense: a `colorBlendMode`
+enum rendered through fixed-function Vulkan blending, two color-effect
+fields, and a fixed ordering — **the effects apply to the sampled texel in
+the fragment shader; the blend mode combines the result with the frame in
+the pipeline's blend state** (the shader never blends; the blend state
+never scales colors).
+
+### The researched colorBlendMode table
+
+WE serializes `colorBlendMode` (editor dropdown = exactly {Normal,
+Multiply, Add, Screen, Subtract}, per the wpdoc UI strings; Steam patch
+note: "standard Photoshop blend modes"; rendered by the proprietary
+`ApplyBlending` shader, type `imageblending`, default 0 — so the original
+never renders modes outside the dropdown). No public WE shader source
+exists, so the value→mode mapping is recovered from the dropdown order and
+the Photoshop formula family, and the formulas below are the oracle ground
+truth, byte-validated on the llvmpipe lane.
+
+Evidence grades: **verified** = a public source pins the value,
+**decoded** = consistent with the complete dropdown (independent
+confirmation impossible), **undecoded** = not expressible in
+fixed-function Vulkan blending (kept for corpus tolerance).
+
+| Value | Name | Implemented? | Vulkan blend state (color / alpha) | Evidence |
+|---|---|---|---|---|
+| 0 | Normal | yes | (ONE, ONE_MINUS_SRC_ALPHA) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | verified — dropdown default |
+| 1 | Multiply | yes | (DST_COLOR, ZERO) / (ZERO, ONE), ADD | decoded |
+| 6 | Add | yes | (ONE, ONE) / (ONE, ONE), ADD | decoded |
+| 7 | Screen | yes | (ONE_MINUS_DST_COLOR, ONE) / (ONE_MINUS_DST_COLOR, ONE), ADD | decoded |
+| 9 | Subtract | yes | (ONE, ONE) REVERSE_SUBTRACT / (ONE, ZERO) ADD | decoded |
+| 11, 12, 24, 30 | — | **no** | clamped to Normal + one bounded diagnostic per scene (`event=renderer.scene.blend_mode_clamped layer=... mode=...`) | undecoded — not fixed-function |
+| any other | — | no | silently Normal (unknown values tolerated, like the original's switch default) | — |
+
+Semantics (the formulas the oracles hand-compute; `t` = texel,
+`b` = background, per channel in 0..255):
+- **Normal** = src-over: `t·a + b·(1−a)`.
+- **Multiply** = `t·b / 255`.
+- **Add** = `min(255, t + b)`.
+- **Screen** = `255 − (255−t)(255−b) / 255` = `t·(1−b) + b`.
+- **Subtract** = `max(0, b − t)` — the background minus the texel: WE's
+  "Photoshop blend modes" family and the Vulkan REVERSE_SUBTRACT algebra
+  (dst − src) agree; a reversed direction would fail the oracle.
+- **Alpha** for multiply/screen/subtract follows the Photoshop family
+  (the mode acts on the color; the alpha survives).
+
+The Screen factors were corrected during oracle validation: the first
+draft used (ONE, ONE_MINUS_DST_COLOR), which computes `t + b·(1−b)` — not
+the screen formula — and the device byte oracle caught the mismatch
+([165,151,125] produced vs [154,141,140] hand-computed). The shipped
+(ONE_MINUS_DST_COLOR, ONE) computes `t·(1−b) + b`, the screen formula.
+
+The renderer prebuilds one pipeline variant per implemented mode (five;
+N ≤ 16) sharing the layout, and binds the layer's variant per draw. The
+`Scene.getLayer` proxy's read/write `blendMode` maps through this table:
+writing 0/1/6/7/9 selects the mode; writing 11/12/24/30 clamps to Normal
+with the same bounded diagnostic; any other value clamps silently.
+
+### brightness and tint
+
+| Field | File key | Default | Effect |
+|---|---|---|---|
+| `brightness` | `brightness` | `1.0` | multiplies the sampled RGB; clamped to `0.0..=10.0`, non-finite → 1.0 |
+| `tint` | `tint` (alias `color` — the WE file key, vec3 or vec4; `tint` wins when both are present) | `[1,1,1,1]` | multiplies the sampled RGBA; per-component clamped to `0.0..=1.0`, non-finite → 1.0; a vec3 implies alpha 1.0 |
+
+Both parse property-wrapped (the corpus editor form) and both clamp
+instead of rejecting — a malformed effect can darken a layer, never fail
+the scene. The tint alpha is folded into the pushed `m1.w` host-side, so
+the shader's single multiply `a · layer_alpha · tint.a` covers both.
+
+Byte-exact oracle (llvmpipe, `scripts/smoke-scene.sh`): fullscreen texel
+(64,103,142) over opaque clear (102,64,26) at the frame center (80,45) —
+normal (142,103,64,255); multiply (14,26,26,255); add (168,167,166,255);
+screen (154,141,140,255); subtract (0,0,38,255); effects (brightness 2.0,
+tint (1, 0.4, 0.5)) (142,82,128,255); and add at layer alpha 0.5 over a
+transparent clear pins the single premultiplication: the attachment stores
+the straight composite (64,103,142,128) — alpha 0.5·255 = 127.5 rounds to
+128 — and the readback premultiplies exactly once (71,52,32,128).
 
 ## Image sources (M3c)
 
@@ -334,8 +423,9 @@ image compositing in M3a.
 |---|---|---|
 | `Scene.getLayer(name \| index)` | **implemented (M3c)** | returns the `Layer` proxy for a registered image layer, or `null` for an unknown name/index (never throws); layers are registered in `objects` order |
 | `Scene.getLayerCount()` | **implemented (M3c)** | the number of registered image layers |
-| `SceneLayer` (`Layer`) | **implemented (M3c)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). Writes are clamped like `Engine.clearcolor`: non-finite → 0, alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
-| effects, text, particles, 3D models, properties | *planned* (M3d–M3k) | the parse tolerates extra keys but renders none of them |
+| `SceneLayer` (`Layer`) | **implemented (M3c, M3d)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). M3d adds `blendMode` (0/1/6/7/9 select the researched modes; 11/12/24/30 clamp to Normal with a bounded diagnostic; anything else clamps silently), `brightness` (0..=10), and `tint` `{r, g, b, a}` (0..=1 each). Writes are clamped like `Engine.clearcolor`: non-finite → 0 (effects → their default 1.0), alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
+| color effects (`brightness`, `tint`) | **implemented (M3d)** | the effects apply to the sampled texel before blending; clamps absorb any out-of-range write |
+| text, particles, 3D models, properties | *planned* (M3e–M3k) | the parse tolerates extra keys but renders none of them |
 | `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
 | image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
 | audio/pointer/media input in script | *planned* | the worker receives and acks the wire inputs (M1a plumbing, unchanged) but exposes none of them to the script in M3a |
@@ -354,7 +444,7 @@ identity for `B8G8R8A8` readback (bytes are already B,G,R,A) and a
 
 ## See also
 
-- docs/BETA_M3.md — the M3a..M3c slices: goal, acceptance evidence, exit
+- docs/BETA_M3.md — the M3a..M3d slices: goal, acceptance evidence, exit
   codes, open risks (interrupt-budget deviation, llvmpipe determinism,
   reader staleness, loader lifetime).
 - docs/adr/0001-original-vulkan-renderer.md — the architecture this slice
