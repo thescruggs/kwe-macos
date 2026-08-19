@@ -264,22 +264,34 @@ Per-kind policies replace the alpha's single set: startup timeouts default to
 6 s for video and 10 s for web (Chromium's cold start), everything else keeps
 the global 3 s; resource limits default to the global budget
 (address-space 4096 MiB, file 160 MiB, 256 descriptors, 1024 processes) except
-web, which needs a 16384 MiB virtual address space and 1024 descriptors
-because V8 reserves a 4 GiB cage before `main`, and video, which overrides the
-process ceiling with `--renderer-video-processes` (default 32768 — the top of
-the validated range). The video override exists because the kernel's
-`RLIMIT_NPROC` check counts every thread of the uid (`user->processes`), so the
-global 1024 ceiling guards the whole desktop, not the worker, and a normal
-desktop session commonly runs more than 1024 threads — libmpv's thread
-creation then fails with EAGAIN and `mpv_create` hangs in its failure path.
+web and video. *(M2b:)* web overrides all three — a 131072 MiB virtual
+address space, 1024 descriptors, and a 32768-process ceiling — because
+Chromium 151's V8 sandbox reserves ~53 GiB of virtual address space per
+process at exec, and the DevTools pipe bootstrap fails *silently* (no stderr,
+the browser just never answers the pipe) whenever `RLIMIT_AS` sits below a
+~98 GiB budget floor; the old 16384 MiB budget SIGTRAPs the browser at exec.
+The budget is purely virtual — resident RSS stays ~250 MB per browser process
+(measured) — so resident protection comes from the supervisor timeouts and,
+at runtime, from the systemd `MemoryMax` of the containing unit. The video
+override remains the process ceiling with `--renderer-video-processes`
+(default 32768 — the top of the validated range); the web process ceiling
+exists because spawning the bwrap sandbox forks a new process tree and the
+kernel's `RLIMIT_NPROC` check counts every thread of the uid
+(`user->processes`), so the global 1024 ceiling guards the whole desktop, not
+the worker, and a normal desktop session commonly runs more than 1024 threads
+— libmpv's thread creation then fails with EAGAIN and `mpv_create` hangs in
+its failure path, and bwrap's fork fails with EAGAIN the same way (measured).
 Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
 (startup/frame/handoff), not from `NPROC`. The daemon flags
 `--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
-`--renderer-web-address-space-mib`, `--renderer-web-open-files`, and
-`--renderer-video-processes` tune these; frame timeouts and the canary stay
-global. The web kind currently keeps the global 1024-process ceiling and is
-expected to need its own knob when the Chromium worker lands (M2) — Chromium
-spawns a process tree, and the same uid-wide `RLIMIT_NPROC` math applies. Per-kind renderer binaries default
+`--renderer-web-address-space-mib`, `--renderer-web-open-files`,
+`--renderer-video-processes`, and `--renderer-web-processes` tune these;
+frame timeouts and the canary stay global. *(M2b:)* web renderers also take
+`--renderer-web-heartbeat-ms` (default 5000) and
+`--renderer-web-heartbeat-max-failures` (default 3): the worker probes the
+page's renderer main thread every interval and exits 73 after consecutive
+failures, so a page wedged after first paint cannot hide behind the keepalive
+re-publication forever (docs/BETA_M2.md §5.3). Per-kind renderer binaries default
 to `kwe-<kind>-renderer` beside the daemon executable (`--renderer-video`,
 `--renderer-web`, `--renderer-scene` override; `--renderer` keeps meaning the
 test kind).

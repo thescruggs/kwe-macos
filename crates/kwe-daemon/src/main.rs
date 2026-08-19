@@ -107,9 +107,15 @@ struct Arguments {
     /// Maximum file descriptors available to each renderer.
     #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u64).range(32..=4096))]
     renderer_open_files: u64,
-    /// Web renderers reserve a 4 GiB virtual cage for V8 before main; the
-    /// global RLIMIT_AS default would kill Chromium at exec.
-    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(256..=65536))]
+    /// Web renderers reserve a ~53 GiB virtual sandbox per Chromium process
+    /// (V8 sandbox on chromium 151, measured), and the DevTools pipe bootstrap
+    /// needs RLIMIT_AS above a ~98 GiB floor (below it the browser starts and
+    /// renders but the CDP pipe never answers, failing silently with no
+    /// stderr); the old 16 GiB budget SIGTRAPs the browser at exec. The 128
+    /// GiB default clears the floor with margin. All of this is virtual —
+    /// RSS stays ~250 MB per browser process (measured) and the resident
+    /// protection comes from the supervisor timeouts.
+    #[arg(long, default_value_t = 131072, value_parser = clap::value_parser!(u64).range(256..=262144))]
     renderer_web_address_space_mib: u64,
     /// Chromium needs more descriptors than the test renderer.
     #[arg(long, default_value_t = 1024, value_parser = clap::value_parser!(u64).range(32..=4096))]
@@ -129,6 +135,25 @@ struct Arguments {
     /// range. Other kinds keep the global default.
     #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
     renderer_video_processes: u64,
+    /// UID-scoped process ceiling for the web renderer kind only. The same
+    /// kernel check that broke libmpv fork/thread creation (the RLIMIT_NPROC
+    /// limit counts every thread of the uid) hits the sandbox at spawn:
+    /// bwrap forks the whole Chromium process tree, and the daemon cannot
+    /// even exec the worker once the uid exceeds the 1024 global default
+    /// (verified: the M2b worker fails "spawning bwrap" under 1024 on a
+    /// ~1265-thread session).
+    #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
+    renderer_web_processes: u64,
+    /// Session-scoped liveness probe interval for web renderers: the
+    /// worker probes the page's renderer main thread every interval and
+    /// exits 73 after consecutive failures (a page that wedges after first
+    /// paint otherwise looks alive forever behind the keepalive
+    /// re-publication).
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(250..=60000))]
+    renderer_web_heartbeat_ms: u64,
+    /// Consecutive heartbeat failures before a web renderer exits 73.
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=10))]
+    renderer_web_heartbeat_max_failures: u32,
     /// Enable synthetic hang/corruption/exit requests for development tests.
     #[arg(long)]
     allow_test_faults: bool,
@@ -248,6 +273,7 @@ fn main() -> Result<()> {
     let web_limits = RendererResourceLimits {
         address_space_mib: arguments.renderer_web_address_space_mib,
         open_files: arguments.renderer_web_open_files,
+        processes: arguments.renderer_web_processes,
         ..global_limits
     };
     let resource_limits_by_kind =
@@ -263,6 +289,8 @@ fn main() -> Result<()> {
         canary_duration: Duration::from_millis(arguments.renderer_canary_ms),
         handoff_timeout: Duration::from_millis(arguments.renderer_handoff_timeout_ms),
         max_failures: arguments.renderer_max_failures,
+        web_heartbeat_ms: arguments.renderer_web_heartbeat_ms,
+        web_heartbeat_max_failures: arguments.renderer_web_heartbeat_max_failures,
         resource_limits_by_kind,
     })?;
     let supervisor = supervisor_service.handle();
@@ -658,7 +686,9 @@ fn process_request(
                 let parsed = serde_json::from_value::<RendererStartParams>(request.params.clone());
                 match parsed {
                     Ok(params)
-                        if (params.test_fault.is_some() || params.stderr_lines.is_some())
+                        if (params.test_fault.is_some()
+                            || params.stderr_lines.is_some()
+                            || params.allow_network)
                             && !allow_test_faults =>
                     {
                         json!({
@@ -705,6 +735,11 @@ struct RendererStartParams {
     test_fault: Option<TestFaultParams>,
     /// Development-only: ask the test renderer for this many stderr lines.
     stderr_lines: Option<u32>,
+    /// Test hook: grant the web sandbox host-loopback network access for the
+    /// sandbox-integrity smoke's positive control. Rejected unless the daemon
+    /// runs with --allow-test-faults; production grants land in M2c.
+    #[serde(default)]
+    allow_network: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -826,6 +861,7 @@ impl TryFrom<RendererStartParams> for StartSpec {
             content,
             test_fault,
             stderr_lines: params.stderr_lines,
+            allow_network: params.allow_network,
         };
         // Single validation point per start: the supervisor event loop no
         // longer re-validates, so content preflight cannot block it twice.
@@ -1111,28 +1147,44 @@ mod tests {
 
     #[test]
     fn video_nproc_default_sits_above_the_desktop_thread_ceiling() {
-        // The CLI defaults are the contract: the video kind gets 32768 (top
-        // of the validated range) while every other kind keeps the global
-        // 1024. A desktop session commonly runs more than 1024 threads of
-        // the uid (this machine measures ~1265), and libmpv then fails to
-        // create threads — the smoke runs without any override as the proof.
+        // The CLI defaults are the contract: the video AND web kinds get
+        // 32768 (top of the validated range) while every other kind keeps
+        // the global 1024. A desktop session commonly runs more than 1024
+        // threads of the uid (this machine measures ~1265), and libmpv then
+        // fails to create threads; the web worker's bwrap fork dies the same
+        // way ("spawning bwrap" EAGAIN). The smoke runs without any override
+        // as the proof.
         let arguments = Arguments::parse_from(["kwe-daemon"]);
         assert_eq!(arguments.renderer_processes, 1024);
         assert_eq!(arguments.renderer_video_processes, 32768);
+        assert_eq!(arguments.renderer_web_processes, 32768);
+        // The web address-space budget sits above the measured CDP floor: a
+        // chromium 151 process reserves ~53 GiB of virtual space for the V8
+        // sandbox before main (16 GiB SIGTRAPs at startup), and the DevTools
+        // pipe bootstrap silently refuses to answer below ~98 GiB. 128 GiB is
+        // the production default, clear of the floor with margin.
+        assert_eq!(arguments.renderer_web_address_space_mib, 131072);
+        // The web liveness heartbeat defaults: probe every 5 s, exit 73
+        // after 3 consecutive failures (a page wedged after first paint
+        // otherwise looks alive forever behind the keepalive).
+        assert_eq!(arguments.renderer_web_heartbeat_ms, 5000);
+        assert_eq!(arguments.renderer_web_heartbeat_max_failures, 3);
     }
 
     #[test]
-    fn per_kind_process_ceiling_applies_only_to_the_video_kind() {
+    fn per_kind_process_ceiling_applies_only_to_video_and_web() {
         let global = sample_limits(1024);
         let video = sample_limits(32768);
         let web = RendererResourceLimits {
-            address_space_mib: 16_384,
+            address_space_mib: 131_072,
             open_files: 1024,
+            processes: 32768,
             ..global
         };
         let map = resource_limits_for_kinds(global, video, web);
         assert_eq!(map[&RendererKind::Video].processes, 32768);
-        for kind in [RendererKind::Test, RendererKind::Web, RendererKind::Scene] {
+        assert_eq!(map[&RendererKind::Web].processes, 32768);
+        for kind in [RendererKind::Test, RendererKind::Scene] {
             assert_eq!(
                 map[&kind].processes,
                 1024,
@@ -1141,17 +1193,21 @@ mod tests {
             );
         }
         // The web budget is untouched by the video knob.
-        assert_eq!(map[&RendererKind::Web].address_space_mib, 16_384);
+        assert_eq!(map[&RendererKind::Web].address_space_mib, 131_072);
         assert_eq!(map[&RendererKind::Web].open_files, 1024);
         // The CLI override feeds the same helper: an explicit
-        // --renderer-video-processes replaces the 32768 default for video
-        // only, and a kind not overridden keeps the global default.
+        // --renderer-web-processes replaces the 32768 default for web only,
+        // and a kind not overridden keeps the global default.
         let overridden = sample_limits(4096);
-        let map = resource_limits_for_kinds(global, overridden, web);
+        let web_overridden = RendererResourceLimits {
+            processes: 8192,
+            ..web
+        };
+        let map = resource_limits_for_kinds(global, overridden, web_overridden);
         assert_eq!(map[&RendererKind::Video].processes, 4096);
+        assert_eq!(map[&RendererKind::Web].processes, 8192);
         assert_eq!(map[&RendererKind::Test].processes, 1024);
         assert_eq!(map[&RendererKind::Scene].processes, 1024);
-        assert_eq!(map[&RendererKind::Web].processes, 1024);
     }
 
     fn cache_for_tests() -> Arc<std::sync::Mutex<WorkshopCache>> {

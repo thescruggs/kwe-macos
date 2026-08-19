@@ -97,6 +97,12 @@ pub struct SupervisorConfig {
     pub canary_duration: Duration,
     pub handoff_timeout: Duration,
     pub max_failures: u32,
+    /// Web renderers: session-scoped liveness probe interval in ms (the
+    /// worker probes the page's renderer main thread; a page wedged after
+    /// first paint otherwise looks alive forever behind the keepalive).
+    pub web_heartbeat_ms: u64,
+    /// Web renderers: consecutive heartbeat failures before exit 73.
+    pub web_heartbeat_max_failures: u32,
     /// Per-kind pre-exec resource ceilings; every kind must be present.
     pub resource_limits_by_kind: BTreeMap<RendererKind, RendererResourceLimits>,
 }
@@ -112,7 +118,9 @@ pub struct RendererResourceLimits {
 
 impl RendererResourceLimits {
     fn validate(self) -> Result<Self> {
-        if !(256..=65_536).contains(&self.address_space_mib)
+        // The address-space bound tops out at 256 GiB: chromium 151 needs a
+        // ~128 GiB budget (V8 sandbox reservations; docs/BETA_M2.md M2b).
+        if !(256..=262_144).contains(&self.address_space_mib)
             || !(129..=1024).contains(&self.file_size_mib)
             || !(32..=4096).contains(&self.open_files)
             || !(64..=32_768).contains(&self.processes)
@@ -163,6 +171,11 @@ impl SupervisorConfig {
             || self.max_failures > 10
         {
             bail!("supervisor deadlines and failure budget must be bounded and non-zero");
+        }
+        if !(250..=60_000).contains(&self.web_heartbeat_ms)
+            || !(1..=10).contains(&self.web_heartbeat_max_failures)
+        {
+            bail!("web heartbeat interval and failure budget must be bounded");
         }
         for (kind, timeout_ms) in &self.startup_timeout_ms_by_kind {
             if !(100..=30_000).contains(timeout_ms) {
@@ -233,6 +246,12 @@ pub struct StartSpec {
     pub test_fault: Option<TestFault>,
     /// Development-only: ask the test renderer for this many stderr lines.
     pub stderr_lines: Option<u32>,
+    /// Test hook (gated behind `--allow-test-faults` at the API boundary):
+    /// grant the web sandbox host-loopback network access so the
+    /// sandbox-integrity smoke's positive control can paint its marker.
+    /// Production wallpapers get per-wallpaper grants in M2c; this hook is
+    /// how the sandbox smoke proves its negative case discriminates.
+    pub allow_network: bool,
 }
 
 impl StartSpec {
@@ -251,6 +270,9 @@ impl StartSpec {
         }
         if self.stderr_lines.is_some() && self.kind != RendererKind::Test {
             bail!("stderr_lines is only available to the test renderer kind");
+        }
+        if self.allow_network && self.kind != RendererKind::Web {
+            bail!("allow_network is only available to the web renderer kind");
         }
         if let Some(count) = self.stderr_lines
             && !(1..=4096).contains(&count)
@@ -964,6 +986,23 @@ impl SupervisorRuntime {
         }
         if let Some(count) = spec.stderr_lines {
             command.arg("--stderr-lines").arg(count.to_string());
+        }
+        if spec.kind == RendererKind::Web {
+            // The worker's session-scoped liveness heartbeat (a page wedged
+            // after first paint otherwise looks alive forever behind the
+            // keepalive re-publication).
+            command
+                .arg("--web-heartbeat-ms")
+                .arg(self.config.web_heartbeat_ms.to_string())
+                .arg("--web-heartbeat-max-failures")
+                .arg(self.config.web_heartbeat_max_failures.to_string());
+            if spec.allow_network {
+                // Test hook (--allow-test-faults gate at the API boundary):
+                // drop the netns isolation so the sandbox-integrity positive
+                // control can reach the host-loopback probe server. Grants
+                // land per-wallpaper in M2c.
+                command.arg("--allow-network");
+            }
         }
         command
             .stdin(Stdio::piped())
@@ -1856,9 +1895,13 @@ fn flush_pending(
 /// (created per launch under the daemon runtime dir — web renderers hold a
 /// profile lock in $HOME, so a shared HOME would make concurrent workers
 /// contend during canary handoff) and a fixed PATH; Web additionally
-/// inherits the daemon's XDG_RUNTIME_DIR because Chromium needs it for
-/// session plumbing. It is deliberately not granted to the video/scene/test
-/// kinds.
+/// inherits the daemon's XDG_RUNTIME_DIR for the future network/permission
+/// grant lanes. Note that the path is a host path: /run is not bound inside
+/// the bwrap root, so the directory does not exist inside the sandbox and
+/// Chromium treats the variable as unset, falling back to its tmpfs
+/// profile — a harmless no-op today, kept so the value rides along once
+/// grants bind it in (M2c). It is deliberately not granted to the
+/// video/scene/test kinds.
 fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
     env_allowlist_with_runtime(kind, home, std::env::var_os("XDG_RUNTIME_DIR"))
 }
@@ -2111,6 +2154,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         assert!(valid.validate().is_ok());
         let mut invalid = valid.clone();
@@ -2135,6 +2179,7 @@ mod tests {
             }),
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         assert!(invalid_scene.validate().is_err());
         invalid_scene.kind = RendererKind::Test;
@@ -2154,6 +2199,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         // Test takes no content.
         let mut mismatched = base.clone();
@@ -2228,6 +2274,32 @@ mod tests {
         assert!(
             RendererResourceLimits {
                 address_space_mib: 128,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        // The web kind's 128 GiB default and the 256 GiB bound top must pass
+        // validation; the old 64 GiB cap would reject the web default.
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 131_072,
+                ..valid
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 262_144,
+                ..valid
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 262_145,
                 ..valid
             }
             .validate()
@@ -2339,6 +2411,8 @@ mod tests {
             canary_duration: Duration::from_secs(1),
             handoff_timeout: Duration::from_secs(5),
             max_failures: 3,
+            web_heartbeat_ms: 5000,
+            web_heartbeat_max_failures: 3,
             resource_limits_by_kind: BTreeMap::from([
                 (RendererKind::Test, limits),
                 (RendererKind::Video, limits),
@@ -2412,6 +2486,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         let mut worker = runtime.spawn_worker(spec).unwrap();
         // Each launch gets its own 0700 HOME under the daemon runtime dir.
@@ -2463,6 +2538,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         let video = StartSpec {
             kind: RendererKind::Video,
@@ -2523,6 +2599,7 @@ mod tests {
             content: Some(ContentSpec::Video { path: real.clone() }),
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         let validated = spec.into_validated().unwrap();
         let path = match validated.content.expect("video content kept") {
@@ -2621,6 +2698,7 @@ mod tests {
             content: Some(ContentSpec::Web { root: root.clone() }),
             test_fault: None,
             stderr_lines: None,
+            allow_network: false,
         };
         let error = runtime
             .spawn_worker(spec)
@@ -2728,6 +2806,7 @@ mod tests {
                 content: None,
                 test_fault: None,
                 stderr_lines: None,
+                allow_network: false,
             },
             child,
             frame_path: PathBuf::new(),

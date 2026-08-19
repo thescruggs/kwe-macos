@@ -60,6 +60,32 @@ impl Client {
         self.request(Some(session_id), method, params)
     }
 
+    /// Send a request inside a flattened target session and return its id
+    /// without waiting for the answer. The response — if it ever arrives —
+    /// is picked up later with [`Client::take_response`], which never
+    /// blocks. This is the non-blocking half of [`Client::request_session`];
+    /// it exists for liveness probes that must not stall the caller's own
+    /// loop (a blocking request would let a wedged page stall the renderer's
+    /// publish pipeline). The pending slot is bounded by the connection's
+    /// in-flight limit; a response to an id the caller stopped tracking is
+    /// dropped by routing. `id` monotonically increases.
+    pub fn send_session(
+        &mut self,
+        session_id: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<u32, Error> {
+        self.connection
+            .send_request(method, params, Some(session_id))
+    }
+
+    /// Take the response for a previously sent request id if it has
+    /// arrived, without waiting. Returns `None` while the request is still
+    /// in flight or after it was discarded.
+    pub fn take_response(&mut self, id: u32) -> Option<Response> {
+        self.connection.take_response(id)
+    }
+
     /// Pump the pipe for up to `timeout` without awaiting any response.
     /// Delivers events into the queue; returns `Error::Io` on pipe failure
     /// or peer close.
@@ -323,5 +349,103 @@ mod tests {
         let response = client.request_browser("Bogus.m", &json!({})).unwrap();
         let error = response.error.expect("protocol error envelope");
         assert_eq!(error["code"], json!(-32601));
+    }
+
+    #[test]
+    fn send_session_then_take_response_is_non_blocking() {
+        let (mut client, peer) = silent_client();
+        let peer_read = peer._read_fd;
+        let peer_write = peer._write_fd;
+        std::thread::spawn(move || {
+            let mut message = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = unsafe { libc::read(peer_read, byte.as_mut_ptr().cast(), 1) };
+                if n != 1 {
+                    return;
+                }
+                if byte[0] == 0 {
+                    break;
+                }
+                message.push(byte[0]);
+            }
+            let request: Value = serde_json::from_slice(&message).unwrap();
+            assert_eq!(request["sessionId"], "SESSION-LIVE");
+            assert_eq!(request["method"], "Runtime.evaluate");
+            assert_eq!(request["params"]["expression"], "1+1");
+            let id = request["id"].as_u64().unwrap();
+            let body = format!(
+                r#"{{"id":{id},"result":{{"result":{{"type":"number","value":2}}}},"sessionId":"SESSION-LIVE"}}"#
+            );
+            let framed = crate::codec::encode_message(body.as_bytes());
+            let mut written = 0;
+            while written < framed.len() {
+                let n = unsafe {
+                    libc::write(
+                        peer_write,
+                        framed[written..].as_ptr().cast(),
+                        framed.len() - written,
+                    )
+                };
+                if n <= 0 {
+                    return;
+                }
+                written += n as usize;
+            }
+        });
+        let id = client
+            .send_session(
+                "SESSION-LIVE",
+                "Runtime.evaluate",
+                &json!({"expression": "1+1"}),
+            )
+            .expect("request sent without waiting");
+        assert!(id > 0);
+        // Still in flight at the moment of sending: never blocks.
+        assert!(client.take_response(id).is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            client.poll(Duration::from_millis(20)).unwrap();
+            if let Some(response) = client.take_response(id) {
+                assert!(response.error.is_none());
+                assert_eq!(response.session_id.as_deref(), Some("SESSION-LIVE"));
+                assert_eq!(response.result.unwrap()["result"]["value"], json!(2));
+                break;
+            }
+            assert!(Instant::now() < deadline, "response never arrived");
+        }
+        // A taken response is not delivered twice.
+        assert!(client.take_response(id).is_none());
+        assert_eq!(client.in_flight(), 0);
+    }
+
+    #[test]
+    fn unacked_send_session_slots_are_dropped_when_id_is_abandoned() {
+        let (mut client, _peer) = silent_client();
+        let id = client
+            .send_session(
+                "SESSION-GHOST",
+                "Runtime.evaluate",
+                &json!({"expression": "1+1"}),
+            )
+            .expect("request sent");
+        // The caller (liveness tracker) abandons the id after its deadline;
+        // the slot must not leak into the next probe's bookkeeping.
+        assert!(client.take_response(id).is_none());
+        assert_eq!(client.in_flight(), 1);
+        let _ = client.poll(Duration::from_millis(30));
+        // Nothing ever answered; the slot stays until a late answer is
+        // dropped by routing or the client drops.
+        assert_eq!(client.in_flight(), 1);
+        // The tracker abandons the old id after its deadline; a fresh probe
+        // must never collide with it.
+        let fresh = client
+            .send_session(
+                "SESSION-GHOST",
+                "Runtime.evaluate",
+                &json!({"expression": "1+1"}),
+            )
+            .expect("request sent");
+        assert!(fresh > id);
     }
 }

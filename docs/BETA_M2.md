@@ -1,6 +1,7 @@
 # BETA_M2 — Wallpaper renderer (CDP) milestone report
 
-Status: **M2a complete** (spike + client + smoke); M2b (renderer worker) not started.
+Status: **M2a complete** (spike + client + smoke); **M2b complete** (sandboxed
+web renderer worker + supervision + smoke).
 
 ## M2a goal
 
@@ -189,3 +190,232 @@ Smoke evidence (2026-08-19 run):
 `frames=8, first_frame_after_start_ms=34, additional_after_ack_stop=3,
 silence_confirmed=true, bytes_per_frame_avg=552` (phase B); both chromium
 instances exited rc=0.
+
+## 5. M2b: the sandboxed web renderer worker
+
+### 5.1 Goal
+
+`crates/kwe-web-renderer` turns one sandboxed headless Chromium into a
+supervised wallpaper renderer: it spawns the browser inside a bwrap sandbox,
+captures the page over the CDP screencast pipe pinned in §1–§2, publishes
+BGRA8888 frames through the same bounded frame protocol the video/test
+workers use, and answers the daemon's pointer and audio lines from its
+control stream. The supervisor treats it like any other worker — canary,
+promotion, failure budget, quarantine — so a crashing or malicious page can
+never escape the worker's fault envelope.
+
+Deliverables: `crates/kwe-web-renderer` (worker binary, ~1500 lines),
+`web_renderer_command()` in `crates/kwe-core/src/websandbox.rs` (the bwrap
+sandbox builder), `scripts/smoke-web.sh` (9 cases), THIRD_PARTY.yml entries,
+this section.
+
+### 5.2 The sandbox
+
+M2a's `chromium_command` produced a bare flag string; M2b replaces it with a
+real bwrap command (this was the M2a gap: bwrap's root namespace starts
+empty, and nothing would bind the browser's system paths in). The sandbox:
+
+- read-only binds `/usr`, `/etc`, `/lib`, `/lib64`, `/bin`, `/sbin`
+  (verified: chromium 151 launches and answers the CDP pipe through this);
+- overlays the wallpaper content root at `/wallpaper` (read-only);
+- gives `/tmp` as a writable tmpfs for the throwaway profile
+  (`/tmp/kwe-profile`, fresh per launch), `/proc` and `/dev`;
+- runs `--unshare-net` unless the content permission set grants network
+  (M1a default OFF; grants land in M2c);
+- `--die-with-parent --new-session`, then `chromium --headless=new
+  --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run
+  --no-default-browser-check --disable-extensions --remote-debugging-pipe
+  --window-size=<spec> --user-data-dir=/tmp/kwe-profile
+  file:///wallpaper/index.html`.
+
+The worker itself runs with the supervisor's stripped environment (no
+`DISPLAY`, no session bus; see SUPERVISOR_API_V1.md) and hands the browser
+the CDP pipe on fds 3/4 exactly as pinned in §1.1/§2.
+
+### 5.3 Worker contract
+
+- **Frames**: `Page.screencastFrame` events (jpeg q80, delivered at the spec
+  size) are acked per frame (the §1.6 contract), base64-decoded by a
+  hand-rolled bounded decoder, JPEG-decoded through the `image` crate with
+  `Limits` capped at **8192 px per dimension / 64 MiB alloc / 16 777 216
+  pixels**, converted to opaque BGRA8888, and published through the shared
+  frame protocol at the pacing deadline (fps). A frame that fails to decode
+  or exceeds the caps is counted (`event=renderer.web.decode_failure`) and
+  skipped, never published. (`MAX_DECODE_DIMENSION = 8192`,
+  `MAX_DECODE_ALLOC_BYTES = 64 MiB`, `MAX_DECODED_PIXELS = 16_777_216` in
+  `crates/kwe-web-renderer/src/main.rs` — the doc and the code agree.)
+- **Keepalive**: a static page produces no screencast frames, so the last
+  decoded frame is re-published at each pacing deadline; the supervisor's
+  frame timeout can never trip on a page that painted once.
+- **Heartbeat**: the keepalive cannot distinguish a still page from a
+  *wedged* page — a page whose renderer main thread hangs after first paint
+  stops answering CDP (acks included) while the browser process survives and
+  the keepalive keeps the sequence advancing forever. A page-independent
+  probe therefore runs every `--web-heartbeat-ms` (default 5000): a
+  session-scoped `Runtime.evaluate("1+1")` sent through the non-blocking CDP
+  API (`Client::send_session` + `take_response` — a blocking probe would
+  stall the publish pipeline past the supervisor's frame timeout, so the
+  daemon would reap the worker before this path could fire). An unanswered
+  probe within its one-interval deadline counts as one consecutive failure;
+  `--web-heartbeat-max-failures` (default 3) consecutive failures/timeouts
+  emit `event=renderer.web.heartbeat_failed` and exit 73. A healthy static
+  page answers every probe, so only genuinely unresponsive pages trip it.
+- **Scale policy**: the frame slot is fixed-size, so letterboxing is
+  unavailable; a delivered frame whose dimensions differ from the spec
+  (compositor aspect rounding, e.g. 160x89 for a 160x90 spec) is stretched
+  with a bounded nearest-neighbor scale (`y*src_h/dst_h` integer ratio) that
+  fills the slot exactly. Output is always exactly spec-sized, so the
+  stretch is O(spec pixels) — bounded and cheap (measured below).
+- **Input**: pointer lines from the control stream are dispatched to the
+  page as CDP `Input.dispatchMouseEvent` in layout CSS pixels (normalized
+  u16/65535 mapped to the screencast viewport; a held-button bitfield is
+  carried on every event); `audio.forward` frames are evaluated as
+  `window.audio_web([...])` at most 30/s (rate-limit diagnostics
+  `event=renderer.web.audio_rate_limited`); media-state messages are
+  ack-only. Each valid message is echoed with its wire sequence (the daemon
+  acks). Evaluation failures are counted and diagnosed
+  (`event=renderer.web.audio_evaluate_error`), never fatal.
+- **Faults**: `--exit-after N`, `--memory-after N` exercise the same fault
+  block as the test/video workers, with the same exit codes: 70
+  (`--exit-after` fired), 71 (memory denied under rlimit), 72 (memory
+  unexpectedly succeeded), 73 (backend rejected — the browser failed to
+  answer the CDP pipe, the sandbox never came up, or the page failed the
+  heartbeat; the daemon folds the chromium stderr tail into the failure
+  detail).
+- **Teardown**: closing the CDP pipe ends is the bounded shutdown signal
+  (chromium exits rc=0 within ~50 ms, §1.7); the bwrap process group is
+  SIGTERMed after a grace, SIGKILLed past it, and reaped with a bound.
+
+### 5.4 Supervision deltas (the 128 GiB address-space decision)
+
+Empirically (all measured on this machine, Chromium 151.0.7922.137):
+
+- The V8 sandbox reserves ~53 GiB of virtual address space per browser
+  process at exec (VmSize ≈ 55 449 708 kB per process; RSS stays ~250 MB,
+  36 threads — the reservation is pure VA, no resident cost).
+- With `RLIMIT_AS` at 16384 MiB the browser SIGTRAPs at exec, silently
+  (rc=133, empty stderr tail); 64 GiB renders fine but the DevTools pipe
+  bootstrap never answers (silent timeout — the V8 sandbox floor is
+  ~98 GiB: 96 GiB fails, 100352 MiB works); the daemon's default is
+  **131072 MiB (128 GiB)**, clearing the floor with margin.
+- The old global 1024-process ceiling kills the bwrap fork: the kernel's
+  `RLIMIT_NPROC` counts every thread of the uid (`user->processes`), this
+  session alone runs ~1265 threads, and `spawning bwrap` then fails with
+  EAGAIN (3× → quarantine). The web kind therefore defaults to a
+  **32768-process ceiling** and 1024 open files, like the M1e video fix.
+- Resident protection comes from the supervisor timeouts plus the
+  containing unit's systemd `MemoryMax`, not from `RLIMIT_AS`.
+
+The status `resource_limits` for a web worker reports
+`{address_space_mib: 131072, open_files: 1024, processes: 32768}`.
+
+### 5.5 Decode latencies (measured)
+
+Offline microbenchmark of the exact decode path (hand-rolled base64 +
+`image` ImageReader with the worker's `Limits` + `into_rgb8` + the
+nearest-neighbor convert; release build, image 0.25.10), on a q80 jpeg
+matching the wire size class:
+
+| Spec | jpeg bytes | decode+convert, median (min–max) |
+| --- | --- | --- |
+| 160x90 | 1504 (wire q80 dark pages: ~555) | 60 µs (58–132) |
+| 960x540 | 17650 | 1435 µs (1402–2121) |
+| 160x89 stretch path | 1504 | 59 µs (58–121) |
+
+The 160x90 decode is ~0.2 % of the 33 ms pacing budget; even 960x540 costs
+~1.4 ms. The stretch policy is free at wallpaper sizes.
+
+### 5.6 M2b acceptance
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| fmt | `cargo fmt --all -- --check` | pass |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| test | `cargo test --workspace --all-targets` | pass (201 tests, 0 failures) |
+| smoke-web | `./scripts/smoke-web.sh` | pass (11 cases, plasmashell pid unchanged) |
+| smoke-cdp | `./scripts/smoke-cdp.sh` | pass (M2a regression) |
+| smoke-video | `./scripts/smoke-video.sh` | pass (M2a regression) |
+| smoke-supervisor | `./scripts/smoke-supervisor.sh` | pass (M2a regression) |
+
+Smoke-web case evidence (2026-08-19 run): canary promote with the 128 GiB
+budget applied (sequence advances, sandbox holds, last-good P6 persisted).
+The sandbox-integrity case is network-dependent, not scheme-isolation-based:
+the fixture fetches `http://127.0.0.1:<port>/probe` (1.5 s abort timeout)
+and paints a red marker covering the probe box (10,10,4,4) in the captured
+frame on success; under `--unshare-net` the sandbox's own loopback does not
+exist and the fetch fails fast, so the marker never paints and the probe
+box stays empty — while the positive control (the same fixture started
+through the daemon with the per-request `allow_network` test hook, gated
+behind `--allow-test-faults`, plus a loopback CORS `python3 -m
+http.server`) paints the marker, proving the negative comes from the
+network namespace, not from a marker that could never paint. The marker is
+positioned in viewport X fractions and spans the full canvas height
+because of the screencast geometry (see §5.7): the headless surface is
+500x3, the screencast aspect-fits it to a 160x1 JPEG, and the slot fill
+duplicates that single row across all 90 frame rows — the marker must
+dominate the row average, or it decodes as a dim smear that fails the
+probe (measured root cause of the earlier positive-control failures).
+Further cases: static-page keepalive (sequence advances, 0 failures, no
+decode diagnostics); pointer oracle (baseline clean, dot at normalized
+(0.5, 0.5) painted and acked, probe verified); audio.forward (acks advance
+to the display generation, 0 protocol errors); kill -9 (recorded once,
+last-good preserved, auto-restarted, not quarantined); missing content root
+rejected `invalid_params`; busy-loop page (worker exit 73, rolled back with
+`exit_code_73`); three candidate-window kills → quarantine (`failures=3`,
+pid null) and `renderer.start` refused with the quarantine phase; late-wedge
+page (promotes to live, then wedges its renderer main thread: the keepalive
+masks the dead stream, the heartbeat times out twice under the smoke
+override and the worker exits 73 with `event=renderer.web.heartbeat_failed`
+in the failure detail, the supervisor records the exit and restarts, and the
+wedge repeats — the case observes three consecutive exit-73 cycles, never
+masked. Note the wedge does NOT quarantine: the failure budget is
+pre-promotion by design (a promotion clears the record — a worker that
+reached live is trusted, so post-promotion exits restart cleanly; the same
+rule that makes case-8's candidate kills accumulate). plasmashell's pid was
+identical and alive before and after the suite.
+
+### 5.7 Open risks
+
+- **VA floor may move with chromium versions**: 128 GiB clears the current
+  98 GiB floor with margin, but a future browser with a bigger V8 sandbox
+  reservation fails *silently* (no stderr) below its own floor. The daemon
+ 's upper bound is 256 GiB (`RendererResourceLimits::validate`).
+- **Bwrap fork under NPROC**: the 32768 ceiling is per-uid-wide process
+  accounting; a session running >32768 threads (or a kernel with tighter
+  `kernel.threads-max`) would hit EAGAIN at spawn, surfacing as an opaque
+  `exit_code_73`/backend-reject with an empty stderr tail. Mitigation is
+  the failure budget + the sandbox holding no secrets.
+- **Screencast geometry (measured root cause of the early positive-control
+  failures, 2026-08-19)**: headless=new ignores `--window-size` — the
+  window is 500x90 with a 500x3 layout viewport — and
+  `Page.startScreencast` aspect-fits the surface into maxWidth/maxHeight,
+  producing a **160x1 JPEG** whose single row is the area-average of the
+  three canvas rows; the worker's bounded slot fill then duplicates that
+  row across all 90 frame rows (`y*src_h/dst_h` is 0 for a 1-row source),
+  so the frame's y-axis carries no information at all. Consequences: a
+  marker painted on a subset of canvas rows decodes as a dim full-height
+  smear (measured (85,13,14) from rows (208,3,3)/(63,14,16)/(16,18,20)),
+  and a fixed-coordinate marker is fragile at best, off-canvas at worst.
+  Fixtures handle it by painting the marker in viewport X fractions
+  spanning the full canvas height — invariant to the surface size, landing
+  at frame columns 6..18 on any geometry. Relatedly, a page that paints
+  identical pixels every frame stops the compositor from producing new
+  frames, which stops rAF callbacks entirely (this was the earlier
+  "1-frame quirk" in isolated captures): animations must change pixels per
+  frame to keep frames flowing. The keepalive re-publish masks still pages;
+  a page that genuinely stops painting is indistinguishable from one that
+  paints once by the frame path alone — the heartbeat bounds that blind
+  spot (a stopped-painting page whose main thread still answers probes is
+  fine; a wedged one exits 73).
+- **Heartbeat interplay with the frame timeout**: the probe deadline is one
+  full interval (default 5 s) and a healthy-but-busy page can take longer
+  than that to answer under extreme load — the worker would then exit 73
+  even though the page is alive. The interval/failure budget is
+  configurable (`--web-heartbeat-ms` / `--web-heartbeat-max-failures`) and
+  the daemon defaults (5 s / 3) sit far above the measured <100 ms answer
+  time; a page that stalls the renderer main thread for >15 s is wedged in
+  every practical sense. The probe is strictly non-blocking, so it never
+  competes with the pacing deadline for the worker's single thread.
+- **Decode budget**: worst-case 960x540 decode ≈1.4 ms is fine at 30 fps;
+  a future 4K spec (3840x2160) would cost ~20 ms/frame in software decode —
+  the caps keep it bounded, but the pacing budget shrinks.
