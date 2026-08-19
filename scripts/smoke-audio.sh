@@ -132,6 +132,12 @@ wait_phase() {
 }
 
 start_video() {
+    # BETA_M2c: the daemon-owned audio grant gates audio.forward delivery for
+    # every wallpaper kind (capture stays global). The case-2 identity must
+    # therefore carry the grant or its frames are dropped silently latest-wins
+    # and input_ack_sequence never advances. permissions.set patches only the
+    # provided field; the grant persists for the daemon's lifetime.
+    call_daemon permissions.set '{"wallpaper_id":"audio-case2","audio":true}' >/dev/null
     local params
     params="$(jq -cn \
         --arg content "$fixture" \

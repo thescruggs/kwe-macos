@@ -166,6 +166,26 @@ fn main() -> Result<()> {
                      killed"
                 ),
             }
+            // Web backend lane (M2e): the web probe boots the real sandboxed
+            // browser (bwrap + headless chromium) over a throwaway content
+            // root and answers Browser.getVersion over the CDP pipe — a
+            // missing sandbox runtime or a browser that cannot boot reports
+            // as a failed probe instead of a blanket "not found".
+            match probe_web_backend() {
+                WebProbeOutcome::Report(report) => print!("web backend: {report}"),
+                WebProbeOutcome::Missing => println!(
+                    "web backend: kwe-web-renderer not found beside this binary; \
+                     run it with --probe manually"
+                ),
+                WebProbeOutcome::Failed { exit, reason } => println!(
+                    "web backend: kwe-web-renderer --probe failed ({reason}, exit {})",
+                    exit.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                ),
+                WebProbeOutcome::Hung => println!(
+                    "web backend: kwe-web-renderer --probe did not finish within 15 s; \
+                     killed"
+                ),
+            }
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
         Command::Preflight { path, video, web } => {
@@ -256,12 +276,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Outcome of the video backend probe lane; each failure mode prints a
-/// distinct diagnostic instead of a blanket "not found".
-enum VideoProbeOutcome {
+/// Outcome of a renderer `--probe` lane; each failure mode prints a
+/// distinct diagnostic instead of a blanket "not found". Shared by the
+/// video lane (M1e) and the web lane (M2e).
+enum ProbeRun {
     /// The probe's JSON report (single line).
     Report(String),
-    /// No `kwe-video-renderer` binary beside this one.
+    /// No renderer binary beside this one.
     Missing,
     /// Spawn failed, or the probe exited nonzero (its own bounded stderr
     /// diagnostic appears above).
@@ -270,15 +291,14 @@ enum VideoProbeOutcome {
     Hung,
 }
 
-/// Run the video renderer's `--probe` (resolved beside this binary) and
-/// return its JSON report. Bounded: the probe is a single libmpv version
-/// query, and a hung probe is killed after a 10 s deadline instead of
-/// hanging the diagnostic.
-fn probe_video_backend() -> VideoProbeOutcome {
+/// Run one renderer's `--probe` (resolved beside this binary) and return
+/// its JSON report. Bounded: the probe is a single backend query, and a
+/// hung probe is killed after `deadline` instead of hanging the diagnostic.
+fn run_renderer_probe(binary: &str, deadline: Duration) -> ProbeRun {
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            return VideoProbeOutcome::Failed {
+            return ProbeRun::Failed {
                 exit: None,
                 reason: error.to_string(),
             };
@@ -287,15 +307,15 @@ fn probe_video_backend() -> VideoProbeOutcome {
     let directory = match executable.parent() {
         Some(path) => path,
         None => {
-            return VideoProbeOutcome::Failed {
+            return ProbeRun::Failed {
                 exit: None,
                 reason: "no parent directory for this binary".to_string(),
             };
         }
     };
-    let probe = directory.join("kwe-video-renderer");
+    let probe = directory.join(binary);
     if !probe.is_file() {
-        return VideoProbeOutcome::Missing;
+        return ProbeRun::Missing;
     }
     let mut child = match std::process::Command::new(&probe)
         .arg("--probe")
@@ -304,19 +324,19 @@ fn probe_video_backend() -> VideoProbeOutcome {
     {
         Ok(child) => child,
         Err(error) => {
-            return VideoProbeOutcome::Failed {
+            return ProbeRun::Failed {
                 exit: None,
                 reason: error.to_string(),
             };
         }
     };
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + deadline;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
             Ok(Some(status)) => {
                 let _ = child.wait();
-                return VideoProbeOutcome::Failed {
+                return ProbeRun::Failed {
                     exit: status.code(),
                     reason: "probe exited nonzero".to_string(),
                 };
@@ -324,13 +344,13 @@ fn probe_video_backend() -> VideoProbeOutcome {
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return VideoProbeOutcome::Hung;
+                return ProbeRun::Hung;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return VideoProbeOutcome::Failed {
+                return ProbeRun::Failed {
                     exit: None,
                     reason: error.to_string(),
                 };
@@ -342,16 +362,59 @@ fn probe_video_backend() -> VideoProbeOutcome {
     let mut stdout = String::new();
     match child.stdout.take() {
         Some(mut pipe) => match pipe.read_to_string(&mut stdout) {
-            Ok(_) => VideoProbeOutcome::Report(stdout),
-            Err(error) => VideoProbeOutcome::Failed {
+            Ok(_) => ProbeRun::Report(stdout),
+            Err(error) => ProbeRun::Failed {
                 exit: None,
                 reason: error.to_string(),
             },
         },
-        None => VideoProbeOutcome::Failed {
+        None => ProbeRun::Failed {
             exit: None,
             reason: "probe stdout was not captured".to_string(),
         },
+    }
+}
+
+/// Outcome of the video backend probe lane (M1e); each failure mode prints
+/// a distinct diagnostic instead of a blanket "not found".
+enum VideoProbeOutcome {
+    Report(String),
+    Missing,
+    Failed { exit: Option<i32>, reason: String },
+    Hung,
+}
+
+/// Run the video renderer's `--probe`: a single libmpv version query, no
+/// device needed; a hung probe is killed after a 10 s deadline.
+fn probe_video_backend() -> VideoProbeOutcome {
+    match run_renderer_probe("kwe-video-renderer", Duration::from_secs(10)) {
+        ProbeRun::Report(report) => VideoProbeOutcome::Report(report),
+        ProbeRun::Missing => VideoProbeOutcome::Missing,
+        ProbeRun::Failed { exit, reason } => VideoProbeOutcome::Failed { exit, reason },
+        ProbeRun::Hung => VideoProbeOutcome::Hung,
+    }
+}
+
+/// Outcome of the web backend probe lane (M2e); each failure mode prints a
+/// distinct diagnostic instead of a blanket "not found".
+enum WebProbeOutcome {
+    Report(String),
+    Missing,
+    Failed { exit: Option<i32>, reason: String },
+    Hung,
+}
+
+/// Run the web renderer's `--probe`: the probe boots the real sandboxed
+/// browser and answers Browser.getVersion over the CDP pipe, so it needs
+/// bwrap and chromium present; a hung probe is killed after a 15 s deadline
+/// (cold browser boot measured at < 1 s in docs/BETA_M2.md §1.7, so the
+/// budget is generous).
+fn probe_web_backend() -> WebProbeOutcome {
+    match run_renderer_probe("kwe-web-renderer", Duration::from_secs(15)) {
+        ProbeRun::Report(report) => WebProbeOutcome::Report(report),
+        ProbeRun::Missing => WebProbeOutcome::Missing,
+        ProbeRun::Failed { exit, reason } => WebProbeOutcome::Failed { exit, reason },
+        ProbeRun::Hung => WebProbeOutcome::Hung,
     }
 }
 

@@ -26,8 +26,9 @@ so no GitHub access or credentials are needed. Only outside the checkout (AUR
 builders) does it fetch the published GitHub repository.
 
 The package installs `kwe-daemon` (supervised renderer daemon), `kwe-manager`
-(the Kirigami app), the `kwe` CLI, the `kwe-test-renderer` and `kwe-vulkan`
-renderers, the staged `org.kde.kwe.wallpaper` Plasma wallpaper package, and a
+(the Kirigami app), the `kwe` CLI, the `kwe-test-renderer`, `kwe-vulkan`,
+`kwe-video-renderer`, `kwe-web-renderer`, and `kwe-audio-worker` renderers and
+workers, the staged `org.kde.kwe.wallpaper` Plasma wallpaper package, and a
 user systemd unit. After installing, enable the daemon user service:
 
 ```sh
@@ -90,6 +91,24 @@ temporary prefix and does not load or change the live desktop:
 
 ```sh
 scripts/smoke-plasma-display.sh
+```
+
+Alpha M2 implements the video and web renderers behind the supervisor:
+`kwe-video-renderer` (the M1e libmpv worker) and the sandboxed
+`kwe-web-renderer` (bwrap + headless Chromium over the CDP pipe, grant-gated
+network and audio, heartbeat-bounded liveness) publish BGRA8888 frames through
+the shared frame protocol; the catalog marks web wallpapers renderer-dependent
+("sandboxed Chromium worker; network and audio off until granted"). Both
+feature-compatibility rows are honestly `partial` — `content.video` (M1e) and
+`content.web` / `runtime.audio-web-64` (M2e) — and `kwe diagnose` prints
+versioned backend probes for each lane. See [docs/BETA_M2.md](docs/BETA_M2.md)
+for the pinned CDP wire contract, the sandbox compromise suite, and the
+close-out; rendering never runs inside plasmashell.
+
+```sh
+scripts/smoke-web.sh
+scripts/smoke-web-compromise.sh
+./target/debug/kwe diagnose
 ```
 
 Playlist work through Alpha M5j provides bounded persistent membership,

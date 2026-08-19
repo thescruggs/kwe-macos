@@ -400,8 +400,8 @@ fn scan_project(root: &Path, limits: &ScanLimits) -> CatalogItem {
             "libmpv worker with software fallback; static video preflight",
         ),
         ProjectKind::Web => (
-            Compatibility::BackendMissing,
-            "Sandboxed web worker is not included in this alpha",
+            Compatibility::RendererDependent,
+            "sandboxed Chromium worker; network and audio off until granted",
         ),
         ProjectKind::Unknown => (
             Compatibility::Unsupported,
@@ -793,6 +793,32 @@ mod tests {
         assert_eq!(
             catalog.items[0].compatibility_detail,
             "libmpv worker with software fallback; static video preflight"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_web_projects_renderer_dependent() {
+        let root = temp_fixture("web-compat");
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            r#"{"title":"Synthetic web","type":"web","file":"index.html"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/index.html"),
+            b"<html>synthetic fixture</html>",
+        )
+        .unwrap();
+        let catalog = scan_installed(std::slice::from_ref(&root), &ScanLimits::default());
+        assert_eq!(catalog.items[0].kind, ProjectKind::Web);
+        assert_eq!(
+            catalog.items[0].compatibility,
+            Compatibility::RendererDependent
+        );
+        assert_eq!(
+            catalog.items[0].compatibility_detail,
+            "sandboxed Chromium worker; network and audio off until granted"
         );
         let _ = fs::remove_dir_all(root);
     }

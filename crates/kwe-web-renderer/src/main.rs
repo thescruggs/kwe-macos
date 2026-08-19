@@ -38,6 +38,7 @@
 // scale that stretches the delivered image to fill the fixed-size slot.
 
 use std::ffi::c_int;
+use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -101,6 +102,14 @@ const MAX_DECODED_PIXELS: u64 = 16_777_216; // 4096^2
 /// Audio injection bound: at most 30 `audio_web(...)` calls per second,
 /// latest-wins (a newer frame replaces an older one).
 const AUDIO_MIN_INTERVAL: Duration = Duration::from_millis(34);
+
+/// Throwaway content page for `--probe` (BETA_M2e): the probe boots the REAL
+/// sandboxed browser over a temp content root and answers Browser.getVersion
+/// on the CDP pipe — a broken sandbox or missing browser fails the probe
+/// exactly as it would fail a supervised worker. The page itself is never
+/// rendered (the version query needs no target).
+const PROBE_PAGE: &str =
+    "<!doctype html><html><head><title>kwe-web-probe</title></head><body></body></html>";
 
 /// Bounded stderr ring for browser diagnostics (same size as the daemon's
 /// per-worker ring).
@@ -250,8 +259,9 @@ fn ensure_ok(response: &kwe_cdp::Response, what: &str) -> Result<()> {
 #[derive(Debug, Parser)]
 #[command(version, about = "Isolated KWE supervised web renderer")]
 struct Arguments {
-    /// Frame mapping file (validated and pre-opened by the daemon).
-    #[arg(long)]
+    /// Frame mapping file (validated and pre-opened by the daemon). Only
+    /// `--probe` may omit it.
+    #[arg(long, required_unless_present = "probe")]
     output: Option<PathBuf>,
     /// Frame width in pixels.
     #[arg(long, default_value_t = 960, value_parser = clap::value_parser!(u32).range(1..=8192))]
@@ -263,8 +273,9 @@ struct Arguments {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
     /// Content root directory (must contain index.html; daemon-validated
-    /// before spawn and preflight-checked again here).
-    #[arg(long)]
+    /// before spawn and preflight-checked again here). Only `--probe` may
+    /// omit it.
+    #[arg(long, required_unless_present = "probe")]
     content: Option<PathBuf>,
     /// Stall before spawning the browser (supervisor startup test).
     #[arg(long)]
@@ -304,6 +315,14 @@ struct Arguments {
     /// clients never pass it themselves.
     #[arg(long)]
     allow_network: bool,
+    /// Print a JSON backend report ({backend, browser_version,
+    /// protocol_version, sandbox, screencast, heartbeat}) by spawning the
+    /// real sandboxed browser over a throwaway content root and answering
+    /// Browser.getVersion on the CDP pipe, then exit 0; any failure is a
+    /// backend rejection (exit 73). `kwe diagnose` runs this lane with a
+    /// 15 s deadline.
+    #[arg(long)]
+    probe: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,11 +1499,115 @@ fn diag_input_error(kind: &str, error: &anyhow::Error, count: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// --probe (BETA_M2e)
+// ---------------------------------------------------------------------------
+
+/// Bounded reap for probe mode: after the CDP pipe ends close (the drop
+/// signal), the sandboxed browser exits rc=0 within ~50 ms (pinned in
+/// docs/BETA_M2.md §1.7); wait with a deadline, then SIGKILL the bwrap
+/// process group (its own group: setpgid in spawn_browser's pre_exec).
+/// Mirror of [`BrowserSession::stop`]'s escalation without the stderr ring.
+fn reap_browser(child: &mut Child) {
+    let deadline = Instant::now() + CHILD_EXIT_DEADLINE;
+    loop {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("event=renderer.web.probe_browser_wedged forcing termination");
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: the sandboxed child was placed in its own process group; a
+    // negative pid restricts delivery to it.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
+/// One bounded Browser.getVersion query through the real sandboxed browser
+/// (bwrap prefix + headless chromium, network-isolated, throwaway tmpfs
+/// profile — the supervised command from [`web_renderer_command`] with the
+/// screencast viewport). The query blocks at most the CDP request timeout
+/// (5 s); the browser is torn down on every path (pipe close -> rc=0, then
+/// the bounded reap), so a hung browser cannot leak. `kwe diagnose` wraps
+/// this lane in a 15 s overall deadline.
+fn probe_browser_version(content: &Path) -> Result<Value> {
+    let spec = FrameSpec::new(160, 90)?;
+    let (mut child, read_fd, write_fd) = spawn_browser(content, spec, false)?;
+    let mut client = Client::new(read_fd, write_fd)?;
+    let outcome = client.request_browser("Browser.getVersion", &json!({}));
+    let mut report = None;
+    let result: Result<()> = (|| {
+        let response = outcome
+            .context("browser did not answer Browser.getVersion within the CDP request timeout")?;
+        ensure_ok(&response, "Browser.getVersion")?;
+        let result = response.result.unwrap_or_default();
+        // Chromium 151 answers with `product` ("Chrome/151.0.7922.137");
+        // older DevTools versions used `browser` — read either.
+        let browser_version = result
+            .get("product")
+            .or_else(|| result.get("browser"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        report = Some(json!({
+            "backend": "chromium",
+            "browser_version": browser_version,
+            "protocol_version": result.get("protocolVersion").and_then(Value::as_str).unwrap_or("unknown"),
+            "sandbox": "bwrap",
+            "screencast": "jpeg-q80",
+            "heartbeat": true,
+        }));
+        Ok(())
+    })();
+    drop(client); // closes the CDP pipe ends: the teardown signal
+    reap_browser(&mut child);
+    result?;
+    Ok(report.expect("report was set on success"))
+}
+
+/// `--probe` entry: create a throwaway content root, drive the real
+/// sandboxed browser against it, print the one-line JSON backend report and
+/// exit 0. A failure (missing bwrap/chromium, browser that never answers,
+/// sandbox that cannot boot) is a backend rejection — the caller exits 73.
+fn probe_report() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("kwe-web-probe-{}", std::process::id()));
+    fs::create_dir_all(&root).context("create probe content root")?;
+    fs::write(root.join("index.html"), PROBE_PAGE).context("write probe index.html")?;
+    let report = match probe_browser_version(&root) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+    println!("{report}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    if arguments.probe {
+        match probe_report() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Backend rejection (mirror of the worker's main error
+                // mapping): bounded stderr diagnostic and exit 73, which
+                // `kwe diagnose`'s web lane reports as a failed probe.
+                eprintln!("event=renderer.web.backend_reject detail={error}");
+                eprintln!("event=renderer.web.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+                exit(EXIT_BACKEND_REJECT);
+            }
+        }
+    }
     if arguments.memory_pressure_after.is_some() != arguments.memory_pressure_mib.is_some() {
         bail!("--memory-pressure-after and --memory-pressure-mib must be supplied together");
     }
