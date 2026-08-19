@@ -69,8 +69,6 @@
 
 ## Symptom
 
-## Symptom
-
 kwe-manager opens with an empty installed gallery. No wallpapers listed,
 no crash. The alpha package (same manager code) listed all 92 projects
 yesterday.
