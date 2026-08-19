@@ -34,4 +34,6 @@ pub use scan::{
     ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,
 };
 pub use webpreflight::{WebPreflight, preflight_web};
-pub use websandbox::{WebSandboxCommand, chromium_command, sandbox_root, web_renderer_command};
+pub use websandbox::{
+    WebSandboxCommand, chromium_command, sandbox_root, web_preview_command, web_renderer_command,
+};

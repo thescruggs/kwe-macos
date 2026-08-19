@@ -2,7 +2,8 @@
 
 Status: **M2a complete** (spike + client + smoke); **M2b complete** (sandboxed
 web renderer worker + supervision + smoke); **M2c complete** (daemon-owned
-permission grants + manager wiring + smoke).
+permission grants + manager wiring + smoke); **M2d complete** (sandbox
+compromise suite + windowed preview fix + web preflight CLI).
 
 ## M2a goal
 
@@ -493,3 +494,121 @@ stays as history; the grants lane (`smoke-web.sh` case 1b) now drives the
 same fixture through `permissions.set` → `renderer.start` (marker paints
 red) and revocation → restart (marker stays away while the probe server
 still runs — the grant, not connectivity, is the discriminator).
+
+## 7. M2d: the sandbox compromise suite, the preview fix, and web preflight
+
+### 7.1 Goal
+
+Three deliverables. (1) `scripts/smoke-web-compromise.sh`: a dedicated
+compromise suite whose runtime-generated fixture page attempts four sandbox
+escapes and paints one color-coded result box per attempt, driven through the
+daemon twice — Scenario A with the default grants (network off), Scenario B
+with a network grant set through `permissions.set` — and asserted with the
+frame oracle AND with the actual sandbox argv read from
+`/proc/<pid>/cmdline`. (2) The manager `WebPreview` fix: the old M2a
+`chromium_command` (empty bwrap root, no system ro-binds, no `--no-sandbox`)
+could not exec chromium at all; the preview now launches the same M2b sandbox
+(shared `sandbox_prefix` builder) with WINDOWED chromium, and the network
+grant is wired through `PermissionsClient` with a bounded relaunch on grant
+change. (3) `kwe preflight --web <root>`: statically validate a web wallpaper
+directory exactly like the existing `--path`/`--video` variants (exit 0 safe /
+2 unsafe / 1 misuse).
+
+### 7.2 The compromise matrix (attempt × scenario × expected → actual)
+
+All results measured 2026-08-19 on Chromium 151.0.7922.137 through the
+daemon pipeline, verified by `scripts/smoke-web-compromise.sh`:
+
+| Attempt | Escape | Scenario A (default, no grant) | Scenario B (network grant) |
+| --- | --- | --- | --- |
+| 1 | network fetch to `http://203.0.113.1/` (TEST-NET-3, RFC 5737), 1.5 s abort bound | blocked fast (~10 ms TypeError, no route under `--unshare-net`) → **green**; actual: green | leaves the sandbox, enters the host network, SYN blackholed by the default route → aborts at the 1.5 s bound → **orange** (positive control); actual: **orange (255,139,0)** |
+| 2 | cors-mode fetch of `file:///etc/passwd` + traversal XHR `file:///wallpaper/../../../../etc/passwd` | both fail → **green**; actual: green | same → **green**; actual: green |
+| 3 | content-root reachability: `file:///wallpaper/index.html` | succeeds → **green**; actual: green | same → **green**; actual: green |
+| 4 | allowed reads: localStorage + `navigator.userAgent` | succeed → **green**; actual: green | same → **green**; actual: green |
+
+The fixture colors are GREEN `#00c000` (sandbox held), ORANGE `#ff8c00`
+(attempt left the sandbox — only the positive control may paint it), RED
+`#ff0000` (escape/compromise — the suite fails), PENDING `#303030`. Probes
+use the shared `scripts/frame-read.py` (JPEG q80 decode, per-channel
+tolerance 60). The M2b screencast-geometry lesson applies (see §5.7): the
+four boxes are painted in viewport X fractions spanning the FULL canvas
+height and land at frame columns 0-40/40-80/80-120/120-160.
+
+### 7.3 The argv-level proof
+
+The grant→argv contract is asserted on the real process tree, not just on
+painted pixels. `renderer.status`'s `pid` is the supervised worker
+(`kwe-web-renderer`), whose only child is the bwrap process; both command
+lines are read from `/proc/<pid>/cmdline` (NUL-separated, `tr '\0' ' '`).
+
+| Process | Scenario A | Scenario B |
+| --- | --- | --- |
+| worker argv | no `--allow-network` (measured) | contains `--allow-network` (measured) |
+| bwrap argv | contains `--unshare-net` (measured) | no `--unshare-net` (measured) |
+
+Scenario B's painted ORANGE box proves the lack of `--unshare-net` is not a
+cosmetic argv diff: the fetch genuinely reached the host network stack.
+
+### 7.4 Measured deviations from the task text (all documented in the fixture)
+
+1. **Attempt 1's positive control cannot literally succeed**: TEST-NET-3 is
+   unroutable by design (RFC 5737); on the host netns the SYN is blackholed
+   by the default route, so the fetch cannot resolve. The observable that
+   proves the fetch LEFT the sandbox is the abort at the 1.5 s bound —
+   ORANGE "network-present", documented honestly in the matrix.
+2. **The abort reason is named `TimeoutError`**: `AbortSignal.timeout()`'s
+   abort reason is a TimeoutError DOMException (spec behavior, confirmed
+   through the daemon pipeline — the fixture's first `AbortError`-only check
+   left scenario B green; the name is `TimeoutError` on chromium 151).
+3. **Attempt 3 must use `no-cors`**: cors-mode fetch/XHR of ANY `file:` URL
+   from a `file://` page is blocked — including the page's own URL (measured
+   in M2d). A no-cors fetch resolves opaque exactly when the file exists, so
+   it is the probe that proves attempt 2's failures come from scheme
+   isolation, not a broken content mount.
+4. **`/etc/passwd` exists inside the sandbox** (a no-cors probe of it
+   resolves): attempt 2's RED would be a genuine host-file read, not a
+   missing-file artifact.
+
+### 7.5 The WebPreview fix
+
+`apps/kwe-manager/src/webpreview.{h,cpp}` now builds the command from the
+shared `sandbox_prefix(root, network_allowed)` in
+`crates/kwe-core/src/websandbox.rs` (the M2b ro-bind set + `--unshare-net`
+toggle, plus `web_preview_command()` as the pinned windowed form): bwrap
+then `chromium --no-sandbox --disable-dev-shm-usage --no-first-run
+--no-default-browser-check --disable-extensions
+--user-data-dir=/tmp/kwe-preview-profile file:///wallpaper/index.html` —
+no `--headless`, no CDP pipe, no screencast viewport; DISPLAY is inherited
+(the preview is the user-facing window). The grant wiring: `WebPreview`
+holds a `PermissionsClient*`; on `play()` it requests the wallpaper's
+permissions, snapshots `isGranted(network)` into the launch, and on a
+`grantedChanged(network)` while the same wallpaper is running relaunches
+the browser with the new argv. Unit coverage without spawning anything:
+`webpreviewtest.cpp` pins the isolation (ro-bind pairs, `--unshare-net`
+default and its removal under grant), the windowed flags (no headless/CDP
+prefixes), and the pre-spawn validation gates (non-local URL rejected,
+non-`index.html` file rejected), plus the `kwe-core` builder test
+`web_preview_command_is_windowed_with_the_m2b_isolation`.
+
+### 7.6 Web preflight
+
+`kwe preflight --web <root>` mirrors the `--path`/`--video` variants:
+`--web` takes a wallpaper directory, `--path` takes a scene dir — exactly
+one is required (anything else exits 1). A web root is safe (exit 0) when
+it is a directory containing an `index.html` (the `sandbox_root` rule);
+anything else exits 2 with the reason. Like the other variants it never
+launches a renderer.
+
+### 7.7 M2d acceptance
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| fmt | `cargo fmt --all -- --check` | pass |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
+| test | `cargo test --workspace --all-targets` | pass (216 tests, 0 failures) |
+| cmake | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | pass |
+| ctest | `cd build/cmake && ctest --output-on-failure` | pass (7/7, incl. `kwe-web-preview-test`) |
+| qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | pass |
+| smoke-web-compromise | `./scripts/smoke-web-compromise.sh` | pass (matrix above: scenario A boxes 1-4 green, scenario B box 1 orange / boxes 2-4 green; both argv proofs; plasmashell pid unchanged) |
+| smoke-web | `./scripts/smoke-web.sh` | pass (11 cases, regression) |
+| smoke-ui | `./scripts/smoke-ui.sh` | pass (regression) |

@@ -182,7 +182,7 @@ Kirigami.ScrollablePage {
             enabled: WallpaperSelection.selectedEntry !== ""
             text: webPreview.running ? qsTr("Web preview running") : qsTr("Preview web wallpaper")
             icon.name: webPreview.running ? "media-playback-stop-symbolic" : "internet-web-browser-symbolic"
-            onClicked: webPreview.running ? webPreview.stop() : webPreview.play(WallpaperSelection.selectedEntry)
+            onClicked: webPreview.running ? webPreview.stop() : webPreview.play(WallpaperSelection.selectedEntry, WallpaperSelection.selectedId)
         }
         Controls.Button {
             Layout.fillWidth: true

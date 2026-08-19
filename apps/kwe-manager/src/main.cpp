@@ -95,7 +95,13 @@ int main(int argc, char *argv[]) {
     WorkshopClient workshopClient;
     VideoPreview videoPreview;
     RendererStatus rendererStatus(socketPath);
-    WebPreview webPreview;
+    // BETA_M2c: daemon-owned per-wallpaper permission grants. Grant state
+    // comes from the daemon (permissions-v1.json), never from local settings.
+    PermissionsClient permissionsClient(socketPath);
+    // BETA_M2d: the web preview asks the grant client for the wallpaper's
+    // network decision and launches the windowed sandbox accordingly
+    // (relaunching once if the loaded record differs).
+    WebPreview webPreview(&permissionsClient);
     PlaylistController playlistController(socketPath);
     // When the daemon socket is absent, start the user service before the
     // catalog begins. Defaults to the systemd user unit; the smoke suite
@@ -125,10 +131,6 @@ int main(int argc, char *argv[]) {
     WallpaperFilterModel workshopFiltered;
     workshopFiltered.setSourceModel(client.sourceModel());
     workshopFiltered.setWorkshopView(true);
-    // BETA_M2c: daemon-owned per-wallpaper permission grants. Grant state
-    // comes from the daemon (permissions-v1.json), never from local settings.
-    PermissionsClient permissionsClient(socketPath);
-
     QQmlApplicationEngine engine;
     // Once the activated daemon socket appears, refresh the catalog right
     // away instead of waiting for the client's exponential retry backoff.

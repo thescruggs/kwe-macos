@@ -39,7 +39,8 @@ enum Command {
         #[arg(long = "steam-root")]
         steam_roots: Vec<PathBuf>,
     },
-    /// Statically validate a scene or video entry without launching a renderer.
+    /// Statically validate a scene, video, or web entry without launching a
+    /// renderer.
     Preflight {
         /// Scene entry to validate.
         #[arg(long)]
@@ -47,6 +48,9 @@ enum Command {
         /// Video file to validate.
         #[arg(long)]
         video: Option<PathBuf>,
+        /// Web wallpaper directory to validate.
+        #[arg(long)]
+        web: Option<PathBuf>,
     },
     /// Statically validate a web wallpaper directory without launching a browser.
     WebPreflight {
@@ -164,17 +168,21 @@ fn main() -> Result<()> {
             }
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
-        Command::Preflight { path, video } => {
-            let (json, safe) = match (path, video) {
-                (Some(path), None) => {
+        Command::Preflight { path, video, web } => {
+            let (json, safe) = match (path, video, web) {
+                (Some(path), None, None) => {
                     let report = preflight_scene(&path);
                     (serde_json::to_string_pretty(&report)?, report.safe)
                 }
-                (None, Some(path)) => {
+                (None, Some(path), None) => {
                     let report = preflight_video(&path);
                     (serde_json::to_string_pretty(&report)?, report.safe)
                 }
-                _ => anyhow::bail!("preflight requires exactly one of --path or --video"),
+                (None, None, Some(path)) => {
+                    let report = preflight_web(&path, &[]);
+                    (serde_json::to_string_pretty(&report)?, report.safe)
+                }
+                _ => anyhow::bail!("preflight requires exactly one of --path, --video, or --web"),
             };
             println!("{json}");
             if !safe {
