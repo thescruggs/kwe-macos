@@ -47,6 +47,24 @@ entries:
     approved_for_code_use: true
     notes: Safe ownership wrappers around mmap for the original fallback frame protocol.
 
+  - id: libmpv
+    project: mpv
+    url: https://github.com/mpv-player/mpv
+    revision: 0.41.0
+    license_observed: LGPL-2.1-or-later (with GPL-2.0+ option)
+    use: dependency
+    approved_for_code_use: true
+    notes: Dynamically linked into the separate-process kwe-video-renderer worker only; never in plasmashell; release license review tracked per PROVENANCE.md. The software render API is declared locally against the system libmpv because the safe wrapper crate cannot host it (see docs/BETA_M1.md).
+
+  - id: rust-mpv
+    project: mpv-rs
+    url: https://crates.io/crates/mpv
+    revision: 0.2.3
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Safe Rust wrapper around libmpv in kwe-video-renderer, used for the client API-version diagnostic; its builder initializes the mpv core before exposing the handle, which libmpv 0.41 forbids with a render context (aborts), so the render API itself is bound directly (docs/BETA_M1.md).
+
   - id: qt-kirigami
     project: Qt 6 and KDE Kirigami
     url: https://invent.kde.org/frameworks/kirigami
