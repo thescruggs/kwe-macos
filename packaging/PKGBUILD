@@ -90,6 +90,7 @@ package() {
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-video-renderer" "${pkgdir}/usr/bin/kwe-video-renderer"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-web-renderer" "${pkgdir}/usr/bin/kwe-web-renderer"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-audio-worker" "${pkgdir}/usr/bin/kwe-audio-worker"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-scene-renderer" "${pkgdir}/usr/bin/kwe-scene-renderer"
 
     # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and
     # the staged org.kde.kwe.wallpaper Plasma wallpaper package.
