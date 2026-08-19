@@ -292,6 +292,8 @@ pkg_corrupt="$smoke_root/corrupt.pkg"
 pkg_truncated="$smoke_root/truncated.pkg"
 pkg_nested="$smoke_root/nested.pkg"
 pkg_traversal="$smoke_root/traversal.pkg"
+pkg_oversized="$smoke_root/oversized.pkg"
+pkg_oversized_script="$smoke_root/oversized-script.pkg"
 # Packaged scene.json uses the corpus serialization: 59 of 60 real wallpapers
 # carry clearcolor as a space-separated "r g b" STRING, not the array form the
 # file-based fixtures use. Exercising both shapes e2e is an M3b acceptance item.
@@ -299,15 +301,16 @@ scene_pkg_json="$smoke_root/scene-string.json"
 cat >"$scene_pkg_json" <<JSON
 {"general": {"clearcolor": "0.7 0.7 0.7", "resolution": [160, 90], "fps": 30, "script": "script.js"}}
 JSON
-python3 - "$pkg_scene" "$pkg_corrupt" "$pkg_truncated" "$pkg_nested" "$pkg_traversal" "$script" "$scene" "$scene_pkg_json" <<'PY'
+python3 - "$pkg_scene" "$pkg_corrupt" "$pkg_truncated" "$pkg_nested" "$pkg_traversal" "$pkg_oversized" "$pkg_oversized_script" "$script" "$scene" "$scene_pkg_json" <<'PY'
 import struct
 import sys
 
 pkg_scene, pkg_corrupt, pkg_truncated = sys.argv[1], sys.argv[2], sys.argv[3]
 pkg_nested, pkg_traversal = sys.argv[4], sys.argv[5]
-script = open(sys.argv[6]).read().encode()
-scene_json = open(sys.argv[7]).read().encode()
-pkg_scene_json = open(sys.argv[8]).read().encode()
+pkg_oversized, pkg_oversized_script = sys.argv[6], sys.argv[7]
+script = open(sys.argv[8]).read().encode()
+scene_json = open(sys.argv[9]).read().encode()
+pkg_scene_json = open(sys.argv[10]).read().encode()
 
 
 def build_pkg(entries, version="0001"):
@@ -343,6 +346,15 @@ open(pkg_nested, "wb").write(
 # Traversal entry inside an otherwise valid package.
 open(pkg_traversal, "wb").write(
     build_pkg([("../evil", b"x"), ("scene.json", pkg_scene_json)])
+)
+# Cap parity: a scene.json entry over the 16 MiB descriptor cap, and a
+# script entry over the 2 MiB cap referenced from a valid descriptor. Both
+# must be refused at preflight (invalid_params), never bounced as workers.
+open(pkg_oversized, "wb").write(
+    build_pkg([("scene.json", b"\x00" * (16 * 1024 * 1024 + 1))])
+)
+open(pkg_oversized_script, "wb").write(
+    build_pkg([("scene.json", pkg_scene_json), ("script.js", b"\x00" * (2 * 1024 * 1024 + 1))])
 )
 PY
 echo "scene smoke: pkg fixtures generated"
@@ -426,6 +438,8 @@ PY
     lz4_frame="$(jq -r '.result.frame_file' <<<"$lz4_status")"
     scene_oracle "$lz4_frame" 1.5
     echo "scene smoke passed: pkg with LZ4-frame script entry decompressed and ran (optional lz4 CLI)"
+else
+    echo "scene smoke: SKIPPED pkg LZ4 case (lz4 CLI not found)"
 fi
 
 # Case 3d (M3b): corrupt, truncated, and traversal packages fail the
@@ -441,6 +455,19 @@ for fixture in "$pkg_corrupt" "$pkg_truncated" "$pkg_traversal"; do
     [[ "$(jq -r '.result.detail' <<<"$reject")" == *"scene package is invalid"* ]]
 done
 echo "scene smoke passed: corrupt/truncated/traversal pkg -> preflight invalid_params"
+
+# Case 3f (M3b review follow-up): preflight/worker cap parity — an
+# oversized scene.json (16 MiB cap) or script (2 MiB cap) entry is caught
+# statically at preflight (invalid_params), never bounced as a worker.
+for fixture in "$pkg_oversized" "$pkg_oversized_script"; do
+    reject="$(call_daemon renderer.start "$(jq -cn --arg content "$fixture" \
+        '{wallpaper_id:"scene-bigpkg",content_hash:"hash-bigpkg",width:160,height:90,fps:30,kind:"scene",content:$content}')" || true)"
+    [[ "$(jq -r '.ok' <<<"$reject")" == "false" ]]
+    [[ "$(jq -r '.result.error' <<<"$reject")" == "invalid_params" ]]
+    [[ "$(jq -r '.result.detail' <<<"$reject")" == *"scene preflight rejected"* ]]
+    [[ "$(jq -r '.result.detail' <<<"$reject")" == *"byte cap"* ]]
+done
+echo "scene smoke passed: oversized scene.json/script entries -> preflight invalid_params"
 
 # Case 3e (M3b): a nested scene.pkg passes the structural preflight (it is a
 # valid archive) but the worker refuses it before the canary: exit 73,

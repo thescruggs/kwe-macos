@@ -47,31 +47,45 @@ A `--content` ending in `.pkg` is opened with the original bounded
 `kwe_core::pkg::PkgReader` (kwe-core, no unsafe, TOCTOU-safe: symlink-
 metadata check, `O_NOFOLLOW|O_CLOEXEC`, fd `fstat` re-check, all reads
 pinned to the fd). Verified corpus layout: u32 LE magic length (8) +
-`PKGV` + 4 ASCII digits (any version — corpus spans 20 versions, e.g.
-`PKGV0001`–`PKGV0026`; the QuickBMS writeup's "PKGV0001, PKGV0006 and so on
-are all the same format" holds) + u32 LE entry count + per entry {u32 LE
-path length, UTF-8 path, u32 LE offset relative to the data section start,
-u32 LE size} + raw concatenated payloads. Bounds: magic ≤ 32 B, entries ≤
-65536, path ≤ 512 B, total payload ≤ 512 MiB, per-entry read cap 64 MiB,
-scene.json cap 16 MiB, script cap 2 MiB. Preflight (structural only, no
-decompression) closes M1 finding G12 ("pkg unvalidated"): every scene pkg is
-validated at `renderer.start` before any worker spawns.
+`PKGV` + 4 ASCII digits (any version — the 60-package corpus spans 20
+distinct versions: **PKGV0001, PKGV0002, PKGV0004, PKGV0005, PKGV0007,
+PKGV0009, PKGV0011–PKGV0024**; the QuickBMS writeup's "PKGV0001, PKGV0006
+and so on are all the same format" holds) + u32 LE entry count + per entry
+{u32 LE path length, UTF-8 path, u32 LE offset relative to the data section
+start, u32 LE size} + raw concatenated payloads. Bounds: magic ≤ 32 B,
+entries ≤ 65536, path ≤ 512 B, total payload ≤ 512 MiB, per-entry read cap
+64 MiB, scene.json cap 16 MiB, script cap 2 MiB. The 512 MiB package cap
+rejects larger real packages at preflight (`invalid_params`); none of the
+60 corpus packages exceeds it (max ≈ 172 MiB — the 3765081478 probe is
+142 MiB). Preflight (structural, no decompression) closes M1 finding G12
+("pkg unvalidated"): every scene pkg is validated at `renderer.start`
+before any worker spawns, and — preflight/worker cap parity — an
+oversized scene.json (16 MiB) or script (2 MiB) entry is refused statically
+as `invalid_params` instead of bouncing workers.
 
-The renderer locates exactly one `scene.json` entry (case-insensitive;
-a `scene.pkg` entry with no `scene.json` is refused — "nested scene.pkg
+The renderer locates exactly one `scene.json` entry — the exact basename,
+case-insensitive, with at most one leading directory component
+(`scene.json`, `dir/scene.json`; `myscene.json` and `a/b/scene.json` do
+not count — `kwe_core::scene_json_entry`, shared with preflight); a
+`scene.pkg` entry with no `scene.json` is refused — "nested scene.pkg
 inside the package is not supported" — and a package with two `scene.json`
-entries is refused), decompresses it if needed (bounded mid-stream decode —
+entries is refused, decompresses it if needed (bounded mid-stream decode —
 the declared size is never trusted) and feeds the existing M3a scene parse.
 `general.script` names an entry inside the package (exactly one match, no
 absolute/`..`/NUL/backslash paths); the script is extracted to a private
-0700 directory under the worker's own HOME and cleaned up with the runtime.
+0700 directory under the worker's own HOME. The worker removes that
+directory on its graceful exit path; a stale directory left by a hard kill
+is replaced by the pid-recycle retry, so a restarted worker with a
+recycled pid never bounces on `AlreadyExists`.
 
 Honest finding: the corpus shows **no compression at all** — all 3128
 payloads are raw, and the format has no per-entry compression flag. The
 LZ4 frame path (`lz4_flex`, MIT, THIRD_PARTY.yml) is therefore a defensive
 detector for payloads beginning `04 22 4D 18`, exercised by unit tests and
 the smoke suite's optional `lz4` CLI case, while raw payloads are the
-corpus-proven primary.
+corpus-proven primary. Raw fallback policy: a payload that begins with the
+frame magic but does not decode as a frame is treated as raw (one bounded
+diagnostic line); an over-cap decompression is never downgraded.
 
 ## Run the suites
 
@@ -80,6 +94,9 @@ scripts/smoke-scene.sh       # M3a + M3b: scene renderer through the daemon,
                              #   scripted-color oracle, containment, the
                              #   scene.pkg lanes, plus a standalone llvmpipe
                              #   lane
+scripts/smoke-corpus-pkg.sh  # M3b evidence: preflight over real Workshop
+                             #   scene packages (KWE_CORPUS_DIR); SKIPPED
+                             #   with exit 0 when unset/missing
 scripts/smoke-video.sh       # unchanged (M1 regression lane)
 scripts/smoke-supervisor.sh  # unchanged (M1a regression lane)
 ```
@@ -112,22 +129,25 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | load-phase busy loop | `function init(){while(true){}}` must not hang the worker | unit `busy_loop_init_is_contained_by_load_budget`: abort within 2 s, `script_timeout kind=hard`, script disabled, static color published; standalone-verified |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 | final stop | graceful stop, health ok | phase `stopped`, pid null |
-| standalone llvmpipe lane | worker directly under `VK_ICD_FILENAMES` + `--device llvmpipe` | scripted-color oracle passes (R 5 → 196), SIGTERM exit 0, `Stopping` state (3) in the header, `event=renderer.complete frames=... script_errors=0 soft_timeouts=0 hard_timeouts=0` |
+| standalone llvmpipe lane | worker directly under `VK_ICD_FILENAMES` + `--device llvmpipe` | scripted-color oracle passes (R 5 → 197), SIGTERM exit 0, `Stopping` state (3) in the header, `event=renderer.complete frames=... script_errors=0 soft_timeouts=0 hard_timeouts=0` |
 | device diagnostics | bounded stderr lines | `event=renderer.scene.device name=... kind=... format=...` on both drivers |
 
 ### M3b — scene.pkg reader, packaged-scene renderer, corpus tolerance (this commit)
 
 | Case | Expected containment | Result |
 |---|---|---|
-| corpus preflight | all 60 real scene wallpapers structurally valid | **60/60 safe** (`format: "scene-package"`): 20 distinct PKGV versions, 3128 entries, zero standalone scene.json in the corpus — every wallpaper is a package |
-| pkg reader unit tests | round-trip, truncation at every boundary, bad magic, unsupported version, count overflow (65537 rejected / 65536 accepted), oversized entry (64 MiB cap), path traversal (`../evil`, absolute, NUL, backslash rejected), decompression bomb (100 MiB zeros stopped at the cap mid-stream), symlinked package refused | 22 tests in `kwe-core::pkg` + 3 pkg branches in `preflight`, all green |
+| corpus preflight (reproducible) | `KWE_CORPUS_DIR=<steam workshop 431960 dir> scripts/smoke-corpus-pkg.sh` runs preflight over every scene.pkg and prints version/count/safe stats; SKIPPED (exit 0) when the env var is unset/missing | **60/60 safe** (`format: "scene-package"`): 20 distinct PKGV versions (0001, 0002, 0004, 0005, 0007, 0009, 0011–0024), 3128 entries, sizes 0.3–172 MiB, zero standalone scene.json in the corpus — every wallpaper is a package; none exceeds the 512 MiB cap (larger real packages are refused at preflight) |
+| pkg reader unit tests | round-trip, truncation at every boundary, bad magic, unsupported version, count overflow (65537 rejected / 65536 accepted), oversized entry (64 MiB cap), path traversal (`../evil`, absolute, NUL, backslash rejected), decompression bomb (100 MiB zeros stopped at the cap mid-stream), symlinked package refused, raw-fallback round-trip, `read_entry_raw` refuses compressed | 26 tests in `kwe-core::pkg` (incl. `scene_json_entry` heuristic) + 4 pkg branches in `preflight`, all green |
 | daemon lane: packaged e2e | `scene.pkg` with a `scene.json` (string-form clearcolor — the corpus shape) + `script.js` entry | reached `live`, `event=renderer.scene.pkg entries=2 script_entry=true` in the ring, extracted script drives the oracle: R 146 → 78 (delta 68 ≥ 32), init-pinned g/b |
-| pkg with LZ4-frame script entry | a script entry re-encoded as an LZ4 frame (`lz4 -z -q -c`) decompresses and runs | passed (optional `lz4` CLI case; the frame detector is the corpus-honest defensive path — real packages are raw) |
+| pkg with LZ4-frame script entry | a script entry re-encoded as an LZ4 frame (`lz4 -z -q -c`) decompresses and runs; absent CLI prints `SKIPPED (lz4 CLI not found)` | passed (optional `lz4` CLI case; the frame detector is the corpus-honest defensive path — real packages are raw) |
+| raw fallback | a payload with the LZ4 frame magic that does not decode is treated as raw (one bounded diagnostic), never a read failure | unit `invalid_lz4_frame_falls_back_to_raw`: read succeeds and returns the stored bytes; over-cap bomb stays a `bounds` error |
 | corrupt magic / truncated table / traversal pkg | static preflight rejects before any worker spawns | daemon RPC `ok:false`, `.result.error: "invalid_params"`, detail `scene preflight rejected ... scene package is invalid` (G12 closed — the path is validated, not just trusted) |
 | nested `scene.pkg` | no `scene.json` entry; refusal is a backend rejection | worker exits 73 → `rolled_back`, `last_failure_detail` carries `exit_code_73` and "nested scene.pkg inside the package is not supported"; base worker stays live |
+| preflight/worker cap parity | oversized scene.json (16 MiB) or script (2 MiB) entry caught statically, same resolution rules as the worker | unit `rejects_oversized_pkg_entries_at_preflight` + smoke case 3f: `invalid_params` with "scene.json entry ... over the 16777216 byte cap" / "script entry ... over the 2097152 byte cap", no worker bounce |
+| extracted-script lifecycle | worker removes its own `kwe-scene-script-<pid>` dir on graceful exit; a stale dir (pid recycled after a daemon restart) is replaced, never a brick; a stale symlink dir is refused | unit `cleanup_script_dir_removes_only_worker_dirs` (foreign dirs untouched), `extract_script_replaces_stale_pid_dir`, `extract_script_refuses_stale_symlink_dir`; `event=renderer.scene.script_dir_cleanup` on the graceful path |
 | clearcolor corpus form | real wallpapers serialize clearcolor as `"r g b"`, not an array | **59 of 60** corpus scenes are string-form (58 exact three-token, one five-digit precision, e.g. `"0.7 0.7 0.7"`), 0 arrays; the parser now accepts both forms (string → alpha 1.0), the property-wrapped object form (1 of 60) stays rejected until user properties (M3c+); two new unit tests |
-| corpus render probe | a real pkg (3765081478, PKGV0024, 264 entries, 142 MiB) driven through the renderer | preflight passes; parse reaches clearcolor (previously exited 73 on the array-only shape — the probe that surfaced the string-form finding) |
-| workspace gates | fmt, clippy `-D warnings`, full test suite | clean, 290 tests pass |
+| corpus render probe | a real pkg (3765081478, PKGV0024, 264 entries, 142 MiB — measured 147 939 386 bytes) driven through the renderer | preflight passes; parse reaches clearcolor (previously exited 73 on the array-only shape — the probe that surfaced the string-form finding) |
+| workspace gates | fmt, clippy `-D warnings`, full test suite | clean, 296 tests pass (87 `kwe-core`, 46 `kwe-scene-renderer`) |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (oracle deviation 2 ≤ 4), `smoke-supervisor.sh` exit 0 |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 

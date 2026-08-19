@@ -398,6 +398,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_pkg_entries_at_preflight() {
+        // M3b review follow-up (preflight/worker cap parity): an oversized
+        // scene.json or script entry is caught statically at preflight
+        // (invalid_params) instead of bouncing the worker (exit 73).
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-pkg-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let mut writer = crate::pkg::testutil::PkgWriter::new();
+        writer.add("scene.json", &vec![0_u8; 16 * 1024 * 1024 + 1]);
+        writer.write(&root.join("big-scene.pkg"), "0001");
+        let report = preflight_scene(&root.join("big-scene.pkg"));
+        assert!(!report.safe);
+        assert!(
+            report.reasons.iter().any(|reason| {
+                reason.contains("scene.json entry") && reason.contains("over the 16777216 byte cap")
+            }),
+            "unexpected reasons: {:?}",
+            report.reasons
+        );
+
+        let mut writer = crate::pkg::testutil::PkgWriter::new();
+        writer.add("scene.json", br#"{"general":{"script":"script.js"}}"#);
+        writer.add("script.js", &vec![0_u8; 2 * 1024 * 1024 + 1]);
+        writer.write(&root.join("big-script.pkg"), "0001");
+        let report = preflight_scene(&root.join("big-script.pkg"));
+        assert!(!report.safe);
+        assert!(
+            report.reasons.iter().any(|reason| {
+                reason.contains("script entry") && reason.contains("over the 2097152 byte cap")
+            }),
+            "unexpected reasons: {:?}",
+            report.reasons
+        );
+
+        // A package whose entries fit the caps stays safe.
+        let mut writer = crate::pkg::testutil::PkgWriter::new();
+        writer.add("scene.json", br#"{"general":{"script":"script.js"}}"#);
+        writer.add("script.js", b"function init() {}");
+        writer.write(&root.join("small.pkg"), "0001");
+        let report = preflight_scene(&root.join("small.pkg"));
+        assert!(report.safe, "unexpected reasons: {:?}", report.reasons);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rejects_directories_as_video_entries() {
         let root =
             std::env::temp_dir().join(format!("kwe-preflight-video-dir-{}", std::process::id()));

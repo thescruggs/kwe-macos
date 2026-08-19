@@ -65,6 +65,15 @@ private `kwe-scene-script-<pid>` directory under the worker's HOME (mode
 assets are **M3c+** and are deliberately not extracted; the renderer logs
 `event=renderer.scene.pkg entries=N script_entry=...`.
 
+The **extension selects the reader**: `--content` ending in `.json` takes
+the file-based parse, `.pkg` takes the archive reader — and mislabeled
+content fails *as its labeled format* (a pkg renamed `.json` is parsed as
+JSON and rejected, and vice versa).
+
+The extracted script directory is the worker's own: it is removed on the
+worker's graceful exit path, and a stale directory left by a hard kill is
+replaced by the pid-recycle retry on the next start (never a brick).
+
 ### Verified layout
 
 Triple-confirmed against byte-level inspection of ~60 real Workshop scene
@@ -103,8 +112,12 @@ start and decompresses it — with the output cap (64 MiB per entry)
 enforced **during** decompression (the frame decoder is wrapped in
 `take(cap + 1)`; a declared content size or a bomb can never allocate past
 the cap). A payload whose first four bytes are not the frame magic is
-returned verbatim. The `compressed` flag on `PkgEntry` reports which path a
-given entry takes.
+returned verbatim. **Raw fallback policy**: a payload that *does* begin
+with the frame magic but does not decode as a frame is treated as raw
+instead of failing the read (raw is the corpus-proven primary) — one
+bounded diagnostic line per fallback; an over-cap decompression is never
+downgraded, so a bomb stays a `bounds` error. The `compressed` flag on
+`PkgEntry` reports which path a given entry takes.
 
 ### Bounds and validation
 
@@ -142,24 +155,36 @@ system.
 ### Worker behavior
 
 * `--content` ending in `.pkg` (case-insensitive) selects the archive path.
-* Exactly one entry ending in `scene.json` (case-insensitive) is required:
-  zero matches with a `scene.pkg` entry present means a **nested archive**
-  (`event=renderer.scene.backend_reject kind=Pkg detail="nested scene.pkg
-  inside the package is not supported (M3b)"`) — nested packages are
-  refused, not recursed; zero matches otherwise, or several matches, are
-  likewise exit 73.
+* Exactly one entry named exactly `scene.json` (case-insensitive) is
+  required, with at most one leading directory component (`scene.json`,
+  `dir/scene.json` — `myscene.json` and `a/b/scene.json` do not count):
+  zero matches with a `scene.pkg` entry present (same name rule) means a
+  **nested archive** (`event=renderer.scene.backend_reject kind=Pkg
+  detail="nested scene.pkg inside the package is not supported (M3b)") —
+  nested packages are refused, not recursed; zero matches otherwise, or
+  several matches, are likewise exit 73. The rule lives in
+  `kwe_core::scene_json_entry`, shared with preflight.
 * The scene.json entry is read bounded to 16 MiB and parsed by the same
   core as file scenes (unknown keys tolerated, `general` rules identical).
-* `general.script` resolves against the package table; the entry is read
-  bounded to 2 MiB, extracted, and loaded by the script engine. A script
-  reference that is empty, `.pkg`, non-`.js`, absolute, traversing, missing
-  from the table, or ambiguous is a backend rejection (exit 73).
+* `general.script` resolves against the package table (same rule as the
+  file lane: relative, `.js`, no `..`/backslash/NUL, exactly one match —
+  `kwe_core::script_entry`); the entry is read bounded to 2 MiB, extracted,
+  and loaded by the script engine. A script reference that is empty, `.pkg`,
+  non-`.js`, absolute, traversing, missing from the table, or ambiguous is
+  a backend rejection (exit 73).
 * Archive failures (corrupt magic/table, truncated data, bounds, traversal
   entries) are backend rejections: `kind=Pkg`, exit 73 before the canary,
   so the supervisor records `exit_code_73` and rolls back. Preflight
   (kwe-core `preflight_scene`) runs the same structural validation for a
   `.pkg` content and rejects a corrupt archive before the worker spawns
   (this closes M1 finding G12, which previously let any `.pkg` through).
+  Preflight also checks the renderer's per-entry caps **statically**, with
+  the same resolution rules: the scene.json entry must be ≤ 16 MiB and the
+  referenced script entry ≤ 2 MiB, so an oversized entry is refused as
+  `invalid_params` instead of bouncing workers (exit 73). The script check
+  reads the descriptor's stored bytes (never decompressed — preflight
+  stays structural; a compressed descriptor skips the check and the
+  renderer's bounded decode still enforces the cap).
 
 ## Script execution model
 

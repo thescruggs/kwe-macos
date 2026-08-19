@@ -18,10 +18,10 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
-/// Cap on the raw scene.json bytes (mirrors kwe-core preflight).
-pub const MAX_SCENE_JSON_BYTES: u64 = 16 * 1024 * 1024;
-/// Cap on a referenced script's bytes.
-pub const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
+/// Cap on the raw scene.json bytes. Single source of truth in kwe-core
+/// (crates/kwe-core/src/pkg.rs), where pkg preflight enforces the same cap
+/// statically (preflight/worker parity, M3b review follow-up).
+pub use kwe_core::{MAX_SCENE_JSON_BYTES, MAX_SCRIPT_BYTES};
 /// The frame protocol's dimension cap (crates/kwe-frame-protocol).
 pub const MAX_DIMENSION: u32 = 8192;
 
@@ -465,9 +465,11 @@ fn resolve_script(root: &Path, reference: &str) -> Result<PathBuf, SceneError> {
 }
 
 /// Resolve a `general.script` reference against the package entry table
-/// (M3b). Rules: relative, `.js`, no `..`/backslash/NUL, and it must match
-/// exactly one entry — case-insensitively, either the literal path or the
-/// entry's tail after a `/` (so `scripts/main.js` finds an entry stored as
+/// (M3b). The rules live in `kwe_core::pkg::script_entry`, shared with
+/// preflight (which checks the script entry's size against the same
+/// resolution): relative, `.js`, no `..`/backslash/NUL, and exactly one
+/// match — case-insensitively, either the literal path or the entry's tail
+/// after a `/` (so `scripts/main.js` finds an entry stored as
 /// `wallpaper/scripts/main.js`). Entry paths were already validated at
 /// package open (no `..`, no absolute paths), so resolution can never leave
 /// the table; the rejection messages exist for diagnostics, not safety.
@@ -475,58 +477,8 @@ fn resolve_pkg_script(
     reference: &str,
     entries: &[kwe_core::PkgEntry],
 ) -> Result<usize, SceneError> {
-    if reference.is_empty() {
-        return Err(SceneError::new(
-            SceneErrorKind::Script,
-            "scene.json \"general.script\" must not be empty",
-        ));
-    }
-    if reference.to_ascii_lowercase().ends_with(".pkg") {
-        return Err(SceneError::new(
-            SceneErrorKind::Script,
-            "scene script must not reference \"scene.pkg\" (the archive itself)",
-        ));
-    }
-    if !reference.to_ascii_lowercase().ends_with(".js") {
-        return Err(SceneError::new(
-            SceneErrorKind::Script,
-            format!("scene script must be a .js file, got \"{reference}\""),
-        ));
-    }
-    if reference.starts_with('/')
-        || reference.contains('\\')
-        || reference.contains('\0')
-        || reference.split('/').any(|component| component == "..")
-    {
-        return Err(SceneError::new(
-            SceneErrorKind::Script,
-            format!("scene script \"{reference}\" must stay inside the package"),
-        ));
-    }
-    let needle = reference.to_ascii_lowercase();
-    let matches: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            let path = entry.path.to_ascii_lowercase();
-            path == needle || path.ends_with(&format!("/{needle}"))
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-    match matches.as_slice() {
-        [] => Err(SceneError::new(
-            SceneErrorKind::Script,
-            format!("scene script \"{reference}\" is not an entry of the package"),
-        )),
-        [idx] => Ok(*idx),
-        _ => Err(SceneError::new(
-            SceneErrorKind::Script,
-            format!(
-                "scene script \"{reference}\" matches {} package entries; exactly one is required",
-                matches.len()
-            ),
-        )),
-    }
+    kwe_core::script_entry(reference, entries)
+        .map_err(|message| SceneError::new(SceneErrorKind::Script, message))
 }
 
 #[cfg(test)]

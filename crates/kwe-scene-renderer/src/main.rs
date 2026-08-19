@@ -608,7 +608,11 @@ fn main() -> Result<()> {
         published: 0,
         consecutive_render_failures: 0,
     };
-    worker.run()
+    let run_result = worker.run();
+    // M3b review follow-up: the worker removes its own extracted script
+    // directory on the graceful exit path (it owns its HOME).
+    cleanup_script_dir(config.script_path.as_deref());
+    run_result
 }
 
 /// A render failure the compositor cannot recover from: the device is not
@@ -624,13 +628,17 @@ fn reject_render(error: &RenderError, detail: &str) -> ! {
 /// archive (M3b).
 ///
 /// Packaged scenes are opened and validated by kwe-core's PkgReader, the
-/// unique `scene.json` entry is parsed in memory (≤ 16 MiB), and — when
-/// `general.script` names a package entry — that entry (≤ 2 MiB) is
-/// extracted into a private `kwe-scene-script-<pid>` directory under the
-/// worker's HOME (mode 0700; the daemon gives every worker its own 0700
-/// HOME inside its runtime tree, so the extraction is removed with the
-/// runtime). Textures and other assets are M3c+ and are deliberately not
-/// extracted.
+/// unique `scene.json` entry (exact basename, case-insensitive, at most
+/// one leading directory component — see kwe-core `scene_json_entry`) is
+/// parsed in memory (≤ 16 MiB), and — when `general.script` names a
+/// package entry — that entry (≤ 2 MiB) is extracted into a private
+/// `kwe-scene-script-<pid>` directory under the worker's HOME (mode 0700;
+/// the daemon gives every worker its own private 0700 HOME). The worker
+/// removes the directory on its graceful exit path (cleanup_script_dir);
+/// a stale directory left by a hard kill is replaced by extract_script's
+/// pid-recycle retry, so a restarted worker with a recycled pid never
+/// bounces on AlreadyExists. Textures and other assets are M3c+ and are
+/// deliberately not extracted.
 fn load_scene(content: &Path) -> SceneConfig {
     let is_pkg = content
         .extension()
@@ -647,7 +655,9 @@ fn load_scene(content: &Path) -> SceneConfig {
         Ok(reader) => reader,
         Err(error) => reject_pkg(error),
     };
-    let scene_idx = match find_scene_entry(reader.entries()) {
+    // The descriptor-location rule lives in kwe-core (shared with pkg
+    // preflight so both agree on what the descriptor entry is).
+    let scene_idx = match kwe_core::scene_json_entry(reader.entries()) {
         Ok(idx) => idx,
         Err(detail) => reject_pkg(detail),
     };
@@ -678,36 +688,6 @@ fn load_scene(content: &Path) -> SceneConfig {
     config
 }
 
-/// Locate the `scene.json` descriptor entry inside a package. Exactly one
-/// is required (case-insensitive match on the entry name ending). No match
-/// with a `scene.pkg` entry present means a nested archive, which M3b does
-/// not support.
-fn find_scene_entry(entries: &[kwe_core::PkgEntry]) -> Result<usize, String> {
-    let matches: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.path.to_ascii_lowercase().ends_with("scene.json"))
-        .map(|(idx, _)| idx)
-        .collect();
-    match matches.as_slice() {
-        [] => {
-            let nested = entries
-                .iter()
-                .any(|entry| entry.path.to_ascii_lowercase().ends_with("scene.pkg"));
-            if nested {
-                Err("nested scene.pkg inside the package is not supported (M3b)".into())
-            } else {
-                Err("package has no scene.json entry".into())
-            }
-        }
-        [idx] => Ok(*idx),
-        _ => Err(format!(
-            "package has {} scene.json entries; exactly one is required",
-            matches.len()
-        )),
-    }
-}
-
 /// Write a script entry into a private 0700 directory under the worker's
 /// HOME (falling back to the system temp dir when the daemon does not set
 /// one), returning the extracted path. The pid-qualified directory keeps
@@ -716,7 +696,31 @@ fn extract_script(script: &[u8]) -> std::io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    extract_script_into(&home, script)
+}
+
+/// The extraction core, testable against a caller-chosen HOME. A stale
+/// `kwe-scene-script-<pid>` directory is replaced rather than refused
+/// (M3b review follow-up: a daemon restart can recycle a pid, and an
+/// AlreadyExists on the pid directory would bounce a valid scene at exit
+/// 73). The directory is the worker's own — inside its private 0700 HOME
+/// — so removing a stale plain directory is safe; a stale symlink is
+/// refused instead of followed.
+fn extract_script_into(home: &Path, script: &[u8]) -> std::io::Result<PathBuf> {
     let dir = home.join(format!("kwe-scene-script-{}", std::process::id()));
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            fs::remove_dir_all(&dir)?;
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stale script directory is not a plain directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let path = dir.join("script.js");
     let mut file = fs::OpenOptions::new()
@@ -726,6 +730,31 @@ fn extract_script(script: &[u8]) -> std::io::Result<PathBuf> {
         .open(&path)?;
     file.write_all(script)?;
     Ok(path)
+}
+
+/// Remove the extracted script directory on the worker's graceful exit
+/// path (the worker owns its HOME). A kill -9 leaves the directory behind;
+/// extract_script's pid-recycle retry replaces it on the next start, so a
+/// leftover is never a brick.
+fn cleanup_script_dir(script_path: Option<&Path>) {
+    let Some(script_path) = script_path else {
+        return;
+    };
+    let Some(dir) = script_path.parent() else {
+        return;
+    };
+    // Defensive: only ever remove what extract_script created.
+    let name = dir.file_name().and_then(|name| name.to_str());
+    if !name.is_some_and(|name| name.starts_with("kwe-scene-script-")) {
+        return;
+    }
+    match fs::remove_dir_all(dir) {
+        Ok(()) => eprintln!(
+            "event=renderer.scene.script_dir_cleanup path={}",
+            dir.display()
+        ),
+        Err(error) => eprintln!("event=renderer.scene.script_dir_cleanup error={error}"),
+    }
 }
 
 /// Backend rejection for a packaged-scene problem (M3b): corrupt archive,
@@ -787,5 +816,66 @@ mod tests {
         assert!(!render_failure_fatal(MAX_CONSECUTIVE_RENDER_FAILURES - 1));
         assert!(render_failure_fatal(MAX_CONSECUTIVE_RENDER_FAILURES));
         assert!(render_failure_fatal(MAX_CONSECUTIVE_RENDER_FAILURES + 10));
+    }
+
+    #[test]
+    fn extract_script_replaces_stale_pid_dir() {
+        // M3b review follow-up (pid-recycle brick): a daemon restart can
+        // recycle a pid, leaving a stale kwe-scene-script-<pid> dir in the
+        // worker's own HOME. Extraction must replace it instead of failing
+        // with AlreadyExists (which would bounce a valid scene at exit 73).
+        let home = std::env::temp_dir().join(format!("kwe-extract-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(format!("kwe-scene-script-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("script.js"), b"stale").unwrap();
+        fs::write(dir.join("leftover.bin"), b"old").unwrap();
+        let first = extract_script_into(&home, b"function init() {}").unwrap();
+        assert_eq!(fs::read(&first).unwrap(), b"function init() {}");
+        // Second extraction on the same pid: the fresh dir now exists
+        // again, exercising the replace-stale path once more.
+        let second = extract_script_into(&home, b"function update() {}").unwrap();
+        assert_eq!(fs::read(&second).unwrap(), b"function update() {}");
+        assert!(
+            !dir.join("leftover.bin").exists(),
+            "stale content must be gone"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn extract_script_refuses_stale_symlink_dir() {
+        // Defense in depth: a stale directory that is a symlink is refused,
+        // never followed and removed.
+        let home = std::env::temp_dir().join(format!("kwe-extract-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let target = home.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let dir = home.join(format!("kwe-scene-script-{}", std::process::id()));
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+        assert!(extract_script_into(&home, b"x").is_err());
+        assert!(target.exists(), "symlink target must be untouched");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cleanup_script_dir_removes_only_worker_dirs() {
+        // The worker removes its extracted script dir on graceful exit; the
+        // cleanup refuses anything it did not create (name-guarded).
+        let home = std::env::temp_dir().join(format!("kwe-cleanup-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(format!("kwe-scene-script-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("script.js"), b"x").unwrap();
+        cleanup_script_dir(Some(&dir.join("script.js")));
+        assert!(!dir.exists(), "script dir must be removed on graceful exit");
+        // A path outside the kwe-scene-script-* naming is left alone.
+        let foreign = home.join("foreign-dir");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("f.js"), b"x").unwrap();
+        cleanup_script_dir(Some(&foreign.join("f.js")));
+        assert!(foreign.exists(), "foreign dirs must not be touched");
+        cleanup_script_dir(None);
+        let _ = fs::remove_dir_all(&home);
     }
 }

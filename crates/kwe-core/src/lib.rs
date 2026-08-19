@@ -24,7 +24,10 @@ pub use keyvalues::{KvError, KvValue, parse_key_values};
 pub use mpris::{MprisStatus, probe_mpris};
 pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
-pub use pkg::{PkgEntry, PkgError, PkgErrorKind, PkgReader, preflight_pkg};
+pub use pkg::{
+    MAX_SCENE_JSON_BYTES, MAX_SCRIPT_BYTES, PkgEntry, PkgError, PkgErrorKind, PkgReader,
+    preflight_pkg, scene_json_entry, script_entry,
+};
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
 pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};
 pub use policy::{

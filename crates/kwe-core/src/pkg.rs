@@ -47,7 +47,11 @@
 // decompresses anything. To satisfy both the brief and reality, payloads are
 // treated as raw by default and additionally recognized as LZ4 *frames*
 // (magic `04 22 4D 18`) at the payload start, decompressed with an output
-// cap enforced during decompression — a declared size is never trusted. See
+// cap enforced during decompression — a declared size is never trusted. A
+// payload that begins with the frame magic but does not decode as a frame
+// is treated as raw instead of failing the read (raw is the corpus-proven
+// primary), with a bounded one-line diagnostic; an over-cap decompression
+// is never downgraded — the bomb defense stays visible. See
 // docs/SCENE_FORMAT_V1.md (M3b section) for the full discussion.
 //
 // # Path-traversal policy (documented decision)
@@ -93,6 +97,13 @@ pub const MAX_PKG_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PKG_MAGIC_BYTES: usize = 32;
 /// LZ4 frame magic: `\x04\x22\x4D\x18`.
 const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+/// Cap on the `scene.json` descriptor entry, shared with the renderer
+/// (kwe-scene-renderer reads the entry bounded to this). Preflight checks
+/// it statically from the table, matching the json lane's preflight cap.
+pub const MAX_SCENE_JSON_BYTES: u64 = 16 * 1024 * 1024;
+/// Cap on a `general.script` entry, shared with the renderer's extraction.
+/// Preflight checks it statically (via the descriptor's script reference).
+pub const MAX_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 
 /// One validated entry of the package table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +309,34 @@ impl PkgReader {
                 ),
             ));
         }
+        let raw = self.read_payload(entry)?;
+        if entry.compressed {
+            return match decompress_lz4_bounded(&raw, cap, &format!("entry \"{}\"", entry.path)) {
+                Ok(out) => Ok(out),
+                // Raw is the corpus-proven primary (all 3128 corpus payloads
+                // are stored raw), so a payload that merely begins with the
+                // LZ4 frame magic but does not decode as a frame is treated
+                // as raw instead of failing the read. The over-cap Bounds
+                // result is NOT downgraded: a decompression bomb stays
+                // visible. (Review follow-up: raw fallback.)
+                Err(error) if error.kind == PkgErrorKind::Format => {
+                    eprintln!(
+                        "pkg reader: entry \"{}\" starts with LZ4 magic but is not a \
+                         valid frame; treating the payload as raw",
+                        entry.path
+                    );
+                    Ok(raw)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        Ok(raw)
+    }
+
+    /// Read one entry's stored payload bytes: seek + bounded read +
+    /// truncation check. The caller has already validated the declared size
+    /// against its own cap, so no allocation here can exceed it.
+    fn read_payload(&self, entry: &PkgEntry) -> Result<Vec<u8>, PkgError> {
         let start = self.data_start + entry.offset;
         (&self.file).seek(SeekFrom::Start(start)).map_err(|e| {
             PkgError::new(
@@ -326,10 +365,45 @@ impl PkgReader {
                 ),
             ));
         }
-        if entry.compressed {
-            return decompress_lz4_bounded(&raw, cap, &format!("entry \"{}\"", entry.path));
-        }
         Ok(raw)
+    }
+
+    /// Read one entry's payload in its stored (raw) form, refusing to
+    /// decompress. Preflight uses this to inspect a scene.json descriptor's
+    /// declared script reference without ever inflating a payload; an entry
+    /// stored as an LZ4 frame is refused here (preflight never decompresses,
+    /// and the renderer's bounded decode enforces the cap when it reads the
+    /// entry).
+    pub fn read_entry_raw(&self, idx: usize) -> Result<Vec<u8>, PkgError> {
+        let entry = self.entries.get(idx).ok_or_else(|| {
+            PkgError::new(
+                PkgErrorKind::Bounds,
+                format!(
+                    "entry index {idx} out of range ({} entries)",
+                    self.entries.len()
+                ),
+            )
+        })?;
+        if entry.compressed {
+            return Err(PkgError::new(
+                PkgErrorKind::Format,
+                format!(
+                    "entry \"{}\" is stored as an LZ4 frame; raw read refused \
+                     (preflight never decompresses)",
+                    entry.path
+                ),
+            ));
+        }
+        if entry.size > MAX_PKG_ENTRY_BYTES {
+            return Err(PkgError::new(
+                PkgErrorKind::Bounds,
+                format!(
+                    "entry \"{}\" is {} bytes, over the {MAX_PKG_ENTRY_BYTES} byte read cap",
+                    entry.path, entry.size
+                ),
+            ));
+        }
+        self.read_payload(entry)
     }
 }
 
@@ -555,9 +629,127 @@ fn decompress_lz4_bounded(raw: &[u8], cap: u64, what: &str) -> Result<Vec<u8>, P
     Ok(out)
 }
 
+/// Match rule for the `scene.json` descriptor entry name: the exact
+/// basename, case-insensitive, with at most one leading directory
+/// component (`scene.json`, `dir/scene.json` — not `a/b/scene.json`, not
+/// `myscene.json`). Review follow-up: the old `ends_with` rule also matched
+/// names like `myscene.json`; the exact-basename rule is shared by the
+/// renderer and preflight so both agree on what the descriptor is.
+fn is_scene_json_name(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('/').collect();
+    matches!(parts.as_slice(), [name] | [_, name] if *name == "scene.json")
+}
+
+/// Locate the `scene.json` descriptor entry inside a package. Exactly one
+/// is required; the name is matched case-insensitively by
+/// `is_scene_json_name`. No match with a `scene.pkg` entry present (same
+/// basename rule) means a nested archive, which M3b does not support.
+/// Returns the entry index or a bounded diagnostic string. Shared by the
+/// renderer (which reads the entry) and preflight (which checks its size).
+pub fn scene_json_entry(entries: &[PkgEntry]) -> Result<usize, String> {
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| is_scene_json_name(&entry.path))
+        .map(|(idx, _)| idx)
+        .collect();
+    match matches.as_slice() {
+        [] => {
+            let nested = entries.iter().any(|entry| {
+                let lower = entry.path.to_ascii_lowercase();
+                let parts: Vec<&str> = lower.split('/').collect();
+                matches!(parts.as_slice(), [name] | [_, name] if *name == "scene.pkg")
+            });
+            if nested {
+                Err("nested scene.pkg inside the package is not supported (M3b)".into())
+            } else {
+                Err("package has no scene.json entry".into())
+            }
+        }
+        [idx] => Ok(*idx),
+        _ => Err(format!(
+            "package has {} scene.json entries; exactly one is required",
+            matches.len()
+        )),
+    }
+}
+
+/// Resolve a `general.script` reference against the package entry table.
+/// Rules (shared with the renderer and preflight): relative, `.js`, no
+/// `..`/backslash/NUL/absolute path, matching either the literal path or
+/// the entry's tail after a `/` (case-insensitive), exactly one match.
+/// Entry paths were already validated at package open (no `..`, no absolute
+/// paths), so resolution can never leave the table; the diagnostic strings
+/// exist for the caller's error message, not for safety.
+pub fn script_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, String> {
+    if reference.is_empty() {
+        return Err("scene.json \"general.script\" must not be empty".into());
+    }
+    if reference.to_ascii_lowercase().ends_with(".pkg") {
+        return Err("scene script must not reference \"scene.pkg\" (the archive itself)".into());
+    }
+    if !reference.to_ascii_lowercase().ends_with(".js") {
+        return Err(format!(
+            "scene script must be a .js file, got \"{reference}\""
+        ));
+    }
+    if reference.starts_with('/')
+        || reference.contains('\\')
+        || reference.contains('\0')
+        || reference.split('/').any(|component| component == "..")
+    {
+        return Err(format!(
+            "scene script \"{reference}\" must stay inside the package"
+        ));
+    }
+    let needle = reference.to_ascii_lowercase();
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            let path = entry.path.to_ascii_lowercase();
+            path == needle || path.ends_with(&format!("/{needle}"))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "scene script \"{reference}\" is not an entry of the package"
+        )),
+        [idx] => Ok(*idx),
+        _ => Err(format!(
+            "scene script \"{reference}\" matches {} package entries; exactly one is required",
+            matches.len()
+        )),
+    }
+}
+
+/// Extract the `general.script` string from scene.json bytes, if any.
+/// Preflight uses this to find the script entry without enforcing the
+/// renderer's full JSON rules (the renderer rejects malformed descriptors
+/// at load). `Err(())` when the descriptor is not parseable or carries no
+/// string script reference — the renderer handles those at load.
+fn script_reference_from_json(bytes: &[u8]) -> Result<String, ()> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let Some(general) = value.get("general").and_then(|g| g.as_object()) else {
+        return Err(());
+    };
+    match general.get("script") {
+        Some(serde_json::Value::String(reference)) => Ok(reference.clone()),
+        _ => Err(()),
+    }
+}
+
 /// Structural preflight for a scene.pkg: the same outer checks as
 /// `preflight_scene` (regular non-symlink file, 512 MiB cap) followed by a
-/// full table validation. No payload is read or decompressed.
+/// full table validation, and the renderer's per-entry caps checked
+/// statically (review follow-up: preflight/worker cap parity). The
+/// scene.json entry's size comes straight from the table; the script
+/// entry's size needs the descriptor's script reference, so the descriptor
+/// is read in its stored form — never decompressed (preflight stays
+/// structural: a compressed descriptor skips the script check, and the
+/// renderer's bounded decode still enforces the cap when it reads it).
 pub fn preflight_pkg(path: &Path) -> ScenePreflight {
     let mut report = ScenePreflight {
         path: path.to_path_buf(),
@@ -592,13 +784,40 @@ pub fn preflight_pkg(path: &Path) -> ScenePreflight {
             .push(format!("scene exceeds {MAX_PKG_BYTES} byte limit"));
         return report;
     }
-    if let Err(error) = PkgReader::open(path) {
-        report
-            .reasons
-            .push(format!("scene package is invalid: {error}"));
-        return report;
+    let reader = match PkgReader::open(path) {
+        Ok(reader) => reader,
+        Err(error) => {
+            report
+                .reasons
+                .push(format!("scene package is invalid: {error}"));
+            return report;
+        }
+    };
+    // Preflight/worker cap parity (M3b review follow-up): an oversized
+    // scene.json or script entry is refused at preflight (invalid_params)
+    // instead of bouncing workers (exit 73 -> rolled_back). Both caps
+    // mirror the renderer's read caps exactly.
+    if let Ok(scene_idx) = scene_json_entry(reader.entries()) {
+        let scene_entry = &reader.entries()[scene_idx];
+        if scene_entry.size > MAX_SCENE_JSON_BYTES {
+            report.reasons.push(format!(
+                "scene.json entry \"{}\" is {} bytes, over the {MAX_SCENE_JSON_BYTES} byte cap",
+                scene_entry.path, scene_entry.size
+            ));
+        } else if !scene_entry.compressed
+            && let Ok(bytes) = reader.read_entry_raw(scene_idx)
+            && let Ok(reference) = script_reference_from_json(&bytes)
+            && let Ok(script_idx) = script_entry(&reference, reader.entries())
+            && reader.entries()[script_idx].size > MAX_SCRIPT_BYTES
+        {
+            let script_entry = &reader.entries()[script_idx];
+            report.reasons.push(format!(
+                "script entry \"{}\" is {} bytes, over the {MAX_SCRIPT_BYTES} byte cap",
+                script_entry.path, script_entry.size
+            ));
+        }
     }
-    report.safe = true;
+    report.safe = report.reasons.is_empty();
     report
 }
 
@@ -1006,24 +1225,77 @@ mod tests {
     }
 
     #[test]
-    fn lying_frame_magic_rejected_as_format() {
+    fn invalid_lz4_frame_falls_back_to_raw() {
+        // Review follow-up: raw is the corpus-proven primary, so a payload
+        // that merely starts with the LZ4 frame magic but does not decode
+        // as a frame is treated as raw instead of failing the read.
         let dir = tmpdir();
         let mut writer = PkgWriter::new();
-        // Starts with the LZ4 frame magic but is not a valid frame.
-        writer.add(
-            "fake.bin",
-            &[0x04, 0x22, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00],
-        );
+        let payload = [0x04, 0x22, 0x4D, 0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00];
+        writer.add("fake.bin", &payload);
         let pkg = write_bytes(&dir, "fake.pkg", &writer.build("0001"));
         let reader = PkgReader::open(&pkg).unwrap();
         assert!(reader.entries()[0].compressed);
-        let error = reader.read_entry(0).unwrap_err();
+        let bytes = reader.read_entry(0).unwrap();
+        assert_eq!(bytes, payload);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_entry_raw_returns_stored_bytes_and_refuses_compressed() {
+        let dir = tmpdir();
+        let mut writer = PkgWriter::new();
+        writer.add("scene.json", br#"{"general":{}}"#);
+        writer.add_lz4("frame.bin", b"compressed payload");
+        let pkg = write_bytes(&dir, "raw.pkg", &writer.build("0001"));
+        let reader = PkgReader::open(&pkg).unwrap();
+        assert_eq!(
+            reader.read_entry_raw(0).unwrap(),
+            br#"{"general":{}}"#.to_vec()
+        );
+        let error = reader.read_entry_raw(1).unwrap_err();
         assert_eq!(error.kind, PkgErrorKind::Format);
         assert!(
-            error.message.contains("not a valid LZ4 frame"),
+            error.message.contains("raw read refused"),
             "{}",
             error.message
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scene_json_entry_heuristic_exact_basename_single_dir() {
+        // Review follow-up: the descriptor is the exact basename
+        // `scene.json` (case-insensitive) with at most one leading
+        // directory component — `myscene.json` and `a/b/scene.json` do
+        // not count.
+        let dir = tmpdir();
+        let mut writer = PkgWriter::new();
+        writer.add("SCENE.JSON", b"{}");
+        writer.add("sub/Scene.Json", b"{}");
+        writer.add("myscene.json", b"{}");
+        writer.add("a/b/scene.json", b"{}");
+        let pkg = write_bytes(&dir, "heur.pkg", &writer.build("0001"));
+        let reader = PkgReader::open(&pkg).unwrap();
+        let error = scene_json_entry(reader.entries()).unwrap_err();
+        assert!(
+            error.contains("2 scene.json entries"),
+            "unexpected: {error}"
+        );
+        // Exactly one valid descriptor, in a subdirectory.
+        let mut writer = PkgWriter::new();
+        writer.add("textures/main.tex", b"t");
+        writer.add("cfg/Scene.json", b"{}");
+        let pkg = write_bytes(&dir, "one.pkg", &writer.build("0001"));
+        let reader = PkgReader::open(&pkg).unwrap();
+        assert_eq!(scene_json_entry(reader.entries()).unwrap(), 1);
+        // Nested archive detection: scene.pkg entry, no scene.json.
+        let mut writer = PkgWriter::new();
+        writer.add("inner/scene.pkg", b"nested");
+        let pkg = write_bytes(&dir, "nested.pkg", &writer.build("0001"));
+        let reader = PkgReader::open(&pkg).unwrap();
+        let error = scene_json_entry(reader.entries()).unwrap_err();
+        assert!(error.contains("nested scene.pkg"), "unexpected: {error}");
         let _ = fs::remove_dir_all(dir);
     }
 
