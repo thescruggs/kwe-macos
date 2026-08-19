@@ -737,8 +737,12 @@ echo "scene smoke: M3c fixtures generated"
 #   subtract max(0, bg-texel)                  -> (38,0,0)
 # plus an add-mode alpha=128 case over a transparent clear (the readback
 # premultiplies: R=(64*128+127)/255=32, G=(103*128+127)/255=52,
-# B=(142*128+127)/255=71, A=128), an effects case (brightness 2.0, tint
-# (1,0.4,0.5): R=128, G=103*2*0.4=82.4->82, B=142), a colorBlendMode=11
+# B=(142*128+127)/255=71, A=128), a translucent multiply case (layer alpha
+# 0.5 over a 0.5-alpha clear: the mode acts on the color, the ALPHA
+# composites src-over — 0.5 + (128/255)*0.5 = 191.5 -> 192, and the
+# readback premultiplies: R=(26*192+127)/255=20, G=20, B=(14*192+127)/255=11
+# — pins the review-fixed alpha policy), an effects case (brightness 2.0,
+# tint (1,0.4,0.5): R=128, G=103*2*0.4=82.4->82, B=142), a colorBlendMode=11
 # clamp case (unimplemented -> normal + bounded one-time diagnostic), and a
 # script-driven case that switches blendMode at runtime.
 m3d_texel="$smoke_root/m3d-texel.png"
@@ -748,11 +752,12 @@ m3d_add_scene="$smoke_root/m3d-add.json"
 m3d_screen_scene="$smoke_root/m3d-screen.json"
 m3d_subtract_scene="$smoke_root/m3d-subtract.json"
 m3d_add128_scene="$smoke_root/m3d-add128.json"
+m3d_multiply128_scene="$smoke_root/m3d-multiply128.json"
 m3d_effects_scene="$smoke_root/m3d-effects.json"
 m3d_clamp_scene="$smoke_root/m3d-clamp11.json"
 m3d_js_scene="$smoke_root/m3d-js.json"
 m3d_js_script="$smoke_root/m3d-js.js"
-python3 - "$m3d_texel" "$m3d_normal_scene" "$m3d_multiply_scene" "$m3d_add_scene" "$m3d_screen_scene" "$m3d_subtract_scene" "$m3d_add128_scene" "$m3d_effects_scene" "$m3d_clamp_scene" "$m3d_js_scene" "$m3d_js_script" <<'PY'
+python3 - "$m3d_texel" "$m3d_normal_scene" "$m3d_multiply_scene" "$m3d_add_scene" "$m3d_screen_scene" "$m3d_subtract_scene" "$m3d_add128_scene" "$m3d_multiply128_scene" "$m3d_effects_scene" "$m3d_clamp_scene" "$m3d_js_scene" "$m3d_js_script" <<'PY'
 import json
 import struct
 import sys
@@ -800,19 +805,24 @@ for mode, path in ((1, sys.argv[3]), (6, sys.argv[4]), (7, sys.argv[5]), (9, sys
 # premultiplies exactly once (the M3c blend oracle pattern).
 l = dict(layer, alpha=0.5, colorBlendMode=6)
 json.dump(scene([l], clear=(0.0, 0.0, 0.0, 0.0)), open(sys.argv[7], "w"))
+# The translucent multiply case: layer alpha 0.5 over a 0.5-alpha clear —
+# the alpha policy (the mode acts on the color, the alpha composites
+# src-over) pinned byte-exact; see the M3d-10 case below.
+l = dict(layer, alpha=0.5, colorBlendMode=1)
+json.dump(scene([l], clear=(0.4, 0.25, 0.1, 0.5)), open(sys.argv[8], "w"))
 # The effects case: brightness 2.0 with a tint (1, 0.4, 0.5) — applied to
 # the sampled texel BEFORE blending, so over the opaque clear the composite
 # is the effect-scaled texel (128, 82, 142).
 l = dict(layer, brightness=2.0, tint=[1.0, 0.4, 0.5])
-json.dump(scene([l]), open(sys.argv[8], "w"))
+json.dump(scene([l]), open(sys.argv[9], "w"))
 # The clamp case: colorBlendMode 11 (known-unimplemented, recorded
 # undecoded) renders src-over with a bounded one-time diagnostic.
 l = dict(layer, colorBlendMode=11)
-json.dump(scene([l]), open(sys.argv[9], "w"))
+json.dump(scene([l]), open(sys.argv[10], "w"))
 # The script-driven case: update() switches the layer's blendMode from
 # add (6) to multiply (1) at t = 3 s; the oracle samples both sides.
-json.dump(scene([layer], script="m3d-js.js"), open(sys.argv[10], "w"))
-open(sys.argv[11], "w").write(
+json.dump(scene([layer], script="m3d-js.js"), open(sys.argv[11], "w"))
+open(sys.argv[12], "w").write(
     "var t = 0;\n"
     "function update(dt) {\n"
     "  t += dt;\n"
@@ -1052,6 +1062,22 @@ m3d_add128_frame="$(jq -r '.result.frame_file' <<<"$m3d_add128_status")"
 scene_pixel_oracle "$m3d_add128_frame" 80 45 "71,52,32,128" 1
 echo "scene smoke passed (M3d 7): add at alpha 128 — straight composite premultiplied once"
 
+# Case M3d-10: the translucent multiply alpha policy — layer alpha 0.5 over
+# a 0.5-alpha clear. The mode acts on the color (the attachment stores the
+# hard multiply B=142*26/255=14, G=103*64/255=26, R=64*102/255=26) while
+# the ALPHA channel composites src-over: 0.5 + (128/255)*0.5 = 0.75098 ->
+# 191.5 -> 192 (the dst alpha is the quantized 128, which pushes the tie to
+# 192). Readback premultiplies exactly once: B=(14*192+127)/255=11,
+# G=(26*192+127)/255=20, R=20, A=192. This pins that the layer's own
+# opacity survives (the review-fixed (ZERO, ONE) delivered the backdrop's
+# (7,13,13,128) instead, discarding the layer's 0.5 entirely).
+call_daemon renderer.start "$(jq -cn --arg content "$m3d_multiply128_scene" \
+    '{wallpaper_id:"scene-m3d-multiply128",content_hash:"hash-m3d-multiply128",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3d_multiply128_status="$(wait_phase live)"
+m3d_multiply128_frame="$(jq -r '.result.frame_file' <<<"$m3d_multiply128_status")"
+scene_pixel_oracle "$m3d_multiply128_frame" 80 45 "11,20,20,192" 1
+echo "scene smoke passed (M3d 10): translucent multiply — alpha src-over, layer opacity survives"
+
 # Case M3d-8: colorBlendMode 11 is a recorded-but-undecoded value that no
 # fixed-function Vulkan factor can express, so it clamps to normal with a
 # bounded one-time diagnostic naming the layer and mode.
@@ -1068,12 +1094,23 @@ echo "scene smoke passed (M3d 8): colorBlendMode 11 -> clamped to normal with th
 # add (6) until t=3s, multiply (1) after. Two samples of the same live
 # frame file: the first while t<3 (the add composite), the second after the
 # script's t crosses 3 (the multiply composite) — two frames, one layer,
-# both oracles.
+# both oracles. The first sample POLLS until the add composite is observed
+# (a slow lane could otherwise sample before the first update() applied the
+# scripted mode, or even after the t=3s switch); only then does the 3.5s
+# wait start, so the second sample always lands past the switch.
 call_daemon renderer.start "$(jq -cn --arg content "$m3d_js_scene" \
     '{wallpaper_id:"scene-m3d-js",content_hash:"hash-m3d-js",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3d_js_status="$(wait_phase live)"
 m3d_js_frame="$(jq -r '.result.frame_file' <<<"$m3d_js_status")"
-scene_pixel_oracle "$m3d_js_frame" 80 45 "168,167,166,255" 1
+m3d_js_add_observed=0
+for _attempt in {1..120}; do
+    if scene_pixel_oracle "$m3d_js_frame" 80 45 "168,167,166,255" 1 >/dev/null 2>&1; then
+        m3d_js_add_observed=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "$m3d_js_add_observed" == "1" ]]
 sleep 3.5
 scene_pixel_oracle "$m3d_js_frame" 80 45 "14,26,26,255" 1
 echo "scene smoke passed (M3d 9): scripted blendMode switch — add at t<3, multiply at t>3"
@@ -1254,10 +1291,28 @@ scene_pixel_oracle "$smoke_root/standalone-m3d-effects.bin" 80 45 "142,82,128,25
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d effects byte oracle"
 
+# Translucent multiply: the alpha-policy pin — layer alpha 0.5 over a
+# 0.5-alpha clear, delivered (11,20,20,192).
+lane_start "$smoke_root/standalone-m3d-multiply128.bin" "$m3d_multiply128_scene" "$smoke_root/standalone-m3d-multiply128.log"
+scene_pixel_oracle "$smoke_root/standalone-m3d-multiply128.bin" 80 45 "11,20,20,192" 0
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3d translucent multiply byte oracle"
+
 # The scripted switch: update() writes blendMode add (6) until t=3s then
-# multiply (1) — two exact samples of the same live frame file.
+# multiply (1) — two exact samples of the same live frame file. The first
+# POLLS until the add composite is observed (a slow lane must not sample
+# before the first update() or after the t=3s switch); the 3.5s wait starts
+# from the observation.
 lane_start "$smoke_root/standalone-m3d-js.bin" "$m3d_js_scene" "$smoke_root/standalone-m3d-js.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-js.bin" 80 45 "168,167,166,255" 0
+m3d_js_lane_add_observed=0
+for _attempt in {1..120}; do
+    if scene_pixel_oracle "$smoke_root/standalone-m3d-js.bin" 80 45 "168,167,166,255" 0 >/dev/null 2>&1; then
+        m3d_js_lane_add_observed=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "$m3d_js_lane_add_observed" == "1" ]]
 sleep 3.5
 scene_pixel_oracle "$smoke_root/standalone-m3d-js.bin" 80 45 "14,26,26,255" 0
 lane_stop

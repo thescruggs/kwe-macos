@@ -150,8 +150,9 @@ pub struct LayerSpec {
     /// load; anything else is tolerated silently (rendering src-over, the
     /// M3c behavior).
     pub blend_mode: u32,
-    /// Brightness multiplier on the sampled RGB (M3d): 0..=10, default 1.0
-    /// (the WE default, verified on the OWE WPImageObject parse).
+    /// Brightness multiplier on the sampled RGB (M3d). The WE default is
+    /// 1.0 — the identity, verified on the OWE WPImageObject parse; the
+    /// clamp range 0..=10 is a design decision, not a documented WE bound.
     pub brightness: f32,
     /// Tint multiplier on the sampled RGBA (M3d): 0..=1 per component,
     /// default [1, 1, 1, 1]. The WE file key is `color` (a vec3 — alpha
@@ -466,21 +467,36 @@ fn parse_image_layer(
 
     // M3d color effects, both property-wrapped like the M3c scalars. WE
     // writes `brightness` as a plain float (default 1.0) — parsed with the
-    // same clamps as the script-side writes (0..=10, non-finite → 1.0); a
-    // malformed type rejects like alpha. Brightness beyond the range is
-    // clamped, not rejected (a >10 boost is not worth failing the scene).
+    // same clamps as the script-side writes (0..=10, non-finite → 1.0). A
+    // numeric string is accepted too (the corpus editor serializes
+    // scalars as strings); any other type rejects like alpha. Brightness
+    // beyond the range is clamped, not rejected (a >10 boost is not worth
+    // failing the scene).
     let brightness = match object.get("brightness") {
         None => 1.0,
         Some(value) => {
-            let brightness = property_value(value).as_f64().ok_or_else(|| {
-                SceneError::new(
+            let value = property_value(value);
+            let brightness = if let Some(number) = value.as_f64() {
+                number
+            } else if let Some(text) = value.as_str() {
+                text.parse::<f64>().map_err(|_| {
+                    SceneError::new(
+                        SceneErrorKind::Shape,
+                        format!(
+                            "scene.json \"{}\" must be a float or a numeric string",
+                            field(index, "brightness")
+                        ),
+                    )
+                })?
+            } else {
+                return Err(SceneError::new(
                     SceneErrorKind::Shape,
                     format!(
-                        "scene.json \"{}\" must be a float",
+                        "scene.json \"{}\" must be a float or a numeric string",
                         field(index, "brightness")
                     ),
-                )
-            })?;
+                ));
+            };
             crate::layers::clamp_layer_brightness(brightness)
         }
     };
@@ -1615,7 +1631,14 @@ mod tests {
         assert_eq!(layers[3].tint, [0.25, 0.5, 0.75, 1.0]);
         assert_eq!(layers[4].brightness, 0.0);
 
-        // A malformed brightness is a shape rejection, like alpha.
+        // A numeric string is accepted (the corpus editor serializes
+        // scalars as strings); a non-numeric one is a shape rejection,
+        // like alpha.
+        let layers = parse_objects_of(
+            r#"{"objects": [{"name": "f", "image": "f.png", "brightness": "2.5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(layers[0].brightness, 2.5);
         let error = parse_objects_of(
             r#"{"objects": [{"name": "l", "image": "a.png", "brightness": "bright"}]}"#,
         )

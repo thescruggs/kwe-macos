@@ -117,7 +117,9 @@ impl BlendMode {
 /// behavior), still rendering src-over.
 pub const BLEND_MODE_UNIMPLEMENTED: [u32; 4] = [11, 12, 24, 30];
 
-/// Upper bound on `brightness` (WE default 1.0; the spec's 0..=10 range).
+/// Upper bound on `brightness`. WE's default is 1.0 — the identity, pinned
+/// by the oracles; the clamp range 0..=10 is a design decision (dimming to
+/// black and up to a 10x boost), not a documented WE bound.
 pub const MAX_LAYER_BRIGHTNESS: f32 = 10.0;
 
 /// The per-layer runtime state the script sees and the compositor draws.
@@ -146,7 +148,8 @@ pub struct LayerState {
     /// WE `colorBlendMode` clamped to the implemented set at every boundary
     /// (parse, script write) — the renderer's per-draw pipeline variant.
     pub blend_mode: BlendMode,
-    /// Brightness multiplier on the sampled RGB (M3d): 0..=10, default 1.
+    /// Brightness multiplier on the sampled RGB (M3d): clamped 0..=10 (the
+    /// design range — WE's default 1.0 is the identity), non-finite → 1.0.
     pub brightness: f32,
     /// Tint multiplier on the sampled RGBA (M3d): 0..=1 per component,
     /// default [1, 1, 1, 1].

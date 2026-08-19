@@ -94,7 +94,7 @@ with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
 | `alpha` | float in `0.0..=1.0` | `1.0` | straight layer alpha; out-of-range or non-finite rejects the scene (like clearcolor) |
 | `visible` | boolean | `true` | an invisible layer draws nothing |
 | `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key; a per-layer blend mode from the researched table in "Blend modes and color effects (M3d)" below. Corpus (re-scan): 432 of 685 image-bearing objects carry it — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 (sums to 432) — the rest omit it (normal). A non-numeric value is tolerated (normal), never a rejection; an undecodable but numeric value clamps to normal with a bounded one-time diagnostic |
-| `brightness` | float in `0.0..=10.0` | `1.0` | multiplies the sampled RGB before blending (see M3d); out-of-range and non-finite values are clamped (negative → 0, >10 → 10, non-finite → 1.0), never a rejection |
+| `brightness` | float or numeric string | `1.0` | multiplies the sampled RGB before blending (see M3d); the default 1.0 is the identity (WE-verified), the clamp range 0..=10 is a design decision; out-of-range and non-finite values clamp, never a rejection; a non-numeric type is a Shape rejection |
 | `tint` | `[r, g, b]` or `[r, g, b, a]` of floats in `0.0..=1.0` (alias `color` — the WE file key, vec3 or vec4; `tint` takes precedence when both are present) | `[1, 1, 1, 1]` | multiplied onto the sampled RGBA before blending (see M3d); a 3-component value implies alpha 1; per-component clamped (non-finite → 1.0), never a rejection |
 
 Property-wrapped values (`{"user": ..., "value": ...}` — how the editor
@@ -145,29 +145,37 @@ never scales colors).
 
 ### The researched colorBlendMode table
 
-WE serializes `colorBlendMode` (editor dropdown = exactly {Normal,
-Multiply, Add, Screen, Subtract}, per the wpdoc UI strings; Steam patch
-note: "standard Photoshop blend modes"; rendered by the proprietary
-`ApplyBlending` shader, type `imageblending`, default 0 — so the original
-never renders modes outside the dropdown). No public WE shader source
-exists, so the value→mode mapping is recovered from the dropdown order and
-the Photoshop formula family, and the formulas below are the oracle ground
-truth, byte-validated on the llvmpipe lane.
+WE serializes `colorBlendMode` as an integer. The editor dropdown exposes
+exactly {Normal, Multiply, Add, Screen, Subtract} (wpdoc UI strings; Steam
+patch note: "standard Photoshop blend modes"; rendered by the proprietary
+`ApplyBlending` shader, type `imageblending`), which pins the five-mode
+FAMILY — it says nothing about the integers behind them. No public WE
+shader source exists, so the value→name mapping below is a corpus-histogram
+HYPOTHESIS: 0 dominates (410 of 432 occurrences) and is the editor's
+default for new objects (verified); 1/6/7/9 are assigned to the remaining
+four dropdown names as the best fit — the histogram's non-zero values that
+round out the dropdown family (the five decoded values cover 17 of the 22
+non-zero occurrences). The other 15 occurrences — 11, 30, 24, 12 — sit
+OUTSIDE the dropdown family, so the original evidently tolerates integers
+its own editor cannot produce (ours clamp to Normal with a diagnostic).
+The formulas below are the oracle ground truth, byte-validated on the
+llvmpipe lane.
 
-Evidence grades: **verified** = a public source pins the value,
-**decoded** = consistent with the complete dropdown (independent
-confirmation impossible), **undecoded** = not expressible in
-fixed-function Vulkan blending (kept for corpus tolerance).
+Evidence grades: **verified** = a public source pins the value (0 only);
+**decoded** = the best-fit corpus-histogram hypothesis, consistent with
+the dropdown family but not independently confirmable; **undecoded** = no
+credible hypothesis and not expressible in fixed-function Vulkan blending
+(kept for corpus tolerance).
 
 | Value | Name | Implemented? | Vulkan blend state (color / alpha) | Evidence |
 |---|---|---|---|---|
-| 0 | Normal | yes | (ONE, ONE_MINUS_SRC_ALPHA) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | verified — dropdown default |
-| 1 | Multiply | yes | (DST_COLOR, ZERO) / (ZERO, ONE), ADD | decoded |
+| 0 | Normal | yes | (ONE, ONE_MINUS_SRC_ALPHA) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | verified — the corpus-dominant value, the editor default |
+| 1 | Multiply | yes | (DST_COLOR, ZERO) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
 | 6 | Add | yes | (ONE, ONE) / (ONE, ONE), ADD | decoded |
-| 7 | Screen | yes | (ONE_MINUS_DST_COLOR, ONE) / (ONE_MINUS_DST_COLOR, ONE), ADD | decoded |
-| 9 | Subtract | yes | (ONE, ONE) REVERSE_SUBTRACT / (ONE, ZERO) ADD | decoded |
-| 11, 12, 24, 30 | — | **no** | clamped to Normal + one bounded diagnostic per scene (`event=renderer.scene.blend_mode_clamped layer=... mode=...`) | undecoded — not fixed-function |
-| any other | — | no | silently Normal (unknown values tolerated, like the original's switch default) | — |
+| 7 | Screen | yes | (ONE_MINUS_DST_COLOR, ONE) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
+| 9 | Subtract | yes | (ONE, ONE) REVERSE_SUBTRACT / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
+| 11, 12, 24, 30 | — | **no** | clamped to Normal + one bounded diagnostic per scene (`event=renderer.scene.blend_mode_clamped layer=... mode=...`) | undecoded — outside the dropdown family, not fixed-function |
+| any other | — | no | silently Normal (unknown values tolerated, like the original evidently tolerates 11/30/24/12) | — |
 
 Semantics (the formulas the oracles hand-compute; `t` = texel,
 `b` = background, per channel in 0..255):
@@ -178,8 +186,15 @@ Semantics (the formulas the oracles hand-compute; `t` = texel,
 - **Subtract** = `max(0, b − t)` — the background minus the texel: WE's
   "Photoshop blend modes" family and the Vulkan REVERSE_SUBTRACT algebra
   (dst − src) agree; a reversed direction would fail the oracle.
-- **Alpha** for multiply/screen/subtract follows the Photoshop family
-  (the mode acts on the color; the alpha survives).
+- **Alpha policy** (deliberate, pinned by oracles): the mode acts on the
+  COLOR; the alpha channel always composites src-over (ONE,
+  ONE_MINUS_SRC_ALPHA) — the layer's own opacity still matters under every
+  mode — except **Add**, whose semantic is additive on both channels
+  (ONE, ONE). This fixes the review finding that Multiply's original
+  (ZERO, ONE) discarded the layer's alpha entirely (a translucent multiply
+  over a transparent backdrop vanished; over an opaque one the delivered
+  alpha ignored the layer's opacity): the translucent-multiply oracle
+  (11,20,20,192) pins the src-over alpha byte-exact.
 
 The Screen factors were corrected during oracle validation: the first
 draft used (ONE, ONE_MINUS_DST_COLOR), which computes `t + b·(1−b)` — not
@@ -197,13 +212,18 @@ with the same bounded diagnostic; any other value clamps silently.
 
 | Field | File key | Default | Effect |
 |---|---|---|---|
-| `brightness` | `brightness` | `1.0` | multiplies the sampled RGB; clamped to `0.0..=10.0`, non-finite → 1.0 |
+| `brightness` | `brightness` | `1.0` | multiplies the sampled RGB. The default 1.0 is the identity — a WE-verified fact (the OWE WPImageObject default); the clamp range `0.0..=10.0` is a design decision (dimming to black, up to a 10x boost), not a documented WE bound. Out-of-range values clamp, non-finite → 1.0 |
 | `tint` | `tint` (alias `color` — the WE file key, vec3 or vec4; `tint` wins when both are present) | `[1,1,1,1]` | multiplies the sampled RGBA; per-component clamped to `0.0..=1.0`, non-finite → 1.0; a vec3 implies alpha 1.0 |
 
 Both parse property-wrapped (the corpus editor form) and both clamp
-instead of rejecting — a malformed effect can darken a layer, never fail
-the scene. The tint alpha is folded into the pushed `m1.w` host-side, so
-the shader's single multiply `a · layer_alpha · tint.a` covers both.
+out-of-range VALUES instead of rejecting — a too-bright effect darkens or
+boosts a layer, never fails the scene. Wrong-TYPED values do reject like
+alpha, with one corpus-honest exception: `brightness` accepts a JSON
+number or a numeric string (the corpus editor serializes scalars as
+strings); `tint` components must be numbers inside an array or
+space-separated string. The tint alpha is folded into the pushed `m1.w`
+host-side, so the shader's single multiply `a · layer_alpha · tint.a`
+covers both.
 
 Byte-exact oracle (llvmpipe, `scripts/smoke-scene.sh`): fullscreen texel
 (64,103,142) over opaque clear (102,64,26) at the frame center (80,45) —
@@ -212,7 +232,11 @@ screen (154,141,140,255); subtract (0,0,38,255); effects (brightness 2.0,
 tint (1, 0.4, 0.5)) (142,82,128,255); and add at layer alpha 0.5 over a
 transparent clear pins the single premultiplication: the attachment stores
 the straight composite (64,103,142,128) — alpha 0.5·255 = 127.5 rounds to
-128 — and the readback premultiplies exactly once (71,52,32,128).
+128 — and the readback premultiplies exactly once (71,52,32,128). The
+translucent-multiply pin: multiply at layer alpha 0.5 over a 0.5-alpha
+clear — the hard multiply stores (14,26,26) and the src-over alpha
+0.5 + (128/255)·0.5 = 191.5 rounds to 192 — delivered (11,20,20,192): the
+layer's own opacity survives, and the readback premultiplies exactly once.
 
 ## Image sources (M3c)
 

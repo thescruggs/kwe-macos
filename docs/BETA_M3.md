@@ -189,15 +189,27 @@ push constants grow 48 → 64 bytes (an `effects` vector is appended; the
 first 48 bytes are byte-identical, so the vertex shader is untouched).
 
 The researched WE table (full evidence in SCENE_FORMAT_V1.md): 0 Normal,
-1 Multiply, 6 Add, 7 Screen, 9 Subtract — decoded from the editor dropdown
-{Normal, Multiply, Add, Screen, Subtract} (wpdoc UI strings, Steam patch
-note "standard Photoshop blend modes") and the corpus histogram (410×0,
-6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12); no public WE shader source
-exists, so values 1/6/7/9 are recorded as "decoded", not independently
-verified. 11, 12, 24, 30 are undecoded and not expressible in
-fixed-function blending: they clamp to Normal with a bounded one-time
-diagnostic (`event=renderer.scene.blend_mode_clamped layer=... mode=...`).
-Subtract is `max(0, background − texel)` — REVERSE_SUBTRACT(ONE, ONE), the
+1 Multiply, 6 Add, 7 Screen, 9 Subtract. The wpdoc editor dropdown pins
+the five-mode FAMILY {Normal, Multiply, Add, Screen, Subtract} (Steam
+patch note "standard Photoshop blend modes") but says nothing about the
+integers; with no public WE shader source, the value→name mapping is a
+corpus-histogram hypothesis — 0 dominates (410×0) and is the editor
+default (verified); 1/6/7/9 are the best fit for the four remaining
+dropdown names. 11, 12, 24, 30 (15 corpus occurrences) sit OUTSIDE the
+dropdown family — the original evidently tolerates integers its editor
+cannot produce — and are not expressible in fixed-function blending: they
+clamp to Normal with a bounded one-time diagnostic
+(`event=renderer.scene.blend_mode_clamped layer=... mode=...`).
+
+The alpha policy is deliberate: the mode acts on the COLOR; the alpha
+channel always composites src-over (ONE, ONE_MINUS_SRC_ALPHA) — the
+layer's own opacity still matters under every mode — except Add, which is
+additive on both channels (ONE, ONE). This fixes the review finding that
+Multiply's original (ZERO, ONE) discarded the layer's alpha (a translucent
+multiply over a transparent backdrop vanished; over an opaque one the
+delivered alpha ignored the layer's opacity) — pinned byte-exact by the
+translucent-multiply oracle (11,20,20,192). Subtract is
+`max(0, background − texel)` — REVERSE_SUBTRACT(ONE, ONE), the
 background-minus-texel direction of Photoshop's Subtract (WE's stated mode
 family) and of the Vulkan dst − src algebra; the reversed direction fails
 the oracle. The Screen factors were corrected during oracle validation:
@@ -205,26 +217,31 @@ the first draft (ONE, ONE_MINUS_DST_COLOR) computes `t + b·(1−b)` instead
 of the screen formula `t·(1−b) + b`; the device byte oracle caught it
 ([165,151,125] produced vs [154,141,140] hand-computed).
 
-Effects: `brightness` (float, default 1, clamped 0..=10, non-finite → 1)
+Effects: `brightness` (default 1, the identity — a WE-verified fact; the
+clamp range 0..=10 is a design decision, not a documented WE bound)
 multiplies RGB; `tint` (alias `color` — the WE file key, vec3 or vec4;
 `tint` wins when both are present; default [1,1,1,1]; per-component
 clamped 0..=1, non-finite → 1; vec3 implies alpha 1) multiplies RGBA. Both
-parse property-wrapped and clamp instead of rejecting. The tint alpha is
-folded into the pushed layer alpha host-side (`m1.w = alpha · tint.a`).
+parse property-wrapped and clamp out-of-range VALUES instead of rejecting;
+wrong-TYPED values reject like alpha, except `brightness`, which accepts a
+numeric string too (the corpus editor serializes scalars as strings). The
+tint alpha is folded into the pushed layer alpha host-side
+(`m1.w = alpha · tint.a`).
 
 ### M3d — acceptance evidence
 
 | Case | Expected containment | Result |
 |---|---|---|
-| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 345 tests pass (91 in `kwe-scene-renderer`) |
-| device tests (llvmpipe) | `KWE_TEST_DEVICE`-gated byte-exact renders: every implemented mode + the effects math | `blend_modes_composite_byte_exact`: texel (64,103,142) over clear (102,64,26) → normal (142,103,64,255), multiply (14,26,26,255), add (168,167,166,255), screen (154,141,140,255), subtract (0,0,38,255); `color_effects_composite_byte_exact`: brightness 2 + tint (1,0.25,0.5) → (142,51 or 52,128,255) — all byte-exact |
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 346 tests pass (92 in `kwe-scene-renderer`) |
+| device tests (llvmpipe) | `KWE_TEST_DEVICE`-gated byte-exact renders: every implemented mode + the effects math | `blend_modes_composite_byte_exact`: texel (64,103,142) over clear (102,64,26) → normal (142,103,64,255), multiply (14,26,26,255), add (168,167,166,255), screen (154,141,140,255), subtract (0,0,38,255); `color_effects_composite_byte_exact`: brightness 2 + tint (1,0.25,0.5) → (142,51 or 52,128,255); `translucent_multiply_alpha_composites_src_over_byte_exact`: multiply at α 0.5 over a 0.5-alpha clear → (11,20,20,192) — all byte-exact |
 | smoke 1–5 (daemon lane) | one scene per implemented mode, fullscreen texel over the opaque clear | (80,45) = (142,103,64,255), (14,26,26,255), (167,167,166,255), (153,141,140,255), (0,0,38,255) — tol 1; the RTX 3070 lands add/screen one byte under the exact llvmpipe values |
 | smoke 6 (daemon lane) | brightness 2.0 + tint (1,0.4,0.5) | (80,45) = (142,82,128,255) |
 | smoke 7 (daemon lane) | add at layer alpha 0.5 over a transparent clear — the single-premultiplication pin | (80,45) = (71,51,32,127) tol 1 — the RTX rounds the 0.5 alpha tie down to 127; the llvmpipe lane pins the RNE byte (71,52,32,128) exactly |
+| smoke 10 (daemon lane) | translucent multiply — the alpha-policy pin | (80,45) = (11,20,20,192) tol 1 — the layer's own opacity survives the multiply |
 | smoke 8 (daemon lane) | `colorBlendMode: 11` | renders normal (142,103,64,255); stderr ring carries `event=renderer.scene.blend_mode_clamped layer=layer mode=11` once |
-| smoke 9 (daemon lane) | scripted switch: `update()` writes `blendMode = t < 3 ? 6 : 1` | two samples of the live frame: add composite, then after t crosses 3 s the multiply composite — two frames, one layer |
-| standalone llvmpipe lanes | every implemented mode + effects + the alpha-128 case + the scripted switch, EXACT bytes | normal (142,103,64,255), multiply (14,26,26,255), add (168,167,166,255), screen (154,141,140,255), subtract (0,0,38,255), add128 (71,52,32,128), effects (142,82,128,255), scripted add→multiply — all exact, tol 0 |
-| clamp/parse/JS units | enum mapping (researched table), variant selection, JS write clamping, scene.json parse of blend mode + effects | `blend_mode_table_matches_the_researched_we_mapping`, `blend_mode_clamp_falls_back_to_normal_for_unknown_values` (asserts 11/12/24/30), `brightness_and_tint_clamps_are_bounded`, `brightness_and_tint_parsed_with_clamps`, `blend_mode_and_effects_writes_clamp_on_the_rust_side`, `blend_attachment_table_matches_the_researched_we_semantics`, `color_effects_math_matches_the_shader`, `blend_modes_recorded` |
+| smoke 9 (daemon lane) | scripted switch: `update()` writes `blendMode = t < 3 ? 6 : 1` | the first sample POLLS until the add composite is observed (a slow lane must not sample before the first update() or after the switch); then, after t crosses 3 s, the multiply composite — two frames, one layer |
+| standalone llvmpipe lanes | every implemented mode + effects + the alpha-128 and translucent-multiply cases + the scripted switch, EXACT bytes | normal (142,103,64,255), multiply (14,26,26,255), add (168,167,166,255), screen (154,141,140,255), subtract (0,0,38,255), add128 (71,52,32,128), multiply128 (11,20,20,192), effects (142,82,128,255), scripted add→multiply (polled) — all exact, tol 0 |
+| clamp/parse/JS units | enum mapping (researched table), variant selection, JS write clamping, scene.json parse of blend mode + effects | `blend_mode_table_matches_the_researched_we_mapping`, `blend_mode_clamp_falls_back_to_normal_for_unknown_values` (asserts 11/12/24/30), `brightness_and_tint_clamps_are_bounded`, `brightness_and_tint_parsed_with_clamps` (incl. the numeric-string brightness form), `blend_mode_and_effects_writes_clamp_on_the_rust_side`, `blend_attachment_table_matches_the_researched_we_semantics`, `color_effects_math_matches_the_shader`, `blend_modes_recorded` |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 

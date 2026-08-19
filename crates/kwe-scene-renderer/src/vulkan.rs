@@ -1118,39 +1118,41 @@ impl LayerRenderer {
 /// The blend attachment state for one implemented blend mode (M3d). The
 /// per-mode factors/ops implement the researched WE semantics
 /// (docs/SCENE_FORMAT_V1.md, M3d section): WE applies its modes as
-/// Photoshop-style color operations (ApplyBlending) with the layer's own
-/// alpha passing through, and each mode below is the fixed-function
-/// realization of its formula:
+/// Photoshop-style COLOR operations (ApplyBlending), and our alpha policy
+/// is deliberate — **the mode acts on the color; the alpha channel always
+/// composites src-over, except Add which is additive on both channels** —
+/// so the layer's own opacity still matters under every mode. The fragment
+/// shader outputs STRAIGHT color, so the attachment stores the straight
+/// composite and bgra_premultiplied applies the ONE premultiplication at
+/// the readback boundary. For Normal, using SRC_ALPHA as the color factor
+/// would store an already-premultiplied composite and the readback would
+/// premultiply AGAIN, darkening translucent pixels by alpha/255 (the
+/// (79,58,36,191) double-premultiplied oracle vs the correct
+/// (106,77,48,191)); scaling the alpha channel by itself (SRC_ALPHA as
+/// its src factor) would double-scale it (a 191/255 layer over an opaque
+/// dst would land at 143/255 instead of staying opaque).
 ///
-/// * Normal (src-over): src + dst·(1 − src.a) — the M3c default. The blend
-///   runs on the fragment's float alpha (the layer alpha from the push
-///   constants), which is what the smoke oracle computes against. The
-///   fragment shader outputs STRAIGHT color, and the color factors are
-///   ONE / ONE_MINUS_SRC_ALPHA — the attachment stores src + dst·(1 -
-///   src.a), still straight. The protocol wants premultiplied BGRA, and
-///   bgra_premultiplied is the ONE premultiplication, applied at the
-///   readback boundary. Using SRC_ALPHA here would store an
-///   already-premultiplied composite and the readback would premultiply
-///   AGAIN, darkening translucent pixels by alpha/255 (the (79,58,36,191)
-///   double-premultiplied oracle vs the correct (106,77,48,191)). The
-///   ALPHA channel uses ONE / ONE_MINUS_SRC_ALPHA — scaling the source
-///   alpha by itself (SRC_ALPHA) would double-scale it (a 191/255 layer
-///   over an opaque dst would land at 143/255 instead of staying opaque).
-/// * Multiply (texel × background): color DST_COLOR / ZERO, ADD. The
-///   alpha channel keeps the destination's (ZERO / ONE): the multiply
-///   result's coverage is the background's — over an opaque background
-///   the composite stays opaque.
-/// * Add (texel + background, saturating): ONE / ONE, ADD, both channels.
-/// * Screen (255−(255−texel)(255−background)/255, i.e.
-///   texel·(1−background) + background): color ONE_MINUS_DST_COLOR / ONE,
-///   ADD (the factors are NOT symmetric — (ONE, ONE_MINUS_DST_COLOR)
-///   would compute texel + background·(1−background), which a device
-///   oracle caught); the alpha channel mirrors the color formula.
-/// * Subtract (max(0, background − texel), Photoshop's base − blend —
-///   the spec's `max(0, c2−c1)` with c1 = texel, c2 = background):
-///   REVERSE_SUBTRACT with ONE / ONE — dst − src, clamped to 0 by the
-///   operation — and alpha ONE / ZERO, ADD (the layer's alpha passes
-///   through untouched; subtract is a color operation).
+/// | Mode | Color (src, dst, op) | Alpha (src, dst, op) |
+/// |---|---|---|
+/// | Normal (src-over) | ONE, ONE_MINUS_SRC_ALPHA, ADD | ONE, ONE_MINUS_SRC_ALPHA, ADD |
+/// | Multiply (texel·background/255) | DST_COLOR, ZERO, ADD | ONE, ONE_MINUS_SRC_ALPHA, ADD |
+/// | Add (texel+background, saturating) | ONE, ONE, ADD | ONE, ONE, ADD |
+/// | Screen (texel·(1−background)+background) | ONE_MINUS_DST_COLOR, ONE, ADD | ONE, ONE_MINUS_SRC_ALPHA, ADD |
+/// | Subtract (max(0, background−texel)) | ONE, ONE, REVERSE_SUBTRACT | ONE, ONE_MINUS_SRC_ALPHA, ADD |
+///
+/// Multiply's color factors are the spec's pinned formula
+/// texel·background/255 — a "hard" multiply that ignores the source alpha
+/// (a translucent multiply over a transparent backdrop is black × its
+/// alpha, and over an opaque one the color is fully hard-multiplied); the
+/// src-over ALPHA keeps the layer's own opacity in the delivered alpha
+/// instead of discarding it — the review-fixed (ZERO, ONE) dropped the
+/// layer's alpha entirely, so a translucent multiply over a transparent
+/// backdrop vanished and over an opaque one delivered a fully opaque
+/// composite regardless of the layer's opacity. Screen's color factors
+/// are NOT symmetric — (ONE, ONE_MINUS_DST_COLOR) would compute texel +
+/// background·(1−background), which a device oracle caught. Subtract is
+/// REVERSE_SUBTRACT (dst − src) clamped to 0 by the operation, Photoshop's
+/// base − blend, the spec's max(0, c2−c1) with c1 = texel, c2 = background.
 fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentState {
     let write_mask = vk::ColorComponentFlags::R
         | vk::ColorComponentFlags::G
@@ -1169,8 +1171,8 @@ fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentStat
             vk::BlendFactor::DST_COLOR,
             vk::BlendFactor::ZERO,
             vk::BlendOp::ADD,
-            vk::BlendFactor::ZERO,
             vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             vk::BlendOp::ADD,
         ),
         BlendMode::Add => (
@@ -1185,8 +1187,8 @@ fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentStat
             vk::BlendFactor::ONE_MINUS_DST_COLOR,
             vk::BlendFactor::ONE,
             vk::BlendOp::ADD,
-            vk::BlendFactor::ONE_MINUS_DST_COLOR,
             vk::BlendFactor::ONE,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             vk::BlendOp::ADD,
         ),
         BlendMode::Subtract => (
@@ -1194,7 +1196,7 @@ fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentStat
             vk::BlendFactor::ONE,
             vk::BlendOp::REVERSE_SUBTRACT,
             vk::BlendFactor::ONE,
-            vk::BlendFactor::ZERO,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             vk::BlendOp::ADD,
         ),
     };
@@ -1754,26 +1756,35 @@ mod tests {
             vk::BlendFactor::ONE_MINUS_SRC_ALPHA
         );
 
-        // Multiply: texel × background (color), background alpha kept.
+        // Multiply: texel × background (color); the alpha composites
+        // src-over — the layer's own opacity must survive (the review-fixed
+        // (ZERO, ONE) discarded it: a translucent multiply over a
+        // transparent backdrop vanished, over an opaque one the composite
+        // ignored the layer's opacity).
         let multiply = blend_attachment_for(BlendMode::Multiply);
         assert_eq!(multiply.src_color_blend_factor, vk::BlendFactor::DST_COLOR);
         assert_eq!(multiply.dst_color_blend_factor, vk::BlendFactor::ZERO);
         assert_eq!(multiply.color_blend_op, vk::BlendOp::ADD);
-        assert_eq!(multiply.src_alpha_blend_factor, vk::BlendFactor::ZERO);
-        assert_eq!(multiply.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(multiply.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(
+            multiply.dst_alpha_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
+        assert_eq!(multiply.alpha_blend_op, vk::BlendOp::ADD);
 
-        // Add: texel + background, both channels.
+        // Add: texel + background, additive on both channels.
         let add = blend_attachment_for(BlendMode::Add);
         assert_eq!(add.src_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(add.dst_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(add.color_blend_op, vk::BlendOp::ADD);
         assert_eq!(add.src_alpha_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(add.dst_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(add.alpha_blend_op, vk::BlendOp::ADD);
 
         // Screen: 255-(255-texel)(255-background)/255 =
         // texel·(1−background) + background — the src factor is
         // ONE_MINUS_DST_COLOR, the dst factor ONE (the device oracle
-        // pinned the direction).
+        // pinned the direction); the alpha composites src-over.
         let screen = blend_attachment_for(BlendMode::Screen);
         assert_eq!(
             screen.src_color_blend_factor,
@@ -1781,15 +1792,23 @@ mod tests {
         );
         assert_eq!(screen.dst_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(screen.color_blend_op, vk::BlendOp::ADD);
+        assert_eq!(screen.src_alpha_blend_factor, vk::BlendFactor::ONE);
+        assert_eq!(
+            screen.dst_alpha_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
 
         // Subtract: max(0, background − texel) — REVERSE_SUBTRACT computes
-        // dst − src with the texel as src; the alpha passes through.
+        // dst − src with the texel as src; the alpha composites src-over.
         let subtract = blend_attachment_for(BlendMode::Subtract);
         assert_eq!(subtract.src_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(subtract.dst_color_blend_factor, vk::BlendFactor::ONE);
         assert_eq!(subtract.color_blend_op, vk::BlendOp::REVERSE_SUBTRACT);
         assert_eq!(subtract.src_alpha_blend_factor, vk::BlendFactor::ONE);
-        assert_eq!(subtract.dst_alpha_blend_factor, vk::BlendFactor::ZERO);
+        assert_eq!(
+            subtract.dst_alpha_blend_factor,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        );
         assert_eq!(subtract.alpha_blend_op, vk::BlendOp::ADD);
 
         for mode in BlendMode::ALL {
@@ -1932,6 +1951,50 @@ mod tests {
             assert_eq!(pixel[1], g, "G = 103·2·0.25 = 51.5");
             assert_eq!(pixel[2], 128, "R = 64·2·1");
             assert_eq!(pixel[3], 255, "A stays opaque");
+        }
+    }
+
+    /// The translucent-multiply alpha policy, byte exact: multiply at layer
+    /// alpha 0.5 over a 0.5-alpha clear. The mode acts on the color, so the
+    /// attachment stores the hard multiply — B = 142·26/255 → 14, G =
+    /// 103·64/255 → 26, R = 64·102/255 → 26 — and the ALPHA channel
+    /// composites src-over: 0.5 + (128/255)·0.5 = 0.75098 → 191.5 → 192 by
+    /// round-to-nearest-even (the dst alpha is the QUANTIZED 128, which is
+    /// what pushes the tie past 191). The readback premultiplies exactly
+    /// once: floor((v·192+127)/255) → (11, 20, 20, 192). This pins that the
+    /// layer's own opacity survives — the review-fixed (ZERO, ONE) alpha
+    /// factors would have delivered the backdrop's (7,13,13,128) instead,
+    /// discarding the layer's 0.5 entirely.
+    #[test]
+    fn translucent_multiply_alpha_composites_src_over_byte_exact() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "translucent_multiply_alpha_composites_src_over_byte_exact: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        renderer
+            .upload_layer(0, &[64, 103, 142, 255], 1, 1)
+            .expect("upload layer");
+        let draws = [LayerDraw {
+            layer_index: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 0.5,
+            blend_mode: BlendMode::Multiply,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+        }];
+        let pixels = renderer
+            .render([0.4, 0.25, 0.1, 0.5], &draws)
+            .expect("render once");
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(
+                pixel,
+                &[11, 20, 20, 192],
+                "multiply α=0.5 over α=0.5 clear: BGRA"
+            );
         }
     }
 }
