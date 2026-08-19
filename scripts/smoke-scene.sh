@@ -283,7 +283,69 @@ JS
 cat >"$oom_scene" <<JSON
 {"general": {"clearcolor": [0.1, 0.1, 0.1, 1.0], "resolution": [160, 90], "fps": 30, "script": "oom.js"}}
 JSON
-echo "scene smoke: fixtures generated"
+# M3b: packaged-scene fixtures. The pkg builder mirrors the verified corpus
+# layout (PKGV0001, length-prefixed paths, raw payloads — docs/SCENE_FORMAT_V1.md
+# "scene.pkg"); corrupt/truncated/traversal/nested variants are derived from
+# the good package, exactly like a tampered Workshop download would arrive.
+pkg_scene="$smoke_root/scene.pkg"
+pkg_corrupt="$smoke_root/corrupt.pkg"
+pkg_truncated="$smoke_root/truncated.pkg"
+pkg_nested="$smoke_root/nested.pkg"
+pkg_traversal="$smoke_root/traversal.pkg"
+# Packaged scene.json uses the corpus serialization: 59 of 60 real wallpapers
+# carry clearcolor as a space-separated "r g b" STRING, not the array form the
+# file-based fixtures use. Exercising both shapes e2e is an M3b acceptance item.
+scene_pkg_json="$smoke_root/scene-string.json"
+cat >"$scene_pkg_json" <<JSON
+{"general": {"clearcolor": "0.7 0.7 0.7", "resolution": [160, 90], "fps": 30, "script": "script.js"}}
+JSON
+python3 - "$pkg_scene" "$pkg_corrupt" "$pkg_truncated" "$pkg_nested" "$pkg_traversal" "$script" "$scene" "$scene_pkg_json" <<'PY'
+import struct
+import sys
+
+pkg_scene, pkg_corrupt, pkg_truncated = sys.argv[1], sys.argv[2], sys.argv[3]
+pkg_nested, pkg_traversal = sys.argv[4], sys.argv[5]
+script = open(sys.argv[6]).read().encode()
+scene_json = open(sys.argv[7]).read().encode()
+pkg_scene_json = open(sys.argv[8]).read().encode()
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+open(pkg_scene, "wb").write(
+    build_pkg([("scene.json", pkg_scene_json), ("script.js", script)])
+)
+good = build_pkg([("scene.json", pkg_scene_json)])
+# Corrupt magic: valid length prefix, wrong magic bytes.
+open(pkg_corrupt, "wb").write(good[:4] + b"XXXX0001" + good[12:])
+# Truncated table: header + count + a half-written entry.
+good = build_pkg([("scene.json", pkg_scene_json), ("script.js", script)])
+open(pkg_truncated, "wb").write(good[: 16 + 4 + len("scene.json") + 2])
+# Nested archive: a scene.pkg entry and no scene.json.
+open(pkg_nested, "wb").write(
+    build_pkg([("scene.pkg", build_pkg([("scene.json", pkg_scene_json)]))])
+)
+# Traversal entry inside an otherwise valid package.
+open(pkg_traversal, "wb").write(
+    build_pkg([("../evil", b"x"), ("scene.json", pkg_scene_json)])
+)
+PY
+echo "scene smoke: pkg fixtures generated"
 
 cd "$project_root"
 cargo build --workspace >/dev/null
@@ -312,6 +374,93 @@ echo "scene smoke passed: live start, kind/content, advancing sequence, frame fi
 # the frame header and the snapshot algorithm end to end.
 scene_oracle "$frame_file" 1.5
 echo "scene smoke passed: scripted clear color oracle (init() + update() drive rendering)"
+
+# Case 3b (M3b): a packaged scene runs end-to-end through the daemon. The
+# pkg's scene.json entry is parsed in memory, its script entry is extracted
+# into the worker's private 0700 HOME, and the frame oracle proves the
+# packaged script drives rendering (same init()/update() semantics as the
+# file-based lane). The pkg diagnostic names the archive path taken.
+call_daemon renderer.start "$(jq -cn --arg content "$pkg_scene" \
+    '{wallpaper_id:"scene-pkg",content_hash:"hash-scene-pkg",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+pkg_status="$(wait_phase live)"
+[[ "$(jq -r '.result.kind' <<<"$pkg_status")" == "scene" ]]
+pkg_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$pkg_status")"
+[[ "$pkg_tail" == *"event=renderer.scene.pkg entries=2 script_entry=true"* ]]
+pkg_frame="$(jq -r '.result.frame_file' <<<"$pkg_status")"
+[[ -n "$pkg_frame" && -f "$pkg_frame" ]]
+scene_oracle "$pkg_frame" 1.5
+echo "scene smoke passed: packaged scene.pkg e2e (extracted script entry drives the oracle)"
+
+# Case 3c (M3b, optional): a pkg whose script entry is an LZ4 frame. The
+# reader's defensive decompression path, end to end — only when the lz4 CLI
+# (which emits frame format) is present. The oracle must pass unchanged:
+# the extracted script is byte-identical after decompression.
+if command -v lz4 >/dev/null; then
+    pkg_lz4="$smoke_root/lz4.pkg"
+    python3 - "$pkg_lz4" "$script" "$scene" <<'PY'
+import struct
+import subprocess
+import sys
+
+pkg_lz4, script_path, scene_path = sys.argv[1], sys.argv[2], sys.argv[3]
+script = open(script_path).read().encode()
+scene_json = open(scene_path).read().encode()
+compressed = subprocess.run(
+    ["lz4", "-z", "-q", "-c"], input=script, capture_output=True, check=True
+).stdout
+assert compressed[:4] == b"\x04\x22\x4d\x18", "lz4 CLI must emit an LZ4 frame"
+out = bytearray(struct.pack("<I", 8) + b"PKGV0001")
+out += struct.pack("<I", 2)
+for path, payload in [("scene.json", scene_json), ("script.js", compressed)]:
+    out += struct.pack("<I", len(path.encode()))
+    out += path.encode()
+    out += struct.pack("<I", 0 if path == "scene.json" else len(scene_json))
+    out += struct.pack("<I", len(payload))
+out += scene_json
+out += compressed
+open(pkg_lz4, "wb").write(bytes(out))
+PY
+    call_daemon renderer.start "$(jq -cn --arg content "$pkg_lz4" \
+        '{wallpaper_id:"scene-pkg-lz4",content_hash:"hash-scene-pkg-lz4",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+    lz4_status="$(wait_phase live)"
+    lz4_frame="$(jq -r '.result.frame_file' <<<"$lz4_status")"
+    scene_oracle "$lz4_frame" 1.5
+    echo "scene smoke passed: pkg with LZ4-frame script entry decompressed and ran (optional lz4 CLI)"
+fi
+
+# Case 3d (M3b): corrupt, truncated, and traversal packages fail the
+# structural preflight before any worker spawns — renderer.start answers
+# invalid_params. This closes M1 finding G12, which previously passed any
+# .pkg through preflight unvalidated.
+for fixture in "$pkg_corrupt" "$pkg_truncated" "$pkg_traversal"; do
+    reject="$(call_daemon renderer.start "$(jq -cn --arg content "$fixture" \
+        '{wallpaper_id:"scene-badpkg",content_hash:"hash-badpkg",width:160,height:90,fps:30,kind:"scene",content:$content}')" || true)"
+    [[ "$(jq -r '.ok' <<<"$reject")" == "false" ]]
+    [[ "$(jq -r '.result.error' <<<"$reject")" == "invalid_params" ]]
+    [[ "$(jq -r '.result.detail' <<<"$reject")" == *"scene preflight rejected"* ]]
+    [[ "$(jq -r '.result.detail' <<<"$reject")" == *"scene package is invalid"* ]]
+done
+echo "scene smoke passed: corrupt/truncated/traversal pkg -> preflight invalid_params"
+
+# Case 3e (M3b): a nested scene.pkg passes the structural preflight (it is a
+# valid archive) but the worker refuses it before the canary: exit 73,
+# rolled back to the base worker, detail names exit_code_73 and the nested
+# reason (nested archives are refused, never recursed).
+call_daemon renderer.start "$(jq -cn --arg content "$scene" \
+    '{wallpaper_id:"scene-base",content_hash:"hash-scene-base",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+base_status="$(wait_phase live)"
+base_pid="$(jq -r '.result.pid' <<<"$base_status")"
+call_daemon renderer.start "$(jq -cn --arg content "$pkg_nested" \
+    '{wallpaper_id:"scene-nested",content_hash:"hash-nested",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+nested_rollback="$(wait_phase rolled_back)"
+[[ "$(jq -r '.result.pid' <<<"$nested_rollback")" == "$base_pid" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$nested_rollback")" == "process_exit" ]]
+# The nested worker's own stderr is captured in the failure detail (the
+# ring tail belongs to the restarted base worker at this point).
+[[ "$(jq -r '.result.last_failure_detail' <<<"$nested_rollback")" == *"exit_code_73"* ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$nested_rollback")" == *"nested scene.pkg inside the package is not supported"* ]]
+kill -0 "$base_pid"
+echo "scene smoke passed: nested scene.pkg -> worker exit 73 -> rolled_back with exit_code_73"
 
 # Case 4: a throwing script stays contained. The renderer keeps rendering the
 # last state, the sequence keeps advancing, no failure is recorded, and the

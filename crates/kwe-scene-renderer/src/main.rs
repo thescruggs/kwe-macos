@@ -22,8 +22,10 @@ mod js;
 mod scene;
 mod vulkan;
 
+use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -537,10 +539,7 @@ fn main() -> Result<()> {
         .context("--content is required (--probe excepted)")?;
 
     // 1. Scene: parse and reject (exit 73) anything the engine cannot render.
-    let config = match SceneConfig::parse(&content) {
-        Ok(config) => config,
-        Err(error) => reject_scene(&error),
-    };
+    let config = load_scene(&content);
     if let Some((w, h)) = config.resolution
         && (w, h) != (arguments.width, arguments.height)
     {
@@ -617,6 +616,124 @@ fn main() -> Result<()> {
 fn reject_render(error: &RenderError, detail: &str) -> ! {
     eprintln!("event=renderer.scene.render_error consecutive=1 detail={error}");
     eprintln!("event=renderer.scene.backend_reject detail={detail}");
+    eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+    exit(EXIT_BACKEND_REJECT);
+}
+
+/// Load the scene descriptor: a plain scene.json (M3a) or a scene.pkg
+/// archive (M3b).
+///
+/// Packaged scenes are opened and validated by kwe-core's PkgReader, the
+/// unique `scene.json` entry is parsed in memory (≤ 16 MiB), and — when
+/// `general.script` names a package entry — that entry (≤ 2 MiB) is
+/// extracted into a private `kwe-scene-script-<pid>` directory under the
+/// worker's HOME (mode 0700; the daemon gives every worker its own 0700
+/// HOME inside its runtime tree, so the extraction is removed with the
+/// runtime). Textures and other assets are M3c+ and are deliberately not
+/// extracted.
+fn load_scene(content: &Path) -> SceneConfig {
+    let is_pkg = content
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("pkg"));
+    if !is_pkg {
+        return match SceneConfig::parse(content) {
+            Ok(config) => config,
+            Err(error) => reject_scene(&error),
+        };
+    }
+
+    let reader = match kwe_core::PkgReader::open(content) {
+        Ok(reader) => reader,
+        Err(error) => reject_pkg(error),
+    };
+    let scene_idx = match find_scene_entry(reader.entries()) {
+        Ok(idx) => idx,
+        Err(detail) => reject_pkg(detail),
+    };
+    let bytes = match reader.read_entry_bounded(scene_idx, scene::MAX_SCENE_JSON_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => reject_pkg(error),
+    };
+    let mut config = match SceneConfig::parse_pkg(&bytes, reader.entries()) {
+        Ok(config) => config,
+        Err(error) => reject_scene(&error),
+    };
+    if let Some(script_idx) = config.script_entry {
+        let script = match reader.read_entry_bounded(script_idx, scene::MAX_SCRIPT_BYTES) {
+            Ok(script) => script,
+            Err(error) => reject_pkg(error),
+        };
+        let extracted = match extract_script(&script) {
+            Ok(path) => path,
+            Err(error) => reject_pkg(format!("cannot extract script entry: {error}")),
+        };
+        config.script_path = Some(extracted);
+    }
+    eprintln!(
+        "event=renderer.scene.pkg entries={} script_entry={}",
+        reader.entries().len(),
+        config.script_entry.is_some()
+    );
+    config
+}
+
+/// Locate the `scene.json` descriptor entry inside a package. Exactly one
+/// is required (case-insensitive match on the entry name ending). No match
+/// with a `scene.pkg` entry present means a nested archive, which M3b does
+/// not support.
+fn find_scene_entry(entries: &[kwe_core::PkgEntry]) -> Result<usize, String> {
+    let matches: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.path.to_ascii_lowercase().ends_with("scene.json"))
+        .map(|(idx, _)| idx)
+        .collect();
+    match matches.as_slice() {
+        [] => {
+            let nested = entries
+                .iter()
+                .any(|entry| entry.path.to_ascii_lowercase().ends_with("scene.pkg"));
+            if nested {
+                Err("nested scene.pkg inside the package is not supported (M3b)".into())
+            } else {
+                Err("package has no scene.json entry".into())
+            }
+        }
+        [idx] => Ok(*idx),
+        _ => Err(format!(
+            "package has {} scene.json entries; exactly one is required",
+            matches.len()
+        )),
+    }
+}
+
+/// Write a script entry into a private 0700 directory under the worker's
+/// HOME (falling back to the system temp dir when the daemon does not set
+/// one), returning the extracted path. The pid-qualified directory keeps
+/// concurrent workers from colliding.
+fn extract_script(script: &[u8]) -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = home.join(format!("kwe-scene-script-{}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join("script.js");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    file.write_all(script)?;
+    Ok(path)
+}
+
+/// Backend rejection for a packaged-scene problem (M3b): corrupt archive,
+/// missing/ambiguous scene.json entry, nested pkg, unreadable or oversized
+/// entries. The detail is bounded to a single line.
+fn reject_pkg(detail: impl std::fmt::Display) -> ! {
+    let detail = detail.to_string().replace(['\n', '\r'], " ");
+    eprintln!("event=renderer.scene.backend_reject kind=Pkg detail={detail}");
     eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
     exit(EXIT_BACKEND_REJECT);
 }

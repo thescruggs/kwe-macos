@@ -38,6 +38,15 @@ entries:
     approved_for_code_use: true
     notes: Linux O_NOFOLLOW/O_CLOEXEC flags, process groups, parent-death signal, bounded worker termination, and per-renderer setrlimit controls.
 
+  - id: rust-lz4-flex
+    project: lz4_flex
+    url: https://crates.io/crates/lz4_flex
+    revision: 0.14.0
+    license_observed: MIT
+    use: dependency
+    approved_for_code_use: true
+    notes: LZ4 frame decompression for the original scene.pkg reader (crates/kwe-core/src/pkg.rs, M3b). Corpus evidence shows Wallpaper Engine stores pkg payloads raw — no compressed entry was found across 3128 entries of 60 packages — so LZ4 is a defensive path triggered only by the frame magic (04 22 4D 18) at a payload's start, with the output cap enforced during decompression (bounded take(cap+1) read). Compression is used by tests only. Used only by the separate-process kwe-core/kwe-scene-renderer worker; never in plasmashell.
+
   - id: rust-memmap2
     project: memmap2
     url: https://crates.io/crates/memmap2

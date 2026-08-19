@@ -9,6 +9,7 @@ rust-version.workspace = true
 hex.workspace = true
 libc.workspace = true
 kwe-input-protocol = { path = "../kwe-input-protocol" }
+lz4_flex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

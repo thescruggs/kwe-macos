@@ -88,6 +88,11 @@ pub fn preflight_scene(path: &Path) -> ScenePreflight {
             },
             Err(error) => report.reasons.push(format!("cannot read scene: {error}")),
         }
+    } else {
+        // M3b: the .pkg branch is structurally validated by the archive
+        // reader (magic, version, entry table, bounds, paths). Before M3b
+        // this branch passed unconditionally (M1 finding G12).
+        return crate::pkg::preflight_pkg(path);
     }
     report.safe = report.reasons.is_empty();
     report
@@ -308,6 +313,84 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("unsupported video extension")),
+            "unexpected reasons: {:?}",
+            report.reasons
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_structural_pkg_scenes() {
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-pkg-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut writer = crate::pkg::testutil::PkgWriter::new();
+        writer.add("scene.json", br#"{"general":{}}"#);
+        writer.write(&root.join("scene.pkg"), "0001");
+        let report = preflight_scene(&root.join("scene.pkg"));
+        assert!(
+            report.safe,
+            "valid pkg must pass preflight: {:?}",
+            report.reasons
+        );
+        assert_eq!(report.format, "scene-package");
+        assert!(report.size_bytes > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_garbage_pkg_scenes() {
+        // M1 finding G12: before M3b the .pkg branch passed preflight
+        // unconditionally. Now the archive table is validated structurally.
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-pkg-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (name, bytes) in [
+            ("garbage.pkg", b"this is not a pkg".as_slice()),
+            ("corrupt-magic.pkg", b"\x08\x00\x00\x00XXXX0001\x00\x00\x00\x00"),
+            (
+                "traversal.pkg",
+                b"\x08\x00\x00\x00PKGV0001\x01\x00\x00\x00\x07\x00\x00\x00../evil\x00\x00\x00\x00\x01\x00\x00\x00x",
+            ),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, bytes).unwrap();
+            let report = preflight_scene(&path);
+            assert!(!report.safe, "{name} must be rejected");
+            assert_eq!(report.format, "scene-package");
+            assert!(
+                report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("scene package is invalid")),
+                "{name}: unexpected reasons: {:?}",
+                report.reasons
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_symlinked_pkg_scenes() {
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-pkg-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut writer = crate::pkg::testutil::PkgWriter::new();
+        writer.add("scene.json", br#"{"general":{}}"#);
+        let real = root.join("real.pkg");
+        writer.write(&real, "0001");
+        let link = root.join("link.pkg");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let report = preflight_scene(&link);
+        assert!(!report.safe);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("must not be a symlink")),
             "unexpected reasons: {:?}",
             report.reasons
         );

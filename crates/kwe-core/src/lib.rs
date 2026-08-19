@@ -10,6 +10,7 @@ mod keyvalues;
 mod mpris;
 mod permissions;
 mod pipewire;
+mod pkg;
 mod playlist;
 mod playlist_runtime;
 mod policy;
@@ -23,6 +24,7 @@ pub use keyvalues::{KvError, KvValue, parse_key_values};
 pub use mpris::{MprisStatus, probe_mpris};
 pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
+pub use pkg::{PkgEntry, PkgError, PkgErrorKind, PkgReader, preflight_pkg};
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
 pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};
 pub use policy::{

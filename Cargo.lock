@@ -309,6 +309,7 @@ dependencies = [
  "hex",
  "kwe-input-protocol",
  "libc",
+ "lz4_flex",
  "serde",
  "serde_json",
  "sha2",
@@ -354,6 +355,7 @@ dependencies = [
  "anyhow",
  "ash",
  "clap",
+ "kwe-core",
  "kwe-frame-protocol",
  "kwe-input-protocol",
  "libc",
@@ -425,6 +427,15 @@ checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -625,6 +636,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8464ec13c3691491391d9fce00f6416c9a48e46972f72d7865688be2080192c9"
 
 [[package]]
 name = "typenum"

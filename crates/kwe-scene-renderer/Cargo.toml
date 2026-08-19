@@ -10,6 +10,7 @@ description = "Isolated KWE SceneScript renderer: QuickJS script engine plus an 
 anyhow.workspace = true
 ash.workspace = true
 clap.workspace = true
+kwe-core = { path = "../kwe-core" }
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
 libc.workspace = true
