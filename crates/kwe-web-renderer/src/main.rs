@@ -104,12 +104,15 @@ const MAX_DECODED_PIXELS: u64 = 16_777_216; // 4096^2
 const AUDIO_MIN_INTERVAL: Duration = Duration::from_millis(34);
 
 /// Throwaway content page for `--probe` (BETA_M2e): the probe boots the REAL
-/// sandboxed browser over a temp content root and answers Browser.getVersion
-/// on the CDP pipe — a broken sandbox or missing browser fails the probe
-/// exactly as it would fail a supervised worker. The page itself is never
-/// rendered (the version query needs no target).
-const PROBE_PAGE: &str =
-    "<!doctype html><html><head><title>kwe-web-probe</title></head><body></body></html>";
+/// sandboxed browser over a temp content root and verifies three boot-class
+/// round trips on the CDP pipe — Browser.getVersion, a one-frame
+/// Page.startScreencast capture with its ack, and a Runtime.evaluate
+/// heartbeat. The page animates because a page that paints identical pixels
+/// every frame stops the compositor and no screencast frames flow
+/// (docs/BETA_M2.md §5.7); the animated canvas keeps frames flowing so the
+/// probe can prove the paint -> screencast -> pipe -> ack path the worker
+/// runs on. The frame content itself is irrelevant.
+const PROBE_PAGE: &str = "<!doctype html><html><head><title>kwe-web-probe</title></head><body><canvas id=\"c\" width=\"160\" height=\"90\"></canvas><script>const c=document.getElementById('c');const x=c.getContext('2d');let i=0;function tick(){x.fillStyle='#101214';x.fillRect(0,0,160,90);x.fillStyle=i%2?'#1a4fae':'#ae3f1a';x.fillRect(i%157,i%77,3,3);i=(i+1)%256;requestAnimationFrame(tick);}requestAnimationFrame(tick);</script></body></html>";
 
 /// Bounded stderr ring for browser diagnostics (same size as the daemon's
 /// per-worker ring).
@@ -1528,21 +1531,75 @@ fn reap_browser(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// One bounded Browser.getVersion query through the real sandboxed browser
+/// Deadline for the probe's one-frame screencast round-trip. First frames
+/// arrive 20–53 ms after Page.startScreencast on this stack
+/// (docs/BETA_M2.md §1.7); 5 s leaves an order of magnitude for a cold
+/// compositor. The overall probe stays far inside `kwe diagnose`'s 15 s
+/// budget (measured ≈0.7 s).
+const PROBE_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Receive and ack screencast frames until at least one has arrived.
+/// Every frame is acked with `Page.screencastFrameAck` (the producer
+/// hard-stalls after exactly 3 unacked frames — docs/BETA_M2.md §1.6);
+/// acking is part of the round-trip under test, so an ack failure is a
+/// backend rejection, not a tolerated diagnostic.
+fn wait_for_probe_frame(client: &mut Client, session_id: &str) -> Result<u32> {
+    let deadline = Instant::now() + PROBE_FRAME_DEADLINE;
+    let mut frames = 0u32;
+    while Instant::now() < deadline {
+        client.poll(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(MAX_WAIT),
+        )?;
+        while let Some(event) = client.next_event() {
+            if event.method != "Page.screencastFrame"
+                || event.session_id.as_deref() != Some(session_id)
+            {
+                continue;
+            }
+            let Some(frame_session) = event.params.get("sessionId").cloned() else {
+                continue;
+            };
+            let response = client.request_session(
+                session_id,
+                "Page.screencastFrameAck",
+                &json!({ "sessionId": frame_session }),
+            )?;
+            ensure_ok(&response, "Page.screencastFrameAck")?;
+            frames = frames.saturating_add(1);
+        }
+        if frames >= 1 {
+            return Ok(frames);
+        }
+    }
+    bail!(
+        "no Page.screencastFrame within {PROBE_FRAME_DEADLINE:?} of Page.startScreencast (capture round-trip failed)"
+    );
+}
+
+/// Three bounded boot-class round trips through the real sandboxed browser
 /// (bwrap prefix + headless chromium, network-isolated, throwaway tmpfs
 /// profile — the supervised command from [`web_renderer_command`] with the
-/// screencast viewport). The query blocks at most the CDP request timeout
-/// (5 s); the browser is torn down on every path (pipe close -> rc=0, then
-/// the bounded reap), so a hung browser cannot leak. `kwe diagnose` wraps
-/// this lane in a 15 s overall deadline.
+/// screencast viewport): Browser.getVersion (boot + CDP pipe),
+/// Page.startScreencast with one received-and-acked frame (paint -> capture
+/// -> pipe -> ack), and Runtime.evaluate("1+1") answering 2 (the worker's
+/// heartbeat probe). The browser is torn down on every path (pipe close ->
+/// rc=0, then the bounded reap), so a hung browser cannot leak. The probe
+/// covers boot-class failures only: the daemon's per-kind rlimit envelope
+/// (docs/BETA_M2.md §5.4) is applied by the supervisor at spawn, not by the
+/// probe, so an rlimit-induced failure can pass the probe yet fail a
+/// supervised launch — that gap is bounded by the envelope's own validation
+/// and the supervisor's failure budget. `kwe diagnose` wraps this lane in a
+/// 15 s overall deadline.
 fn probe_browser_version(content: &Path) -> Result<Value> {
     let spec = FrameSpec::new(160, 90)?;
     let (mut child, read_fd, write_fd) = spawn_browser(content, spec, false)?;
     let mut client = Client::new(read_fd, write_fd)?;
-    let outcome = client.request_browser("Browser.getVersion", &json!({}));
-    let mut report = None;
-    let result: Result<()> = (|| {
-        let response = outcome
+    let report: Result<Value> = (|| {
+        // 1. Boot + CDP pipe: the browser must answer Browser.getVersion.
+        let response = client
+            .request_browser("Browser.getVersion", &json!({}))
             .context("browser did not answer Browser.getVersion within the CDP request timeout")?;
         ensure_ok(&response, "Browser.getVersion")?;
         let result = response.result.unwrap_or_default();
@@ -1553,20 +1610,54 @@ fn probe_browser_version(content: &Path) -> Result<Value> {
             .or_else(|| result.get("browser"))
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        report = Some(json!({
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        // 2. Capture round-trip: attach and start the screencast, then
+        // receive and ack at least one frame (the probe page animates, so
+        // the compositor keeps producing frames — see PROBE_PAGE).
+        let target_id = find_page_target(&mut client, Instant::now() + STARTUP_DEADLINE)?;
+        let (session_id, _started_at) = attach_and_start(&mut client, &target_id, spec)?;
+        let frames = wait_for_probe_frame(&mut client, &session_id)?;
+
+        // 3. Heartbeat round-trip: Runtime.evaluate("1+1") must answer 2
+        // (the worker's wedged-page probe, docs/BETA_M2.md §5.3).
+        let response = client.request_session(
+            &session_id,
+            "Runtime.evaluate",
+            &json!({ "expression": "1+1" }),
+        )?;
+        ensure_ok(&response, "Runtime.evaluate")?;
+        let evaluated = response.result.unwrap_or_default();
+        if evaluated.get("exceptionDetails").is_some() {
+            bail!("Runtime.evaluate heartbeat raised an exception");
+        }
+        let heartbeat_value = evaluated
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        if heartbeat_value != "2" {
+            bail!("Runtime.evaluate heartbeat did not answer 1+1=2 (got {heartbeat_value:?})");
+        }
+
+        Ok(json!({
             "backend": "chromium",
             "browser_version": browser_version,
-            "protocol_version": result.get("protocolVersion").and_then(Value::as_str).unwrap_or("unknown"),
+            "protocol_version": protocol_version,
             "sandbox": "bwrap",
             "screencast": "jpeg-q80",
+            "screencast_frames": frames,
             "heartbeat": true,
-        }));
-        Ok(())
+            "heartbeat_value": heartbeat_value,
+        }))
     })();
     drop(client); // closes the CDP pipe ends: the teardown signal
     reap_browser(&mut child);
-    result?;
-    Ok(report.expect("report was set on success"))
+    report
 }
 
 /// `--probe` entry: create a throwaway content root, drive the real

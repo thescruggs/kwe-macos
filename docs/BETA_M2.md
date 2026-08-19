@@ -660,7 +660,7 @@ daemon's job, M2c).
 | --- | --- | --- |
 | fmt | `cargo fmt --all -- --check` | pass |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | pass |
-| test | `cargo test --workspace --all-targets` | pass (221 tests, 0 failures) |
+| test | `cargo test --workspace --all-targets` | pass (221 tests, 0 failures at the M2d gate; 222 with the M2e scan test) |
 | cmake | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | pass |
 | ctest | `cd build/cmake && ctest --output-on-failure` | pass (7/7, incl. `kwe-web-preview-test`) |
 | qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | pass |
@@ -691,15 +691,21 @@ the M2 exit-gate summary.
 `crates/kwe-web-renderer/src/main.rs` adds `--probe` (the `--output` and
 `--content` args become `required_unless_present = "probe"`):
 
-- `probe_report()` writes a throwaway content root (a static `PROBE_PAGE` as
-  `index.html` under `$TMPDIR/kwe-web-probe-<pid>`), then
+- `probe_report()` writes a throwaway content root (an animated `PROBE_PAGE`
+  as `index.html` under `$TMPDIR/kwe-web-probe-<pid>`), then
   `probe_browser_version(content)` spawns the real M2b sandbox
-  (`spawn_browser` with `FrameSpec::new(160, 90)`, network off), sends
-  `Browser.getVersion` over the CDP pipe, and reads the version from
-  `result.product` — Chromium 151 puts the version there
-  (`"Chrome/151.0.7922.137"`), the legacy `browser` field is kept as a
-  fallback — reporting
-  `{"backend":"chromium","browser_version":...,"protocol_version":...,"sandbox":"bwrap","screencast":"jpeg-q80","heartbeat":true}`.
+  (`spawn_browser` with `FrameSpec::new(160, 90)`, network off) and verifies
+  three boot-class round trips on the CDP pipe: (1) `Browser.getVersion`
+  (boot + pipe), reading the version from `result.product` — Chromium 151
+  puts the version there (`"Chrome/151.0.7922.137"`), the legacy `browser`
+  field is kept as a fallback; (2) a one-frame `Page.startScreencast`
+  capture, received and acked with `Page.screencastFrameAck` (the §1.6
+  contract) — proving the paint -> capture -> pipe -> ack path the worker
+  runs on; the probe page animates because a page that paints identical
+  pixels stops the compositor (§5.7); (3) `Runtime.evaluate("1+1")`
+  answering `2` — the worker's own heartbeat probe (§5.3). The report
+  carries the measured results (`screencast_frames`, `heartbeat_value`),
+  so the manifest fields are exercised, not declared.
 - Every path closes the CDP pipe and `reap_browser()`s the bwrap process
   group: a bounded try_wait loop to a 5 s deadline, then
   `libc::kill(-pid, SIGKILL)` on the group — a probe never leaves a browser
@@ -707,14 +713,23 @@ the M2 exit-gate summary.
 - Backend reject = exit 73 with bounded diagnostics:
   `event=renderer.web.backend_reject detail=<reason>` and
   `event=renderer.web.backend_reject exit_code=73` — the same exit code the
-  worker uses for backend rejection. Measured (2026-08-19): missing bwrap on
-  PATH → `detail=spawning bwrap`, exit 73; a cold probe completes in **0.55 s
-  total**, far inside the 15 s budget `kwe diagnose` grants it.
+  worker uses for backend rejection. The probe covers **boot-class
+  failures** (missing bwrap/chromium, a sandbox that cannot boot, a browser
+  that never answers the pipe, a capture round-trip that never produces a
+  frame, a heartbeat that does not answer). The daemon's per-kind rlimit
+  envelope (§5.4) is applied by the supervisor at spawn, not by the probe,
+  so an rlimit-induced failure (e.g. the 128 GiB VA floor) can pass the
+  probe yet fail a supervised launch — that gap is bounded by the envelope's
+  own validation and the supervisor's failure budget. Measured
+  (2026-08-19): missing bwrap on PATH → `detail=spawning bwrap`, exit 73; a
+  cold probe completes in **≈0.6 s total**, far inside the 15 s budget
+  `kwe diagnose` grants it. Backend versions pinned: Chromium 151.0.7922.137
+  (this machine), bubblewrap **0.11.2** (`bwrap --version`).
 
 Probe output (2026-08-19 run):
 
 ```json
-{"backend":"chromium","browser_version":"Chrome/151.0.7922.137","heartbeat":true,"protocol_version":"1.3","sandbox":"bwrap","screencast":"jpeg-q80"}
+{"backend":"chromium","browser_version":"Chrome/151.0.7922.137","heartbeat":true,"heartbeat_value":"2","protocol_version":"1.3","sandbox":"bwrap","screencast":"jpeg-q80","screencast_frames":1}
 ```
 
 ### 8.3 The `kwe diagnose` web lane
@@ -723,12 +738,15 @@ Probe output (2026-08-19 run):
 shared `ProbeRun` outcome plus `run_renderer_probe(binary, deadline)` (the
 video lane's `probe_video_backend()` becomes the first caller) and adds a
 `probe_web_backend()` lane with the same Report/Missing/Failed{Hung} mapping.
-A hung web probe is killed after 15 s ("did not finish within 15 s; killed").
-Measured output (2026-08-19):
+A hung probe is killed after its deadline ("did not finish within 15 s;
+killed") — the probe child is spawned into its own process group and the
+kill targets that group (negative pid, mirroring the renderer's
+`reap_browser` escalation), so a hung probe cannot leave a bwrap ->
+chromium tree behind. Measured output (2026-08-19):
 
 ```
 video backend: {"backend":"libmpv","client_api_version":"2.5","libmpv_supports_sw_render":true}
-web backend:   {"backend":"chromium","browser_version":"Chrome/151.0.7922.137","heartbeat":true,"protocol_version":"1.3","sandbox":"bwrap","screencast":"jpeg-q80"}
+web backend:   {"backend":"chromium","browser_version":"Chrome/151.0.7922.137","heartbeat":true,"heartbeat_value":"2","protocol_version":"1.3","sandbox":"bwrap","screencast":"jpeg-q80","screencast_frames":1}
 ```
 
 Failure paths verified: the web renderer removed from beside the binary →
@@ -764,7 +782,7 @@ assessment for `content.web` (ladder text in FEATURE_COMPATIBILITY.md,
 | --- | --- | --- |
 | 1. renderer/service capability-manifest entry | **met** | `kwe-web-renderer --probe` (§8.2) reports backend/version/protocol/sandbox/screencast/heartbeat; `kwe diagnose` prints the same lane (§8.3) |
 | 2. original synthetic fixture exercising success and failure | **met** | smoke-web.sh (11 cases: canary promote, grant control and revocation, keepalive, pointer oracle, audio-grant gating, kill -9, missing root, busy-loop exit 73, quarantine, wedged heartbeat), smoke-web-compromise.sh (4 attempts x 2 scenarios, M2d §7.2), the scan fixture (§8.4) |
-| 3. automated protocol/state tests and an image/event oracle | **met** | 221 workspace tests (kwe-cdp fake-peer suite, daemon protocol tests, kwe-core websandbox builder tests, webpreviewtest.cpp) + the `scripts/frame-read.py` oracle over the seqlock frame snapshot |
+| 3. automated protocol/state tests and an image/event oracle | **met** | Rust: 222 tests, 0 failures (`cargo test --workspace --all-targets` — kwe-cdp fake-peer suite, daemon protocol tests, kwe-core websandbox builder tests, the M2e scan test); C++: 7/7 (`ctest` — kwe-daemon-activator, kwe-playlist-controller, kwe-permissions-client, kwe-web-preview); plus the `scripts/frame-read.py` oracle over the seqlock frame snapshot |
 | 4. UI presentation for supported/partial/unavailable/failed states | **not met** | scoped to the M4 UI milestone, exactly as recorded for `content.video` in M1e |
 | 5. backend/version/hardware evidence | **met** | probe report above; Chromium 151.0.7922.137, bubblewrap 0.11.2; V8 VA floor / 128 GiB default (M2b §5.4); decode latencies 60 µs / 1435 µs (M2b §5.5); `/proc` argv proofs (M2d §7.3) |
 | 6. documentation of intentional semantic differences | **met** | FEATURE_COMPATIBILITY.md `content.web` cell: headless screencast geometry, keepalive-vs-empty frames, heartbeat, `audio_web` cadence and grant gating, file-scheme isolation boundary, tmpfs-profile cookie/localStorage behavior |
@@ -796,7 +814,7 @@ capture immediately."* Clause by clause:
 | Clause | Evidence | Fully demonstrated? |
 | --- | --- | --- |
 | compromise tests cannot read arbitrary home files | smoke-web-compromise.sh attempt 2: cors-mode fetch and traversal XHR of `file:///etc/passwd` both fail — GREEN in scenario A and B (M2d §7.2); the sandbox ro-binds only `/usr` `/etc` `/lib` `/lib64` `/bin` `/sbin` plus the content root (M2b §5.2), so no home path exists in the namespace; the traversal target exists inside the sandbox (M2d §7.4.3), so a painted RED would be a genuine host-file read | **yes**, with the honest note from M2d §7.2: the observable boundary under test is the browser's file-scheme/CORS isolation (cors-mode file: fetches are blocked from a `file://` page, its own URL included); the sandbox's non-bound-path contribution is asserted by the command-builder tests (`webpreviewtest.cpp::isolationByDefault`; kwe-core `defaults_to_network_isolation_and_read_only_content`, `web_renderer_command_carries_the_pinned_flags`), not by page-observable behavior |
-| cannot crash Plasma | plasmashell pid guard in every smoke suite — smoke-web, smoke-web-compromise, smoke-audio, smoke-video, smoke-supervisor — asserts the pid is identical and alive before and after (smoke-web's guard line is one of its 11 cases); the supervisor's fault envelope (canary, promotion, failure budget, quarantine, forced kill and reap) contains every renderer failure mode; the project rule (README: untrusted parsing/rendering/web/audio never runs inside plasmashell) is structural | **yes** |
+| cannot crash Plasma | plasmashell pid guard in the two suites that run the web renderer — smoke-web (its guard line is one of the 11 cases) and smoke-web-compromise — asserts the pid is identical and alive before and after, observed with the browser and its pages live; the remaining lanes (smoke-audio, smoke-video, smoke-supervisor) rely on the supervisor fault envelope (canary, promotion, failure budget, quarantine, forced kill and reap) and the structural rule that untrusted parsing/rendering/web/audio never runs inside plasmashell (README) | **yes** |
 | disabling audio tears down capture immediately | smoke-audio case 3: `renderer.stop` while audio flows → silent latest-wins drops, only the rate-limited `event=audio.forward.dropped` note (1–10 lines over 2 s), zero client errors — grant-gated delivery is immediate; smoke-audio case 5: daemon SIGTERM → the worker logs `event=audio.worker.stopped` and its pid vanishes with no `forced_kill` line; the daemon's audio supervisor gives the worker exactly `STOP_GRACE = 1 s` (SIGTERM, grace, then SIGKILL of the process group — `crates/kwe-daemon/src/audio.rs`), so graceful capture teardown is bounded by 1 s by construction. Note: since M2c the audio grant gates delivery for every wallpaper kind, so smoke-audio case 2's video identity carries the grant (`permissions.set {"wallpaper_id":"audio-case2","audio":true}`) and its ack-advance assertions run on the granted path | **yes** for grant-gated delivery and daemon-shutdown teardown; honest limit: capture itself is global in M2 (one shared `kwe-audio-worker` while any wallpaper runs, per M2c §6.2 — the grant gates delivery, not capture), and a per-wallpaper capture switch belongs to the M4/M5 per-output work |
 
 ### 8.8 M2e acceptance
@@ -813,5 +831,5 @@ capture immediately."* Clause by clause:
 | smoke-audio | `./scripts/smoke-audio.sh` | pass (regression) |
 | smoke-video | `./scripts/smoke-video.sh` | pass (regression) |
 | smoke-supervisor | `./scripts/smoke-supervisor.sh` | pass (regression) |
-| probe | `./target/debug/kwe-web-renderer --probe` | pass (0.55 s, report in §8.2) |
+| probe | `./target/debug/kwe-web-renderer --probe` | pass (≈0.6 s, report in §8.2) |
 | diagnose | `./target/debug/kwe diagnose` | pass (web lane prints the report; Missing/Failed/Hung diagnostics distinct) |

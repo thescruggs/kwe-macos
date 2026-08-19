@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
     path::PathBuf,
     time::Duration,
 };
@@ -317,9 +318,14 @@ fn run_renderer_probe(binary: &str, deadline: Duration) -> ProbeRun {
     if !probe.is_file() {
         return ProbeRun::Missing;
     }
+    // The probe child gets its own process group (mirror of the web
+    // renderer's spawn_browser setpgid): a hung probe may have spawned
+    // bwrap -> chromium beneath it, and only a negative-pid kill reaches
+    // the whole tree.
     let mut child = match std::process::Command::new(&probe)
         .arg("--probe")
         .stdout(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
     {
         Ok(child) => child,
@@ -342,7 +348,13 @@ fn run_renderer_probe(binary: &str, deadline: Duration) -> ProbeRun {
                 };
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                let pid = child.id() as libc::pid_t;
+                // SAFETY: the probe child was placed in its own process
+                // group above; a negative pid restricts delivery to it,
+                // reaching any bwrap/chromium descendants too.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
                 let _ = child.wait();
                 return ProbeRun::Hung;
             }
