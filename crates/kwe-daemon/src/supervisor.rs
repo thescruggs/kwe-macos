@@ -17,12 +17,12 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
 use crate::persist::unix_nanos;
-use crate::persist::{atomic_write, ensure_private_dir};
+use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
 use anyhow::{Context, Result, anyhow, bail};
 use kwe_core::preflight_scene;
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
@@ -1517,13 +1517,6 @@ fn validate_identity_part(name: &str, value: &str) -> Result<()> {
 
 fn truncate_detail(detail: &str) -> String {
     detail.chars().take(256).collect()
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

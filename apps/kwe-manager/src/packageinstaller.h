@@ -2,10 +2,14 @@
 #pragma once
 
 #include <QObject>
+#include <QQmlEngine>
 #include <QString>
 
 class PackageInstaller final : public QObject {
   Q_OBJECT
+  // Instances are constructed in C++ and exposed as a context property; QML
+  // still needs the registered type to reach the State enum values.
+  QML_UNCREATABLE("PackageInstaller is created by the manager")
   Q_PROPERTY(State state READ state NOTIFY stateChanged)
   Q_PROPERTY(QString message READ message NOTIFY messageChanged)
   Q_PROPERTY(QString packagePath READ packagePath CONSTANT)

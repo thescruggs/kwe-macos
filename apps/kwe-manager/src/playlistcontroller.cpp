@@ -174,6 +174,10 @@ void PlaylistController::applyList(const QJsonArray &playlists) {
         const auto object = value.toObject();
         const auto title = object.value(QStringLiteral("title")).toString().trimmed();
         const auto id = object.value(QStringLiteral("id")).toString();
+        // Deduplicate by title, not id: every map below is keyed by title, so
+        // two same-titled playlists (possible after legacy import, where the
+        // daemon suffixes ids) would otherwise collide and corrupt each other.
+        // The duplicate is dropped and reported via hadInvalid.
         if (title.isEmpty() || id.isEmpty() || names.contains(title)) {
             hadInvalid = true;
             continue;

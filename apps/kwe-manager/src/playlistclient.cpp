@@ -135,7 +135,11 @@ void PlaylistClient::failCurrent(const QString &error) {
         retryLater();
         return;
     }
-    // Re-queue the failed operation at the front so no edit is lost.
+    // Re-queue the failed operation at the front so no edit is lost, but
+    // respect the capacity bound: if the queue is already full the oldest
+    // pending operation is dropped to make room.
+    if (m_queue.size() >= MaxQueuedOperations)
+        m_queue.removeLast();
     m_queue.push_front(std::move(m_current));
     m_current = {};
     setState(Error, error);

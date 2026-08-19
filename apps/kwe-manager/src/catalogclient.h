@@ -5,12 +5,16 @@
 
 #include <QObject>
 #include <QLocalSocket>
+#include <QQmlEngine>
 #include <QTimer>
 #include <QStringList>
 #include <QHash>
 
 class CatalogClient final : public QObject {
     Q_OBJECT
+    // Instances are constructed in C++ and exposed as a context property; QML
+    // still needs the registered type to reach the State enum values.
+    QML_UNCREATABLE("CatalogClient is created by the manager")
     Q_PROPERTY(State state READ state NOTIFY stateChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
     Q_PROPERTY(QString socketPath READ socketPath CONSTANT)

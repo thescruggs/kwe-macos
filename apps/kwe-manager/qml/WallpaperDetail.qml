@@ -57,10 +57,11 @@ Kirigami.ScrollablePage {
                 model: WallpaperSelection.selectedPermissions
                 delegate: Controls.Button {
                     required property string modelData
-                    text: catalogStats.isPermissionGranted(WallpaperSelection.selectedId, modelData)
+                    readonly property bool granted: catalogStats.isPermissionGranted(WallpaperSelection.selectedId, modelData)
+                    text: granted
                         ? qsTr("%1 granted").arg(modelData)
                         : qsTr("Grant %1").arg(modelData)
-                    icon.name: catalogStats.isPermissionGranted(WallpaperSelection.selectedId, modelData)
+                    icon.name: granted
                         ? "dialog-ok-apply-symbolic" : "dialog-cancel-symbolic"
                     onClicked: catalogStats.togglePermission(WallpaperSelection.selectedId, modelData)
                 }

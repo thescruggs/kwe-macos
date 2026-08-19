@@ -90,8 +90,11 @@ int main(int argc, char *argv[]) {
     RendererStatus rendererStatus(socketPath);
     WebPreview webPreview;
     PlaylistController playlistController(socketPath);
-    if (parser.isSet(safeModeOption))
-        packageInstaller.enterSafeMode();
+    if (parser.isSet(safeModeOption)) {
+        if (!packageInstaller.enterSafeMode())
+            qWarning("Warning: --safe-mode could not be activated (%s)",
+                     qPrintable(packageInstaller.message()));
+    }
     if (parser.isSet(leaveSafeModeOption))
         packageInstaller.leaveSafeMode();
 

@@ -4,7 +4,7 @@ qt_add_executable(kwe-package-installer-test
     ../src/packageinstaller.cpp
     ../src/packageinstaller.h
 )
-target_link_libraries(kwe-package-installer-test PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(kwe-package-installer-test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
 add_test(NAME kwe-package-installer-test COMMAND kwe-package-installer-test)
 
 qt_add_executable(kwe-workshop-client-test

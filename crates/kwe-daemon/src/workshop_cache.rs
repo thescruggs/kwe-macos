@@ -197,8 +197,20 @@ impl WorkshopCache {
                 ));
             }
         }
-        let mut changed = !updates.is_empty();
+        let mut changed = false;
         for (id, entry) in updates {
+            let dominated = self.items.get(&id).is_some_and(|existing| {
+                existing.title == entry.title
+                    && existing.kind == entry.kind
+                    && existing.tags == entry.tags
+                    && existing.preview_present == entry.preview_present
+                    && existing.metadata_hash == entry.metadata_hash
+                    && existing.workshop_state == entry.workshop_state
+                    && existing.workshop_progress == entry.workshop_progress
+            });
+            if !dominated {
+                changed = true;
+            }
             self.items.insert(id, entry);
         }
 
@@ -260,17 +272,29 @@ impl WorkshopCache {
     /// Persists the cache atomically; evicts the oldest entries when the
     /// bounded file size would be exceeded.
     pub fn save(&mut self) {
+        // Evict in estimated batches instead of one entry per encode: each
+        // pass encodes once, evicts enough oldest entries to cover the
+        // overshoot, then re-encodes to confirm. Re-encoding once per eviction
+        // was O(N²) when many entries had to go.
         let mut bytes = self.encode_state();
         let mut evicted = 0;
-        while bytes.len() as u64 > MAX_CACHE_BYTES && !self.items.is_empty() {
-            let oldest = self
-                .items
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen_unix_ms)
-                .map(|(id, _)| id.clone());
-            let Some(oldest) = oldest else { break };
-            self.items.remove(&oldest);
-            evicted += 1;
+        while (bytes.len() as u64) > MAX_CACHE_BYTES && !self.items.is_empty() {
+            let overshoot = bytes.len() as u64 - MAX_CACHE_BYTES;
+            let per_entry = ((bytes.len() / self.items.len().max(1)) as u64).max(1);
+            let mut to_evict = (overshoot / per_entry + 1).min(self.items.len() as u64);
+            while to_evict > 0 {
+                let Some(oldest) = self
+                    .items
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_seen_unix_ms)
+                    .map(|(id, _)| id.clone())
+                else {
+                    break;
+                };
+                self.items.remove(&oldest);
+                evicted += 1;
+                to_evict -= 1;
+            }
             bytes = self.encode_state();
         }
         if evicted > 0 {
@@ -545,5 +569,71 @@ mod tests {
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".invalid-"));
         assert!(quarantined, "corrupt cache must be quarantined");
+    }
+
+    #[test]
+    fn merge_reports_unchanged_when_only_last_seen_moves() {
+        let dir = state_dir("changed-detect");
+        fs::create_dir_all(&dir).unwrap();
+        let mut cache = WorkshopCache::open(&dir);
+        let mut catalog = empty_catalog();
+        let mut item = missing_item("abc");
+        item.title = "Stable Title".into();
+        item.workshop_state = "subscribed_installed".into();
+        item.kind = ProjectKind::Scene;
+        item.metadata_hash = Some("hash-1".into());
+        catalog.items.push(item);
+        assert!(
+            cache.merge_and_update(&mut catalog, now_ms()),
+            "first sighting of an entry is a change"
+        );
+        assert!(
+            !cache.merge_and_update(&mut catalog, now_ms() + 1000),
+            "unchanged metadata must not report a change"
+        );
+        catalog.items[0].metadata_hash = Some("hash-2".into());
+        assert!(
+            cache.merge_and_update(&mut catalog, now_ms() + 2000),
+            "a changed metadata hash is a substantive change"
+        );
+        catalog.items[0].title = "New Title".into();
+        assert!(
+            cache.merge_and_update(&mut catalog, now_ms() + 3000),
+            "a changed title is a substantive change"
+        );
+    }
+
+    #[test]
+    fn save_evicts_oldest_entries_to_stay_within_bound() {
+        let dir = state_dir("save-evict");
+        fs::create_dir_all(&dir).unwrap();
+        let mut cache = WorkshopCache::open(&dir);
+        // Each entry carries a ~64 KiB tag; 300 of them clearly exceed the
+        // 16 MiB file bound, so save() must evict the oldest-first.
+        let big_tag: String = "x".repeat(64 * 1024);
+        let now = now_ms();
+        for index in 0..300u128 {
+            let id = format!("id-{index:03}");
+            let (id, mut cached) = entry(&id, &format!("Title {index}"), now + index);
+            cached.tags = vec![big_tag.clone()];
+            cache.items.insert(id, cached);
+        }
+        cache.save();
+        assert!(
+            cache.items.contains_key("id-299"),
+            "newest entry must survive eviction"
+        );
+        assert!(
+            !cache.items.contains_key("id-000"),
+            "oldest entry must be evicted first"
+        );
+        let metadata = fs::metadata(&cache.path).unwrap();
+        assert!(
+            metadata.len() <= MAX_CACHE_BYTES,
+            "persisted cache must fit the bound, got {} bytes",
+            metadata.len()
+        );
+        let reloaded = WorkshopCache::open(&dir);
+        assert_eq!(reloaded.items.len(), cache.items.len());
     }
 }

@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 qt_add_executable(kwe-manager
     src/main.cpp
-    src/catalogclient.cpp
-    src/catalogclient.h
     src/catalogmodel.cpp
     src/catalogmodel.h
-    src/packageinstaller.cpp
-    src/packageinstaller.h
     src/workshopclient.cpp
     src/workshopclient.h
     src/videopreview.cpp
@@ -33,6 +29,14 @@ qt_add_qml_module(kwe-manager
     URI org.kde.kwe
     VERSION 1.0
     NO_IMPORT_SCAN
+    # CatalogClient and PackageInstaller carry QML_UNCREATABLE so their Q_ENUM
+    # State values are reachable from QML as CatalogClient.Ready /
+    # PackageInstaller.Installed (instance-based enum access is gone).
+    SOURCES
+        src/catalogclient.cpp
+        src/catalogclient.h
+        src/packageinstaller.cpp
+        src/packageinstaller.h
     QML_FILES
         qml/Main.qml
         qml/GalleryPage.qml

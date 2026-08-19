@@ -39,6 +39,9 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// `playlist.import` carries a whole legacy playlist blob (up to 4 MiB, the
 /// manager's historical store bound) and is capped separately.
 const MAX_IMPORT_REQUEST_BYTES: usize = 4 * 1024 * 1024 + 1024;
+/// Byte marker used to tell import requests from other methods before the
+/// full JSON parse. The post-parse method check stays authoritative.
+const IMPORT_MARKER: &[u8] = b"playlist.import";
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Crash-contained KDE Wallpaper Engine user service")]
@@ -225,6 +228,66 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Collects one newline-terminated request line from `reader`.
+///
+/// Requests are capped at `MAX_IMPORT_REQUEST_BYTES` overall; anything that
+/// does not carry the `playlist.import` marker is rejected once it exceeds
+/// `MAX_REQUEST_BYTES`, before the rest is buffered or parsed. The marker
+/// scan is incremental (newest chunk plus overlap) so large imports stay
+/// linear in request size. Slow reads sleep briefly instead of busy-spinning.
+fn read_request_line<R: Read>(reader: &mut R, deadline: Instant) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    // Whether IMPORT_MARKER has been seen anywhere in the buffered bytes so
+    // far; memoized so each chunk is scanned at most once.
+    let mut saw_import_marker = false;
+    loop {
+        if line.contains(&b'\n') {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("request deadline exceeded");
+        }
+        let mut chunk = [0u8; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                // Overlap the previous tail so a marker spanning a chunk
+                // boundary is still found; re-scanning the whole line per
+                // chunk would be quadratic for large import payloads.
+                let scan_start = line.len().saturating_sub(IMPORT_MARKER.len() - 1);
+                line.extend_from_slice(&chunk[..count]);
+                if line.len() > MAX_IMPORT_REQUEST_BYTES {
+                    bail!("request exceeded {MAX_IMPORT_REQUEST_BYTES} bytes");
+                }
+                if !saw_import_marker {
+                    saw_import_marker = line[scan_start..]
+                        .windows(IMPORT_MARKER.len())
+                        .any(|w| w == IMPORT_MARKER);
+                }
+                // Reject oversized non-import requests early to avoid buffering
+                // and parsing up to 4 MiB for methods that only accept 64 KiB.
+                // The post-parse method check stays authoritative.
+                if line.len() > MAX_REQUEST_BYTES && !saw_import_marker {
+                    bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !line.contains(&b'\n') {
+        bail!("request ended without a newline");
+    }
+    Ok(line)
+}
+
 fn handle_client(
     mut stream: UnixStream,
     catalog: &Arc<RwLock<Catalog>>,
@@ -240,34 +303,7 @@ fn handle_client(
     // trickling peer hold the single-threaded accept loop open indefinitely.
     // Enforce an overall deadline for collecting the request line.
     let request_deadline = Instant::now() + Duration::from_secs(10);
-    let mut line = Vec::new();
-    loop {
-        if line.contains(&b'\n') {
-            break;
-        }
-        if Instant::now() >= request_deadline {
-            bail!("request deadline exceeded");
-        }
-        let mut chunk = [0u8; 8192];
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(count) => {
-                line.extend_from_slice(&chunk[..count]);
-                if line.len() > MAX_IMPORT_REQUEST_BYTES {
-                    bail!("request exceeded {MAX_IMPORT_REQUEST_BYTES} bytes");
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if !line.contains(&b'\n') {
-        bail!("request ended without a newline");
-    }
+    let line = read_request_line(&mut reader, request_deadline)?;
     let request: Request = serde_json::from_slice(&line).context("invalid request JSON")?;
     if line.len() > MAX_REQUEST_BYTES && request.method != "playlist.import" {
         bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
@@ -906,5 +942,71 @@ mod tests {
         let (ok, result) = process(r#"{"version":1,"method":"playlist.list"}"#, &catalog, None);
         assert!(!ok);
         assert_eq!(result["error"], "playlist_unavailable");
+    }
+
+    fn generous_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn oversized_non_import_request_is_rejected_early() {
+        let mut payload = Vec::with_capacity(MAX_REQUEST_BYTES + 2048);
+        payload
+            .extend_from_slice(b"{\"version\":1,\"id\":\"big\",\"method\":\"health\",\"pad\":\"");
+        payload.resize(MAX_REQUEST_BYTES + 1024, b'a');
+        payload.extend_from_slice(b"\"}\n");
+        let error = read_request_line(&mut &payload[..], generous_deadline()).unwrap_err();
+        assert!(
+            format!("{error}").contains(&format!("{MAX_REQUEST_BYTES}")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn import_marker_allows_requests_beyond_the_normal_cap() {
+        let mut payload = Vec::with_capacity(MAX_REQUEST_BYTES + 2048);
+        payload.extend_from_slice(
+            b"{\"version\":1,\"id\":\"i\",\"method\":\"playlist.import\",\"pad\":\"",
+        );
+        payload.resize(MAX_REQUEST_BYTES + 1024, b'a');
+        payload.extend_from_slice(b"\"}\n");
+        let line = read_request_line(&mut &payload[..], generous_deadline()).unwrap();
+        assert_eq!(line.len(), payload.len());
+    }
+
+    #[test]
+    fn import_marker_spanning_a_chunk_boundary_is_detected() {
+        // Reads happen in 8192-byte chunks; place the marker so it starts in
+        // the first chunk and ends in the second. Without the overlap scan
+        // the marker would be missed and the request rejected.
+        let mut payload = vec![b'x'; 8190];
+        payload.extend_from_slice(IMPORT_MARKER);
+        payload.resize(MAX_REQUEST_BYTES + 1024, b'y');
+        payload.push(b'\n');
+        let line = read_request_line(&mut &payload[..], generous_deadline()).unwrap();
+        assert_eq!(line.len(), payload.len());
+    }
+
+    #[test]
+    fn import_requests_are_capped_at_the_import_limit() {
+        let mut payload = Vec::with_capacity(MAX_IMPORT_REQUEST_BYTES + 2048);
+        payload.extend_from_slice(b"{\"method\":\"playlist.import\",\"pad\":\"");
+        payload.resize(MAX_IMPORT_REQUEST_BYTES + 1024, b'a');
+        payload.extend_from_slice(b"\"}\n");
+        let error = read_request_line(&mut &payload[..], generous_deadline()).unwrap_err();
+        assert!(
+            format!("{error}").contains(&format!("{MAX_IMPORT_REQUEST_BYTES}")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn request_without_trailing_newline_is_rejected() {
+        let payload = br#"{"version":1,"id":"x","method":"health"}"#.to_vec();
+        let error = read_request_line(&mut &payload[..], generous_deadline()).unwrap_err();
+        assert!(
+            format!("{error}").contains("without a newline"),
+            "unexpected error: {error}"
+        );
     }
 }

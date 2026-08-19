@@ -86,22 +86,23 @@ Kirigami.Page {
                 text: qsTr("Rescan")
                 icon.name: "view-refresh-symbolic"
                 display: Controls.AbstractButton.TextBesideIcon
-                enabled: catalogClient.state !== catalogClient.Loading
+                enabled: catalogClient.state !== CatalogClient.Loading
                 Accessible.name: qsTr("Rescan Steam Workshop folders")
                 onClicked: catalogClient.rescan()
             }
 
             Controls.ToolButton {
-                text: packageInstaller.state === packageInstaller.SafeMode
+                readonly property bool inSafeMode: packageInstaller.state === PackageInstaller.SafeMode
+                text: inSafeMode
                     ? qsTr("Leave safe mode") : qsTr("Safe mode")
-                icon.name: packageInstaller.state === packageInstaller.SafeMode
+                icon.name: inSafeMode
                     ? "dialog-ok-apply-symbolic" : "security-high-symbolic"
                 display: Controls.AbstractButton.TextBesideIcon
-                enabled: (packageInstaller.state === packageInstaller.Installed
+                enabled: (packageInstaller.state === PackageInstaller.Installed
                         && packageInstaller.userPackagePresent)
-                    || packageInstaller.state === packageInstaller.SafeMode
+                    || inSafeMode
                 Accessible.name: text
-                onClicked: packageInstaller.state === packageInstaller.SafeMode
+                onClicked: inSafeMode
                     ? packageInstaller.leaveSafeMode() : packageInstaller.enterSafeMode()
             }
         }
@@ -114,7 +115,7 @@ Kirigami.Page {
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Error
-            visible: catalogClient.state === catalogClient.Error
+            visible: catalogClient.state === CatalogClient.Error
             text: catalogClient.errorMessage
             actions: [
                 Kirigami.Action {
@@ -228,15 +229,15 @@ Kirigami.Page {
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Information
-            visible: catalogClient.state === catalogClient.Ready
+            visible: catalogClient.state === CatalogClient.Ready
             text: qsTr("Alpha 0.1 indexes installed content safely. Applying wallpapers stays disabled until the isolated Plasma frame bridge is ready.")
             showCloseButton: true
         }
 
         Kirigami.InlineMessage {
             Layout.fillWidth: true
-            visible: packageInstaller.state !== packageInstaller.Installed
-            type: packageInstaller.state === packageInstaller.Failed
+            visible: packageInstaller.state !== PackageInstaller.Installed
+            type: packageInstaller.state === PackageInstaller.Failed
                 ? Kirigami.MessageType.Error : Kirigami.MessageType.Warning
             text: packageInstaller.message
             actions: [
@@ -244,13 +245,13 @@ Kirigami.Page {
                     text: qsTr("Install display bridge")
                     icon.name: "install-symbolic"
                     visible: packageSource !== ""
-                        && packageInstaller.state !== packageInstaller.SafeMode
+                        && packageInstaller.state !== PackageInstaller.SafeMode
                     onTriggered: packageInstaller.installFrom(packageSource)
                 },
                 Kirigami.Action {
                     text: qsTr("Leave safe mode")
                     icon.name: "dialog-ok-apply-symbolic"
-                    visible: packageInstaller.state === packageInstaller.SafeMode
+                    visible: packageInstaller.state === PackageInstaller.SafeMode
                     onTriggered: packageInstaller.leaveSafeMode()
                 }
             ]
@@ -343,10 +344,10 @@ Kirigami.Page {
                     Kirigami.PlaceholderMessage {
                         anchors.centerIn: parent
                         width: Math.min(parent.width - Kirigami.Units.gridUnit * 2, Kirigami.Units.gridUnit * 28)
-                        visible: catalogClient.state === catalogClient.Loading || (catalogClient.state === catalogClient.Ready && galleryPage.filterModel.count === 0)
+                        visible: catalogClient.state === CatalogClient.Loading || (catalogClient.state === CatalogClient.Ready && galleryPage.filterModel.count === 0)
                         text: catalogClient.state === catalogClient.Loading ? qsTr("Scanning installed wallpapers…") : qsTr("No matching wallpapers")
                         explanation: catalogClient.state === catalogClient.Loading ? qsTr("Workshop metadata is parsed by the isolated service.") : galleryPage.emptyExplanation
-                        icon.name: catalogClient.state === catalogClient.Loading ? "view-refresh-symbolic" : "edit-find-symbolic"
+                        icon.name: catalogClient.state === CatalogClient.Loading ? "view-refresh-symbolic" : "edit-find-symbolic"
                     }
                 }
             }
