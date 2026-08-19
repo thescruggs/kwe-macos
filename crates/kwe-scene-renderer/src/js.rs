@@ -5,10 +5,12 @@
 // THIRD_PARTY.yml). Bounded execution:
 //   * heap cap 64 MiB (Runtime::set_memory_limit)  -> Error::Allocation
 //   * stack cap 4 MiB (Runtime::set_max_stack_size) -> exception, contained
-//   * per-update wall-clock budget via the interrupt handler: 8 ms soft
-//     (skip the frame, bounded `script_timeout` diagnostic) and 33 ms hard
-//     (interrupt raises an uncatchable exception; the frame is skipped; the
-//     renderer always keeps publishing the last good state)
+//   * per-update and per-load wall-clock budget via the interrupt handler:
+//     8 ms soft (skip the frame, bounded `script_timeout` diagnostic) and
+//     33 ms hard (interrupt raises an uncatchable exception; the frame is
+//     skipped; the renderer always keeps publishing the last good state).
+//     The load phase (eval/init()/resized()) runs under the same hard
+//     budget; a load-phase abort disables the script instead of hanging
 //
 // The interrupt handler is QuickJS's own callback and runs at its internal
 // bytecode checkpoints; rquickjs 0.12.2 does not expose interpreter step
@@ -489,17 +491,29 @@ impl ScriptEngine {
         })
     }
 
-    /// Evaluate the scene script, then call init() and resized() if defined.
-    /// Any script exception disables the script (contained) with a bounded
+    /// Evaluate the scene script, then call init() and resized() if defined,
+    /// under the same interrupt budget as update() — a load-phase busy loop
+    /// is contained (script disabled, bounded diagnostic), not hung. Any
+    /// script exception disables the script (contained) with a bounded
     /// diagnostic; only an engine-level allocation error is fatal.
     fn load_script(&mut self, config: &SceneConfig) -> Result<(), EngineStartError> {
         let Some(script_path) = &config.script_path else {
             return Ok(()); // static scene: clear color only
         };
-        let source = std::fs::read_to_string(script_path).map_err(|e| {
-            EngineStartError::Bootstrap(format!("read script {}: {e}", script_path.display()))
+        // The parse-time metadata check alone races a swapped/grown file:
+        // re-read with the same bounded reader as the scene descriptor.
+        let bytes = crate::scene::read_bounded(script_path, crate::scene::MAX_SCRIPT_BYTES)
+            .map_err(|e| {
+                EngineStartError::Bootstrap(format!("read script {}: {e}", script_path.display()))
+            })?;
+        let source = String::from_utf8(bytes).map_err(|e| {
+            EngineStartError::Bootstrap(format!(
+                "scene script {} is not valid UTF-8: {e}",
+                script_path.display()
+            ))
         })?;
 
+        self.budget.arm();
         let outcome = self.context.with(|ctx| {
             if let Err(e) = ctx.eval::<(), &str>(&source) {
                 return self.load_call_error(&ctx, "eval", &e);
@@ -518,6 +532,8 @@ impl ScriptEngine {
             LoadOutcome::Ok
         });
 
+        self.budget.disarm();
+
         match outcome {
             LoadOutcome::Ok => {
                 self.script_ok = true;
@@ -527,6 +543,14 @@ impl ScriptEngine {
                 Ok(())
             }
             LoadOutcome::Allocation => Err(EngineStartError::Allocation),
+            LoadOutcome::Timeout => {
+                // Hard budget during eval/init()/resized(): the script is
+                // disabled (contained) and the renderer keeps the static
+                // scene.json clear color.
+                self.stats.hard_timeouts += 1;
+                self.report_timeout("hard", self.stats.hard_timeouts);
+                Ok(())
+            }
             LoadOutcome::Error { class } => {
                 if self.error_log.admit(&class) {
                     self.stats.script_errors += 1;
@@ -632,6 +656,12 @@ impl ScriptEngine {
             eprintln!("event=renderer.scene.memory_limit phase={phase} fatal=1");
             return LoadOutcome::Allocation;
         }
+        // The load-phase budget aborts eval/init()/resized() by raising an
+        // uncatchable exception; recognize it as a timeout, not a script
+        // error (mirrors the update path, but the script is disabled).
+        if self.budget.hard_hit() {
+            return LoadOutcome::Timeout;
+        }
         if matches!(error, JsError::Exception) {
             let message = self.exception_message(ctx);
             if message.to_ascii_lowercase().contains("out of memory") {
@@ -734,7 +764,11 @@ impl ScriptEngine {
 enum LoadOutcome {
     Ok,
     Allocation,
-    Error { class: String },
+    /// The load-phase hard budget aborted eval/init()/resized().
+    Timeout,
+    Error {
+        class: String,
+    },
 }
 
 /// console plumbing. `kweConsoleLog` receives "level:line" because the JS
@@ -1013,6 +1047,42 @@ mod tests {
         // this becomes a HardTimeout and the test fails.
         let result = engine.step(0.1);
         assert_eq!(result, StepResult::Allocation);
+    }
+
+    #[test]
+    fn busy_loop_init_is_contained_by_load_budget() {
+        let dir = tmpdir();
+        let config = config_with_script(&dir, "function init() { while (true) {} }");
+        // The load phase runs under the armed hard budget: an init() busy
+        // loop is aborted (contained), never hung, never an exit.
+        let started = Instant::now();
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "load-budget interrupt did not fire"
+        );
+        assert!(!engine.script_ok());
+        assert_eq!(engine.step(0.1), StepResult::ScriptError);
+        assert!(engine.stats().hard_timeouts >= 1);
+        assert_eq!(engine.clear_color(), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn oom_in_init_is_fatal_allocation() {
+        let dir = tmpdir();
+        let config = config_with_script(
+            &dir,
+            r#"
+            function init() {
+                // One oversized allocation: rejected by the 64 MiB heap cap
+                // at the allocation check, far under the 33 ms hard budget,
+                // so the memory-limit exit fires deterministically.
+                var huge = new Uint8Array(128 * 1024 * 1024);
+            }
+            "#,
+        );
+        let engine = ScriptEngine::new(&config, 320, 200, 30);
+        assert!(matches!(engine, Err(EngineStartError::Allocation)));
     }
 
     #[test]

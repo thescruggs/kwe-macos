@@ -1758,11 +1758,12 @@ fn inspect_worker(
             // Drain the full diagnostic pipe once the child is gone so the
             // final stderr lands in the ring before the caller reaps it.
             drain_stderr(worker, usize::MAX);
-            let controlled_memory_pressure = matches!(
-                worker.spec.test_fault.as_ref(),
-                Some(TestFault::MemoryPressure { .. })
-            );
-            if status.code() == Some(71) && controlled_memory_pressure {
+            // Any worker exiting 71 declares a resource limit (memory
+            // denied): the test renderer's memory-pressure fault and the
+            // scene worker's QuickJS heap-cap hit both use it. The mapping
+            // is unconditional — 71 is a resource-limit contract, not a
+            // test-fault signal (the fault-flag gating was test-era).
+            if status.code() == Some(71) {
                 return Some(WorkerObservation::Failure(
                     FailureKind::ResourceLimit,
                     "memory_allocation_denied".to_string(),

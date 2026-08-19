@@ -42,8 +42,9 @@ use vulkan::{ClearRenderer, RenderError};
 
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
-/// Synthetic fault exit codes, identical to the video worker's contract
-/// (the daemon maps exit 71 into `resource_limit`).
+/// Synthetic fault exit codes, identical to the video worker's contract.
+/// Exit 71 is the resource-limit declaration: the daemon maps ANY worker
+/// exit 71 to `resource_limit` (memory denied), fault flag or not.
 const EXIT_EXIT_AFTER: i32 = 70;
 const EXIT_MEMORY_DENIED: i32 = 71;
 const EXIT_MEMORY_UNEXPECTED: i32 = 72;
@@ -384,8 +385,13 @@ impl SceneWorker {
         );
         // The script may be broken (contained at load), so publish the
         // scene.json clear color once before the loop: the supervisor's
-        // canary must pass regardless of script health.
-        let initial = self.renderer.render(self.engine.clear_color())?;
+        // canary must pass regardless of script health. An initial render
+        // failure means the compositor cannot produce frames at all: that
+        // is a backend rejection (exit 73), not an internal error.
+        let initial = match self.renderer.render(self.engine.clear_color()) {
+            Ok(pixels) => pixels,
+            Err(error) => reject_render(&error, "initial render failure"),
+        };
         self.published = self.writer.publish(&initial)?;
         let mut last_pixels: Option<Vec<u8>> = Some(initial);
         loop {
@@ -441,14 +447,18 @@ impl SceneWorker {
                                 "event=renderer.scene.render_error consecutive={} detail={error}",
                                 self.consecutive_render_failures
                             );
+                            // A fence timeout means the GPU is not making
+                            // progress: the submit still owns the fence and
+                            // the command buffer, so any retry would reset a
+                            // pending fence and re-record a pending command
+                            // buffer (Vulkan VUID violations). It is
+                            // immediately fatal. Other render failures
+                            // escalate after a bounded streak.
+                            if matches!(error, RenderError::FenceTimeout) {
+                                reject_render(&error, "fence timeout (device not making progress)");
+                            }
                             if render_failure_fatal(self.consecutive_render_failures) {
-                                eprintln!(
-                                    "event=renderer.scene.backend_reject detail=render failure streak"
-                                );
-                                eprintln!(
-                                    "event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}"
-                                );
-                                exit(EXIT_BACKEND_REJECT);
+                                reject_render(&error, "render failure streak");
                             }
                             self.render_keepalive(&last_pixels)?;
                         }
@@ -577,7 +587,16 @@ fn main() -> Result<()> {
             eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
             exit(EXIT_BACKEND_REJECT);
         }
-        Err(RenderError::FenceTimeout) => unreachable!("fence wait only happens in the loop"),
+        // Defensive: `new` performs no fence waits today, but a setup path
+        // that ever does must reject the backend instead of inventing a
+        // recovery (fence waits happen at the initial render below too).
+        Err(RenderError::FenceTimeout) => {
+            eprintln!(
+                "event=renderer.scene.backend_reject detail=fence timeout during device setup"
+            );
+            eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+            exit(EXIT_BACKEND_REJECT);
+        }
     };
 
     let mut worker = SceneWorker {
@@ -591,6 +610,15 @@ fn main() -> Result<()> {
         consecutive_render_failures: 0,
     };
     worker.run()
+}
+
+/// A render failure the compositor cannot recover from: the device is not
+/// producing frames, so the worker declares the backend unusable (exit 73).
+fn reject_render(error: &RenderError, detail: &str) -> ! {
+    eprintln!("event=renderer.scene.render_error consecutive=1 detail={error}");
+    eprintln!("event=renderer.scene.backend_reject detail={detail}");
+    eprintln!("event=renderer.scene.backend_reject exit_code={EXIT_BACKEND_REJECT}");
+    exit(EXIT_BACKEND_REJECT);
 }
 
 /// Backend rejection for anything the scene itself cannot be rendered from.

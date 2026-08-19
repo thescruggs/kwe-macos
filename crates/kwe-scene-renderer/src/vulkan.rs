@@ -16,8 +16,13 @@
 // the byte order already encodes the channel order).
 //
 // Synchronization: one fence, in-flight 1, 1 s wait bound. A fence timeout
-// is a recoverable error; the caller counts consecutive failures and
-// escalates to backend reject (exit 73) after a bounded streak.
+// means the GPU is not making progress; the queue still holds the
+// uncompleted submit (fence and command buffer remain pending), so retrying
+// would reset a pending fence and re-record a pending command buffer —
+// VUID violations on the exact error this used to claim to recover from.
+// FenceTimeout is therefore immediately fatal: the caller escalates the
+// first timeout to backend reject (exit 73). Other render failures are
+// counted into a bounded streak before escalation.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -543,6 +548,10 @@ impl ClearRenderer {
                 .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
         } {
             Ok(()) => {}
+            // The submit is still pending: this fence and this command
+            // buffer must not be reused (a retry would reset a pending
+            // fence and re-record a pending command buffer — VUID
+            // violations). The caller treats FenceTimeout as fatal.
             Err(_) => return Err(RenderError::FenceTimeout),
         }
 

@@ -172,7 +172,9 @@ fn canonical_root(path: &Path) -> Result<PathBuf, SceneError> {
 }
 
 /// Read `path` into memory, refusing to buffer more than `cap` bytes.
-fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, SceneError> {
+/// Shared with the script loader so the 2 MiB script cap is enforced at
+/// read time (metadata pre-checks alone race a swapped/grown file).
+pub(crate) fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, SceneError> {
     let meta = fs::metadata(path).map_err(SceneError::from)?;
     if meta.len() > cap {
         return Err(SceneError::new(

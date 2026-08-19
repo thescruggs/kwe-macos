@@ -24,6 +24,8 @@ throw_scene="$smoke_root/throw.json"
 throw_script="$smoke_root/throw.js"
 garbage_scene="$smoke_root/garbage.json"
 missing_scene="$smoke_root/missing.json"
+oom_scene="$smoke_root/oom.json"
+oom_script="$smoke_root/oom.js"
 daemon_pid=""
 plasma_before="$(pgrep -x plasmashell | head -1 || true)"
 
@@ -269,6 +271,18 @@ JSON
 cat >"$missing_scene" <<'JSON'
 {"general": {"clearcolor": [0.1, 0.1, 0.1, 1.0], "script": "nonexistent.js"}}
 JSON
+# Real QuickJS heap-cap OOM: init() makes ONE oversized allocation (128 MiB
+# vs the 64 MiB cap). The allocation check rejects it immediately — far
+# under the 33 ms hard load budget — so the memory-limit exit fires
+# deterministically, not the interrupt.
+cat >"$oom_script" <<'JS'
+function init() {
+  var huge = new Uint8Array(128 * 1024 * 1024);
+}
+JS
+cat >"$oom_scene" <<JSON
+{"general": {"clearcolor": [0.1, 0.1, 0.1, 1.0], "resolution": [160, 90], "fps": 30, "script": "oom.js"}}
+JSON
 echo "scene smoke: fixtures generated"
 
 cd "$project_root"
@@ -408,6 +422,21 @@ missing_rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.last_failure_detail' <<<"$missing_rollback_status")" == *"exit_code_73"* ]]
 kill -0 "$base_pid"
 echo "scene smoke passed: missing script file -> worker exit 73 -> rolled_back with exit_code_73"
+
+# Case 8b: the REAL 64 MiB QuickJS heap cap — a script that allocates past
+# it in init() (one oversized allocation, rejected at the allocation check
+# far under the 33 ms hard load budget). The worker exits 71; the daemon
+# maps ANY exit 71 to a resource_limit failure (the unconditional mapping,
+# not the test-fault path) and rolls back to the base worker.
+oom_params="$(jq -cn --arg content "$oom_scene" \
+    '{wallpaper_id:"scene-oom",content_hash:"hash-scene-oom",width:160,height:90,fps:30,kind:"scene",content:$content}')"
+call_daemon renderer.start "$oom_params" >/dev/null
+oom_rollback_status="$(wait_phase rolled_back)"
+[[ "$(jq -r '.result.last_failure' <<<"$oom_rollback_status")" == "resource_limit" ]]
+[[ "$(jq -r '.result.last_failure_detail' <<<"$oom_rollback_status")" == "memory_allocation_denied" ]]
+[[ "$(jq -r '.result.pid' <<<"$oom_rollback_status")" == "$base_pid" ]]
+kill -0 "$base_pid"
+echo "scene smoke passed: real QuickJS heap-cap OOM -> exit 71 -> rolled_back with resource_limit"
 
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null

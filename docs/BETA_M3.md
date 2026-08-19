@@ -18,7 +18,10 @@ scope.
 (`general.script`, ≤ 2 MiB, must stay inside the content root) in a
 per-worker QuickJS runtime (rquickjs 0.12.2, MIT — see THIRD_PARTY.yml;
 heap cap 64 MiB, stack cap 4 MiB), calls `init()`, then `update(dt)` on the
-pacing cadence with an 8 ms soft / 33 ms hard per-update wall-clock budget,
+pacing cadence with an 8 ms soft / 33 ms hard per-update wall-clock budget;
+the same hard budget also guards the load phase (eval/init()/resized()) — a
+load-phase abort disables the script and the renderer keeps publishing the
+scene's clear color,
 and renders each step offscreen with Vulkan: a W×H `COLOR_OPTIMAL`
 attachment, a fullscreen triangle pipeline, image→buffer copy→map→BGRA
 convert, published as premultiplied BGRA8888 through the
@@ -70,6 +73,8 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | three kills | quarantined; `renderer.start` refused for the identity | failures 3, phase `quarantined`, refused |
 | garbage scene.json | passes static preflight, worker rejects before the canary | exit 73 → `rolled_back`, `exit_code_73` in the detail, base worker stays live |
 | missing script file | same backend rejection | exit 73 → `rolled_back`, `exit_code_73` |
+| real QuickJS heap-cap OOM | script allocates past 64 MiB in init() (one oversized allocation, rejected at the allocation check) | exit 71 → `rolled_back` with `resource_limit` / `memory_allocation_denied` — the daemon's unconditional exit-71 mapping, not the test-fault path |
+| load-phase busy loop | `function init(){while(true){}}` must not hang the worker | unit `busy_loop_init_is_contained_by_load_budget`: abort within 2 s, `script_timeout kind=hard`, script disabled, static color published; standalone-verified |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 | final stop | graceful stop, health ok | phase `stopped`, pid null |
 | standalone llvmpipe lane | worker directly under `VK_ICD_FILENAMES` + `--device llvmpipe` | scripted-color oracle passes (R 5 → 197), SIGTERM exit 0, `Stopping` state (3) in the header, `event=renderer.complete frames=... script_errors=0 soft_timeouts=0 hard_timeouts=0` |
@@ -81,7 +86,7 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 |---|---|---|
 | 0 | graceful stop (SIGTERM) | normal stop |
 | 70 | `--exit-after` synthetic fault | `process_exit` failure |
-| 71 | memory denied (QuickJS heap cap hit, or `--memory-pressure-after`) | `process_exit` failure (`resource_limit`) |
+| 71 | memory denied (QuickJS heap cap hit, or `--memory-pressure-after`) | `resource_limit` failure (`memory_allocation_denied`), mapped unconditionally — any worker exiting 71 declares a resource limit, test fault or not |
 | 72 | memory-pressure allocation unexpectedly succeeded | `process_exit` failure |
 | 73 | backend rejection: scene parse (bad JSON, wrong shape, script non-string or over caps), missing/unreadable script, Vulkan device/compositor unusable, sustained render failure streak | `exit_code_73` in `last_failure_detail` |
 | signal | killed (e.g. kill -9) | `process_exit` with `signal_9` |
@@ -134,9 +139,11 @@ counted as a `hard_timeout`, not a script error.
 6. **Memory-limit recognition.** QuickJS raises a JS "Out of memory"
    exception (not an allocation error) when the 64 MiB heap cap is hit, so
    the limit is recognized from the exception message and exits 71
-   (bounded, fatal); the memory-pressure fault flag is also exercised by
-   `smoke-supervisor.sh`'s test-renderer lane. The unit tests keep the
-   exit-71 decision pure.
+   (bounded, fatal); the supervisor maps any worker exit 71 to
+   `resource_limit` unconditionally, so the scene worker's heap-cap hit and
+   the test renderer's `--memory-pressure-after` fault land in the same
+   failure class (both lanes exercised by the smoke suites). The unit
+   tests keep the exit-71 decision pure.
 7. **`resized(w, h)` has no live path in M3a.** It is called once with the
    daemon-provided size at script load; dimensions are fixed for the
    worker's lifetime (the supervisor restarts a renderer whose geometry
