@@ -28,7 +28,7 @@ pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSna
 pub use policy::{
     PlaybackAction, PlaybackPolicy, PolicyDecision, PolicyRule, PolicySnapshot, PolicyTrigger,
 };
-pub use preflight::{ScenePreflight, preflight_scene};
+pub use preflight::{ScenePreflight, VideoPreflight, preflight_scene, preflight_video};
 pub use scan::{
     Catalog, CatalogItem, CatalogStats, Compatibility, Diagnostic, DiagnosticLevel, ProjectKind,
     ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,

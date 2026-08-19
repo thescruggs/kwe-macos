@@ -63,15 +63,30 @@ Validated on 2026-08-18 (mpv 1:0.41.0, libmpv.so.2.5.0, CachyOS).
 | kill -9 of active worker | one failure + auto-restart | `process_exit signal_9` recorded in the restart window; new pid promoted; never quarantined |
 | repeated kill -9, no intervening success | three-failure budget | quarantined with failures 3; `renderer.start` for the identity refused (phase `quarantined`) |
 | missing content path | path-level rejection | `invalid_params`, nothing spawned |
-| 64 KiB garbage content | backend rejection | worker exits 73; active base preserved; phase `rolled_back`, `last_failure_detail` names `exit_code_73` |
+| 64 KiB garbage content | backend rejection | worker exits 73; active base preserved; phase `rolled_back`, `last_failure_detail` names `exit_code_73` (M1c note: the smoke fixture now ends in `.mp4` — see the M1c table for the extension-reject split) |
 | graceful SIGTERM | stop without restart | standalone: exit 0, `producer_state` `Stopping` (the daemon records no failure on graceful stops, so `last_failure` is not smoke-assertable); smoke: phase `stopped`, no worker, daemon healthy |
 | input channel | decode + ack | `pointer_position`, `media_state`, `audio_bands` acked on stdout; malformed/junk lines ignored silently |
 | media-state mapping | pause/seek | `paused`→pause, `playing`→pause=false, `stopped`→pause + seek 0 |
 | unit tests | 7 in-crate | rgb24→BGRA exact bytes, keepalive decision, media mapping, fault-flag exit table |
 
+### M1c — static video preflight + catalog compatibility flip
+
+| Case | Expected | Result |
+|---|---|---|
+| allowlisted extension (mp4/webm/mkv/mov/avi/wmv/flv/m4v/ogv, case-insensitive) | static preflight passes | unit: all 9 extensions pass; `.MP4` normalized to `video-mp4` |
+| disallowed extension | rejected with reason | unit `unsupported video extension`; supervisor `validate()` bails with the same reason; daemon `renderer.start` → `invalid_params` before any spawn |
+| missing file | rejected with reason | unit `cannot stat video`; daemon `invalid_params` (M1b case 7 unchanged) |
+| symlink | rejected | unit + supervisor test, `video entry must not be a symlink` |
+| oversized (> 2 GiB) | rejected | sparse `set_len` fixture — no big allocation |
+| directory entry | rejected | unit, `video entry must be a regular file` |
+| canonicalized spawn path | `into_validated` stores the resolved path | M1a TOCTOU fix preserved (supervisor unit test) |
+| catalog video row | `planned` → renderer-dependent | `RendererDependent` + "libmpv worker with software fallback; static video preflight"; scan unit test added |
+| CLI `kwe preflight --video` | JSON report, exit 2 on unsafe | mirrors `--path`; exactly one of `--path`/`--video` required |
+| smoke split | extension reject vs garbage-content exit 73 | case 8 renamed to `garbage.mp4` → worker exit 73 → `rolled_back`; new case 9 `.bin` → `invalid_params` with preflight reason |
+
 Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
 --workspace --all-targets -- -D warnings`, and `cargo test --workspace
---all-targets` are clean (111 tests); `smoke-video.sh` (8 cases) and
+--all-targets` are clean (117 tests); `smoke-video.sh` (9 cases) and
 `smoke-supervisor.sh` (15 cases) both pass.
 
 ## Failure and recovery cases
@@ -137,10 +152,13 @@ Whole-workspace gates: `cargo fmt --all -- --check`, `cargo clippy
    pacing interval, which the supervisor's frame timeout (default 1 s) must
    accommodate; the smoke exercises pause with the test timings. Tuning of
    interval × fps against the frame timeout is a live-apply concern.
-6. **M1c boundary.** `preflight_video` (media-level validation of the
-   content path) is deliberately deferred to M1c; M1b validates content only
-   at the path level, so a corrupt file reaches the worker and fails closed
-   with exit 73 (verified by the garbage-content case).
+6. **M1c boundary — resolved.** M1b's temporary path-level content check
+   was replaced in M1c by the static `preflight_video` (regular non-symlink
+   file, allowlisted container extension, ≤ 2 GiB). Decode and duration
+   bounds remain the worker's job: a corrupt file inside an allowlisted
+   extension still reaches the worker and fails closed with exit 73 (smoke
+   case 8, `garbage.mp4`), while a disallowed extension is now rejected
+   before any worker spawns (smoke case 9).
 
 ## Renderer exit codes
 

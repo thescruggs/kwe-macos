@@ -1222,7 +1222,7 @@ mod tests {
         );
         assert!(!ok);
         assert_eq!(result["error"], "invalid_params");
-        // Video content path that does not exist fails the path-level check.
+        // Video content path that does not exist fails the static preflight.
         let (ok, result) = process(
             r#"{"version":1,"method":"renderer.start","params":{"wallpaper_id":"x","content_hash":"y","kind":"video","content":"/nonexistent/kwe-m1a-video.mp4"}}"#,
             &catalog,

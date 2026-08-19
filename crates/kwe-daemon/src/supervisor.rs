@@ -25,7 +25,7 @@ use std::{
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
 use anyhow::{Context, Result, anyhow, bail};
-use kwe_core::{preflight_scene, preflight_web};
+use kwe_core::{preflight_scene, preflight_video, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
 use kwe_input_protocol::{
     AudioFrame, MAX_MESSAGE_BYTES as MAX_INPUT_MESSAGE_BYTES, MediaState, PointerButton,
@@ -260,9 +260,14 @@ impl StartSpec {
         match (&self.kind, &self.content) {
             (RendererKind::Test, None) => {}
             (RendererKind::Video, Some(ContentSpec::Video { path })) => {
-                // TODO(m1c): full video preflight (container, codec, probes)
-                // lands in M1c; path-level checks are temporary.
-                validate_video_path(path)?;
+                let report = preflight_video(path);
+                if !report.safe {
+                    bail!(
+                        "video preflight rejected {}: {}",
+                        path.display(),
+                        report.reasons.join("; ")
+                    );
+                }
             }
             (RendererKind::Web, Some(ContentSpec::Web { root })) => {
                 // No permission grants yet: the empty list keeps network
@@ -316,32 +321,23 @@ impl StartSpec {
     /// Validate and return the spec with content paths resolved in place.
     /// Called exactly once per start (in the RPC layer); the supervisor
     /// event loop consumes the result without re-running preflight, which
-    /// can read up to 16 MiB of scene/web content.
+    /// can read up to 16 MiB of scene/web content. The video content path
+    /// is preflighted first (so a symlink or missing entry is rejected)
+    /// and then canonicalized into the validated spec so spawn passes the
+    /// resolved file rather than the caller-supplied path, which could be
+    /// re-pointed between validation and exec.
     pub fn into_validated(mut self) -> Result<Self> {
+        self.validate()?;
         if self.kind == RendererKind::Video
             && let Some(ContentSpec::Video { path }) = &self.content
         {
-            let canonical = validate_video_path(path)?;
-            self.content = Some(ContentSpec::Video { path: canonical });
+            self.content = Some(ContentSpec::Video {
+                path: fs::canonicalize(path)
+                    .with_context(|| format!("resolve video content {}", path.display()))?,
+            });
         }
-        self.validate()?;
         Ok(self)
     }
-}
-
-/// Temporary path-level video validation; superseded by preflight_video in M1c.
-/// Returns the canonicalized path so spawn passes the resolved file rather
-/// than the caller-supplied path (which could be re-pointed between checks).
-fn validate_video_path(path: &Path) -> Result<PathBuf> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("stat video content {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        bail!("video content must not be a symlink: {}", path.display());
-    }
-    if !metadata.is_file() {
-        bail!("video content is not a regular file: {}", path.display());
-    }
-    fs::canonicalize(path).with_context(|| format!("resolve video content {}", path.display()))
 }
 
 #[derive(Debug, Clone)]
@@ -2155,7 +2151,7 @@ mod tests {
         // Video requires video content.
         mismatched.kind = RendererKind::Video;
         assert!(mismatched.validate().is_err());
-        // Missing video file fails the temporary path-level check.
+        // Missing video file fails the static video preflight.
         let missing_video = StartSpec {
             kind: RendererKind::Video,
             content: Some(ContentSpec::Video {
@@ -2177,6 +2173,23 @@ mod tests {
             ..base.clone()
         };
         assert!(symlink_video.validate().is_err());
+        // A disallowed extension is rejected at validation with the
+        // preflight reason surfaced in the error.
+        let bad_extension = root.join("garbage.bin");
+        fs::write(&bad_extension, b"not a real video").unwrap();
+        let bad_ext_video = StartSpec {
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video {
+                path: bad_extension,
+            }),
+            ..base.clone()
+        };
+        let error = format!("{}", bad_ext_video.validate().unwrap_err());
+        assert!(
+            error.contains("video preflight rejected")
+                && error.contains("unsupported video extension"),
+            "unexpected error: {error}"
+        );
         fs::remove_dir_all(root).unwrap();
         // stderr_lines is a test-renderer dev helper.
         let mut dev_only = base.clone();

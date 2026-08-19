@@ -396,8 +396,8 @@ fn scan_project(root: &Path, limits: &ScanLimits) -> CatalogItem {
             "Scene metadata is indexed; Alpha renderer parity is not yet claimed",
         ),
         ProjectKind::Video => (
-            Compatibility::BackendMissing,
-            "Video playback worker is planned for the next slice",
+            Compatibility::RendererDependent,
+            "libmpv worker with software fallback; static video preflight",
         ),
         ProjectKind::Web => (
             Compatibility::BackendMissing,
@@ -767,6 +767,32 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.workshop_state == "subscribed_missing")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marks_video_projects_renderer_dependent() {
+        let root = temp_fixture("video-compat");
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            r#"{"title":"Synthetic video","type":"video","file":"clip.mp4"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/clip.mp4"),
+            b"not a real video",
+        )
+        .unwrap();
+        let catalog = scan_installed(std::slice::from_ref(&root), &ScanLimits::default());
+        assert_eq!(catalog.items[0].kind, ProjectKind::Video);
+        assert_eq!(
+            catalog.items[0].compatibility,
+            Compatibility::RendererDependent
+        );
+        assert_eq!(
+            catalog.items[0].compatibility_detail,
+            "libmpv worker with software fallback; static video preflight"
         );
         let _ = fs::remove_dir_all(root);
     }

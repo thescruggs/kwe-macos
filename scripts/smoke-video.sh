@@ -14,7 +14,8 @@ socket="$smoke_root/daemon.sock"
 runtime_dir="$smoke_root/runtime"
 state_dir="$smoke_root/state"
 fixture="$smoke_root/fixture.mp4"
-garbage="$smoke_root/garbage.bin"
+garbage="$smoke_root/garbage.mp4"
+bad_extension="$smoke_root/garbage.bin"
 daemon_pid=""
 
 cleanup() {
@@ -118,6 +119,7 @@ command -v ffmpeg >/dev/null
 ffmpeg -loglevel error -f lavfi -i "testsrc2=size=64x64:rate=30" -t 2 \
     -pix_fmt yuv420p "$fixture" -y
 head -c 65536 /dev/urandom >"$garbage"
+head -c 65536 /dev/urandom >"$bad_extension"
 echo "video smoke: fixture generated"
 
 cd "$project_root"
@@ -234,9 +236,10 @@ if call_daemon renderer.start "$missing_params" >/dev/null 2>&1; then
 fi
 echo "video smoke passed: missing content path rejected with invalid_params"
 
-# Case 8: garbage content is launchable (path-level preflight passes) but the
-# worker rejects the backend (exit 73) before the canary; the active base
-# worker stays live and the failure detail names exit_code_73.
+# Case 8: garbage content inside an allowlisted extension passes the static
+# preflight and is launchable, but the worker rejects the backend (exit 73)
+# before the canary; the active base worker stays live and the failure detail
+# names exit_code_73.
 base_params='{"wallpaper_id":"case8-base","content_hash":"hash-case8-base","width":160,"height":90,"fps":30,"kind":"video","content":"'"$fixture"'"}'
 call_daemon renderer.start "$base_params" >/dev/null
 base_status="$(wait_phase live)"
@@ -248,7 +251,18 @@ rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.last_failure' <<<"$rollback_status")" == "process_exit" ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$rollback_status")" == *"exit_code_73"* ]]
 kill -0 "$base_pid"
-echo "video smoke passed: garbage content -> worker exit 73 -> rolled_back with exit_code_73"
+echo "video smoke passed: garbage.mp4 content -> worker exit 73 -> rolled_back with exit_code_73"
+
+# Case 9: a disallowed extension is rejected by the static video preflight
+# before any worker is spawned (invalid_params naming the preflight reason).
+bad_extension_params='{"wallpaper_id":"case9-bad-ext","content_hash":"hash-case9-bad-ext","width":160,"height":90,"fps":30,"kind":"video","content":"'"$bad_extension"'"}'
+if rejected="$(call_daemon renderer.start "$bad_extension_params" 2>&1)"; then
+    echo "disallowed video extension was accepted" >&2
+    exit 1
+fi
+[[ "$rejected" == *"video preflight rejected"* ]]
+[[ "$rejected" == *"unsupported video extension"* ]]
+echo "video smoke passed: .bin extension rejected by preflight with reason"
 
 # Final stop: the daemon stops the active worker and stays healthy. A
 # graceful stop records no failure (last_failure surfaces the *requested*

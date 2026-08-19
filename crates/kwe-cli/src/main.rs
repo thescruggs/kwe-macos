@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kwe_core::{
-    ScanLimits, chromium_command, default_steam_roots, preflight_scene, preflight_web, probe_mpris,
-    probe_pipewire, sandbox_root, scan_installed,
+    ScanLimits, chromium_command, default_steam_roots, preflight_scene, preflight_video,
+    preflight_web, probe_mpris, probe_pipewire, sandbox_root, scan_installed,
 };
 
 #[derive(Debug, Parser)]
@@ -39,10 +39,14 @@ enum Command {
         #[arg(long = "steam-root")]
         steam_roots: Vec<PathBuf>,
     },
-    /// Statically validate a scene entry without launching a renderer.
+    /// Statically validate a scene or video entry without launching a renderer.
     Preflight {
+        /// Scene entry to validate.
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
+        /// Video file to validate.
+        #[arg(long)]
+        video: Option<PathBuf>,
     },
     /// Statically validate a web wallpaper directory without launching a browser.
     WebPreflight {
@@ -129,10 +133,20 @@ fn main() -> Result<()> {
             println!("global diagnostics: {}", catalog.diagnostics.len());
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
-        Command::Preflight { path } => {
-            let report = preflight_scene(&path);
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            if !report.safe {
+        Command::Preflight { path, video } => {
+            let (json, safe) = match (path, video) {
+                (Some(path), None) => {
+                    let report = preflight_scene(&path);
+                    (serde_json::to_string_pretty(&report)?, report.safe)
+                }
+                (None, Some(path)) => {
+                    let report = preflight_video(&path);
+                    (serde_json::to_string_pretty(&report)?, report.safe)
+                }
+                _ => anyhow::bail!("preflight requires exactly one of --path or --video"),
+            };
+            println!("{json}");
+            if !safe {
                 std::process::exit(2);
             }
         }
