@@ -5,7 +5,7 @@
 ## Current repo state
 
 - **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS.
-- **Branch:** `fix/qt611-gallery-delegates` (no upstream). HEAD `1833331` = "fix: QML enum access and daemon hardening from adversarial review" (12 files; Qt 6.11 enum access via QML module + daemon request-line/cache hardening). Uncommitted: only the AI-Skills setup + `docs/BETA_PLAN.md` removal (moved into AI-Skills).
+- **Branch:** `fix/qt611-gallery-delegates` (no upstream). HEAD `62bdbdc` — after `1833331` (Qt 6.11 fix) comes `db8563d` (AI-Skills setup), `77caf61` (plan mark-up), then **BETA_M1a**: `cd2d61e` (per-kind renderer contract) + `62bdbdc` (adversarial review fixes). Working tree clean.
 - **Installed:** `kde-wallpaper-engine-0.1.0.alpha.1-1` built from local HEAD and installed on this CachyOS machine (2026-08-18). Alpha gallery works; Apply disabled; video/web/scene shown as "planned".
 - **Graphify:** `graphify-out/` knowledge graph rebuilt 2026-08-18 (1,497 nodes / 3,224 edges / 70 communities). Query with `graphify query "<question>"`. Known integrity notes: 180 dangling-endpoint edges, `metadata.json` produces zero AST nodes.
 
@@ -69,3 +69,4 @@ Known code gaps the plan resolves (details in BETA_PLAN.md §Found gaps): render
 |---|---|---|---|
 | 2026-08-16 | Qwen (prior) | Wrote fix/qt611-gallery-delegates: Qt 6.11 gallery/detail fix + uncommitted hardening changes | Uncommitted diff on branch |
 | 2026-08-18 | Claude (this) | Resumed the fix: fixed test target Qt6::Qml link, verified (check.sh, ctest, qmllint, smoke×3), committed `1833331`, built+installed alpha package. Authored beta plan with user decisions. Rebuilt graphify graph. Created AI-Skills setup per maintainer directive. | HEAD 1833331, alpha installed, beta plan pending |
+| 2026-08-18 | Claude + sub-agents | BETA_M1a orchestrated: sonnet sub-agent implemented the per-kind renderer contract in worktree `beta-m1a-renderer-contract`; separate Explore reviewer found 12 findings (5 must-fix); same implementer fixed all; verified 104 tests + 18 smoke cases; ff-merged as `cd2d61e`+`62bdbdc`. Key resulting contracts: StartSpec kind/content, per-kind paths/timeouts/limits, per-worker HOME (0700, `runtime/home-<serial>`), bounded stderr ring in status + exit-stderr in failure detail, `audio.forward`/`media.state` with generation-gated forwarding, kind-qualified quarantine identity with legacy migration, systemd 3G/400%/96. Next: BETA_M1b (`kwe-video-renderer`, libmpv). | HEAD 62bdbdc, M1a done |
