@@ -112,7 +112,9 @@ pub struct RendererResourceLimits {
 
 impl RendererResourceLimits {
     fn validate(self) -> Result<Self> {
-        if !(256..=65_536).contains(&self.address_space_mib)
+        // The address-space bound tops out at 256 GiB: chromium 151 needs a
+        // ~128 GiB budget (V8 sandbox reservations; docs/BETA_M2.md M2b).
+        if !(256..=262_144).contains(&self.address_space_mib)
             || !(129..=1024).contains(&self.file_size_mib)
             || !(32..=4096).contains(&self.open_files)
             || !(64..=32_768).contains(&self.processes)
@@ -2228,6 +2230,32 @@ mod tests {
         assert!(
             RendererResourceLimits {
                 address_space_mib: 128,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        // The web kind's 128 GiB default and the 256 GiB bound top must pass
+        // validation; the old 64 GiB cap would reject the web default.
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 131_072,
+                ..valid
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 262_144,
+                ..valid
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            RendererResourceLimits {
+                address_space_mib: 262_145,
                 ..valid
             }
             .validate()

@@ -11,6 +11,7 @@ members = [
     "crates/kwe-test-renderer",
     "crates/kwe-video-renderer",
     "crates/kwe-vulkan",
+    "crates/kwe-web-renderer",
 ]
 
 [workspace.package]

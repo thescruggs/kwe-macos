@@ -151,3 +151,30 @@ entries:
     use: separate-process-backend
     approved_for_code_use: false
     notes: Optional isolated Workshop bridge after distribution review.
+
+  - id: chromium
+    project: The Chromium Project (headless Chromium)
+    url: https://www.chromium.org/
+    revision: 151.0.7922.137 (installed package 151.0.7922.137-1.1 on the development machine)
+    license_observed: BSD-3-Clause
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-web-renderer spawns one headless Chromium per web wallpaper inside a bwrap sandbox (crates/kwe-core/src/websandbox.rs) and drives it exclusively over a DevTools pipe (CDP screencast -> BGRA frames); no upstream code is copied and chromium is never linked, only exec'd. The V8 sandbox reserves ~53 GiB of virtual address space per process, which is why the daemon's web-kind RLIMIT_AS default is 128 GiB (docs/BETA_M2.md M2b open risks). Revision pinned to the installed package; flag/behavior shapes verified empirically on 151.
+
+  - id: bubblewrap
+    project: bubblewrap (bwrap)
+    url: https://github.com/containers/bubblewrap
+    revision: 0.11.2-1.1 (installed package on the development machine)
+    license_observed: LGPL-2.0-or-later
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-web-renderer execs bwrap to build the read-only rootfs and user namespaces for the sandboxed chromium (crates/kwe-core/src/websandbox.rs); never linked, no upstream code copied. Spawning the bwrap fork is what RLIMIT_NPROC governs, hence the web kind's 32768 process ceiling (docs/BETA_M2.md M2b). Revision pinned to the installed package.
+
+  - id: rust-image
+    project: image
+    url: https://crates.io/crates/image
+    revision: 0.25.10
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Decodes the BGRA frames the web renderer publishes from chromium CDP screencast events; exact transitive set pinned in Cargo.lock.
