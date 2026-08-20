@@ -273,7 +273,7 @@ Kirigami.Page {
             // BETA_M4b: applying is no longer alpha-gated; the daemon's apply
             // transaction is what the details pane drives, and every switch
             // is reversible from the same page.
-            text: qsTr("Applying wallpapers is available for video, web, and scene content. Use Restore on the wallpaper details page to switch back to the image wallpaper.")
+            text: qsTr("Applying wallpapers is available for video, web, and scene content. Use Reset to image wallpaper on the wallpaper details page to switch back.")
             showCloseButton: true
         }
 

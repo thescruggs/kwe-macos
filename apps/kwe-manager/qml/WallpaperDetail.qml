@@ -206,6 +206,11 @@ Kirigami.ScrollablePage {
             enabled: !applyClient.busy && applyClient.outputs.length > 0
             Accessible.name: qsTr("Output to apply the wallpaper to")
             Accessible.description: qsTr("The wallpaper is applied to the selected display output")
+            // A new target invalidates a stale failure: retry() replays the
+            // recorded output, so leaving Try Again armed after a reselection
+            // would silently apply to the old display while the UI shows the
+            // new one. Clearing also hides the Try Again affordance.
+            onCurrentIndexChanged: applyClient.resetStatus()
             Controls.ToolTip.visible: hovered
             Controls.ToolTip.text: applyClient.outputs.length === 0
                 ? qsTr("No display outputs are available yet")
@@ -233,7 +238,7 @@ Kirigami.ScrollablePage {
             Accessible.description: !detailPage.applyableKind
                 ? qsTr("This wallpaper type cannot be applied")
                 : !detailPage.contentResolvable
-                    ? qsTr("The wallpaper content path is not available")
+                    ? qsTr("The wallpaper content path is not declared")
                     : !detailPage.rendererCompatible
                         ? qsTr("This wallpaper is not marked renderer-dependent; applying is disabled")
                         : qsTr("Apply this wallpaper to the selected display output")
@@ -243,11 +248,14 @@ Kirigami.ScrollablePage {
         }
         Controls.Label {
             Layout.fillWidth: true
-            visible: WallpaperSelection.selectedId !== "" && detailPage.applyableKind && !detailPage.canApply
+            // The empty-outputs label above already explains the no-output
+            // case; this hint only adds per-gate detail when outputs exist.
+            visible: WallpaperSelection.selectedId !== "" && detailPage.applyableKind
+                && !detailPage.canApply && applyClient.outputs.length > 0
             text: !detailPage.rendererCompatible
                 ? qsTr("Applying is disabled: this wallpaper is not marked renderer-dependent.")
                 : !detailPage.contentResolvable
-                    ? qsTr("Applying is disabled: the wallpaper content path is not available.")
+                    ? qsTr("Applying is disabled: the wallpaper content path is not declared.")
                     : qsTr("Applying is disabled: no display output is selected.")
             opacity: 0.75
             wrapMode: Text.Wrap
@@ -255,12 +263,16 @@ Kirigami.ScrollablePage {
         Controls.Button {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== ""
+            // "Reset", not "Restore": on an output this client never applied
+            // to, the daemon falls back to the stock image — promising "the
+            // previous wallpaper back" would overstate it. The fallback is
+            // named so the safe-mode lane never surprises.
             text: applyClient.state === ApplyClient.Restoring
                 ? qsTr("Restoring…")
-                : qsTr("Restore KDE wallpaper")
+                : qsTr("Reset to image wallpaper")
             icon.name: "edit-undo-symbolic"
             enabled: detailPage.hasOutput && !applyClient.busy
-            Accessible.description: qsTr("Restore the previous image wallpaper on the selected display (safe mode)")
+            Accessible.description: qsTr("Reset the selected display to the image wallpaper: the saved previous wallpaper when one exists, otherwise the stock image (safe mode)")
             onClicked: applyClient.restoreWallpaper(outputPicker.currentText)
         }
         Kirigami.InlineMessage {

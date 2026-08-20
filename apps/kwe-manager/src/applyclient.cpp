@@ -102,6 +102,10 @@ void ApplyClient::retry() {
                        QUrl::fromLocalFile(m_lastFailedContent));
     } else if (m_lastFailedMethod == Restore) {
         restoreWallpaper(m_lastFailedOutput);
+    } else if (m_lastFailedMethod == ListOutputs) {
+        // An enumeration failure has no recorded target to replay; re-run the
+        // listing itself.
+        listOutputs();
     }
 }
 
@@ -248,8 +252,13 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_lastFailedKind = kind;
             m_lastFailedContent = content;
             clearResult();
+            // The UI's Try Again only makes sense for operations with a
+            // recorded target to replay (apply/restore). An enumeration
+            // failure has no payload, so failedMethod stays empty and the
+            // affordance stays hidden (the picker re-lists on its own).
             m_failedMethod = method == Apply ? QStringLiteral("apply")
-                                             : QStringLiteral("restore");
+                                             : method == Restore ? QStringLiteral("restore")
+                                                                 : QString();
             setErrorMessage(mapError(errorCode, detail));
             setState(Failed);
         }
@@ -304,9 +313,18 @@ void ApplyClient::failCurrent(const QString &error) {
                                 "operations are pending."));
         }
     }
+    const bool backgroundMirror = m_current.method == Assignments;
     m_queue.push_front(std::move(m_current));
     m_current = {};
     emit busyChanged();
+    if (backgroundMirror) {
+        // The assignment mirror must not clobber the user-facing state or a
+        // just-confirmed result on a socket failure either — the same
+        // isolation as the daemon-answered failure path in finish(). It
+        // re-queues at the front and retries in the background.
+        retryLater();
+        return;
+    }
     clearResult();
     setErrorMessage(error);
     setState(Failed);

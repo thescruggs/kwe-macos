@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -31,11 +32,15 @@ public:
         receivedParams.clear();
         failByMethod.clear();
         holdResponses = false;
+        holdByMethod.clear();
         restoreMode = QStringLiteral("stock");
     }
     /// Records requests but never answers them, so a client stays busy with
     /// its queue filling.
     bool holdResponses = false;
+    /// Holds requests of one method unanswered, so a client stays busy on
+    /// exactly that operation while the others complete.
+    QSet<QString> holdByMethod;
     /// Fails one method with the given wire error code/detail.
     QHash<QString, Fail> failByMethod;
     QList<QString> receivedMethods;
@@ -84,7 +89,7 @@ private:
                 const auto params = request.value(QStringLiteral("params")).toObject();
                 receivedMethods.push_back(method);
                 receivedParams.push_back(params);
-                if (holdResponses)
+                if (holdResponses || holdByMethod.contains(method))
                     return;
                 QJsonObject result;
                 bool ok = true;
@@ -274,6 +279,8 @@ private slots:
               QStringLiteral("could not be reached"));
         check(QStringLiteral("wallpaper.apply"), QStringLiteral("apply_unavailable"), QString(),
               QStringLiteral("does not support applying"));
+        check(QStringLiteral("wallpaper.apply"), QStringLiteral("invalid_params"),
+              QStringLiteral("kind: unexpected"), QStringLiteral("rejected the request"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("output_missing"),
               QStringLiteral("DP-2"), QStringLiteral("Output not found: DP-2"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("restore_failed"),
@@ -364,6 +371,55 @@ private slots:
         QCOMPARE(client.state(), ApplyClient::Idle);
         QVERIFY(client.errorMessage().isEmpty());
         QVERIFY(client.assignments().isEmpty());
+    }
+
+    void assignmentsSocketFailureLeavesTheUserFacingStateAlone() {
+        // Hold the success auto-refresh in flight, then kill the daemon: the
+        // mirror fails over the socket (not the daemon-answered path) and
+        // must requeue in the background without clobbering the confirmed
+        // apply result or the state.
+        m_daemon.holdByMethod.insert(QStringLiteral("wallpaper.assignments"));
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() == 2, 5000);
+        QCOMPARE(m_daemon.receivedMethods.at(1), QStringLiteral("wallpaper.assignments"));
+        m_daemon.dropClients();
+        // The mirror requeues at the front and retries (the daemon accepts
+        // again within the backoff window); the apply confirmation survives
+        // the whole detour.
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() == 3, 15000);
+        QCOMPARE(client.state(), ApplyClient::Applied);
+        QCOMPARE(client.appliedOutput(), QStringLiteral("DP-1"));
+        QCOMPARE(client.appliedWallpaperId(), QStringLiteral("1"));
+        QVERIFY(client.errorMessage().isEmpty());
+        QVERIFY(client.failedMethod().isEmpty());
+    }
+
+    void failedEnumerationIsNotLabeledRestoreAndRetries() {
+        m_daemon.failByMethod.insert(QStringLiteral("wallpaper.outputs"),
+                                     {QStringLiteral("shell_unreachable"),
+                                      QStringLiteral("plasma crashed")});
+        ApplyClient client(m_socketPath);
+        client.listOutputs();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        QVERIFY(client.errorMessage().contains(QStringLiteral("plasma crashed")));
+        QVERIFY(client.errorMessage().contains(QStringLiteral("could not be reached")));
+        // An enumeration failure has no recorded target to replay: the UI
+        // hides Try Again, so it must not be mislabeled "restore".
+        QVERIFY(client.failedMethod().isEmpty());
+        QVERIFY(!client.busy());
+        // retry() re-runs the listing itself.
+        m_daemon.failByMethod.clear();
+        client.retry();
+        const QStringList expected{QStringLiteral("DP-1"), QStringLiteral("HDMI-A-1")};
+        QTRY_VERIFY_WITH_TIMEOUT(client.outputs() == expected, 10000);
+        QCOMPARE(client.state(), ApplyClient::Idle);
+        QVERIFY(client.errorMessage().isEmpty());
+        QCOMPARE(m_daemon.receivedMethods.size(), 2);
+        QCOMPARE(m_daemon.receivedMethods.first(), QStringLiteral("wallpaper.outputs"));
+        QCOMPARE(m_daemon.receivedMethods.at(1), QStringLiteral("wallpaper.outputs"));
     }
 
     void retryRerunsTheExactFailedApply() {

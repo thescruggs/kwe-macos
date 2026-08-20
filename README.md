@@ -49,8 +49,9 @@ an isolated Vulkan hardware preflight. Applying is now manager-controlled for
 video, web, and scene content: the wallpaper service runs a validated
 transaction (renderer start, bounded promotion wait, assignment persist,
 Plasma switch) with per-output assignment, and every switch is reversible from
-the wallpaper details page ("Restore KDE wallpaper" reverts the saved previous
-wallpaper config or restores the stock image wallpaper).
+the wallpaper details page ("Reset to image wallpaper" reverts the saved
+previous wallpaper config, or resets to the stock image wallpaper when no
+saved assignment exists).
 
 Alpha M1a also includes the first safe-display harness: an external generated
 frame producer and a standalone native preview using the bounded shared-memory

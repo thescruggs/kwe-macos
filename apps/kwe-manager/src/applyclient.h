@@ -37,7 +37,8 @@ class ApplyClient final : public QObject {
     Q_PROPERTY(QString restoreMode READ restoreMode NOTIFY resultChanged)
     /// "apply" or "restore" when the last user-facing operation failed
     /// (the UI's retry affordance targets exactly that operation); empty
-    /// when nothing failed.
+    /// when nothing failed or when the failed operation was an enumeration
+    /// (no recorded target to replay — the UI hides Try Again).
     Q_PROPERTY(QString failedMethod READ failedMethod NOTIFY resultChanged)
     Q_PROPERTY(QVariantMap assignments READ assignments NOTIFY assignmentsChanged)
 
@@ -80,9 +81,9 @@ public:
     /// output enumeration; called when the selection changes so a result for
     /// one wallpaper never reads as the next one's.
     Q_INVOKABLE void resetStatus();
-    /// Re-runs the operation that just failed (apply or restore), for the
-    /// UI's retry affordance. No-op after a failed enumeration or when
-    /// nothing failed.
+    /// Re-runs the operation that just failed (apply, restore, or the output
+    /// enumeration), for the UI's retry affordance. No-op when nothing
+    /// failed.
     Q_INVOKABLE void retry();
 
 signals:

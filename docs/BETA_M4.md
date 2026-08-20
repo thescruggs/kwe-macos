@@ -259,15 +259,17 @@ etc.):
 | `Applying` | `wallpaper.apply` in flight | Apply shows "Applying…", disabled |
 | `Restoring` | `wallpaper.restore` in flight | Restore shows "Restoring…", disabled |
 | `Applied` | apply succeeded (fields: `appliedWallpaperId`, `appliedOutput`) | Positive InlineMessage "Applied \<title\> to \<output\>" |
-| `Failed` | apply/restore/list failed | Error InlineMessage with the mapped detail + Try Again |
+| `Failed` | apply/restore failed (or enumeration, with Try Again hidden) | Error InlineMessage with the mapped detail; Try Again only when `failedMethod` is set |
 
 Result honesty rules: a result belongs to the operation that produced it —
 `resetStatus()` runs on selection change, a new user-facing operation clears
 the previous confirmation, and the Applied message only shows when the
-current selection still matches `appliedWallpaperId`/`appliedOutput`. The
+current selection still matches `appliedWallpaperId`/`appliedOutput`, and
+changing the picker selection runs `resetStatus()`. The
 assignment mirror (`refreshAssignments()`/`assignments`, auto-refreshed
 after every successful apply/restore) is a background lane: its failures
-never clobber the user-facing state.
+never clobber the user-facing state — neither the daemon-answered failure
+path nor a socket-level loss while the mirror is in flight.
 
 Daemon error mapping (actionable text, detail included when the daemon
 bounded one):
@@ -304,13 +306,19 @@ bounded one):
 - **Failure** — Error InlineMessage with the mapped daemon detail (text +
   icon; never color alone) and a **Try Again** affordance that re-runs
   *exactly* the operation that failed (`retry()` re-sends the recorded
-  apply or restore), never a different one.
-- **Safe mode** — a "Restore KDE wallpaper" action on the same page,
+  apply or restore, or re-runs the enumeration), never a different one.
+  Enumeration failures have no recorded target to replay, so Try Again
+  stays hidden there (`failedMethod` is only set for apply/restore) — and
+  changing the output picker clears any stale failure so retry can never
+  replay a recorded output the UI no longer shows.
+- **Safe mode** — a "Reset to image wallpaper" action on the same page,
   always available when an output is selected, calling
-  `applyClient.restoreWallpaper`; success shows the Information InlineMessage
-  "Restored the image wallpaper on \<output\>" (with a "(stock image
-  fallback)" suffix when the daemon restored the stock image rather than a
-  saved assignment).
+  `applyClient.restoreWallpaper`; the label names the stock fallback
+  because on an output this client never applied to, the daemon resets to
+  the stock image rather than a saved "previous" wallpaper. Success shows
+  the Information InlineMessage "Restored the image wallpaper on
+  \<output\>" (with a "(stock image fallback)" suffix when the daemon
+  restored the stock image rather than a saved assignment).
 - **Gallery banner** — the alpha "Applying stays disabled" framing is
   replaced by the honest current state; the playlist frame's stale
   "Display assignment is not enabled yet" line now reads "Playlist display
@@ -322,12 +330,14 @@ bounded one):
 protocol, mirroring `kwe-permissions-client-test`): listOutputs round-trip,
 apply success state machine, web content-root param, apply failure surfaces
 the daemon detail, restore round-trip (stock + assignment modes), the error
-mapping table, queue serialization (second op waits, drain in order after a
-daemon loss), queue bound (66th op fails immediately, least-urgent drop on
-daemon loss), assignments round-trip, background-failure isolation, retry
-re-runs the exact failed op, resetStatus, invalid-input rejection without
-traffic. `smoke-ui.sh` is intentionally unchanged (the live smoke flips in
-M4d).
+mapping table (incl. `invalid_params`), queue serialization (second op
+waits, drain in order after a daemon loss), queue bound (66th op fails
+immediately, least-urgent drop on daemon loss), assignments round-trip,
+background-failure isolation (daemon-answered and socket-level loss while
+the mirror is in flight), failed-enumeration retry (Try Again hidden,
+`retry()` re-lists), retry re-runs the exact failed op, resetStatus,
+invalid-input rejection without traffic. `smoke-ui.sh` is intentionally
+unchanged (the live smoke flips in M4d).
 
 ## Run the suites
 
@@ -379,7 +389,7 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
 |---|---|---|
 | workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; all unit/RPC tests pass |
 | manager build | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | builds clean |
-| ApplyClient unit suite | `ctest` `kwe-apply-client-test`: listOutputs round-trip; apply state machine (Idle→Applying→Applied, wire params incl. web content root); apply failure surfaces the daemon detail + `failedMethod`; restore round-trip (stock/assignment modes); error mapping table (`output_missing`→"Output not found", `apply_busy`, `apply_unknown_wallpaper`, `shell_unreachable`, `apply_failed`, `restore_failed`, `apply_unavailable`); serialized queue (second op waits; daemon loss re-queues in order); queue bound (66th op immediate failure, least-urgent drop); assignments round-trip; background mirror failures isolated; retry re-runs the exact failed op; resetStatus; invalid input rejected without traffic | all pass |
+| ApplyClient unit suite | `ctest` `kwe-apply-client-test`: listOutputs round-trip; apply state machine (Idle→Applying→Applied, wire params incl. web content root); apply failure surfaces the daemon detail + `failedMethod`; restore round-trip (stock/assignment modes); error mapping table (`output_missing`→"Output not found", `apply_busy`, `apply_unknown_wallpaper`, `shell_unreachable`, `apply_failed`, `restore_failed`, `apply_unavailable`, `invalid_params`); serialized queue (second op waits; daemon loss re-queues in order); queue bound (66th op immediate failure, least-urgent drop); assignments round-trip; background mirror failures isolated (daemon-answered and socket loss while the mirror is in flight); failed enumeration retryable via `retry()` with `failedMethod` empty (Try Again hidden); retry re-runs the exact failed op; resetStatus; invalid input rejected without traffic | all pass |
 | qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | clean |
 | smoke-ui | `./scripts/smoke-ui.sh` unchanged (no apply-flow assertions here by design; M4d adds the live smoke) | passes |
 | UI honesty | alpha "Applying disabled" banner and stale "Display assignment is not enabled yet" line replaced with the true current state; Apply gated on kind/content/compatibility/output | verified in QML + docs |
