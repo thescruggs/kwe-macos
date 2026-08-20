@@ -69,7 +69,7 @@ use crate::supervisor::{
 const ASSIGNMENTS_FILE: &str = "assignments-v1.json";
 /// Bounded assignment map: one record per output, hard-capped before the
 /// 1 MiB byte bound (mirrors the grants store's count bound).
-const MAX_ASSIGNED_OUTPUTS: usize = 16;
+pub(crate) const MAX_ASSIGNED_OUTPUTS: usize = 16;
 const MAX_ASSIGNMENT_BYTES: u64 = 1024 * 1024;
 /// Wallpaper content paths live on disk; the stored string is advisory.
 const MAX_CONTENT_CHARS: usize = 4096;
@@ -315,11 +315,15 @@ impl AssignmentStore {
 // ---------------------------------------------------------------------------
 
 /// `wallpaper.apply` switch script: a pure function of the desktop array
-/// index and the validated plugin name.
+/// index and the validated plugin name. The desktop guard makes a stale
+/// index fail visibly (`evaluateScript` reports success even on script
+/// exceptions, so without the guard a stale index would silently switch
+/// nothing); the daemon's post-switch verification probe is the second
+/// line of defense.
 pub fn apply_script(desktop_index: usize, plugin: &str) -> Result<String, String> {
     validate_identity_part("wallpaper_plugin", plugin).map_err(|error| error.to_string())?;
     Ok(format!(
-        "var d = desktops()[{desktop_index}]; d.wallpaperPlugin = \"{plugin}\";"
+        "var d = desktops()[{desktop_index}]; if (!d) throw \"no desktop {desktop_index}\"; d.wallpaperPlugin = \"{plugin}\";"
     ))
 }
 
@@ -347,7 +351,9 @@ pub fn restore_script(
         group.push_str(part);
         group.push('"');
     }
-    let mut script = format!("var d = desktops()[{desktop_index}];\n");
+    let mut script = format!(
+        "var d = desktops()[{desktop_index}];\nif (!d) throw \"no desktop {desktop_index}\";\n"
+    );
     script.push_str(&format!("d.currentConfigGroup = [{group}];\n"));
     if let Some(image) = image {
         if image.is_empty() || image.len() > MAX_IMAGE_CHARS {
@@ -475,10 +481,16 @@ pub(crate) struct StubProbe {
     /// The JSON reply for enumeration scripts (the whole probe reply, as
     /// parsed by `parse_probe_reply`); None fails the probe.
     pub reply: Option<String>,
+    /// The enumeration reply used once the probe has seen the kwe switch
+    /// script (the live post-switch state: the desktop reports our plugin).
+    pub kwe_reply: Option<String>,
     pub scripts: std::sync::Mutex<Vec<String>>,
     /// Fails every non-enumeration script (the switch step). Atomic so the
     /// RPC tests can flip it through the shared `Arc`.
     pub reject_scripts: std::sync::atomic::AtomicBool,
+    /// Set when the probe has seen the kwe switch script; enumeration
+    /// then reports the post-switch desktop state.
+    pub kwe_assigned: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -487,9 +499,17 @@ impl StubProbe {
         Self {
             outputs,
             reply,
+            kwe_reply: None,
             scripts: std::sync::Mutex::new(Vec::new()),
             reject_scripts: std::sync::atomic::AtomicBool::new(false),
+            kwe_assigned: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The enumeration reply used after the kwe switch script has run.
+    pub fn after_switch(mut self, reply: String) -> Self {
+        self.kwe_reply = Some(reply);
+        self
     }
 
     pub fn scripts(&self) -> Vec<String> {
@@ -502,17 +522,28 @@ impl ShellProbe for StubProbe {
     fn evaluate_script(&self, script: &str) -> Result<String, ProbeError> {
         self.scripts.lock().unwrap().push(script.to_string());
         if script.contains("var d = desktops();") {
-            match &self.reply {
+            let reply = if self.kwe_assigned.load(std::sync::atomic::Ordering::SeqCst) {
+                self.kwe_reply.as_ref().or(self.reply.as_ref())
+            } else {
+                self.reply.as_ref()
+            };
+            match reply {
                 Some(reply) => Ok(reply.clone()),
                 None => Err(ProbeError::Rejected("stub probe rejected".into())),
             }
-        } else if self
-            .reject_scripts
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            Err(ProbeError::Unreachable("stub probe unreachable".into()))
         } else {
-            Ok(String::new())
+            if script.contains("wallpaperPlugin = \"org.kde.kwe.wallpaper\"") {
+                self.kwe_assigned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if self
+                .reject_scripts
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(ProbeError::Unreachable("stub probe unreachable".into()))
+            } else {
+                Ok(String::new())
+            }
         }
     }
 
@@ -891,7 +922,10 @@ fn parse_probe_reply(text: &str) -> Result<ProbeReply, ProbeError> {
 /// Merges the system outputs, the desktop probe, and the connector mapping
 /// into the per-output view. Desktops without a screen (orphaned
 /// containments) never match a connector and stay excluded; a connector
-/// without a matching desktop yields a desktop-less output.
+/// without a matching desktop yields a desktop-less output. A connector
+/// that maps to screen -1 (screenForConnector reports unknown) likewise
+/// never binds an orphaned desktop — an orphan must not be treated as the
+/// target of a real output.
 fn assemble_outputs(
     system: Vec<SystemOutput>,
     desktops: Vec<ProbeDesktop>,
@@ -901,7 +935,9 @@ fn assemble_outputs(
         .into_iter()
         .map(|output| {
             let screen = connectors.get(&output.name).copied().unwrap_or(-1);
-            let desktop = desktops.iter().find(|desktop| desktop.screen == screen);
+            let desktop = (screen >= 0)
+                .then(|| desktops.iter().find(|desktop| desktop.screen == screen))
+                .flatten();
             OutputInfo {
                 name: output.name,
                 screen,
@@ -990,15 +1026,20 @@ impl ApplyError {
     }
 }
 
-/// `wallpaper.apply` params (deny_unknown_fields). `kind`/`content` follow
-/// the StartSpec rules; the test kind is not assignable.
+/// `wallpaper.apply` params (deny_unknown_fields). `kind` follows the
+/// StartSpec rules; the test kind is not assignable. `content` is
+/// optional: when supplied it must match the catalog item's resolved
+/// content path (it is verified, never trusted), and when absent the
+/// catalog content is used — the renderer always starts with the catalog
+/// content.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyWallpaperParams {
     pub output: String,
     pub wallpaper_id: String,
     pub kind: RendererKind,
-    pub content: PathBuf,
+    #[serde(default)]
+    pub content: Option<PathBuf>,
     #[serde(default = "default_apply_width")]
     pub width: u32,
     #[serde(default = "default_apply_height")]
@@ -1162,10 +1203,12 @@ impl ApplyHandle {
     }
 
     /// The full live-apply transaction. Completes when the renderer
-    /// PROMOTES (Live or AwaitingAck), not when the display ack arrives —
-    /// the ack comes later from the wallpaper bridge. Any failure after a
-    /// step has side effects rolls back: a failed wallpaper switch stops
-    /// the promoted renderer and drops the persisted assignment.
+    /// PROMOTES (Live or AwaitingAck) AND the Plasma switch is verified —
+    /// not when the display ack arrives (that comes later from the
+    /// wallpaper bridge). Everything after `renderer.start` is covered by
+    /// one rollback: stop the renderer (only while it is still ours) and
+    /// revert the store to the pre-apply record — so a failed re-apply can
+    /// never destroy the original wallpaper config.
     pub fn apply(&self, params: ApplyWallpaperParams) -> Result<Value, ApplyError> {
         let _guard = self.acquire_apply_lock()?;
 
@@ -1184,7 +1227,33 @@ impl ApplyHandle {
                 params.kind.as_str()
             )));
         }
-        spec.content_hash = content_hash_for(&item, &params.content);
+
+        // 2b. The renderer runs the CATALOG content (authoritative): the
+        // item's resolved entry (or the web content root). Client-supplied
+        // content is verified against it and never trusted; absent content
+        // means the catalog path is used.
+        let content = catalog_content_path(&item, params.kind);
+        if let Some(client_content) = &params.content {
+            let client_canon = std::fs::canonicalize(client_content).ok();
+            let catalog_canon = std::fs::canonicalize(&content).ok();
+            if client_canon.as_deref() != catalog_canon.as_deref() {
+                return Err(ApplyError::Invalid(format!(
+                    "content {} does not match the catalog item's resolved content {}",
+                    client_content.display(),
+                    content.display()
+                )));
+            }
+        }
+        if content.to_string_lossy().chars().count() > MAX_CONTENT_CHARS {
+            return Err(ApplyError::Invalid(format!(
+                "catalog content path exceeds {MAX_CONTENT_CHARS} characters"
+            )));
+        }
+        spec.content = Some(content_spec_for(params.kind, &content));
+        spec = spec
+            .into_validated()
+            .map_err(|error| ApplyError::Invalid(error.to_string()))?;
+        spec.content_hash = content_hash_for(&item, &content);
 
         // 3. Fresh enumeration; the output must be live and have a desktop.
         let outputs = self.enumerate_fresh()?;
@@ -1195,17 +1264,59 @@ impl ApplyHandle {
         let desktop_index = output.desktop_index.ok_or_else(|| {
             ApplyError::Transaction(format!("output {} has no desktop containment", output.name))
         })?;
-        let previous = PreviousWallpaper {
-            wallpaper_plugin: output.wallpaper_plugin.clone().ok_or_else(|| {
-                ApplyError::Transaction(format!(
-                    "output {} has no wallpaper plugin to save as previous",
-                    output.name
-                ))
-            })?,
-            config_group: output.config_group.clone(),
-            image: output.image.clone(),
-        };
 
+        // 3b. The pre-apply wallpaper state. When a stored assignment
+        // exists AND the live enumeration already shows our plugin, the
+        // stored record's `previous` is carried forward — a re-apply must
+        // never overwrite the original wallpaper config with our own.
+        let previous = self.previous_for(output)?;
+
+        // The store record that must survive if the transaction fails
+        // after starting the renderer (the store is only touched
+        // post-start, so this is the rollback target).
+        let old_assignment = self.stored_assignment(&output.name)?;
+
+        // 4+. Start the renderer; EVERY failure from here on rolls back.
+        let result = self.complete_apply(&spec, &content, &output.name, desktop_index, previous);
+        if let Err(error) = result {
+            // Rollback: stop the renderer we started — but only while it
+            // is still ours; an ownership change means the playlist
+            // session owns the supervisor now, and stopping it would kill
+            // their renderer — and revert the store to the pre-apply
+            // record (set the old record back, never just remove, so the
+            // original previous survives a failed re-apply).
+            if let Ok(status) = self.supervisor.status() {
+                let ours = status.requested_wallpaper_id.as_deref() == Some(&spec.wallpaper_id)
+                    && status.requested_content_hash.as_deref() == Some(&spec.content_hash);
+                if ours {
+                    let _ = self.supervisor.stop();
+                }
+            }
+            if let Ok(mut store) = self.store.lock() {
+                match old_assignment {
+                    Some(old) => {
+                        let _ = store.set(&output.name, old);
+                    }
+                    None => {
+                        let _ = store.remove(&output.name);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    /// The post-start half of the apply transaction. Every failure here is
+    /// rolled back by `apply` (stop the renderer, revert the store).
+    fn complete_apply(
+        &self,
+        spec: &StartSpec,
+        content: &std::path::Path,
+        output_name: &str,
+        desktop_index: usize,
+        previous: PreviousWallpaper,
+    ) -> Result<Value, ApplyError> {
         // 4. Start the renderer and wait (bounded) for OUR promotion.
         let started = self
             .supervisor
@@ -1218,17 +1329,16 @@ impl ApplyHandle {
             )));
         }
         self.wait_for_promotion(&spec.wallpaper_id, &spec.content_hash)?;
+        // Ownership re-check immediately before the persist/switch steps:
+        // a playlist start landing between promotion and persist would
+        // otherwise be masked until the (misleading) timeout.
+        self.ensure_ours(&spec.wallpaper_id, &spec.content_hash)?;
 
         // 5. Persist the assignment (previous = the config that was live).
         let assignment = Assignment {
             wallpaper_id: spec.wallpaper_id.clone(),
             kind: spec.kind,
-            content: params
-                .content
-                .to_string_lossy()
-                .chars()
-                .take(MAX_CONTENT_CHARS)
-                .collect(),
+            content: content.to_string_lossy().into_owned(),
             width: spec.width,
             height: spec.height,
             fps: spec.fps,
@@ -1241,7 +1351,7 @@ impl ApplyHandle {
                 .lock()
                 .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
             store
-                .set(&output.name, assignment.clone())
+                .set(output_name, assignment.clone())
                 .map_err(|error| {
                     ApplyError::Transaction(format!("persist assignment failed: {error}"))
                 })?;
@@ -1250,29 +1360,89 @@ impl ApplyHandle {
         // 6. Switch the Plasma wallpaper config. The script is a pure
         // function of {desktop index, plugin name} — never wallpaper
         // content — and runs through a bounded, shell-less qdbus call.
+        // The desktop guard makes a stale index fail visibly (evaluateScript
+        // reports success even on script exceptions), and the verification
+        // probe below is the second line of defense.
         let script = apply_script(desktop_index, KWE_PLUGIN)
             .map_err(|error| ApplyError::Transaction(format!("script error: {error}")))?;
         if let Err(error) = self.probe.evaluate_script(&script) {
-            // Rollback: the config was not switched, so undo what the
-            // transaction did — stop the renderer, drop the assignment.
-            let _ = self.supervisor.stop();
-            if let Ok(mut store) = self.store.lock() {
-                let _ = store.remove(&output.name);
-            }
             return Err(match error {
                 ProbeError::Unreachable(detail) => ApplyError::ShellUnreachable(detail),
                 other => ApplyError::Transaction(format!("wallpaper switch failed: {other}")),
             });
         }
 
-        Ok(json!({ "output": output.name, "applied": assignment }))
+        // 6b. Post-switch verification: the desktop must now report our
+        // plugin; fail (and roll back) when it does not.
+        self.verify_switch(output_name, desktop_index)?;
+
+        Ok(json!({ "output": output_name, "applied": assignment }))
+    }
+
+    /// The wallpaper config to save as `previous` for a new apply: the
+    /// live config — unless a stored assignment exists AND the live
+    /// enumeration already shows our plugin, in which case the stored
+    /// record's `previous` is carried forward so re-applying never
+    /// destroys the original wallpaper.
+    fn previous_for(&self, output: &OutputInfo) -> Result<PreviousWallpaper, ApplyError> {
+        if output.wallpaper_plugin.as_deref() == Some(KWE_PLUGIN)
+            && let Some(stored) = self.stored_assignment(&output.name)?
+            && let Some(previous) = stored.previous
+        {
+            return Ok(previous);
+        }
+        Ok(PreviousWallpaper {
+            wallpaper_plugin: output.wallpaper_plugin.clone().ok_or_else(|| {
+                ApplyError::Transaction(format!(
+                    "output {} has no wallpaper plugin to save as previous",
+                    output.name
+                ))
+            })?,
+            config_group: output.config_group.clone(),
+            image: output.image.clone(),
+        })
+    }
+
+    /// The stored assignment for one output, or None.
+    fn stored_assignment(&self, output_name: &str) -> Result<Option<Assignment>, ApplyError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
+        Ok(store.get(output_name).cloned())
+    }
+
+    /// Post-switch verification: re-probe and confirm the output's desktop
+    /// really carries our plugin. `evaluateScript` exits 0 even on script
+    /// exceptions, so the script alone could silently switch nothing; this
+    /// probe (plus the script's desktop guard) makes that fail instead of
+    /// reporting success over a no-op.
+    fn verify_switch(&self, output_name: &str, desktop_index: usize) -> Result<(), ApplyError> {
+        let outputs = self.enumerate_fresh()?;
+        let Some(output) = outputs.iter().find(|info| info.name == output_name) else {
+            return Err(ApplyError::Transaction(format!(
+                "post-switch verification: output {output_name} is gone"
+            )));
+        };
+        if output.wallpaper_plugin.as_deref() != Some(KWE_PLUGIN)
+            || output.desktop_index != Some(desktop_index)
+        {
+            return Err(ApplyError::Transaction(format!(
+                "post-switch verification failed: output {} reports plugin {:?} on desktop {:?}, expected {KWE_PLUGIN} on desktop {desktop_index}",
+                output_name, output.wallpaper_plugin, output.desktop_index
+            )));
+        }
+        Ok(())
     }
 
     /// Reverts the wallpaper config of one output to its saved `previous`
     /// (or to the stock image plugin when there is no assignment — the
     /// safe-mode contract: restore never leaves a desktop assigned to a
-    /// daemon-owned renderer, so it always succeeds on a known output).
-    /// The assignment is cleared only after the script ran.
+    /// daemon-owned renderer, and succeeds on any real output with a
+    /// desktop containment while the shell is reachable). The assignment
+    /// is cleared only after the restore script ran AND the verification
+    /// probe confirmed the plugin switch — never on a silently no-op
+    /// script, which would destroy the saved `previous`.
     pub fn restore(&self, output_name: String) -> Result<Value, ApplyError> {
         let outputs = self.enumerate_fresh()?;
         let output = outputs
@@ -1282,13 +1452,7 @@ impl ApplyHandle {
         let desktop_index = output.desktop_index.ok_or_else(|| {
             ApplyError::Transaction(format!("output {} has no desktop containment", output.name))
         })?;
-        let stored = {
-            let store = self
-                .store
-                .lock()
-                .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
-            store.get(&output_name).cloned()
-        };
+        let stored = self.stored_assignment(&output_name)?;
         let target = restore_target(stored.clone(), stock_image_path());
         let script = restore_script(
             desktop_index,
@@ -1303,6 +1467,9 @@ impl ApplyHandle {
                 other => ApplyError::RestoreFailed(other.to_string()),
             });
         }
+        // Post-restore verification: only clear the record once the live
+        // plugin matches the restore target.
+        self.verify_restore(&output_name, &target.wallpaper_plugin)?;
         if stored.is_some()
             && let Ok(mut store) = self.store.lock()
         {
@@ -1318,6 +1485,24 @@ impl ApplyHandle {
             },
             "stock_image": stock_image_path(),
         }))
+    }
+
+    /// Post-restore verification: the output's desktop must report the
+    /// restore target plugin before the assignment is cleared.
+    fn verify_restore(&self, output_name: &str, expected_plugin: &str) -> Result<(), ApplyError> {
+        let outputs = self.enumerate_fresh()?;
+        let Some(output) = outputs.iter().find(|info| info.name == output_name) else {
+            return Err(ApplyError::RestoreFailed(format!(
+                "post-restore verification: output {output_name} is gone"
+            )));
+        };
+        if output.wallpaper_plugin.as_deref() != Some(expected_plugin) {
+            return Err(ApplyError::RestoreFailed(format!(
+                "post-restore verification failed: output {} reports plugin {:?}, expected {expected_plugin:?}",
+                output_name, output.wallpaper_plugin
+            )));
+        }
+        Ok(())
     }
 
     /// Every stored assignment.
@@ -1365,6 +1550,17 @@ impl ApplyHandle {
             })?;
             let ours = status.requested_wallpaper_id.as_deref() == Some(wallpaper_id)
                 && status.requested_content_hash.as_deref() == Some(content_hash);
+            // Fail fast on ownership change: a renderer we did not start
+            // is running (the playlist session thread replaced ours);
+            // waiting for ours to promote would only mislead with a
+            // timeout long after the handoff happened.
+            if !ours && !matches!(status.phase, WorkerPhase::Idle) {
+                return Err(ApplyError::Transaction(format!(
+                    "renderer ownership changed (requested {}:{}, expected {wallpaper_id}:{content_hash})",
+                    status.requested_wallpaper_id.as_deref().unwrap_or("none"),
+                    status.requested_content_hash.as_deref().unwrap_or("none"),
+                )));
+            }
             match promotion_verdict(status.phase, ours, status.last_failure_detail.as_deref()) {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(detail)) => {
@@ -1383,6 +1579,27 @@ impl ApplyHandle {
                 }
             }
         }
+    }
+
+    /// Fail fast when the supervisor's requested renderer no longer
+    /// matches ours (the playlist session can replace our renderer
+    /// mid-transaction; the check is repeated immediately before the
+    /// persist/switch steps).
+    fn ensure_ours(&self, wallpaper_id: &str, content_hash: &str) -> Result<(), ApplyError> {
+        let status = self
+            .supervisor
+            .status()
+            .map_err(|error| ApplyError::Transaction(format!("renderer.status failed: {error}")))?;
+        let ours = status.requested_wallpaper_id.as_deref() == Some(wallpaper_id)
+            && status.requested_content_hash.as_deref() == Some(content_hash);
+        if !ours {
+            return Err(ApplyError::Transaction(format!(
+                "renderer ownership changed (requested {}:{}, expected {wallpaper_id}:{content_hash})",
+                status.requested_wallpaper_id.as_deref().unwrap_or("none"),
+                status.requested_content_hash.as_deref().unwrap_or("none"),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1429,15 +1646,39 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
             "wallpaper.apply does not accept the test renderer kind".into(),
         ));
     }
+    // Content is a boundary input even though the renderer runs the
+    // catalog content: a supplied path is validated and bounded here, and
+    // matched against the catalog after the lookup (never truncated).
+    if let Some(content) = &params.content {
+        let len = content.to_string_lossy().chars().count();
+        if len == 0 || len > MAX_CONTENT_CHARS {
+            return Err(ApplyError::Invalid(format!(
+                "content path must be 1..={MAX_CONTENT_CHARS} characters"
+            )));
+        }
+    }
+    let Some(content) = params.content.as_ref() else {
+        return Ok(StartSpec {
+            wallpaper_id: params.wallpaper_id.clone(),
+            content_hash: "pending".into(),
+            width: params.width,
+            height: params.height,
+            fps: params.fps,
+            kind: params.kind,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+        });
+    };
     let content = match params.kind {
         RendererKind::Video => ContentSpec::Video {
-            path: params.content.clone(),
+            path: content.clone(),
         },
         RendererKind::Web => ContentSpec::Web {
-            root: params.content.clone(),
+            root: content.clone(),
         },
         RendererKind::Scene => ContentSpec::Scene {
-            path: params.content.clone(),
+            path: content.clone(),
         },
         RendererKind::Test => unreachable!("test kind rejected above"),
     };
@@ -1454,6 +1695,36 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
     }
     .into_validated()
     .map_err(|error| ApplyError::Invalid(error.to_string()))
+}
+
+/// The content path the daemon starts the renderer with for a catalog
+/// item (the catalog content is authoritative): the item's runnable entry
+/// for video/scene (or its scene.json when no entry is declared), and the
+/// content root for web (the renderer serves the whole root).
+fn catalog_content_path(item: &CatalogItem, kind: RendererKind) -> PathBuf {
+    if kind == RendererKind::Web {
+        return item.content_root.clone();
+    }
+    match &item.entry_file {
+        Some(entry) => entry.clone(),
+        None => item.content_root.join("scene.json"),
+    }
+}
+
+/// The validated ContentSpec for a kind and a resolved content path.
+fn content_spec_for(kind: RendererKind, path: &std::path::Path) -> ContentSpec {
+    match kind {
+        RendererKind::Video => ContentSpec::Video {
+            path: path.to_path_buf(),
+        },
+        RendererKind::Web => ContentSpec::Web {
+            root: path.to_path_buf(),
+        },
+        RendererKind::Scene => ContentSpec::Scene {
+            path: path.to_path_buf(),
+        },
+        RendererKind::Test => unreachable!("test kind rejected before content resolution"),
+    }
 }
 
 /// Stable content identity for the supervisor's quarantine key: the
@@ -1703,9 +1974,11 @@ mod tests {
 
     #[test]
     fn apply_and_restore_scripts_are_exact_strings() {
+        // The desktop guard fails visibly on a stale index (evaluateScript
+        // reports success even on script exceptions).
         assert_eq!(
             apply_script(1, "org.kde.kwe.wallpaper").unwrap(),
-            "var d = desktops()[1]; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";"
+            "var d = desktops()[1]; if (!d) throw \"no desktop 1\"; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";"
         );
         assert_eq!(
             restore_script(
@@ -1716,6 +1989,7 @@ mod tests {
             )
             .unwrap(),
             "var d = desktops()[1];\n\
+             if (!d) throw \"no desktop 1\";\n\
              d.currentConfigGroup = [\"Wallpaper\", \"org.kde.image\", \"General\"];\n\
              d.writeConfig(\"Image\", \"file:///usr/share/wallpapers/cachy.png\");\n\
              d.wallpaperPlugin = \"org.kde.image\";"
@@ -1732,10 +2006,25 @@ mod tests {
         assert_eq!(
             script,
             "var d = desktops()[0];\n\
+             if (!d) throw \"no desktop 0\";\n\
              d.currentConfigGroup = [\"Wallpaper\", \"org.kde.image\", \"General\"];\n\
              d.wallpaperPlugin = \"org.kde.image\";"
         );
         assert!(!script.contains("writeConfig"));
+    }
+
+    #[test]
+    fn scripts_guard_against_a_stale_desktop_index() {
+        // A stale desktop index must fail visibly (the throw aborts the
+        // script; the daemon's verification probe then catches the no-op).
+        let apply = apply_script(7, "org.kde.kwe.wallpaper").unwrap();
+        // The guard precedes the assignment, so a stale index aborts the
+        // script before anything is switched.
+        assert!(apply.starts_with(
+            "var d = desktops()[7]; if (!d) throw \"no desktop 7\"; d.wallpaperPlugin"
+        ));
+        let restore = restore_script(7, "org.kde.image", &["Wallpaper".into()], None).unwrap();
+        assert!(restore.contains("if (!d) throw \"no desktop 7\";\n"));
     }
 
     #[test]
@@ -1799,6 +2088,7 @@ mod tests {
         )
         .unwrap();
         let expected = "var d = desktops()[0];\n\
+                        if (!d) throw \"no desktop 0\";\n\
                         d.currentConfigGroup = [\"Wallpaper\", \"org.kde.image\", \"General\"];\n\
                         d.writeConfig(\"Image\", \"file:///x\\\"; process.exit(1); // \\\\ and \\n and \\u2028\");\n\
                         d.wallpaperPlugin = \"org.kde.image\";";
@@ -1944,6 +2234,87 @@ mod tests {
         assert_eq!(outputs[1].desktop_id, None);
         assert_eq!(outputs[1].desktop_index, None);
         assert_eq!(outputs[1].image, None);
+    }
+
+    #[test]
+    fn connector_mapping_to_negative_screen_never_binds_an_orphan() {
+        // screenForConnector reports -1 for an unknown/unmapped connector;
+        // the orphaned desktop also carries screen -1. It must never match:
+        // a real output would otherwise bind the orphan's containment and
+        // capture the wrong previous config.
+        let system = vec![SystemOutput {
+            name: "DP-2".into(),
+            enabled: true,
+            connected: true,
+            geometry: None,
+        }];
+        let desktops = vec![ProbeDesktop {
+            index: 3,
+            id: 105,
+            screen: -1,
+            wp: "org.kde.image".into(),
+            image: Some("file:///old.png".into()),
+        }];
+        let connectors = BTreeMap::from([("DP-2".into(), -1)]);
+        let outputs = assemble_outputs(system, desktops, connectors);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].screen, -1);
+        assert_eq!(outputs[0].desktop_id, None);
+        assert_eq!(outputs[0].desktop_index, None);
+        assert_eq!(outputs[0].wallpaper_plugin, None);
+        assert_eq!(outputs[0].image, None);
+    }
+
+    #[test]
+    fn catalog_content_path_resolves_entries_roots_and_scene_json() {
+        fn item(content_root: &str, entry_file: Option<&str>, kind: ProjectKind) -> CatalogItem {
+            CatalogItem {
+                workshop_id: "1".into(),
+                title: "Synthetic".into(),
+                kind,
+                compatibility: kwe_core::Compatibility::RendererDependent,
+                compatibility_detail: String::new(),
+                content_root: PathBuf::from(content_root),
+                project_file: PathBuf::from(content_root).join("project.json"),
+                entry_file: entry_file.map(PathBuf::from),
+                preview_file: None,
+                metadata_hash: None,
+                tags: Vec::new(),
+                requested_permissions: Vec::new(),
+                workshop_state: "local".into(),
+                workshop_progress: None,
+                diagnostics: Vec::new(),
+            }
+        }
+        // A declared entry wins (the runnable scene.json or scene.pkg).
+        assert_eq!(
+            catalog_content_path(
+                &item("/w/1", Some("/w/1/scene.json"), ProjectKind::Scene),
+                RendererKind::Scene
+            ),
+            PathBuf::from("/w/1/scene.json")
+        );
+        // A scene without a declared entry runs its scene.json.
+        assert_eq!(
+            catalog_content_path(&item("/w/2", None, ProjectKind::Scene), RendererKind::Scene),
+            PathBuf::from("/w/2/scene.json")
+        );
+        // The web renderer serves the whole content root, not the entry.
+        assert_eq!(
+            catalog_content_path(
+                &item("/w/3", Some("/w/3/index.html"), ProjectKind::Web),
+                RendererKind::Web
+            ),
+            PathBuf::from("/w/3")
+        );
+        // Video uses its declared media entry.
+        assert_eq!(
+            catalog_content_path(
+                &item("/w/4", Some("/w/4/video.mp4"), ProjectKind::Video),
+                RendererKind::Video
+            ),
+            PathBuf::from("/w/4/video.mp4")
+        );
     }
 
     // -- cache, restore target, promotion verdict, path lookup -----------

@@ -2248,7 +2248,8 @@ with open(args.output, "wb") as frame:
     /// Fake steam root with one subscribed scene project (workshop id "1").
     fn scene_catalog() -> Arc<RwLock<Catalog>> {
         let root = temp_dir("apply-catalog");
-        std::fs::create_dir_all(root.join("steamapps/workshop/content/431960/1")).unwrap();
+        let content_dir = root.join("steamapps/workshop/content/431960/1");
+        std::fs::create_dir_all(&content_dir).unwrap();
         std::fs::write(
             root.join("steamapps/libraryfolders.vdf"),
             "\"LibraryFolders\" { }\n",
@@ -2260,11 +2261,25 @@ with open(args.output, "wb") as frame:
         )
         .unwrap();
         std::fs::write(
-            root.join("steamapps/workshop/content/431960/1/project.json"),
+            content_dir.join("project.json"),
             r#"{"title":"Synthetic One","type":"scene","tags":[]}"#,
         )
         .unwrap();
+        // The runnable scene.json inside the content root (the resolved
+        // catalog content, BETA_M4a review fix 5: the renderer runs the
+        // catalog content, and a client-supplied content must match it).
+        std::fs::write(content_dir.join("scene.json"), br#"{"general":{}}"#).unwrap();
         Arc::new(RwLock::new(scan_installed(&[root], &ScanLimits::default())))
+    }
+
+    /// The resolved catalog content path for the fixture item "1".
+    fn fixture_scene_path(catalog: &Catalog) -> PathBuf {
+        let item = catalog
+            .items
+            .iter()
+            .find(|item| item.workshop_id == "1")
+            .expect("fixture item 1");
+        item.content_root.join("scene.json")
     }
 
     /// A supervisor fast enough for the promotion wait (150 ms canary) with
@@ -2317,8 +2332,21 @@ with open(args.output, "wb") as frame:
     /// stock image plugin and a saved Image value.
     const DP1_PROBE_REPLY: &str = r#"{"desktops":[{"index":1,"id":111,"screen":0,"wp":"org.kde.image","image":"file:///usr/share/wallpapers/fallback.png"}],"connectors":{"DP-1":0}}"#;
 
+    /// The same output after the kwe switch script ran: the desktop now
+    /// reports our plugin (and the stock Image is out of reach).
+    const KWE_PROBE_REPLY: &str = r#"{"desktops":[{"index":1,"id":111,"screen":0,"wp":"org.kde.kwe.wallpaper","image":null}],"connectors":{"DP-1":0}}"#;
+
     fn stub_probe(outputs: Vec<apply::SystemOutput>, reply: Option<&str>) -> Arc<apply::StubProbe> {
         Arc::new(apply::StubProbe::new(outputs, reply.map(str::to_string)))
+    }
+
+    /// A stub probe that flips its enumeration reply after the kwe switch
+    /// script runs (the post-switch verification then sees our plugin).
+    fn stub_probe_with_switch(outputs: Vec<apply::SystemOutput>) -> Arc<apply::StubProbe> {
+        Arc::new(
+            apply::StubProbe::new(outputs, Some(DP1_PROBE_REPLY.to_string()))
+                .after_switch(KWE_PROBE_REPLY.to_string()),
+        )
     }
 
     #[test]
@@ -2416,14 +2444,10 @@ with open(args.output, "wb") as frame:
         let supervisor = supervisor_service();
         let probe = stub_probe(vec![], Some(DP1_PROBE_REPLY));
         let handle = apply_handle(probe, &catalog, supervisor.handle());
-        let root = temp_dir("apply-unknown-output");
-        let scene = root.join("scene.json");
-        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        // No content is supplied: the catalog content is used (and the
+        // content verification passes before the output enumeration).
         let (ok, result) = process_with_apply(
-            &format!(
-                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
-                scene.display()
-            ),
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene"}}"#,
             &handle,
             &catalog,
         );
@@ -2514,10 +2538,11 @@ with open(args.output, "wb") as frame:
         let catalog = scene_catalog();
         let supervisor_service = fast_scene_supervisor(&root);
         let supervisor = supervisor_service.handle();
-        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
         let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
-        let scene = root.join("scene.json");
-        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        // The client content must match the catalog item's resolved path
+        // (the renderer runs the catalog content).
+        let scene = fixture_scene_path(&catalog.read().unwrap());
         let (ok, result) = process_with_apply(
             &format!(
                 r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","width":320,"height":180,"fps":30}}}}"#,
@@ -2560,7 +2585,7 @@ with open(args.output, "wb") as frame:
             .expect("the switch script must have been evaluated");
         assert_eq!(
             switch,
-            "var d = desktops()[1]; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";"
+            "var d = desktops()[1]; if (!d) throw \"no desktop 1\"; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";"
         );
         // Wallpaper content never reaches the script.
         assert!(!switch.contains("scene.json"));
@@ -2591,13 +2616,10 @@ with open(args.output, "wb") as frame:
             .reject_scripts
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
-        let scene = root.join("scene.json");
-        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        // No content: the catalog content is used, so the switch rejection
+        // is reached without a content-match detour.
         let (ok, result) = process_with_apply(
-            &format!(
-                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
-                scene.display()
-            ),
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene"}}"#,
             &handle,
             &catalog,
         );
@@ -2623,6 +2645,325 @@ with open(args.output, "wb") as frame:
     }
 
     #[test]
+    fn reapply_carries_the_original_previous_forward_and_rollback_restores_it() {
+        let root = temp_dir("apply-reapply");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let content = fixture_scene_path(&catalog.read().unwrap());
+
+        // Apply #1 succeeds: previous = the live org.kde.image config.
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                content.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "first apply failed: {result}");
+        assert_eq!(
+            result["applied"]["previous"]["image"],
+            "file:///usr/share/wallpapers/fallback.png"
+        );
+
+        // Apply #2: the live enumeration now reports our plugin (the stub
+        // flipped after the switch), so the stored record's ORIGINAL
+        // previous must be carried forward — never replaced by our own
+        // plugin state. Failing the switch exercises the rollback: the
+        // pre-apply record must be set back, not removed.
+        probe
+            .reject_scripts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                content.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "shell_unreachable");
+        // The original wallpaper config survives: the record is intact with
+        // the original previous (org.kde.image + fallback.png), and the
+        // failed re-apply did not destroy it.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        let record = &result["outputs"]["DP-1"];
+        assert_eq!(record["wallpaper_id"], "1");
+        assert_eq!(record["previous"]["wallpaper_plugin"], "org.kde.image");
+        assert_eq!(
+            record["previous"]["image"],
+            "file:///usr/share/wallpapers/fallback.png"
+        );
+    }
+
+    #[test]
+    fn apply_persist_failure_rolls_back_and_stops_the_renderer() {
+        let root = temp_dir("apply-persist-fail");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        // A store already at the 16-output bound: the persist of the new
+        // output must fail AFTER the renderer promoted.
+        let dir = temp_dir("apply-persist-store");
+        let mut store = apply::AssignmentStore::open(&dir).unwrap();
+        for index in 0..apply::MAX_ASSIGNED_OUTPUTS {
+            store
+                .set(
+                    &format!("Synthetic-{index}"),
+                    apply::Assignment {
+                        wallpaper_id: format!("Synthetic-{index}"),
+                        kind: RendererKind::Scene,
+                        content: "/tmp/x.json".into(),
+                        width: 320,
+                        height: 180,
+                        fps: 30,
+                        applied_at_unix_seconds: 1,
+                        previous: None,
+                    },
+                )
+                .unwrap();
+        }
+        let handle = apply_handle_with_store(probe.clone(), &catalog, supervisor.clone(), store);
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_failed");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("persist assignment failed"),
+            "{result}"
+        );
+        // The renderer that promoted was stopped by the rollback — it must
+        // not come up live later, unassigned and invisible to restore.
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Stopped);
+        // The 16 seeded records are untouched; DP-1 was never stored.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"].as_object().unwrap().len(), 16);
+        assert!(result["outputs"]["DP-1"].is_null());
+    }
+
+    #[test]
+    fn apply_promotion_timeout_rolls_back_and_stops_the_renderer() {
+        let root = temp_dir("apply-promotion-timeout");
+        let catalog = scene_catalog();
+        // A renderer that never publishes a frame: it can never promote,
+        // and the bounded wait must time out instead of hanging.
+        let hang = root.join("hang-renderer.py");
+        fs::write(
+            &hang,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = root.join("supervisor");
+        let limits = sample_limits(1024);
+        let supervisor_service = SupervisorService::start(SupervisorConfig {
+            renderer_paths: BTreeMap::from([(RendererKind::Scene, hang)]),
+            runtime_dir: dir.join("runtime"),
+            state_dir: dir.join("state"),
+            startup_timeout_ms_by_kind: BTreeMap::from([
+                (RendererKind::Test, 3000),
+                (RendererKind::Video, 6000),
+                (RendererKind::Web, 10_000),
+                (RendererKind::Scene, 3000),
+            ]),
+            frame_timeout: Duration::from_secs(2),
+            stop_grace: Duration::from_millis(500),
+            restart_delay: Duration::from_millis(250),
+            canary_duration: Duration::from_millis(150),
+            handoff_timeout: Duration::from_secs(5),
+            max_failures: 3,
+            web_heartbeat_ms: 5000,
+            web_heartbeat_max_failures: 3,
+            resource_limits_by_kind: BTreeMap::from([
+                (RendererKind::Test, limits),
+                (RendererKind::Video, limits),
+                (RendererKind::Web, limits),
+                (RendererKind::Scene, limits),
+            ]),
+        })
+        .unwrap();
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let store_dir = temp_dir("apply-promotion-store");
+        let handle = apply::ApplyHandle::for_test(
+            apply::AssignmentStore::open(&store_dir).unwrap(),
+            probe,
+            catalog.clone(),
+            supervisor.clone(),
+            // Far below the 3 s startup timeout so the wait times out while
+            // the renderer is still starting.
+            Duration::from_millis(300),
+        );
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_failed");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("did not promote"),
+            "{result}"
+        );
+        // The never-promoting renderer was stopped by the rollback.
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Stopped);
+    }
+
+    #[test]
+    fn apply_ownership_change_fails_fast_without_stopping_the_other_renderer() {
+        let root = temp_dir("apply-ownership");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.clone());
+        let content = fixture_scene_path(&catalog.read().unwrap());
+
+        // Apply runs on its own thread; while it waits for promotion, the
+        // "playlist session" replaces the renderer with a different
+        // wallpaper. The apply must fail fast — not wait out a misleading
+        // timeout — and must NOT stop the renderer it no longer owns.
+        let foreign_content = content.clone();
+        let apply_thread = {
+            let handle = handle.clone();
+            let catalog = catalog.clone();
+            std::thread::spawn(move || {
+                process_with_apply(
+                    &format!(
+                        r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                        content.display()
+                    ),
+                    &handle,
+                    &catalog,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let foreign = supervisor
+            .start(StartSpec {
+                wallpaper_id: "other".into(),
+                content_hash: "foreign-hash".into(),
+                width: 320,
+                height: 180,
+                fps: 30,
+                kind: RendererKind::Scene,
+                content: Some(ContentSpec::Scene {
+                    path: foreign_content,
+                }),
+                test_fault: None,
+                stderr_lines: None,
+            })
+            .unwrap();
+        assert_eq!(foreign.requested_wallpaper_id.as_deref(), Some("other"));
+
+        let (ok, result) = apply_thread.join().expect("apply thread panicked");
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_failed");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("ownership changed"),
+            "{result}"
+        );
+        // The foreign renderer is still running: the rollback only stops
+        // the renderer it started.
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.requested_wallpaper_id.as_deref(), Some("other"));
+        assert_ne!(status.phase, WorkerPhase::Stopped);
+        assert_ne!(status.phase, WorkerPhase::Idle);
+        // Nothing was persisted.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn apply_content_mismatch_is_rejected_before_the_shell_is_touched() {
+        let catalog = scene_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.handle());
+        // A real scene.json that is NOT the catalog item's resolved content
+        // must be rejected — the renderer only runs catalog content.
+        let root = temp_dir("apply-content-mismatch");
+        let scene = root.join("scene.json");
+        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("does not match the catalog"),
+            "{result}"
+        );
+        // The shell was never probed and no renderer was started.
+        assert!(probe.scripts().is_empty());
+    }
+
+    #[test]
+    fn apply_content_path_is_bounded_at_the_params_boundary() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        let oversized = format!("/tmp/{}", "x".repeat(4096));
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                oversized
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        assert!(
+            result["detail"].as_str().unwrap().contains("characters"),
+            "{result}"
+        );
+    }
+
+    #[test]
     fn restore_without_assignment_falls_back_to_the_stock_image() {
         let catalog = empty_catalog();
         let supervisor = supervisor_service();
@@ -2636,8 +2977,14 @@ with open(args.output, "wb") as frame:
         assert!(ok);
         assert_eq!(result["mode"], "stock");
         assert_eq!(result["restored"]["wallpaper_plugin"], "org.kde.image");
+        // The last non-probe script is the restore (the verification probe
+        // runs after it and reports the stock plugin back).
         let scripts = probe.scripts();
-        let restore = scripts.last().unwrap();
+        let restore = scripts
+            .iter()
+            .rev()
+            .find(|script| !script.contains("screenForConnector"))
+            .expect("the restore script must have been evaluated");
         match result["stock_image"].as_str() {
             // A stock image present on this system was recorded and
             // scripted into the restore.
@@ -2702,7 +3049,11 @@ with open(args.output, "wb") as frame:
             "file:///usr/share/wallpapers/old.png"
         );
         let scripts = probe.scripts();
-        let restore = scripts.last().unwrap();
+        let restore = scripts
+            .iter()
+            .rev()
+            .find(|script| !script.contains("screenForConnector"))
+            .expect("the restore script must have been evaluated");
         assert!(
             restore.contains("d.writeConfig(\"Image\", \"file:///usr/share/wallpapers/old.png\")"),
             "{restore}"

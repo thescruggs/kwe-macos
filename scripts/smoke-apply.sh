@@ -37,7 +37,10 @@ socket="$smoke_root/daemon.sock"
 runtime_dir="$smoke_root/runtime"
 state_dir="$smoke_root/state"
 steam_root="$smoke_root/steam"
-scene_json="$smoke_root/scene.json"
+# The runnable scene.json lives INSIDE the fixture content root: the
+# renderer runs the catalog content, and a supplied content must match it
+# (BETA_M4a review fix 5).
+scene_json="$steam_root/steamapps/workshop/content/431960/1/scene.json"
 daemon_pid=""
 
 cleanup() {

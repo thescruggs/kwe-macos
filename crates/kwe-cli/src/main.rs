@@ -258,8 +258,11 @@ fn main() -> Result<()> {
                 .with_context(|| format!("connect to daemon {}", socket.display()))?;
             // The wallpaper.apply transaction waits (bounded) for the
             // renderer to promote before answering, so the read deadline
-            // must cover the apply promotion window (BETA_M4a).
-            stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+            // must cover the apply promotion window (BETA_M4a). The daemon
+            // allows the promotion wait up to --apply-promotion-timeout-ms
+            // = 60 s plus the bounded probes (enumerate x2 + switch), so
+            // the CLI deadline covers the configured maximum with margin.
+            stream.set_read_timeout(Some(Duration::from_secs(90)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
             serde_json::to_writer(&mut stream, &request)?;
             stream.write_all(b"\n")?;
