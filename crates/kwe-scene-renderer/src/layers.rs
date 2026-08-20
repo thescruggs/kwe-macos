@@ -275,14 +275,20 @@ pub fn clamp_layer_tint(value: f64) -> f32 {
     }
 }
 
-/// What a draw command renders (M3e). Image draws use the renderer's
+/// What a draw command renders (M3e, M3f). Image draws use the renderer's
 /// shared unit quad; text draws use the layer's per-layer vertex buffer
-/// with an explicit vertex count. The vertex data is regenerated on text /
-/// alignment / font-size change, never per frame (text.rs).
+/// with an explicit vertex count (regenerated on text / alignment /
+/// font-size change, never per frame — text.rs). Particle draws (M3f)
+/// use the system's own host-visible vertex buffer (6 verts per particle,
+/// rebuilt by the worker every fixed step that moved particles) with the
+/// same explicit count; the draw's `layer_index` is the system's texture
+/// slot (MAX_LAYERS + system_index — particles.rs), which is also how the
+/// renderer finds both the descriptor set and the vertex buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawKind {
     Image,
     Text { vertex_count: u32 },
+    Particles { vertex_count: u32 },
 }
 
 /// One layer's draw command for one frame. `m` and `t` are the model

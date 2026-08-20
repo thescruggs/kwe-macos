@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Supervised SceneScript smoke suite (BETA_M3a..M3c).
+# Supervised SceneScript smoke suite (BETA_M3a..M3f).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. The
-# scene.json + script.js fixtures (and the M3c solid-PNG images) are
-# generated at runtime and never committed, and the SceneScript engine is
-# exercised end-to-end: the frame oracle proves update() drives rendering
-# (the clear color is scripted, not the scene.json default), a throwing
-# script stays contained, and a final standalone llvmpipe lane runs the
-# worker directly under the software rasterizer with --device llvmpipe
-# (docs/BETA_M3.md). The M3c cases (a)-(f) exercise the compositor with
-# pixel oracles: two-layer composites, the src-over blend math, draw order,
-# missing-image skips, the 256-layer cap, and script-driven layer
-# transforms via Scene.getLayer. The standalone llvmpipe lane repeats the
-# scripted-color oracle AND the M3c composite/blend layer oracles, so a
+# scene.json + script.js fixtures (and the solid-PNG images) are generated
+# at runtime and never committed, and the SceneScript engine is exercised
+# end-to-end: the frame oracle proves update() drives rendering (the clear
+# color is scripted, not the scene.json default), a throwing script stays
+# contained, and a final standalone llvmpipe lane runs the worker directly
+# under the software rasterizer with --device llvmpipe (docs/BETA_M3.md).
+# The M3c cases (a)-(f) exercise the compositor with pixel oracles: two-
+# layer composites, the src-over blend math, draw order, missing-image
+# skips, the 256-layer cap, and script-driven layer transforms via
+# Scene.getLayer. The M3e text lanes are structural (the resolved font is
+# machine-dependent). The M3f particle cases (a)-(e) pin the deterministic
+# simulation (motion trail, gravity differential, the spawn cap with its
+# bounded diagnostic, the instance.count factor from script, and the
+# blend-mode differential) through region/gravity/max oracles. The
+# standalone llvmpipe lanes repeat the scripted-color oracle AND the M3c
+# composite/blend layer oracles AND the M3f particle oracles, so a
 # driver-dependent readback orientation (mirrored frames) or a broken quad
 # is caught on the CI-friendly lane.
 set -euo pipefail
@@ -923,6 +928,256 @@ json.dump(
 PY
 echo "scene smoke: M3e fixtures generated"
 
+# ---------------------------------------------------------------------------
+# M3f fixtures: particle systems (BETA_M3f). Cases (a)-(e) cover the
+# deterministic motion trail, the gravity differential, the spawn cap
+# (particles_capped), the instance.count factor from script, and the
+# blend-mode differential. Every scene is one or two particle systems over
+# a fullscreen clear; scene (0,0) = frame (80,45) (the M3c convention),
+# particles draw after the clear in object order. The particle texture is
+# the runtime-generated 8x8 solid PNG (m3f-white.png / m3f-gray.png) — the
+# same png_solid writer as M3c. All cases use opaque textures and system
+# alpha 1, so the readback premultiply is the identity (the M3c/M3d
+# convention): Normal (0) = src-over = the texture color, Add (6) =
+# min(255, texture + bg) per the researched WE semantics.
+m3f_white="$smoke_root/m3f-white.png"
+m3f_gray="$smoke_root/m3f-gray.png"
+m3f_a_scene="$smoke_root/m3f-a.json"
+m3f_b_scene="$smoke_root/m3f-b.json"
+m3f_c_scene="$smoke_root/m3f-c.json"
+m3f_d_scene="$smoke_root/m3f-d.json"
+m3f_d_script="$smoke_root/m3f-d.js"
+m3f_e_scene="$smoke_root/m3f-e.json"
+python3 - "$m3f_white" "$m3f_gray" "$m3f_a_scene" "$m3f_b_scene" "$m3f_c_scene" "$m3f_d_scene" "$m3f_d_script" "$m3f_e_scene" <<'PY'
+import json
+import struct
+import sys
+import zlib
+
+
+def png_solid(r, g, b, a=255):
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 8, 8, 8, 6, 0, 0, 0)  # 8x8, color type 6 (RGBA)
+    raw = b"".join(b"\x00" + bytes((r, g, b, a)) * 8 for _ in range(8))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+white, gray = sys.argv[1], sys.argv[2]
+open(white, "wb").write(png_solid(255, 255, 255))
+open(gray, "wb").write(png_solid(76, 76, 76))
+
+
+def scene(objects, clear=(0.0, 0.0, 0.0, 1.0), script=None):
+    general = {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30}
+    if script is not None:
+        general["script"] = script
+    return {"general": general, "objects": objects}
+
+
+def system(name, material, origin=(0.0, 0.0), **particle):
+    # The shared props (blendMode, visible, alpha, brightness — the
+    # M3c/M3d path) live on the OBJECT, not inside the "particle" dict:
+    # WE serializes them beside `particle` (corpus: colorBlendMode on
+    # image objects), and the parser reads them from there. Only the
+    # particle-definition keys stay in the dict.
+    object_props = {}
+    for key in ("blendMode", "colorBlendMode", "visible"):
+        if key in particle:
+            object_props[key] = particle.pop(key)
+    spec = {
+        "spawnRate": 100.0,
+        "life": 1.0,
+        "speed": 60.0,
+        "spread": 6.283185,  # 2pi, clamps to TAU
+        "sizeStart": 8.0,
+        "sizeEnd": 8.0,
+        "colorStart": [1.0, 1.0, 1.0, 1.0],
+        "colorEnd": [1.0, 1.0, 1.0, 1.0],
+        "alphaStart": 1.0,
+        "alphaEnd": 1.0,
+        "material": material,
+    }
+    spec.update(particle)
+    obj = {"name": name, "particle": spec, "origin": list(origin)}
+    obj.update(object_props)
+    return obj
+
+
+# (a): one deterministic trail — 100/s, life 1 s, speed 60, direction 0,
+# spread 0. Steady state: 100 particles, one per px, x in [1,60] scene px
+# (frame x 81..140), y exactly 0 (frame y 45); the 8px quads tile the band
+# [76,144]x[41,49] with no gaps (a fully covered 69x8 = 552 px rectangle;
+# 536 measured — the head and tail quads straddle the band edge).
+json.dump(
+    scene(
+        [
+            system(
+                "dust",
+                "m3f-white.png",
+                spawnRate=100.0,
+                life=1.0,
+                speed=60.0,
+                direction=0.0,
+                spread=0.0,
+            )
+        ]
+    ),
+    open(sys.argv[3], "w"),
+)
+# (b): gravity differential — blue with gravity [0,80] falls from the
+# origin; red without stays at the center. Red drawn LAST so its 8x8
+# square at the origin stays visible (fresh blue particles pass through
+# it). After 2 s: blue steady-state trail falls y = 40 t^2 (t <= 2 ->
+# y up to 160 px, clipped at the frame bottom), mean frame-y well below
+# the red 45.
+json.dump(
+    scene(
+        [
+            system(
+                "blue",
+                "m3f-white.png",
+                spawnRate=60.0,
+                life=2.0,
+                speed=0.0,
+                spread=0.0,
+                gravity=[0.0, 80.0],
+                colorStart=[0.0, 0.0, 1.0, 1.0],
+                colorEnd=[0.0, 0.0, 1.0, 1.0],
+            ),
+            system(
+                "red",
+                "m3f-white.png",
+                spawnRate=60.0,
+                life=2.0,
+                speed=0.0,
+                spread=0.0,
+                gravity=[0.0, 0.0],
+                colorStart=[1.0, 0.0, 0.0, 1.0],
+                colorEnd=[1.0, 0.0, 0.0, 1.0],
+            ),
+        ]
+    ),
+    open(sys.argv[4], "w"),
+)
+# (c): the spawn cap — 4096/s would fill 20480 over one life (5 s) but
+# maxCount 4096 (the hard cap) clamps the population; excess spawns are
+# dropped (never evicting live particles) with the one-time
+# particles_capped diagnostic. The drop policy keeps the population ONE
+# aging cohort (age spread = maxCount/spawnRate = 1 s): a dense annulus
+# sweeping outward at 30 px/s (radius ~30 t), frame-white 4k-8.4k px for
+# ~40% of every 5 s cycle — the whole-frame oracle converges quickly.
+json.dump(
+    scene(
+        [
+            system(
+                "dust",
+                "m3f-white.png",
+                spawnRate=4096.0,
+                life=5.0,
+                speed=30.0,
+                maxCount=4096,  # the WE key is an integer (floats reject)
+            )
+        ]
+    ),
+    open(sys.argv[5], "w"),
+)
+# (d): the instance.count factor from script — two identical systems at
+# origins (-50,0) and (50,0) (frame x 30 and 130), spawnRate 100, life
+# 0.5, speed 60, spread 2pi, size 4: 50 live particles each -> a ~700 px
+# sparse disc (box [0,60]x[15,75]). The script multiplies pb's count by 8
+# at t=2 s: 400 particles saturate the same disc (~2800 px), so the white
+# count ratio pb/pa climbs past 3.
+json.dump(
+    scene(
+        [
+            system(
+                "pa",
+                "m3f-white.png",
+                origin=(-50.0, 0.0),
+                spawnRate=100.0,
+                life=0.5,
+                speed=60.0,
+                sizeStart=4.0,
+                sizeEnd=4.0,
+            ),
+            system(
+                "pb",
+                "m3f-white.png",
+                origin=(50.0, 0.0),
+                spawnRate=100.0,
+                life=0.5,
+                speed=60.0,
+                sizeStart=4.0,
+                sizeEnd=4.0,
+            ),
+        ],
+        script="m3f-d.js",
+    ),
+    open(sys.argv[6], "w"),
+)
+open(sys.argv[7], "w").write(
+    "var t = 0, logged = false;\n"
+    "function update(dt) {\n"
+    "  t += dt;\n"
+    "  if (t >= 2.0 && !logged) {\n"
+    "    var pb = Scene.getParticleSystem(\"pb\");\n"
+    "    if (pb === null) throw new Error(\"particle system not registered\");\n"
+    "    pb.instance.count = 8;\n"
+    "    console.log(\"M3F-COUNT-SET \" + pb.instance.count);\n"
+    "    logged = true;\n"
+    "  }\n"
+    "}\n"
+)
+# (e): blend-mode differential over an opaque mid-gray clear (30,30,30):
+# Normal (0) is src-over — an opaque gray (76,76,76) texture draws 76
+# regardless of overlap; Add (6) is min(255, texture + bg) = 106 single,
+# 182 double-overlapped, up to 255 — the add disc's max channel value
+# clearly exceeds the normal disc's. Origins (-48,0) and (48,0) (frame x
+# 32 / 128), discs r=45 (speed 30, life 1.5): add's right edge at scene
+# x 77 stays clear of the [80,160] normal box, and the boxes' max-R
+# gates (>= 150 / <= 100) separate the modes. blendMode is an OBJECT
+# prop (the M3c/M3d shared path), hoisted by the system() helper.
+json.dump(
+    scene(
+        [
+            system(
+                "add",
+                "m3f-gray.png",
+                origin=(-48.0, 0.0),
+                spawnRate=30.0,
+                life=1.5,
+                speed=30.0,
+                blendMode=6.0,
+            ),
+            system(
+                "normal",
+                "m3f-gray.png",
+                origin=(48.0, 0.0),
+                spawnRate=30.0,
+                life=1.5,
+                speed=30.0,
+                blendMode=0.0,
+            ),
+        ],
+        clear=(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0),
+    ),
+    open(sys.argv[8], "w"),
+)
+PY
+echo "scene smoke: M3f fixtures generated"
+
 # Frame pixel oracle for the shared frame file: like scene_oracle, but for
 # one arbitrary pixel against an expected BGRA value with a tolerance
 # (driver float rounding). Reads whole, stable even generation.
@@ -1259,6 +1514,158 @@ print(
 PY
 }
 
+# M3f oracle: the gravity differential (case b) — counts the pixels within
+# tol of each of two colors in the whole frame and requires the mean FRAME
+# y of the falling system to sit below the stationary one by at least
+# mean_delta px (scene +y = frame +y, the M3c convention). Prints the
+# actuals for the acceptance record. Args: frame red_color blue_color tol
+# red_min blue_min mean_delta.
+scene_gravity_oracle() {
+    local frame_file="$1"
+    python3 - "$@" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+red_color = tuple(int(v) for v in sys.argv[2].split(","))
+blue_color = tuple(int(v) for v in sys.argv[3].split(","))
+tol, red_min, blue_min = (int(sys.argv[i]) for i in (4, 5, 6))
+mean_delta = float(sys.argv[7])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue
+        return bytes(pixels), header
+    sys.exit("frame generation never stabilized")
+
+
+pixels, header = snapshot()
+red_count = blue_count = 0
+red_y = blue_y = 0.0
+for yy in range(header["height"]):
+    i = yy * header["stride"]
+    for xx in range(header["width"]):
+        b, g, r, a = pixels[i : i + 4]
+        if max(abs(r - red_color[2]), abs(g - red_color[1]), abs(b - red_color[0])) <= tol:
+            red_count += 1
+            red_y += yy
+        elif max(abs(r - blue_color[2]), abs(g - blue_color[1]), abs(b - blue_color[0])) <= tol:
+            blue_count += 1
+            blue_y += yy
+        i += 4
+if red_count < red_min:
+    sys.exit("red %d < %d" % (red_count, red_min))
+if blue_count < blue_min:
+    sys.exit("blue %d < %d" % (blue_count, blue_min))
+red_mean = red_y / red_count
+blue_mean = blue_y / blue_count
+if red_mean - blue_mean < mean_delta:
+    sys.exit("gravity gap %.1f px < %s (red_mean_y %.1f, blue_mean_y %.1f)" % (red_mean - blue_mean, mean_delta, red_mean, blue_mean))
+print("ORACLE-OK gravity red=%d blue=%d red_mean_y=%.1f blue_mean_y=%.1f" % (red_count, blue_count, red_mean, blue_mean))
+PY
+}
+
+# M3f oracle: the maximum channel value in a box among pixels differing
+# from the background by more than tol — the blend-mode differential pin
+# (case e). Gray particle textures make all three channels equal, so the
+# R bounds alone carry the assertion. Prints the max for the acceptance
+# record. Args: frame x0 y0 w h bg tol min_r max_r.
+scene_region_max() {
+    local frame_file="$1"
+    python3 - "$@" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+x0, y0, w, h = (int(sys.argv[i]) for i in (2, 3, 4, 5))
+bg = tuple(int(v) for v in sys.argv[6].split(","))
+tol, min_r, max_r = int(sys.argv[7]), int(sys.argv[8]), int(sys.argv[9])
+
+
+def read_header(data):
+    if len(data) < 64 or data[0:8] != b"KWEFRM1\0":
+        sys.exit("bad header")
+    header = {}
+    for name, offset, fmt in (
+        ("version", 8, "<I"),
+        ("header_bytes", 12, "<I"),
+        ("total", 16, "<Q"),
+        ("width", 24, "<I"),
+        ("height", 28, "<I"),
+        ("stride", 32, "<I"),
+        ("generation", 48, "<Q"),
+        ("active", 56, "<I"),
+    ):
+        (header[name],) = struct.unpack_from(fmt, data, offset)
+    return header
+
+
+def snapshot():
+    for _ in range(64):
+        with open(path, "rb") as f:
+            data = f.read()
+        header = read_header(data)
+        if header["generation"] % 2 != 0:
+            continue
+        slot = header["active"]
+        offset = 64 + slot * header["stride"] * header["height"]
+        pixels = data[offset : offset + header["stride"] * header["height"]]
+        with open(path, "rb") as f:
+            data2 = f.read()
+        header2 = read_header(data2)
+        if header2["generation"] != header["generation"] or header2["active"] != slot:
+            continue
+        region = bytearray()
+        for yy in range(y0, y0 + h):
+            i = yy * header["stride"] + x0 * 4
+            region += pixels[i : i + w * 4]
+        return bytes(region)
+    sys.exit("frame generation never stabilized")
+
+
+region = snapshot()
+best = 0
+for p in range(0, len(region), 4):
+    b, g, r, a = region[p], region[p + 1], region[p + 2], region[p + 3]
+    if max(abs(r - bg[2]), abs(g - bg[1]), abs(b - bg[0])) > tol:
+        best = max(best, r)
+if not (min_r <= best <= max_r):
+    sys.exit("max R %d outside [%d, %d]" % (best, min_r, max_r))
+print("ORACLE-OK max R=%d" % best)
+PY
+}
+
 # Case M3c-a: two image layers — a red fullscreen under a blue 40x22 layer
 # centered at scene (60,34) (frame (140,79)). Samples: (10,10) -> (90,55)
 # red (outside the mark's [40,100]x[23,45] rect); (60,34) and (70,40) blue.
@@ -1541,6 +1948,149 @@ else
     echo "scene smoke SKIP (M3e b/c/d): no system fonts under /usr/share/fonts — text lanes need real fonts"
 fi
 
+# ---------------------------------------------------------------------------
+# M3f cases (BETA_M3f): particle systems. Same lane conventions as M3c/M3d:
+# daemon lanes sample the live shared frame file (tolerance 1); the
+# standalone llvmpipe lanes below repeat the oracles against the worker's
+# own frame file. Scene (0,0) = frame (80,45), particles draw after the
+# clear in object order; opaque textures and system alpha 1 keep the
+# readback premultiply the identity, so Normal = the texture color and
+# Add = min(255, texture + bg).
+
+# Case M3f-a: the deterministic trail — 100 particles, one per scene px,
+# x in [81,140] frame, y exactly 45: the 8px quads tile the band
+# [76,144]x[41,49] with no gaps (536 white px measured — the head and
+# tail quads straddle the band edge). The region
+# [70,35,80,20] must hold >= 450 full-white pixels with a pure-white
+# mean. Polls until the trail fills (life 1 s steady state), then asserts.
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_a_scene" \
+    '{wallpaper_id:"scene-m3f-a",content_hash:"hash-m3f-a",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_a_status="$(wait_phase live)"
+m3f_a_frame="$(jq -r '.result.frame_file' <<<"$m3f_a_status")"
+m3f_a_fg=0
+for _attempt in {1..120}; do
+    if m3f_a_probe="$(scene_region_probe "$m3f_a_frame" 70 35 80 20 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_a_fg="${m3f_a_probe#foreground=}"
+        (( m3f_a_fg >= 450 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_a_fg" -ge 450 ]]
+scene_region_oracle "$m3f_a_frame" 70 35 80 20 "0,0,0,255" "255,255,255,255" 20 30 450 450 250 255 250 255 250 255
+echo "scene smoke passed (M3f a): deterministic trail — $m3f_a_fg white px in the 69x8 band at frame y 45"
+
+# Case M3f-b: the gravity differential — the stationary red square (no
+# gravity) stays at frame y 45; the blue system (gravity [0,80]) falls
+# y = 40 t^2, so its on-screen mean frame-y sits ~15 px lower. Polls for
+# the blue column below the origin (>= 100 px), then the mean-gap oracle
+# (red_mean_y > blue_mean_y + 3, both counts bounded below). Colors are
+# in the suite's memory (B,G,R,A) order like every pixel oracle: visual
+# blue is "255,0,0,255" (B=255), visual red is "0,0,255,255" (R=255).
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_b_scene" \
+    '{wallpaper_id:"scene-m3f-b",content_hash:"hash-m3f-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_b_status="$(wait_phase live)"
+m3f_b_frame="$(jq -r '.result.frame_file' <<<"$m3f_b_status")"
+m3f_b_blue=0
+for _attempt in {1..120}; do
+    if m3f_b_probe="$(scene_region_probe "$m3f_b_frame" 60 50 40 40 "255,0,0,255" 30 2>/dev/null)"; then
+        m3f_b_blue="${m3f_b_probe#foreground=}"
+        (( m3f_b_blue >= 100 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_b_blue" -ge 100 ]]
+scene_gravity_oracle "$m3f_b_frame" "255,0,0,255" "0,0,255,255" 30 25 40 3
+echo "scene smoke passed (M3f b): gravity differential — blue fell, mean frame-y below the stationary red by > 3 px"
+
+# Case M3f-c: the spawn cap — spawnRate 4096/s would fill 20480 over one
+# life (5 s) but maxCount 4096 (the hard cap) caps the population; excess
+# spawns are dropped (live particles are never evicted) and the bounded
+# one-time diagnostic fires at the first drop (~1 s sim). The drop policy
+# keeps the population ONE aging cohort (its age spread is
+# maxCount/spawnRate = 1 s): a dense annulus sweeping outward at 30 px/s,
+# frame-white 4k-8.4k px for ~40% of every 5 s cycle — the whole-frame
+# poll converges in a few samples. (An uncapped population would fill the
+# whole 14400 px frame.)
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_c_scene" \
+    '{wallpaper_id:"scene-m3f-c",content_hash:"hash-m3f-c",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_c_status="$(wait_phase live)"
+m3f_c_frame="$(jq -r '.result.frame_file' <<<"$m3f_c_status")"
+m3f_c_fg=0
+for _attempt in {1..120}; do
+    if m3f_c_probe="$(scene_region_probe "$m3f_c_frame" 0 0 160 90 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_c_fg="${m3f_c_probe#foreground=}"
+        (( m3f_c_fg >= 4000 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_c_fg" -ge 4000 ]]
+# The bounded one-time diagnostic fires at the first dropped spawn (step
+# 60, ~1.0 s sim — well before the whole-frame poll above finishes), so
+# it is re-queried after the poll, not off the first live status.
+m3f_c_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3f_c_tail" == *"event=renderer.scene.particles_capped system=dust"* ]]
+echo "scene smoke passed (M3f c): spawn cap — 4096 of 4096/s live, particles_capped diagnostic, $m3f_c_fg px in the annulus"
+
+# Case M3f-d: the instance.count factor from script — pb.instance.count =
+# 8 at t=2 s multiplies pb's spawn rate: its disc saturates (~2800 px)
+# while pa's stays sparse (~700 px). The poll first requires pa's sparse
+# disc (>= 300 white), then the pb/pa white ratio past 3 (the switch lands
+# at t=2; a slow lane just waits longer). The script logs the clamped
+# factor through console.log — re-queried via renderer.status so the
+# t=2 log line is in the tail.
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_d_scene" \
+    '{wallpaper_id:"scene-m3f-d",content_hash:"hash-m3f-d",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_d_status="$(wait_phase live)"
+m3f_d_frame="$(jq -r '.result.frame_file' <<<"$m3f_d_status")"
+m3f_d_ratio=0
+for _attempt in {1..120}; do
+    if m3f_d_pa="$(scene_region_probe "$m3f_d_frame" 0 15 60 60 "255,255,255,255" 30 2>/dev/null)" \
+        && m3f_d_pb="$(scene_region_probe "$m3f_d_frame" 100 15 60 60 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_d_ca="${m3f_d_pa#foreground=}"
+        m3f_d_cb="${m3f_d_pb#foreground=}"
+        if (( m3f_d_ca >= 300 && m3f_d_cb > 3 * m3f_d_ca )); then
+            m3f_d_ratio=$(( m3f_d_cb * 10 / m3f_d_ca ))
+            break
+        fi
+    fi
+    sleep 0.25
+done
+[[ "$m3f_d_ratio" -ge 30 ]] || {
+    echo "M3f-d failure: ratio x10=$m3f_d_ratio (pa=$m3f_d_ca pb=$m3f_d_cb) frame=$m3f_d_frame" >&2
+    call_daemon renderer.status | jq -r '.result | "phase=\(.phase) frame_file=\(.frame_file) last_failure_detail=\(.last_failure_detail)", (.stderr_tail | join("\n"))' >&2
+    exit 1
+}
+m3f_d_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3f_d_tail" == *"M3F-COUNT-SET 8"* ]] || {
+    echo "M3f-d failure: M3F-COUNT-SET 8 not in the stderr tail; tail was:" >&2
+    printf '%s\n' "$m3f_d_tail" >&2
+    exit 1
+}
+echo "scene smoke passed (M3f d): instance.count from script — pb/pa white ratio $(( m3f_d_ratio / 10 )).$(( m3f_d_ratio % 10 )) (> 3 after count=8)"
+
+# Case M3f-e: the blend-mode differential over an opaque mid-gray clear
+# (30,30,30) — the gray (76,76,76) texture: Normal (0) is src-over, an
+# opaque texture draws 76 regardless of overlap; Add (6) is
+# min(255, texture + bg): 106 single, 182 double-overlapped, up to 255.
+# The add disc's max R sits well above the normal disc's; each box
+# [0,80]x[15,75] / [80,80]x[15,75] holds one disc (r=45 at frame x 32/128).
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_e_scene" \
+    '{wallpaper_id:"scene-m3f-e",content_hash:"hash-m3f-e",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_e_status="$(wait_phase live)"
+m3f_e_frame="$(jq -r '.result.frame_file' <<<"$m3f_e_status")"
+m3f_e_add_observed=0
+for _attempt in {1..120}; do
+    if scene_region_max "$m3f_e_frame" 0 15 80 60 "30,30,30,255" 20 150 255 >/dev/null 2>&1; then
+        m3f_e_add_observed=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_e_add_observed" == "1" ]]
+scene_region_max "$m3f_e_frame" 0 15 80 60 "30,30,30,255" 20 150 255
+scene_region_max "$m3f_e_frame" 80 15 80 60 "30,30,30,255" 20 0 100
+echo "scene smoke passed (M3f e): blend differential — add disc max R >= 150, normal disc max R <= 100"
+
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
 stopped_status="$(wait_phase stopped)"
@@ -1787,5 +2337,95 @@ if [[ -n "$m3e_any_font" ]]; then
 else
     echo "scene smoke SKIP (M3e a): no system fonts under /usr/share/fonts — text lane needs real fonts"
 fi
+
+# The M3f oracles on the llvmpipe lane: the same five cases, run directly
+# against the worker's own frame file. The canary wait (lane_start) covers
+# startup; each lane then polls its steady-state signal exactly like the
+# daemon lane above (tolerances identical — the region/gravity/max oracles
+# are structural, never byte-pins, because particle positions are
+# frame-time dependent).
+
+# (a): the deterministic trail.
+lane_start "$smoke_root/standalone-m3f-a.bin" "$m3f_a_scene" "$smoke_root/standalone-m3f-a.log"
+m3f_a_lane_fg=0
+for _attempt in {1..120}; do
+    if m3f_a_lane_probe="$(scene_region_probe "$smoke_root/standalone-m3f-a.bin" 70 35 80 20 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_a_lane_fg="${m3f_a_lane_probe#foreground=}"
+        (( m3f_a_lane_fg >= 450 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_a_lane_fg" -ge 450 ]]
+scene_region_oracle "$smoke_root/standalone-m3f-a.bin" 70 35 80 20 "0,0,0,255" "255,255,255,255" 20 30 450 450 250 255 250 255 250 255
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f a trail oracle ($m3f_a_lane_fg white px)"
+
+# (b): the gravity differential.
+lane_start "$smoke_root/standalone-m3f-b.bin" "$m3f_b_scene" "$smoke_root/standalone-m3f-b.log"
+m3f_b_lane_blue=0
+for _attempt in {1..120}; do
+    if m3f_b_lane_probe="$(scene_region_probe "$smoke_root/standalone-m3f-b.bin" 60 50 40 40 "255,0,0,255" 30 2>/dev/null)"; then
+        m3f_b_lane_blue="${m3f_b_lane_probe#foreground=}"
+        (( m3f_b_lane_blue >= 100 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_b_lane_blue" -ge 100 ]]
+scene_gravity_oracle "$smoke_root/standalone-m3f-b.bin" "255,0,0,255" "0,0,255,255" 30 25 40 3
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f b gravity oracle"
+
+# (c): the spawn cap — the diagnostic fires in the lane's own log (first
+# dropped spawn, ~1.0 s sim — after the whole-frame poll below, like the
+# daemon lane) and the annulus saturates the frame.
+lane_start "$smoke_root/standalone-m3f-c.bin" "$m3f_c_scene" "$smoke_root/standalone-m3f-c.log"
+m3f_c_lane_fg=0
+for _attempt in {1..120}; do
+    if m3f_c_lane_probe="$(scene_region_probe "$smoke_root/standalone-m3f-c.bin" 0 0 160 90 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_c_lane_fg="${m3f_c_lane_probe#foreground=}"
+        (( m3f_c_lane_fg >= 4000 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_c_lane_fg" -ge 4000 ]]
+grep -q "event=renderer.scene.particles_capped system=dust" "$smoke_root/standalone-m3f-c.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f c cap oracle ($m3f_c_lane_fg px, particles_capped diag)"
+
+# (d): the instance.count factor from script.
+lane_start "$smoke_root/standalone-m3f-d.bin" "$m3f_d_scene" "$smoke_root/standalone-m3f-d.log"
+m3f_d_lane_ratio=0
+for _attempt in {1..120}; do
+    if m3f_d_lane_pa="$(scene_region_probe "$smoke_root/standalone-m3f-d.bin" 0 15 60 60 "255,255,255,255" 30 2>/dev/null)" \
+        && m3f_d_lane_pb="$(scene_region_probe "$smoke_root/standalone-m3f-d.bin" 100 15 60 60 "255,255,255,255" 30 2>/dev/null)"; then
+        m3f_d_lane_ca="${m3f_d_lane_pa#foreground=}"
+        m3f_d_lane_cb="${m3f_d_lane_pb#foreground=}"
+        if (( m3f_d_lane_ca >= 300 && m3f_d_lane_cb > 3 * m3f_d_lane_ca )); then
+            m3f_d_lane_ratio=$(( m3f_d_lane_cb * 10 / m3f_d_lane_ca ))
+            break
+        fi
+    fi
+    sleep 0.25
+done
+[[ "$m3f_d_lane_ratio" -ge 30 ]]
+grep -q "M3F-COUNT-SET 8" "$smoke_root/standalone-m3f-d.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f d instance.count oracle (ratio $(( m3f_d_lane_ratio / 10 )).$(( m3f_d_lane_ratio % 10 )))"
+
+# (e): the blend-mode differential.
+lane_start "$smoke_root/standalone-m3f-e.bin" "$m3f_e_scene" "$smoke_root/standalone-m3f-e.log"
+m3f_e_lane_add_observed=0
+for _attempt in {1..120}; do
+    if scene_region_max "$smoke_root/standalone-m3f-e.bin" 0 15 80 60 "30,30,30,255" 20 150 255 >/dev/null 2>&1; then
+        m3f_e_lane_add_observed=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "$m3f_e_lane_add_observed" == "1" ]]
+scene_region_max "$smoke_root/standalone-m3f-e.bin" 0 15 80 60 "30,30,30,255" 20 150 255
+scene_region_max "$smoke_root/standalone-m3f-e.bin" 80 15 80 60 "30,30,30,255" 20 0 100
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f e blend differential oracle"
 
 echo "all scene smoke cases passed"

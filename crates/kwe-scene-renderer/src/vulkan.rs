@@ -32,6 +32,19 @@
 // upload is bounded (textures.rs caps) and a failed upload skips the layer
 // without touching the renderer's health.
 //
+// M3f: particle systems are CPU-simulated (particles.rs) and composited as
+// one batched draw per system — a second pipeline family (particle.vert /
+// particle.frag, stride 40: pos, uv, color, size) with one host-visible
+// vertex buffer per system, rebuilt per frame from the simulation. Each
+// system owns a descriptor slot at MAX_LAYERS + system_index (the pool and
+// the upload bound are TEXTURE_SLOT_COUNT = MAX_LAYERS + MAX_PARTICLE_SYSTEMS
+// sets), so a system's texture can never collide with a layer's. Particle
+// draws reuse the same push constants and per-mode blend variants; the
+// render dispatch picks the pipeline family and vertex source by
+// DrawKind::Particles (layer_index - MAX_LAYERS into the particle buffers).
+// The particle vertex count is bounded by the simulation cap (particles.rs:
+// at most MAX_PARTICLES × 6 verts per system, 4096 × 6 × 40 B = 983,040 B).
+//
 // Format: B8G8R8A8_UNORM when the device supports COLOR_ATTACHMENT +
 // TRANSFER_SRC in optimal tiling (the common case, and what the protocol
 // wants); otherwise R8G8B8A8_UNORM and the conversion swaps the first and
@@ -54,10 +67,17 @@ use ash::vk;
 use ash::{Device, Entry, Instance};
 
 use crate::layers::{BlendMode, DrawKind, LayerDraw, MAX_LAYERS};
+use crate::particles::MAX_PARTICLE_SYSTEMS;
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
 /// backend failure by the caller.
 pub const FENCE_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// Total descriptor-slot budget: one set per layer plus one texture set per
+/// particle system (M3f), so systems and layers never share descriptor
+/// sets. Bounded by both caps; the pool and the upload bound use this, and
+/// particle system i lives at slot MAX_LAYERS + i (see particles.rs).
+const TEXTURE_SLOT_COUNT: usize = MAX_LAYERS + MAX_PARTICLE_SYSTEMS;
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -187,6 +207,19 @@ pub struct LayerRenderer {
     pipelines: Vec<vk::Pipeline>,
     vertex_module: vk::ShaderModule,
     fragment_module: vk::ShaderModule,
+    /// M3f: the particle pipeline family — one per blend mode, same
+    /// variant ordering and shared state as `pipelines`, but built from
+    /// particle.vert/frag (stride 40: pos, uv, color, size). Selected when
+    /// the draw kind is Particles.
+    particle_pipelines: Vec<vk::Pipeline>,
+    particle_vertex_module: vk::ShaderModule,
+    particle_fragment_module: vk::ShaderModule,
+    /// M3f: one host-visible vertex buffer per particle system, rebuilt per
+    /// frame from the CPU simulation (bounded: ≤ MAX_PARTICLES × 6 × 40 B
+    /// per system). Index-aligned with the system table: system i lives at
+    /// particle_vertex_buffers[i], reached from a draw's layer_index minus
+    /// MAX_LAYERS.
+    particle_vertex_buffers: Vec<Option<LayerVertexBuffer>>,
     /// Unit quad: 6 × (pos vec2, uv vec2) — see UNIT_QUAD.
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
@@ -414,6 +447,13 @@ impl LayerRenderer {
 
         let vertex_module = shader_module(&device, QUAD_SPIRV)?;
         let fragment_module = shader_module(&device, TEXTURE_SPIRV)?;
+        // M3f: the particle pipeline family shares the descriptor layout,
+        // the render pass, and the 64-byte push constant block; its vertex
+        // input is the 40-byte per-particle vertex (pos, uv, color, size)
+        // written by the CPU simulation (see PARTICLE_VERTEX_BYTES and the
+        // binding in `new`).
+        let particle_vertex_module = shader_module(&device, PARTICLE_VERT_SPIRV)?;
+        let particle_fragment_module = shader_module(&device, PARTICLE_FRAG_SPIRV)?;
 
         // The unit quad (pos + uv). The uv origin is the image's top-left
         // corner (row 0 = the top of the picture), which in scene space
@@ -465,8 +505,10 @@ impl LayerRenderer {
             .max_lod(0.25); // single mip level: the LOD clamps to 0
         let sampler = unsafe { device.create_sampler(&sampler_info, None) }?;
 
-        // Per-layer descriptor sets: at most MAX_LAYERS, one combined image
-        // sampler each (the bounded table the draw list indexes into).
+        // Per-layer descriptor sets: one combined image sampler each, at
+        // most TEXTURE_SLOT_COUNT — MAX_LAYERS layers plus one set per
+        // particle system (M3f), the bounded table the draw list indexes
+        // into (a particle system's texture lives at MAX_LAYERS + i).
         let set_layout_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -478,14 +520,15 @@ impl LayerRenderer {
             unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }?;
         let pool_size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(MAX_LAYERS as u32);
+            .descriptor_count(TEXTURE_SLOT_COUNT as u32);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             // FREE_DESCRIPTOR_SET: M3e re-uploads a text layer's atlas in
             // place on rebuild, freeing the previous set — without the
             // flag, vkFreeDescriptorSets is a no-op and the bounded pool
-            // (MAX_LAYERS sets) would exhaust after MAX_LAYERS rebuilds.
+            // (TEXTURE_SLOT_COUNT sets) would exhaust after that many
+            // rebuilds.
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(MAX_LAYERS as u32)
+            .max_sets(TEXTURE_SLOT_COUNT as u32)
             .pool_sizes(std::slice::from_ref(&pool_size));
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
 
@@ -595,6 +638,76 @@ impl LayerRenderer {
             pipelines.push(pipeline);
         }
 
+        // M3f: the particle pipeline family — same variant ordering and
+        // per-mode blend state, but with the particle vertex input (one
+        // 40-byte vertex: pos.xy @ 0, uv.xy @ 8, color.rgba @ 16, size @
+        // 32 — the layout particles.rs::build_vertex_bytes writes). The
+        // draw loop selects this family for DrawKind::Particles.
+        let particle_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(particle_vertex_module)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(particle_fragment_module)
+                .name(c"main"),
+        ];
+        let particle_binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(40)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let particle_attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(8),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32G32B32A32_SFLOAT)
+                .offset(16),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(3)
+                .format(vk::Format::R32_SFLOAT)
+                .offset(32),
+        ];
+        let particle_vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&particle_binding))
+            .vertex_attribute_descriptions(&particle_attributes);
+        let mut particle_pipelines = Vec::with_capacity(BlendMode::ALL.len());
+        for mode in BlendMode::ALL {
+            let blend_attachment = blend_attachment_for(mode);
+            let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&particle_stages)
+                .vertex_input_state(&particle_vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .color_blend_state(&color_blend)
+                .layout(pipeline_layout)
+                .render_pass(render_pass)
+                .subpass(0)
+                .depth_stencil_state(&depth_stencil);
+            let pipeline = match unsafe {
+                device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            } {
+                Ok(pipelines) => pipelines[0],
+                Err((_, result)) => return Err(result.into()),
+            };
+            particle_pipelines.push(pipeline);
+        }
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -628,6 +741,10 @@ impl LayerRenderer {
             pipelines,
             vertex_module,
             fragment_module,
+            particle_pipelines,
+            particle_vertex_module,
+            particle_fragment_module,
+            particle_vertex_buffers: Vec::new(),
             vertex_buffer,
             vertex_buffer_memory,
             sampler,
@@ -664,9 +781,10 @@ impl LayerRenderer {
         width: u32,
         height: u32,
     ) -> Result<(), RenderError> {
-        if index >= MAX_LAYERS {
+        if index >= TEXTURE_SLOT_COUNT {
             return Err(RenderError::Vulkan(format!(
-                "layer index {index} beyond the {MAX_LAYERS} layer cap"
+                "layer index {index} beyond the {TEXTURE_SLOT_COUNT} texture-slot cap \
+                 ({MAX_LAYERS} layers + {MAX_PARTICLE_SYSTEMS} particle systems)"
             )));
         }
         let expected = width as usize * height as usize * 4;
@@ -1015,6 +1133,62 @@ impl LayerRenderer {
         Ok(())
     }
 
+    /// Upload one particle system's vertex data (M3f): 6 verts per particle
+    /// of {pos.xy, uv.xy, color.rgba, size, pad} — the stride-40 layout
+    /// particles.rs::build_vertex_bytes writes, rebuilt every frame the
+    /// simulation changes. Host-visible create-or-grow like the text
+    /// buffers; `bytes` is bounded by the simulation cap (≤ MAX_PARTICLES
+    /// × 6 × 40 B per system), so a system's buffer never grows past
+    /// 983,040 B. A failed allocation returns an error the caller treats
+    /// like a failed texture upload (system draw skipped, renderer
+    /// healthy).
+    pub fn upload_particle_vertices(
+        &mut self,
+        index: usize,
+        bytes: &[u8],
+    ) -> Result<(), RenderError> {
+        while self.particle_vertex_buffers.len() <= index {
+            self.particle_vertex_buffers.push(None);
+        }
+        let entry = self.particle_vertex_buffers[index].get_or_insert_with(|| LayerVertexBuffer {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            bytes: 0,
+        });
+        if entry.bytes < bytes.len() {
+            if entry.buffer != vk::Buffer::null() {
+                unsafe { self.device.destroy_buffer(entry.buffer, None) };
+                unsafe { self.device.free_memory(entry.memory, None) };
+            }
+            let size = bytes.len().max(64) as vk::DeviceSize;
+            let info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = unsafe { self.device.create_buffer(&info, None) }?;
+            let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+            let memory =
+                allocate_host_visible(&self.instance, &self.device, self.physical, &requirements)?;
+            unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
+            entry.buffer = buffer;
+            entry.memory = memory;
+            entry.bytes = size as usize;
+        }
+        let mapped = unsafe {
+            self.device.map_memory(
+                entry.memory,
+                0,
+                bytes.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+        }?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+            self.device.unmap_memory(entry.memory);
+        }
+        Ok(())
+    }
+
     /// Clear the attachment with `color` (straight RGBA), draw the given
     /// layers in order (scene.json order, src-over blending), read the
     /// pixels back, and return them premultiplied BGRA. In-flight 1: a
@@ -1067,11 +1241,18 @@ impl LayerRenderer {
             // variant index is always in range). Binding inside the pass
             // per draw is what makes per-layer blend modes work.
             let variant = draw.blend_mode.variant_index();
+            // M3f: the pipeline family follows the draw kind — particle
+            // draws bind the particle variant (same per-mode blend state,
+            // different shaders and vertex input).
+            let pipeline = match draw.kind {
+                DrawKind::Particles { .. } => self.particle_pipelines[variant],
+                _ => self.pipelines[variant],
+            };
             unsafe {
                 self.device.cmd_bind_pipeline(
                     self.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines[variant],
+                    pipeline,
                 );
             }
             // The push constant layout (shared by both stages, 64 bytes):
@@ -1117,11 +1298,12 @@ impl LayerRenderer {
                     std::slice::from_ref(&set),
                     &[],
                 );
-                // M3e: the vertex source depends on the draw kind — image
-                // draws use the shared unit quad, text draws bind the
-                // layer's own quad buffer (geometry rebuilt on change,
-                // never per frame). Binding inside the pass per draw is
-                // what makes the per-layer vertex data work.
+                // M3e/M3f: the vertex source depends on the draw kind —
+                // image draws use the shared unit quad, text draws bind
+                // the layer's own quad buffer (geometry rebuilt on change,
+                // never per frame), particle draws bind the system's
+                // per-frame vertex buffer. Binding inside the pass per
+                // draw is what makes the per-layer vertex data work.
                 let vertex_count = match draw.kind {
                     DrawKind::Image => {
                         self.device.cmd_bind_vertex_buffers(
@@ -1150,6 +1332,28 @@ impl LayerRenderer {
                         else {
                             // Defense: the draw list builder already skips
                             // text layers without vertex data.
+                            continue;
+                        };
+                        self.device.cmd_bind_vertex_buffers(
+                            self.command_buffer,
+                            0,
+                            std::slice::from_ref(&buffer.buffer),
+                            &[0],
+                        );
+                        vertex_count
+                    }
+                    // M3f: particle systems bind their own per-frame vertex
+                    // buffer (rebuild-on-change, never per draw); the draw
+                    // list builder only emits these for systems with live
+                    // vertices and an uploaded texture, so the missing
+                    // buffer branch is a defense.
+                    DrawKind::Particles { vertex_count } => {
+                        let system = draw.layer_index.saturating_sub(MAX_LAYERS);
+                        let Some(buffer) = self
+                            .particle_vertex_buffers
+                            .get(system)
+                            .and_then(|slot| slot.as_ref())
+                        else {
                             continue;
                         };
                         self.device.cmd_bind_vertex_buffers(
@@ -1380,6 +1584,19 @@ impl Drop for LayerRenderer {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
+            // M3f: per-system particle vertex buffers and the particle
+            // pipeline family.
+            for buffer in self.particle_vertex_buffers.iter().flatten() {
+                self.device.destroy_buffer(buffer.buffer, None);
+                self.device.free_memory(buffer.memory, None);
+            }
+            for pipeline in &self.particle_pipelines {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
+            self.device
+                .destroy_shader_module(self.particle_fragment_module, None);
+            self.device
+                .destroy_shader_module(self.particle_vertex_module, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -1524,6 +1741,154 @@ fn shader_module(device: &Device, code: &[u32]) -> Result<vk::ShaderModule, Rend
     let info = vk::ShaderModuleCreateInfo::default().code(code);
     unsafe { device.create_shader_module(&info, None) }.map_err(Into::into)
 }
+
+/// The M3f particle vertex shader: pos + uv + color + size per vertex,
+/// transformed by the shared push-constant model (world = mat2(m0.xy,
+/// m1.xy)·pos + (m0.z, m1.z); NDC = world × 2 / viewport; NO y-flip
+/// — see quad.vert for the orientation contract). Compiled with
+/// glslangValidator -V --target-env vulkan1.2 from shaders/particle.vert.
+#[rustfmt::skip]
+const PARTICLE_VERT_SPIRV: &[u32] = &[
+    0x07230203, 0x00010500, 0x0008000b, 0x0000004d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x000d000f, 0x00000000, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000023, 0x0000003c,
+    0x00000044, 0x00000045, 0x00000047, 0x00000049, 0x0000004c, 0x00030003, 0x00000002, 0x000001c2,
+    0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000009, 0x6c726f77, 0x00000064,
+    0x00030005, 0x0000000b, 0x00004350, 0x00040006, 0x0000000b, 0x00000000, 0x0000306d, 0x00040006,
+    0x0000000b, 0x00000001, 0x0000316d, 0x00060006, 0x0000000b, 0x00000002, 0x77656976, 0x74726f70,
+    0x00000000, 0x00030005, 0x0000000d, 0x00006370, 0x00040005, 0x00000023, 0x736f5061, 0x00000000,
+    0x00030005, 0x0000002f, 0x0063646e, 0x00060005, 0x0000003a, 0x505f6c67, 0x65567265, 0x78657472,
+    0x00000000, 0x00060006, 0x0000003a, 0x00000000, 0x505f6c67, 0x7469736f, 0x006e6f69, 0x00070006,
+    0x0000003a, 0x00000001, 0x505f6c67, 0x746e696f, 0x657a6953, 0x00000000, 0x00070006, 0x0000003a,
+    0x00000002, 0x435f6c67, 0x4470696c, 0x61747369, 0x0065636e, 0x00070006, 0x0000003a, 0x00000003,
+    0x435f6c67, 0x446c6c75, 0x61747369, 0x0065636e, 0x00030005, 0x0000003c, 0x00000000, 0x00030005,
+    0x00000044, 0x00565576, 0x00030005, 0x00000045, 0x00565561, 0x00040005, 0x00000047, 0x6c6f4376,
+    0x0000726f, 0x00040005, 0x00000049, 0x6c6f4361, 0x0000726f, 0x00040005, 0x0000004c, 0x7a695361,
+    0x00000065, 0x00030047, 0x0000000b, 0x00000002, 0x00050048, 0x0000000b, 0x00000000, 0x00000023,
+    0x00000000, 0x00050048, 0x0000000b, 0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x0000000b,
+    0x00000002, 0x00000023, 0x00000020, 0x00040047, 0x00000023, 0x0000001e, 0x00000000, 0x00030047,
+    0x0000003a, 0x00000002, 0x00050048, 0x0000003a, 0x00000000, 0x0000000b, 0x00000000, 0x00050048,
+    0x0000003a, 0x00000001, 0x0000000b, 0x00000001, 0x00050048, 0x0000003a, 0x00000002, 0x0000000b,
+    0x00000003, 0x00050048, 0x0000003a, 0x00000003, 0x0000000b, 0x00000004, 0x00040047, 0x00000044,
+    0x0000001e, 0x00000000, 0x00040047, 0x00000045, 0x0000001e, 0x00000001, 0x00040047, 0x00000047,
+    0x0000001e, 0x00000001, 0x00040047, 0x00000049, 0x0000001e, 0x00000002, 0x00040047, 0x0000004c,
+    0x0000001e, 0x00000003, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000002, 0x00040020, 0x00000008,
+    0x00000007, 0x00000007, 0x00040017, 0x0000000a, 0x00000006, 0x00000004, 0x0005001e, 0x0000000b,
+    0x0000000a, 0x0000000a, 0x0000000a, 0x00040020, 0x0000000c, 0x00000009, 0x0000000b, 0x0004003b,
+    0x0000000c, 0x0000000d, 0x00000009, 0x00040015, 0x0000000e, 0x00000020, 0x00000001, 0x0004002b,
+    0x0000000e, 0x0000000f, 0x00000000, 0x00040020, 0x00000010, 0x00000009, 0x0000000a, 0x0004002b,
+    0x0000000e, 0x00000014, 0x00000001, 0x00040018, 0x00000018, 0x00000007, 0x00000002, 0x0004002b,
+    0x00000006, 0x00000019, 0x3f800000, 0x0004002b, 0x00000006, 0x0000001a, 0x00000000, 0x00040020,
+    0x00000022, 0x00000001, 0x00000007, 0x0004003b, 0x00000022, 0x00000023, 0x00000001, 0x00040015,
+    0x00000026, 0x00000020, 0x00000000, 0x0004002b, 0x00000026, 0x00000027, 0x00000002, 0x00040020,
+    0x00000028, 0x00000009, 0x00000006, 0x0004002b, 0x00000006, 0x00000031, 0x40000000, 0x0004002b,
+    0x0000000e, 0x00000033, 0x00000002, 0x0004002b, 0x00000026, 0x00000038, 0x00000001, 0x0004001c,
+    0x00000039, 0x00000006, 0x00000038, 0x0006001e, 0x0000003a, 0x0000000a, 0x00000006, 0x00000039,
+    0x00000039, 0x00040020, 0x0000003b, 0x00000003, 0x0000003a, 0x0004003b, 0x0000003b, 0x0000003c,
+    0x00000003, 0x00040020, 0x00000041, 0x00000003, 0x0000000a, 0x00040020, 0x00000043, 0x00000003,
+    0x00000007, 0x0004003b, 0x00000043, 0x00000044, 0x00000003, 0x0004003b, 0x00000022, 0x00000045,
+    0x00000001, 0x0004003b, 0x00000041, 0x00000047, 0x00000003, 0x00040020, 0x00000048, 0x00000001,
+    0x0000000a, 0x0004003b, 0x00000048, 0x00000049, 0x00000001, 0x00040020, 0x0000004b, 0x00000001,
+    0x00000006, 0x0004003b, 0x0000004b, 0x0000004c, 0x00000001, 0x00050036, 0x00000002, 0x00000004,
+    0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000008, 0x00000009, 0x00000007,
+    0x0004003b, 0x00000008, 0x0000002f, 0x00000007, 0x00050041, 0x00000010, 0x00000011, 0x0000000d,
+    0x0000000f, 0x0004003d, 0x0000000a, 0x00000012, 0x00000011, 0x0007004f, 0x00000007, 0x00000013,
+    0x00000012, 0x00000012, 0x00000000, 0x00000001, 0x00050041, 0x00000010, 0x00000015, 0x0000000d,
+    0x00000014, 0x0004003d, 0x0000000a, 0x00000016, 0x00000015, 0x0007004f, 0x00000007, 0x00000017,
+    0x00000016, 0x00000016, 0x00000000, 0x00000001, 0x00050051, 0x00000006, 0x0000001b, 0x00000013,
+    0x00000000, 0x00050051, 0x00000006, 0x0000001c, 0x00000013, 0x00000001, 0x00050051, 0x00000006,
+    0x0000001d, 0x00000017, 0x00000000, 0x00050051, 0x00000006, 0x0000001e, 0x00000017, 0x00000001,
+    0x00050050, 0x00000007, 0x0000001f, 0x0000001b, 0x0000001c, 0x00050050, 0x00000007, 0x00000020,
+    0x0000001d, 0x0000001e, 0x00050050, 0x00000018, 0x00000021, 0x0000001f, 0x00000020, 0x0004003d,
+    0x00000007, 0x00000024, 0x00000023, 0x00050091, 0x00000007, 0x00000025, 0x00000021, 0x00000024,
+    0x00060041, 0x00000028, 0x00000029, 0x0000000d, 0x0000000f, 0x00000027, 0x0004003d, 0x00000006,
+    0x0000002a, 0x00000029, 0x00060041, 0x00000028, 0x0000002b, 0x0000000d, 0x00000014, 0x00000027,
+    0x0004003d, 0x00000006, 0x0000002c, 0x0000002b, 0x00050050, 0x00000007, 0x0000002d, 0x0000002a,
+    0x0000002c, 0x00050081, 0x00000007, 0x0000002e, 0x00000025, 0x0000002d, 0x0003003e, 0x00000009,
+    0x0000002e, 0x0004003d, 0x00000007, 0x00000030, 0x00000009, 0x0005008e, 0x00000007, 0x00000032,
+    0x00000030, 0x00000031, 0x00050041, 0x00000010, 0x00000034, 0x0000000d, 0x00000033, 0x0004003d,
+    0x0000000a, 0x00000035, 0x00000034, 0x0007004f, 0x00000007, 0x00000036, 0x00000035, 0x00000035,
+    0x00000000, 0x00000001, 0x00050088, 0x00000007, 0x00000037, 0x00000032, 0x00000036, 0x0003003e,
+    0x0000002f, 0x00000037, 0x0004003d, 0x00000007, 0x0000003d, 0x0000002f, 0x00050051, 0x00000006,
+    0x0000003e, 0x0000003d, 0x00000000, 0x00050051, 0x00000006, 0x0000003f, 0x0000003d, 0x00000001,
+    0x00070050, 0x0000000a, 0x00000040, 0x0000003e, 0x0000003f, 0x0000001a, 0x00000019, 0x00050041,
+    0x00000041, 0x00000042, 0x0000003c, 0x0000000f, 0x0003003e, 0x00000042, 0x00000040, 0x0004003d,
+    0x00000007, 0x00000046, 0x00000045, 0x0003003e, 0x00000044, 0x00000046, 0x0004003d, 0x0000000a,
+    0x0000004a, 0x00000049, 0x0003003e, 0x00000047, 0x0000004a, 0x000100fd, 0x00010038,
+];
+
+/// The M3f particle fragment shader: sample the system texture,
+/// multiply by the per-particle color carried in the vertex attributes
+/// (instance factors folded in on the CPU), apply the M3d effects
+/// (brightness × tint), scale alpha by the pushed layer alpha.
+/// Compiled with glslangValidator -V --target-env vulkan1.2 from
+/// shaders/particle.frag.
+#[rustfmt::skip]
+const PARTICLE_FRAG_SPIRV: &[u32] = &[
+    0x07230203, 0x00010500, 0x0008000b, 0x0000004c, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x000a000f, 0x00000004, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000d, 0x00000011, 0x00000015,
+    0x0000001b, 0x0000003e, 0x00030010, 0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001c2,
+    0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000009, 0x00000063, 0x00030005,
+    0x0000000d, 0x00786574, 0x00030005, 0x00000011, 0x00565576, 0x00040005, 0x00000015, 0x6c6f4376,
+    0x0000726f, 0x00030005, 0x00000019, 0x00004350, 0x00040006, 0x00000019, 0x00000000, 0x0000306d,
+    0x00040006, 0x00000019, 0x00000001, 0x0000316d, 0x00060006, 0x00000019, 0x00000002, 0x77656976,
+    0x74726f70, 0x00000000, 0x00050006, 0x00000019, 0x00000003, 0x65666665, 0x00737463, 0x00030005,
+    0x0000001b, 0x00006370, 0x00050005, 0x0000003e, 0x4374756f, 0x726f6c6f, 0x00000000, 0x00040047,
+    0x0000000d, 0x00000021, 0x00000000, 0x00040047, 0x0000000d, 0x00000022, 0x00000000, 0x00040047,
+    0x00000011, 0x0000001e, 0x00000000, 0x00040047, 0x00000015, 0x0000001e, 0x00000001, 0x00030047,
+    0x00000019, 0x00000002, 0x00050048, 0x00000019, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+    0x00000019, 0x00000001, 0x00000023, 0x00000010, 0x00050048, 0x00000019, 0x00000002, 0x00000023,
+    0x00000020, 0x00050048, 0x00000019, 0x00000003, 0x00000023, 0x00000030, 0x00040047, 0x0000003e,
+    0x0000001e, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00030016,
+    0x00000006, 0x00000020, 0x00040017, 0x00000007, 0x00000006, 0x00000004, 0x00040020, 0x00000008,
+    0x00000007, 0x00000007, 0x00090019, 0x0000000a, 0x00000006, 0x00000001, 0x00000000, 0x00000000,
+    0x00000000, 0x00000001, 0x00000000, 0x0003001b, 0x0000000b, 0x0000000a, 0x00040020, 0x0000000c,
+    0x00000000, 0x0000000b, 0x0004003b, 0x0000000c, 0x0000000d, 0x00000000, 0x00040017, 0x0000000f,
+    0x00000006, 0x00000002, 0x00040020, 0x00000010, 0x00000001, 0x0000000f, 0x0004003b, 0x00000010,
+    0x00000011, 0x00000001, 0x00040020, 0x00000014, 0x00000001, 0x00000007, 0x0004003b, 0x00000014,
+    0x00000015, 0x00000001, 0x0006001e, 0x00000019, 0x00000007, 0x00000007, 0x00000007, 0x00000007,
+    0x00040020, 0x0000001a, 0x00000009, 0x00000019, 0x0004003b, 0x0000001a, 0x0000001b, 0x00000009,
+    0x00040015, 0x0000001c, 0x00000020, 0x00000001, 0x0004002b, 0x0000001c, 0x0000001d, 0x00000003,
+    0x00040015, 0x0000001e, 0x00000020, 0x00000000, 0x0004002b, 0x0000001e, 0x0000001f, 0x00000000,
+    0x00040020, 0x00000020, 0x00000009, 0x00000006, 0x00040017, 0x00000023, 0x00000006, 0x00000003,
+    0x00040020, 0x00000027, 0x00000007, 0x00000006, 0x0004002b, 0x0000001e, 0x0000002a, 0x00000001,
+    0x0004002b, 0x0000001e, 0x0000002d, 0x00000002, 0x00040020, 0x00000030, 0x00000009, 0x00000007,
+    0x00040020, 0x0000003d, 0x00000003, 0x00000007, 0x0004003b, 0x0000003d, 0x0000003e, 0x00000003,
+    0x0004002b, 0x0000001e, 0x00000041, 0x00000003, 0x0004002b, 0x0000001c, 0x00000044, 0x00000001,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
+    0x00000008, 0x00000009, 0x00000007, 0x0004003d, 0x0000000b, 0x0000000e, 0x0000000d, 0x0004003d,
+    0x0000000f, 0x00000012, 0x00000011, 0x00050057, 0x00000007, 0x00000013, 0x0000000e, 0x00000012,
+    0x0003003e, 0x00000009, 0x00000013, 0x0004003d, 0x00000007, 0x00000016, 0x00000015, 0x0004003d,
+    0x00000007, 0x00000017, 0x00000009, 0x00050085, 0x00000007, 0x00000018, 0x00000017, 0x00000016,
+    0x0003003e, 0x00000009, 0x00000018, 0x00060041, 0x00000020, 0x00000021, 0x0000001b, 0x0000001d,
+    0x0000001f, 0x0004003d, 0x00000006, 0x00000022, 0x00000021, 0x0004003d, 0x00000007, 0x00000024,
+    0x00000009, 0x0008004f, 0x00000023, 0x00000025, 0x00000024, 0x00000024, 0x00000000, 0x00000001,
+    0x00000002, 0x0005008e, 0x00000023, 0x00000026, 0x00000025, 0x00000022, 0x00050041, 0x00000027,
+    0x00000028, 0x00000009, 0x0000001f, 0x00050051, 0x00000006, 0x00000029, 0x00000026, 0x00000000,
+    0x0003003e, 0x00000028, 0x00000029, 0x00050041, 0x00000027, 0x0000002b, 0x00000009, 0x0000002a,
+    0x00050051, 0x00000006, 0x0000002c, 0x00000026, 0x00000001, 0x0003003e, 0x0000002b, 0x0000002c,
+    0x00050041, 0x00000027, 0x0000002e, 0x00000009, 0x0000002d, 0x00050051, 0x00000006, 0x0000002f,
+    0x00000026, 0x00000002, 0x0003003e, 0x0000002e, 0x0000002f, 0x00050041, 0x00000030, 0x00000031,
+    0x0000001b, 0x0000001d, 0x0004003d, 0x00000007, 0x00000032, 0x00000031, 0x0008004f, 0x00000023,
+    0x00000033, 0x00000032, 0x00000032, 0x00000001, 0x00000002, 0x00000003, 0x0004003d, 0x00000007,
+    0x00000034, 0x00000009, 0x0008004f, 0x00000023, 0x00000035, 0x00000034, 0x00000034, 0x00000000,
+    0x00000001, 0x00000002, 0x00050085, 0x00000023, 0x00000036, 0x00000035, 0x00000033, 0x00050041,
+    0x00000027, 0x00000037, 0x00000009, 0x0000001f, 0x00050051, 0x00000006, 0x00000038, 0x00000036,
+    0x00000000, 0x0003003e, 0x00000037, 0x00000038, 0x00050041, 0x00000027, 0x00000039, 0x00000009,
+    0x0000002a, 0x00050051, 0x00000006, 0x0000003a, 0x00000036, 0x00000001, 0x0003003e, 0x00000039,
+    0x0000003a, 0x00050041, 0x00000027, 0x0000003b, 0x00000009, 0x0000002d, 0x00050051, 0x00000006,
+    0x0000003c, 0x00000036, 0x00000002, 0x0003003e, 0x0000003b, 0x0000003c, 0x0004003d, 0x00000007,
+    0x0000003f, 0x00000009, 0x0008004f, 0x00000023, 0x00000040, 0x0000003f, 0x0000003f, 0x00000000,
+    0x00000001, 0x00000002, 0x00050041, 0x00000027, 0x00000042, 0x00000009, 0x00000041, 0x0004003d,
+    0x00000006, 0x00000043, 0x00000042, 0x00060041, 0x00000020, 0x00000045, 0x0000001b, 0x00000044,
+    0x00000041, 0x0004003d, 0x00000006, 0x00000046, 0x00000045, 0x00050085, 0x00000006, 0x00000047,
+    0x00000043, 0x00000046, 0x00050051, 0x00000006, 0x00000048, 0x00000040, 0x00000000, 0x00050051,
+    0x00000006, 0x00000049, 0x00000040, 0x00000001, 0x00050051, 0x00000006, 0x0000004a, 0x00000040,
+    0x00000002, 0x00070050, 0x00000007, 0x0000004b, 0x00000048, 0x00000049, 0x0000004a, 0x00000047,
+    0x0003003e, 0x0000003e, 0x0000004b, 0x000100fd, 0x00010038,
+];
 
 /// The M3c layer-quad vertex shader: the unit quad (pos, uv) transformed
 /// by the per-layer push-constant model matrix; compiled with

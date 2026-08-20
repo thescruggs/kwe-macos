@@ -6,9 +6,9 @@
 // (`general.clearcolor`) or referenced from it (`general.script`, resolved
 // relative to the scene's content root). Unknown keys are tolerated so that
 // real wallpaper packages never make the worker reject a scene; the M3c
-// slice interprets the root `objects` array as image layers (models,
-// particles, audio, text and the `effects`/`properties` sections stay
-// M3d+).
+// slice interprets the root `objects` array as image layers, M3e as text
+// layers, M3f as particle systems (models, audio, and the
+// `effects`/`properties` sections stay M3d+).
 //
 // Every read is bounded: the scene.json file is capped at 16 MiB (the daemon's
 // preflight uses the same bound) and the referenced script at 2 MiB.
@@ -21,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
+use crate::particles;
 use crate::text::{HorizontalAlign, VerticalAlign};
 use crate::textures::DecodedTexture;
 
@@ -108,13 +109,27 @@ pub struct SceneConfig {
     pub fps: Option<f32>,
     /// The `objects` array interpreted as image and text layers, in
     /// scene.json order (M3c image, M3e text). Every other object kind
-    /// (models, particles, audio — M3d+) is ignored. The loader resolves
-    /// and decodes each layer's `image` and fills `texture`.
+    /// (models, audio — M3d+) is ignored. The loader resolves and decodes
+    /// each layer's `image` and fills `texture`.
     pub layers: Vec<LayerSpec>,
+    /// The `objects` array interpreted as particle systems (M3f), in
+    /// scene.json order. The loader resolves and decodes each system's
+    /// material and fills `texture`.
+    pub particles: Vec<ParticleSpec>,
     /// Text objects skipped because the scene declares more than
     /// text::MAX_TEXT_LAYERS of them. Never a rejection — the extra layers
     /// just do not register; counted for the worker's one-time diagnostic.
     pub text_layer_skips: usize,
+    /// Particle systems skipped because the scene declares more than
+    /// particles::MAX_PARTICLE_SYSTEMS of them (counted for the worker's
+    /// one-time diagnostic; the particle pool is separate from the layer
+    /// cap).
+    pub particle_system_skips: usize,
+    /// Particle objects whose `particle` value is a string — an external
+    /// particle definition file (a researched WE feature). The M3f parse
+    /// registers such systems with all defaults (the file-level definition
+    /// merge is planned); counted for the worker's one-time diagnostic.
+    pub particle_file_refs: usize,
     /// Objects carrying both `image` and `text` (image wins per the M3c
     /// rule; counted for the worker's one-time diagnostic).
     pub text_on_image_objects: usize,
@@ -179,6 +194,85 @@ pub struct LayerSpec {
     /// text path: a per-layer glyph atlas + a quad whose vertex data the
     /// worker rebuilds on change (text.rs).
     pub text: Option<TextSpec>,
+}
+
+/// One `objects` entry interpreted as a particle system (M3f). The
+/// classification key is `particle`, checked after `image` and before
+/// `text` — the researched WE order (image, sound, particle, text): an
+/// object value is an inline definition, a string is a reference to an
+/// external particle definition file (counted and registered with
+/// defaults — the merge is planned).
+///
+/// WE describes particle systems with a component model (emitter /
+/// initializer / operator / renderer arrays — researched from
+/// docs.wallpaperengine.io, recorded in the M3f doc section); M3f
+/// implements a flat subset of the emitter surface with documented
+/// defaults. A real WE particle object therefore parses with all defaults
+/// (the component-model parse is planned); every scalar below is
+/// property-wrapped like the M3c fields, and out-of-range values CLAMP to
+/// the documented ranges (the M3f task contract — deviating from layer
+/// property strictness, recorded in the matrix).
+#[derive(Debug, Clone)]
+pub struct ParticleSpec {
+    /// The script's identity (`Scene.getParticleSystem(name)`; also
+    /// reachable through Scene.getLayer, WE-style).
+    pub name: String,
+    /// Spawn position in scene units; (0,0) = scene center, +y down. The
+    /// object's `angles`/`scale` are parsed (shared props) but NOT applied
+    /// in M3f — particle systems render world-space (documented deviation;
+    /// the system transform is planned).
+    pub origin: [f32; 2],
+    /// Particles per second, 0..=4096, default 10.
+    pub spawn_rate: f32,
+    /// Seconds, 0.1..=60, default 1.0.
+    pub life: f32,
+    /// Launch speed range in px/s, 0..=1e6, default 0. `speedMin`/
+    /// `speedMax` win over a bare `speed`; the pair normalizes (min ≤ max).
+    pub speed_min: f32,
+    pub speed_max: f32,
+    /// Launch direction in radians from +x (y down), default 0. WE
+    /// emitters have no direction/spread fields (velocity comes from the
+    /// velocity-random initializer) — the flat model is the M3f extension
+    /// the deterministic smoke oracles need (documented deviation).
+    pub direction: f32,
+    /// Launch angle spread in radians, 0..=2π, default 0 (all particles
+    /// take the exact direction).
+    pub spread: f32,
+    /// Acceleration in px/s², ±1e6, default [0, 0]. A scalar applies to y
+    /// (down); arrays take 1..=3 components.
+    pub gravity: [f32; 2],
+    /// Quad endpoints in px, 1..=512, default 8; interpolated over life.
+    pub size_start: f32,
+    pub size_end: f32,
+    /// RGBA straight-alpha, 0..=1 each (3 components imply alpha 1),
+    /// default white; interpolated over life.
+    pub color_start: [f32; 4],
+    pub color_end: [f32; 4],
+    /// Alpha endpoints 0..=1, default 1 → 0 (particles fade out).
+    pub alpha_start: f32,
+    pub alpha_end: f32,
+    /// `material` is the WE texture key; the brief's `texture` wins when
+    /// both are present. Raw reference exactly as written; `None` when
+    /// present but not a string (the system registers and simulates, but
+    /// draws nothing — skipped at load with a bounded diagnostic).
+    pub material: Option<String>,
+    /// Live-particle cap, 1..=particles::MAX_PARTICLES, default 1000
+    /// (documented deviation from WE's 100). Excess spawns drop, never
+    /// evict live particles (particles.rs).
+    pub max_count: u32,
+    /// `blendMode`/`colorBlendMode` exactly as written, pre-clamp (the
+    /// runtime clamps to the implemented set like every layer).
+    pub blend_mode: u32,
+    /// Object alpha 0..=1 (default 1) — the drawn alpha; read-only in M3f
+    /// (the script surface covers the instance factors only).
+    pub alpha: f32,
+    pub visible: bool,
+    /// Brightness 0..=10 (default 1) — drawn effects; read-only in M3f.
+    pub brightness: f32,
+    /// Decoded texture, filled by the loader (main.rs); `None` when the
+    /// material is missing, unreadable, over budget, or not decodable —
+    /// the system stays registered but draws nothing.
+    pub texture: Option<DecodedTexture>,
 }
 
 /// One `objects` entry interpreted as a text layer (M3e). Field names
@@ -288,7 +382,7 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
     let clear_color = parse_clear_color(general)?;
     let resolution = parse_resolution(general)?;
     let fps = parse_fps(general)?;
-    let (layers, counts) = parse_objects(root_obj)?;
+    let (layers, particles, counts) = parse_objects(root_obj)?;
 
     let script_reference = match general.get("script") {
         None | Some(Value::Null) => None,
@@ -309,42 +403,55 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
         resolution,
         fps,
         layers,
+        particles,
         text_layer_skips: counts.text_layer_skips,
+        particle_system_skips: counts.particle_system_skips,
+        particle_file_refs: counts.particle_file_refs,
         text_on_image_objects: counts.text_on_image_objects,
         text_size_ignored: counts.text_size_ignored,
     })
 }
 
-/// Bounded counts the parser collects while interpreting `objects` (M3e):
-/// never rejections, only one-time worker diagnostics.
+/// Bounded counts the parser collects while interpreting `objects` (M3e,
+/// M3f): never rejections, only one-time worker diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObjectCounts {
     pub text_layer_skips: usize,
     pub text_on_image_objects: usize,
     pub text_size_ignored: usize,
+    /// Particle objects past particles::MAX_PARTICLE_SYSTEMS (skipped).
+    pub particle_system_skips: usize,
+    /// Particle objects whose `particle` value is a string — external
+    /// particle definition file references (registered with defaults; the
+    /// file-level merge is planned).
+    pub particle_file_refs: usize,
 }
 
-/// The `objects` array, interpreted as image (M3c) and text (M3e) layers
-/// in scene.json order (the compositor's draw order — the layer on top is
-/// drawn last, over the others). An object is an image layer exactly when
-/// it carries an `image` field; a text layer exactly when it carries a
-/// `text` field without `image` (an object with both counts as image —
+/// The `objects` array, interpreted as image (M3c), particle (M3f), and
+/// text (M3e) layers in scene.json order (the compositor's draw order —
+/// the layer on top is drawn last, over the others). An object is an image
+/// layer exactly when it carries an `image` field; a particle system
+/// exactly when it carries a `particle` field without `image` (classified
+/// after image, before text — the researched WE order: image, sound,
+/// particle, text); a text layer exactly when it carries a `text` field
+/// without `image` (an object with both counts as image —
 /// `text_on_image_objects` — and an object with neither is ignored:
-/// models, particles, audio — M3d+). A reference that ends in `.json` is a
-/// model instance under the WE solid-model architecture (620 of the 685
-/// corpus image references point at model files; the other 65 carry a null
-/// image value) — skipped BEFORE any validation, so a malformed model
-/// layer (no name, out-of-range alpha, ...) can never reject the scene,
-/// and it is not counted toward the layer cap, until models arrive (M3h).
+/// models, audio — M3d+). A reference that ends in `.json` is a model
+/// instance under the WE solid-model architecture (620 of the 685 corpus
+/// image references point at model files; the other 65 carry a null image
+/// value) — skipped BEFORE any validation, so a malformed model layer (no
+/// name, out-of-range alpha, ...) can never reject the scene, and it is
+/// not counted toward the layer cap, until models arrive (M3h).
 ///
 /// Text layers beyond text::MAX_TEXT_LAYERS are skipped (counted, never a
-/// rejection); both caps (MAX_TEXT_LAYERS and MAX_LAYERS) apply to the
-/// layers that register.
+/// rejection); particle systems beyond particles::MAX_PARTICLE_SYSTEMS are
+/// skipped the same way. The layer caps (MAX_TEXT_LAYERS and MAX_LAYERS)
+/// apply to the layers that register; the particle pool is separate.
 fn parse_objects(
     root_obj: &serde_json::Map<String, Value>,
-) -> Result<(Vec<LayerSpec>, ObjectCounts), SceneError> {
+) -> Result<(Vec<LayerSpec>, Vec<ParticleSpec>, ObjectCounts), SceneError> {
     let Some(value) = root_obj.get("objects") else {
-        return Ok((Vec::new(), ObjectCounts::default()));
+        return Ok((Vec::new(), Vec::new(), ObjectCounts::default()));
     };
     let array = value.as_array().ok_or_else(|| {
         SceneError::new(
@@ -353,6 +460,7 @@ fn parse_objects(
         )
     })?;
     let mut layers = Vec::new();
+    let mut particles = Vec::new();
     let mut text_layers = 0usize;
     let mut counts = ObjectCounts::default();
     for (index, entry) in array.iter().enumerate() {
@@ -379,6 +487,22 @@ fn parse_objects(
             }
             let layer = parse_image_layer(object, index)?;
             layers.push(layer);
+        } else if object.contains_key("particle") {
+            // A particle system (M3f), classified after image and before
+            // text per the researched WE order. A string `particle` value
+            // is a reference to an external particle definition file (a WE
+            // feature): counted for the worker's one-time diagnostic; the
+            // system registers with all defaults (the file-level
+            // definition merge is planned). Systems past the cap are
+            // skipped (counted, never a rejection).
+            if particles.len() >= particles::MAX_PARTICLE_SYSTEMS {
+                counts.particle_system_skips += 1;
+                continue;
+            }
+            if property_value(object.get("particle").expect("caller checked")).is_string() {
+                counts.particle_file_refs += 1;
+            }
+            particles.push(parse_particle_system(object, index)?);
         } else if object.contains_key("text") {
             if text_layers >= crate::text::MAX_TEXT_LAYERS {
                 counts.text_layer_skips += 1;
@@ -391,7 +515,7 @@ fn parse_objects(
             }
             layers.push(layer);
         } else {
-            continue; // particles, audio, ... — M3d+
+            continue; // audio, ... — M3d+
         }
     }
     if layers.len() > MAX_LAYERS {
@@ -403,7 +527,7 @@ fn parse_objects(
             ),
         ));
     }
-    Ok((layers, counts))
+    Ok((layers, particles, counts))
 }
 
 /// The layer properties image (M3c) and text (M3e) layers share: name,
@@ -770,6 +894,236 @@ fn parse_text_layer(
             has_size,
         }),
     })
+}
+
+/// A particle spec with every flat emitter-model field at its documented
+/// default (common props land from the shared parse path).
+fn particle_spec_defaults(common: CommonProps) -> ParticleSpec {
+    ParticleSpec {
+        name: common.name,
+        origin: common.origin,
+        spawn_rate: particles::DEFAULT_PARTICLE_SPAWN_RATE,
+        life: particles::DEFAULT_PARTICLE_LIFE,
+        speed_min: particles::DEFAULT_PARTICLE_SPEED,
+        speed_max: particles::DEFAULT_PARTICLE_SPEED,
+        direction: particles::DEFAULT_PARTICLE_DIRECTION,
+        spread: particles::DEFAULT_PARTICLE_SPREAD,
+        gravity: particles::DEFAULT_PARTICLE_GRAVITY,
+        size_start: particles::DEFAULT_PARTICLE_SIZE,
+        size_end: particles::DEFAULT_PARTICLE_SIZE,
+        color_start: [1.0, 1.0, 1.0, 1.0],
+        color_end: [1.0, 1.0, 1.0, 1.0],
+        alpha_start: particles::DEFAULT_PARTICLE_ALPHA_START,
+        alpha_end: particles::DEFAULT_PARTICLE_ALPHA_END,
+        material: None,
+        max_count: particles::DEFAULT_PARTICLE_MAX_COUNT,
+        blend_mode: common.blend_mode,
+        alpha: common.alpha,
+        visible: common.visible,
+        brightness: common.brightness,
+        texture: None,
+    }
+}
+
+/// One particle system entry (M3f). The `particle` value is the
+/// definition: an object of flat emitter-model fields, or — the WE
+/// external particle file form (a string) / any malformed value — the
+/// system registers with all documented defaults (skip never reject; the
+/// file-level merge is planned). Scalar fields are property-wrapped like
+/// every M3c scalar and accept numeric strings (the corpus editor
+/// serialization); missing or non-finite values take the documented
+/// default and out-of-range values CLAMP to the documented ranges — the
+/// M3f task contract, deviating from the layer properties' strict
+/// rejection (recorded in the coverage matrix). The WE component model
+/// keys (emitter/initializer/operator/renderer/controlpoint/children/
+/// flags/...) are tolerated extra keys that parse to nothing in M3f.
+fn parse_particle_system(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<ParticleSpec, SceneError> {
+    let common = parse_common_props(object, index, "particle")?;
+    let mut spec = particle_spec_defaults(common);
+    let Value::Object(definition) = property_value(object.get("particle").expect("caller checked"))
+    else {
+        return Ok(spec); // file reference or malformed value: defaults
+    };
+
+    // A bounded float-or-numeric-string scalar (the brightness style):
+    // missing/non-finite -> the default, out-of-range -> the clamp.
+    let scalar = |name: &str, fallback: f64, clamp: fn(f64) -> f32| -> Result<f32, SceneError> {
+        let Some(value) = definition.get(name) else {
+            return Ok(clamp(fallback));
+        };
+        let value = property_value(value);
+        let number = if let Some(number) = value.as_f64() {
+            number
+        } else if let Some(text) = value.as_str() {
+            text.parse::<f64>().map_err(|_| {
+                SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be a float or a numeric string",
+                        field(index, name)
+                    ),
+                )
+            })?
+        } else {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!(
+                    "scene.json \"{}\" must be a float or a numeric string",
+                    field(index, name)
+                ),
+            ));
+        };
+        Ok(clamp(number))
+    };
+
+    spec.spawn_rate = scalar(
+        "spawnRate",
+        f64::from(particles::DEFAULT_PARTICLE_SPAWN_RATE),
+        particles::clamp_spawn_rate,
+    )?;
+    spec.life = scalar(
+        "life",
+        f64::from(particles::DEFAULT_PARTICLE_LIFE),
+        particles::clamp_life,
+    )?;
+    // `speedMin`/`speedMax` win over a bare `speed`; a missing `speedMax`
+    // falls back to the resolved minimum (the pair supersedes `speed` —
+    // [90, 100] from `speed: 100, speedMin: 90` would silently stretch the
+    // range), and a reversed pair normalizes so min <= max (the runtime
+    // picks in [min, max]).
+    let speed = scalar(
+        "speed",
+        f64::from(particles::DEFAULT_PARTICLE_SPEED),
+        particles::clamp_speed,
+    )?;
+    let speed_min = scalar("speedMin", f64::from(speed), particles::clamp_speed)?;
+    let speed_max = scalar("speedMax", f64::from(speed_min), particles::clamp_speed)?;
+    let (speed_min, speed_max) = if speed_min <= speed_max {
+        (speed_min, speed_max)
+    } else {
+        (speed_max, speed_min)
+    };
+    spec.speed_min = speed_min;
+    spec.speed_max = speed_max;
+    spec.direction = scalar(
+        "direction",
+        f64::from(particles::DEFAULT_PARTICLE_DIRECTION),
+        particles::clamp_direction,
+    )?;
+    spec.spread = scalar(
+        "spread",
+        f64::from(particles::DEFAULT_PARTICLE_SPREAD),
+        particles::clamp_spread,
+    )?;
+    spec.size_start = scalar(
+        "sizeStart",
+        f64::from(particles::DEFAULT_PARTICLE_SIZE),
+        particles::clamp_size,
+    )?;
+    spec.size_end = scalar(
+        "sizeEnd",
+        f64::from(particles::DEFAULT_PARTICLE_SIZE),
+        particles::clamp_size,
+    )?;
+    spec.alpha_start = scalar(
+        "alphaStart",
+        f64::from(particles::DEFAULT_PARTICLE_ALPHA_START),
+        particles::clamp_alpha,
+    )?;
+    spec.alpha_end = scalar(
+        "alphaEnd",
+        f64::from(particles::DEFAULT_PARTICLE_ALPHA_END),
+        particles::clamp_alpha,
+    )?;
+
+    // gravity: arrays take 1..=3 components ([g] -> [0, g], the extra z is
+    // dropped); scalar shapes reject like every WE vector (parse_vector) —
+    // the scalar fields clamp, the vector fields keep the M3c behavior,
+    // documented in the matrix.
+    spec.gravity = match definition.get("gravity") {
+        None => particles::DEFAULT_PARTICLE_GRAVITY,
+        Some(value) => {
+            let vector = parse_vector(
+                property_value(value),
+                &field(index, "gravity"),
+                &[1, 2, 3],
+                false,
+            )?;
+            match vector.as_slice() {
+                [g] => [0.0, *g],
+                [x, y] => [*x, *y],
+                [x, y, _] => [*x, *y],
+                _ => unreachable!("parse_vector enforces the allowed lengths"),
+            }
+        }
+    };
+
+    spec.color_start = parse_particle_color(definition, "colorStart", index)?;
+    spec.color_end = parse_particle_color(definition, "colorEnd", index)?;
+
+    // maxCount (the WE key): the live-particle cap, 1..=MAX_PARTICLES.
+    if let Some(value) = definition.get("maxCount") {
+        let value = property_value(value);
+        let count = if let Some(number) = value.as_u64() {
+            number
+        } else if let Some(text) = value.as_str() {
+            text.parse::<u64>().map_err(|_| {
+                SceneError::new(
+                    SceneErrorKind::Shape,
+                    format!(
+                        "scene.json \"{}\" must be an integer or a numeric string",
+                        field(index, "maxCount")
+                    ),
+                )
+            })?
+        } else {
+            return Err(SceneError::new(
+                SceneErrorKind::Shape,
+                format!(
+                    "scene.json \"{}\" must be an integer or a numeric string",
+                    field(index, "maxCount")
+                ),
+            ));
+        };
+        spec.max_count = particles::clamp_max_count(count);
+    }
+
+    // `material` is the WE texture key; the brief's `texture` wins when
+    // both are present. A non-string value is None — the system registers
+    // and simulates, but draws nothing (skipped at load like a non-string
+    // layer image).
+    let material = definition
+        .get("texture")
+        .or_else(|| definition.get("material"));
+    spec.material = match material.map(property_value) {
+        Some(Value::String(reference)) => Some(reference.clone()),
+        _ => None,
+    };
+
+    Ok(spec)
+}
+
+/// Parse one particle color field (M3f): a vec3/vec4 in the WE vector
+/// forms (array or space-separated string, property-wrapped allowed), each
+/// component clamped 0..=1 like the layer tint; 3 components imply alpha
+/// 1.0. Missing -> opaque white.
+fn parse_particle_color(
+    definition: &serde_json::Map<String, Value>,
+    name: &str,
+    index: usize,
+) -> Result<[f32; 4], SceneError> {
+    let Some(value) = definition.get(name) else {
+        return Ok([1.0, 1.0, 1.0, 1.0]);
+    };
+    let vector = parse_vector(property_value(value), &field(index, name), &[3, 4], false)?;
+    let mut color = [1.0, 1.0, 1.0, 1.0];
+    for (slot, component) in color.iter_mut().zip(vector.iter()) {
+        *slot = particles::clamp_color_component(f64::from(*component));
+    }
+    Ok(color)
 }
 
 /// OWE align_or_default for one axis: the `key` value (property-wrapped
@@ -1634,7 +1988,14 @@ mod tests {
     fn parse_objects_of(json: &str) -> Result<Vec<LayerSpec>, SceneError> {
         let value: Value = serde_json::from_str(json).unwrap();
         let root = value.as_object().unwrap();
-        parse_objects(root).map(|(layers, _)| layers)
+        parse_objects(root).map(|(layers, _, _)| layers)
+    }
+
+    /// Like parse_objects_of, but returning the particle systems (M3f).
+    fn parse_particles_of(json: &str) -> Result<Vec<ParticleSpec>, SceneError> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        let root = value.as_object().unwrap();
+        parse_objects(root).map(|(_, particles, _)| particles)
     }
 
     #[test]
@@ -2130,7 +2491,7 @@ mod tests {
         objects.push_str("]}");
         let value: Value = serde_json::from_str(&objects).unwrap();
         let root = value.as_object().unwrap();
-        let (layers, counts) = parse_objects(root).unwrap();
+        let (layers, _, counts) = parse_objects(root).unwrap();
         assert_eq!(layers.len(), MAX_TEXT_LAYERS + 1); // 16 text + 1 image
         assert!(layers[MAX_TEXT_LAYERS].text.is_none()); // "both" is an image layer
         assert_eq!(layers[MAX_TEXT_LAYERS].image.as_deref(), Some("a.png"));
@@ -2170,5 +2531,313 @@ mod tests {
         assert_eq!(config.layers.len(), 1);
         assert_eq!(config.layers[0].image.as_deref(), Some("textures/bg.png"));
         assert!(config.layers[0].texture.is_none());
+    }
+
+    // ---- M3f: particle systems ----
+
+    #[test]
+    fn particle_systems_parsed_with_documented_defaults() {
+        // A bare particle object: every flat emitter-model field takes its
+        // documented default (spawnRate 10, life 1.0, speed 0, direction 0,
+        // spread 0, gravity [0,0], size 8/8, white, alpha 1->0, maxCount
+        // 1000) and the shared common props (origin, alpha, visible,
+        // blendMode, brightness) land like every other layer kind.
+        let particles =
+            parse_particles_of(r#"{"objects": [{"name": "dust", "particle": {}}]}"#).unwrap();
+        assert_eq!(particles.len(), 1);
+        let spec = &particles[0];
+        assert_eq!(spec.name, "dust");
+        assert_eq!(spec.origin, [0.0, 0.0]);
+        assert_eq!(spec.spawn_rate, particles::DEFAULT_PARTICLE_SPAWN_RATE);
+        assert_eq!(spec.life, particles::DEFAULT_PARTICLE_LIFE);
+        assert_eq!(spec.speed_min, 0.0);
+        assert_eq!(spec.speed_max, 0.0);
+        assert_eq!(spec.direction, 0.0);
+        assert_eq!(spec.spread, 0.0);
+        assert_eq!(spec.gravity, [0.0, 0.0]);
+        assert_eq!(spec.size_start, 8.0);
+        assert_eq!(spec.size_end, 8.0);
+        assert_eq!(spec.color_start, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(spec.color_end, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(spec.alpha_start, 1.0);
+        assert_eq!(spec.alpha_end, 0.0);
+        assert_eq!(spec.max_count, 1000);
+        assert_eq!(spec.material, None);
+        assert_eq!(spec.blend_mode, 0);
+        assert_eq!(spec.alpha, 1.0);
+        assert!(spec.visible);
+        assert_eq!(spec.brightness, 1.0);
+        assert!(spec.texture.is_none());
+
+        // Common props parse like every layer kind.
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {},
+                              "origin": "40 20 0", "alpha": 0.5,
+                              "visible": false, "colorBlendMode": 6,
+                              "brightness": "2.5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].origin, [40.0, 20.0]);
+        assert_eq!(particles[0].alpha, 0.5);
+        assert!(!particles[0].visible);
+        assert_eq!(particles[0].blend_mode, 6);
+        assert_eq!(particles[0].brightness, 2.5);
+    }
+
+    #[test]
+    fn particle_flat_emitter_fields_parsed_with_clamps() {
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {
+                "spawnRate": 100,
+                "life": 3.0,
+                "speed": 60,
+                "speedMin": 10,
+                "speedMax": 90,
+                "direction": 1.5,
+                "spread": 2.0,
+                "gravity": [0, 80],
+                "sizeStart": 4,
+                "sizeEnd": 16,
+                "colorStart": "1 0 0",
+                "colorEnd": [0, 1, 0, 0.5],
+                "alphaStart": 1,
+                "alphaEnd": 0.25,
+                "maxCount": 500,
+                "material": "textures/dot.png"
+            }}]}"#,
+        )
+        .unwrap();
+        let spec = &particles[0];
+        assert_eq!(spec.spawn_rate, 100.0);
+        assert_eq!(spec.life, 3.0);
+        assert_eq!(spec.speed_min, 10.0);
+        assert_eq!(spec.speed_max, 90.0);
+        assert_eq!(spec.direction, 1.5);
+        assert_eq!(spec.spread, 2.0);
+        assert_eq!(spec.gravity, [0.0, 80.0]);
+        assert_eq!(spec.size_start, 4.0);
+        assert_eq!(spec.size_end, 16.0);
+        assert_eq!(spec.color_start, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(spec.color_end, [0.0, 1.0, 0.0, 0.5]);
+        assert_eq!(spec.alpha_start, 1.0);
+        assert_eq!(spec.alpha_end, 0.25);
+        assert_eq!(spec.max_count, 500);
+        assert_eq!(spec.material.as_deref(), Some("textures/dot.png"));
+
+        // Clamps: spawnRate 9999 -> 4096, life 0 -> 0.1, size 0.5 -> 1,
+        // colors out of range -> 0..=1, maxCount 1e9 -> 4096.
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {
+                "spawnRate": 9999, "life": 0, "sizeStart": 0.5,
+                "sizeEnd": 9999, "colorStart": [2, -1, 0.5],
+                "maxCount": 1000000000
+            }}]}"#,
+        )
+        .unwrap();
+        let spec = &particles[0];
+        assert_eq!(spec.spawn_rate, particles::MAX_PARTICLE_SPAWN_RATE);
+        assert_eq!(spec.life, particles::MIN_PARTICLE_LIFE);
+        assert_eq!(spec.size_start, particles::MIN_PARTICLE_SIZE);
+        assert_eq!(spec.size_end, particles::MAX_PARTICLE_SIZE);
+        assert_eq!(spec.color_start, [1.0, 0.0, 0.5, 1.0]);
+        assert_eq!(spec.max_count, particles::MAX_PARTICLES as u32);
+    }
+
+    #[test]
+    fn particle_speed_precedence_and_normalization() {
+        // speedMin/speedMax win over a bare `speed`; a reversed pair
+        // normalizes.
+        let particles = parse_particles_of(
+            r#"{"objects": [
+                {"name": "a", "particle": {"speed": 60}},
+                {"name": "b", "particle": {"speed": 1, "speedMin": 10, "speedMax": 20}},
+                {"name": "c", "particle": {"speed": 100, "speedMin": 90}},
+                {"name": "d", "particle": {"speedMin": 80, "speedMax": 20}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].speed_min, 60.0);
+        assert_eq!(particles[0].speed_max, 60.0);
+        assert_eq!(particles[1].speed_min, 10.0);
+        assert_eq!(particles[1].speed_max, 20.0);
+        assert_eq!(particles[2].speed_min, 90.0);
+        assert_eq!(
+            particles[2].speed_max, 90.0,
+            "missing max falls back to speed"
+        );
+        assert_eq!(particles[3].speed_min, 20.0, "reversed pair normalizes");
+        assert_eq!(particles[3].speed_max, 80.0);
+    }
+
+    #[test]
+    fn particle_scalar_forms_and_gravity_shapes() {
+        // Numeric strings (the corpus editor serialization) and wrapped
+        // values are accepted; gravity takes 1..=3 components (z dropped) —
+        // scalar shapes reject like every WE vector.
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {
+                "spawnRate": {"user": "rate", "value": "250"},
+                "life": "1.5"
+            }}]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].spawn_rate, 250.0);
+        assert_eq!(particles[0].life, 1.5);
+        assert_eq!(particles[0].gravity, [0.0, 0.0]);
+        let scalar_error =
+            parse_particles_of(r#"{"objects": [{"name": "dust", "particle": {"gravity": 100}}]}"#)
+                .unwrap_err();
+        assert_eq!(scalar_error.kind, SceneErrorKind::Shape);
+        let particles = parse_particles_of(
+            r#"{"objects": [
+                {"name": "a", "particle": {"gravity": "0 100 0"}},
+                {"name": "b", "particle": {"gravity": [5, -5]}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].gravity, [0.0, 100.0]);
+        assert_eq!(particles[1].gravity, [5.0, -5.0]);
+        // Out-of-range vector components reject like every WE vector.
+        let error = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {"gravity": [1e12, 0]}}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        // A non-numeric scalar rejects like brightness.
+        let error = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {"spawnRate": "fast"}}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    #[test]
+    fn particle_texture_precedence_and_non_string() {
+        // `texture` (the brief's key) wins over `material` (the WE key);
+        // a non-string value is None (registered, draws nothing).
+        let particles = parse_particles_of(
+            r#"{"objects": [
+                {"name": "a", "particle": {"texture": "t.png", "material": "m.png"}},
+                {"name": "b", "particle": {"material": "m.png"}},
+                {"name": "c", "particle": {"material": 42}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].material.as_deref(), Some("t.png"));
+        assert_eq!(particles[1].material.as_deref(), Some("m.png"));
+        assert_eq!(particles[2].material, None);
+    }
+
+    #[test]
+    fn particle_file_references_register_with_defaults() {
+        // A string `particle` value is an external particle definition
+        // file (researched WE feature): counted for the worker's one-time
+        // diagnostic, the system registers with all defaults — the merge
+        // is planned. Never a rejection.
+        let json = r#"{"objects": [{"name": "dust", "particle": "particles/dust.json"}]}"#;
+        let value: Value = serde_json::from_str(json).unwrap();
+        let root = value.as_object().unwrap();
+        let (_, particles, counts) = parse_objects(root).unwrap();
+        assert_eq!(particles.len(), 1);
+        assert_eq!(particles[0].name, "dust");
+        assert_eq!(particles[0].spawn_rate, 10.0);
+        assert_eq!(counts.particle_file_refs, 1);
+        assert_eq!(counts.particle_system_skips, 0);
+    }
+
+    #[test]
+    fn particle_system_cap_counts_skips() {
+        // Systems past particles::MAX_PARTICLE_SYSTEMS are skipped and
+        // counted (never a rejection); the pool is separate from the layer
+        // cap — 16 particle systems plus 256 image layers still parses.
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..particles::MAX_PARTICLE_SYSTEMS {
+            objects.push_str(&format!(r#"{{"name": "p{i}", "particle": {{}}}},"#));
+        }
+        objects.push_str(r#"{"name": "extra", "particle": {}}"#);
+        objects.push_str(r#",{"name": "l0", "image": "a.png"}"#);
+        objects.push_str("]}");
+        let value: Value = serde_json::from_str(&objects).unwrap();
+        let root = value.as_object().unwrap();
+        let (layers, particles, counts) = parse_objects(root).unwrap();
+        assert_eq!(particles.len(), particles::MAX_PARTICLE_SYSTEMS);
+        assert_eq!(counts.particle_system_skips, 1);
+        assert_eq!(layers.len(), 1);
+        // The layer cap is untouched by the particle pool: 256 layers plus
+        // 16 systems together.
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..MAX_LAYERS {
+            objects.push_str(&format!(r#"{{"name": "l{i}", "image": "t.png"}},"#));
+        }
+        for i in 0..particles::MAX_PARTICLE_SYSTEMS {
+            objects.push_str(&format!(r#"{{"name": "p{i}", "particle": {{}}}},"#));
+        }
+        objects.pop();
+        objects.push_str("]}");
+        let value: Value = serde_json::from_str(&objects).unwrap();
+        let root = value.as_object().unwrap();
+        let (layers, particles, _) = parse_objects(root).unwrap();
+        assert_eq!(layers.len(), MAX_LAYERS);
+        assert_eq!(particles.len(), particles::MAX_PARTICLE_SYSTEMS);
+    }
+
+    #[test]
+    fn particle_classification_order_image_then_particle_then_text() {
+        // The researched WE order: image, sound, particle, text. An object
+        // with image + particle counts as an image layer; an object with
+        // particle + text counts as a particle system; text-only as text.
+        let json = r#"{"objects": [
+            {"name": "a", "image": "a.png", "particle": {}},
+            {"name": "b", "particle": {}, "text": "hi"},
+            {"name": "c", "text": "hi"},
+            {"name": "d", "audio": "s.mp3"}
+        ]}"#;
+        let value: Value = serde_json::from_str(json).unwrap();
+        let root = value.as_object().unwrap();
+        let (layers, particles, counts) = parse_objects(root).unwrap();
+        assert_eq!(layers.len(), 2, "a (image wins) and c (text)");
+        assert_eq!(layers[0].name, "a");
+        assert!(layers[0].text.is_none());
+        assert_eq!(layers[1].name, "c");
+        assert_eq!(particles.len(), 1);
+        assert_eq!(particles[0].name, "b");
+        assert_eq!(counts.text_on_image_objects, 0);
+    }
+
+    #[test]
+    fn particle_malformed_common_props_reject_like_layers() {
+        // Shared props follow the layer strictness (name required, alpha
+        // 0..=1, visible bool, ...); the emitter fields clamp instead.
+        let error = parse_particles_of(r#"{"objects": [{"particle": {}}]}"#).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+        assert!(error.message.contains("name"), "{}", error.message);
+        let error =
+            parse_particles_of(r#"{"objects": [{"name": "p", "particle": {}, "alpha": 2.0}]}"#)
+                .unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    #[test]
+    fn pkg_scene_carries_particle_systems() {
+        // The pkg lane parses the same `objects` array; material references
+        // resolve against the package table at load, not here.
+        let dir = tmpdir();
+        let scene_json = br#"{"objects": [{"name": "dust", "particle": {
+            "spawnRate": 50, "material": "textures/dot.png"}}]}"#;
+        let entries = pkg_entries(
+            &dir,
+            &build_pkg(&[
+                ("scene.json", scene_json),
+                ("textures/dot.png", b"TEXV0005"),
+            ]),
+        );
+        let config = SceneConfig::parse_pkg(scene_json, &entries).unwrap();
+        assert_eq!(config.particles.len(), 1);
+        assert_eq!(config.particles[0].spawn_rate, 50.0);
+        assert_eq!(
+            config.particles[0].material.as_deref(),
+            Some("textures/dot.png")
+        );
+        assert!(config.particles[0].texture.is_none());
     }
 }

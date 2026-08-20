@@ -40,6 +40,25 @@
 //   Layer.tint        {r,g,b,a} RGBA multiplier, 0..=1, default 1s
 // Changing a layer's image at runtime is planned, not in M3c. See the
 // coverage matrix in docs/SCENE_FORMAT_V1.md for implemented vs planned.
+//
+// The M3f slice adds particle systems (researched WE surface with the
+// documented deviations recorded in docs/SCENE_FORMAT_V1.md):
+//   Scene.getParticleSystem(name | index) -> ParticleSystem proxy or null
+//       (the task-mandated M3f extension; WE has no such call — particle
+//       systems are reached through thisScene.getLayer, and M3f preserves
+//       that behavior: layer indices >= Scene.getLayerCount() dispatch to
+//       particle systems, matching WE's combined object index space)
+//   Scene.getParticleSystemCount() -> number of registered systems
+// with writable emitter properties (spawnRate, life, speedMin, speedMax,
+// direction, spread, gravity, sizeStart, sizeEnd, colorStart, colorEnd,
+// alphaStart, alphaEnd, maxCount, blendMode), layer properties (alpha,
+// brightness, visible), the WE IParticleSystemInstance factors
+// (instance.count/speed/lifetime/size/alpha/rate/colorn — the WE
+// spelling of "colorn" is intentional), and the WE IParticleSystem
+// controls play()/pause()/stop()/isPlaying()/emitParticles(count).
+// Every write is clamped at the bridge (non-finite -> documented default
+// or identity 1.0); an out-of-range index is a no-op or a default value,
+// never an error.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -54,6 +73,7 @@ use crate::layers::{
     BlendMode, LayerState, clamp_layer_alpha, clamp_layer_brightness, clamp_layer_scalar,
     clamp_layer_size, clamp_layer_tint,
 };
+use crate::particles::{self, ParticleSystemState};
 use crate::scene::SceneConfig;
 use crate::text::{
     HorizontalAlign, MAX_FONT_PX, MAX_TEXT_CHARS, MIN_FONT_PX, VerticalAlign, truncate_chars,
@@ -389,7 +409,21 @@ pub struct ScriptEngine {
     /// Bounded one-time diagnostic for script writes of an over-long text
     /// (M3e): the string is truncated to MAX_TEXT_CHARS chars.
     text_truncate_diag: Rc<Cell<bool>>,
+    /// M3f: runtime particle-system states in scene.json object order,
+    /// built from the parsed spec before the script loads (init() sees
+    /// the resolved systems). Scripts mutate them through the
+    /// Scene.getParticleSystem proxies (and the WE-compatible getLayer
+    /// fallback at indices >= layer count); every write is clamped at the
+    /// bridge, and playback controls go through the system methods. The
+    /// worker simulates them per frame (particles.rs) for the draw list.
+    particles: Vec<Rc<RefCell<ParticleSystemState>>>,
+    /// Bounded one-time diagnostic for script writes of an unimplemented
+    /// particle blendMode (same contract as the layer's blend_mode_diag).
+    particle_blend_mode_diag: Rc<Cell<bool>>,
     script_ok: bool,
+    /// Whether the scene configured a script file at all (a scriptless
+    /// scene is not an error — step() falls through to NoUpdate).
+    has_script: bool,
     last_update: Option<Instant>,
     frames: u64,
     stats: ScriptStats,
@@ -435,7 +469,9 @@ impl ScriptEngine {
     /// Build the per-worker runtime/context, evaluate the scene's script, and
     /// call init()/resized() if the script defines them. Script exceptions
     /// are contained: `script_ok` goes false, the renderer keeps rendering
-    /// the scene.json clear color, and the exception is logged once.
+    /// the scene.json clear color, and the exception is logged once. A
+    /// scene with NO script file is not an error: step() falls through to
+    /// NoUpdate (M3f — scriptless particle scenes still simulate).
     pub fn new(
         config: &SceneConfig,
         width: u32,
@@ -466,6 +502,16 @@ impl ScriptEngine {
             .map(|spec| Rc::new(RefCell::new(LayerState::from_spec(spec))))
             .collect();
 
+        // M3f: particle systems in scene.json object order. The seed mixes
+        // in the system index, so the same spec at different indices
+        // simulates differently (and identically across runs).
+        let particles = config
+            .particles
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| Rc::new(RefCell::new(ParticleSystemState::from_spec(spec, index))))
+            .collect();
+
         let mut engine = Self {
             runtime,
             context,
@@ -479,7 +525,10 @@ impl ScriptEngine {
             layers,
             blend_mode_diag: Rc::new(Cell::new(false)),
             text_truncate_diag: Rc::new(Cell::new(false)),
+            particles,
+            particle_blend_mode_diag: Rc::new(Cell::new(false)),
             script_ok: false,
+            has_script: config.script_path.is_some(),
             last_update: None,
             frames: 0,
             stats: ScriptStats::default(),
@@ -511,6 +560,14 @@ impl ScriptEngine {
     /// at the bridge.
     pub fn layers(&self) -> Vec<Rc<RefCell<LayerState>>> {
         self.layers.clone()
+    }
+
+    /// The runtime particle-system states, in scene.json object order
+    /// (M3f). The worker simulates these per frame (particles.rs) and
+    /// scripts mutate them through the Scene.getParticleSystem proxies;
+    /// every write is clamped at the bridge.
+    pub fn particles(&self) -> Vec<Rc<RefCell<ParticleSystemState>>> {
+        self.particles.clone()
     }
 
     /// Register the `Engine` object, `console`, and their plumbing. Fatal
@@ -877,8 +934,344 @@ impl ScriptEngine {
                 .set("kweSceneSetText", set_text)
                 .map_err(|e| EngineStartError::Bootstrap(format!("global kweSceneSetText: {e}")))?;
 
+            // ---- M3f: particle-system bridges (researched WE surface,
+            // see docs/SCENE_FORMAT_V1.md — flat M3f model: the emitter
+            // properties, the layer properties, the IParticleSystemInstance
+            // factors and the IParticleSystem playback controls, all
+            // clamped here; an out-of-range index is a no-op or a default
+            // value, never an error).
+            let particles = self.particles.clone();
+
+            let particle_count_fn = Function::new(ctx.clone(), move || particles.len() as i32)
+                .map_err(|e| EngineStartError::Bootstrap(format!("particle count fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticleCount", particle_count_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticleCount: {e}"))
+                })?;
+
+            let find_particles = self.particles.clone();
+            let particle_find_fn = Function::new(ctx.clone(), move |name: String| -> i32 {
+                find_particles
+                    .iter()
+                    .position(|system| system.borrow().name == name)
+                    .map_or(-1, |index| index as i32)
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle find fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneFindParticle", particle_find_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneFindParticle: {e}"))
+                })?;
+
+            let name_particles = self.particles.clone();
+            let particle_name_fn = Function::new(ctx.clone(), move |index: i32| -> String {
+                name_particles
+                    .get(index as usize)
+                    .map_or_else(String::new, |system| system.borrow().name.clone())
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle name fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticleName", particle_name_fn)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticleName: {e}"))
+                })?;
+
+            let scalar_particles = self.particles.clone();
+            let particle_get_scalar =
+                Function::new(ctx.clone(), move |index: i32, prop: String| -> f64 {
+                    let Some(system) = scalar_particles.get(index as usize) else {
+                        return 0.0;
+                    };
+                    let system = system.borrow();
+                    match prop.as_str() {
+                        // Emitter properties (already clamped at parse and
+                        // at every write, so these are the live values).
+                        "spawnRate" => f64::from(system.spawn_rate),
+                        "life" => f64::from(system.life),
+                        "speedMin" => f64::from(system.speed_min),
+                        "speedMax" => f64::from(system.speed_max),
+                        "direction" => f64::from(system.direction),
+                        "spread" => f64::from(system.spread),
+                        "sizeStart" => f64::from(system.size_start),
+                        "sizeEnd" => f64::from(system.size_end),
+                        "alphaStart" => f64::from(system.alpha_start),
+                        "alphaEnd" => f64::from(system.alpha_end),
+                        "maxCount" => f64::from(system.max_count),
+                        "blendMode" => f64::from(system.blend_mode.as_u32()),
+                        // Layer-style properties.
+                        "alpha" => f64::from(system.alpha),
+                        "brightness" => f64::from(system.brightness),
+                        "visible" => f64::from(u8::from(system.visible)),
+                        "emitting" => f64::from(u8::from(system.emitting)),
+                        // WE IParticleSystemInstance factors (default 1.0).
+                        // "alphaFactor" backs the proxy's instance.alpha so
+                        // it cannot collide with the layer alpha.
+                        "count" => f64::from(system.count),
+                        "speed" => f64::from(system.speed),
+                        "lifetime" => f64::from(system.lifetime),
+                        "size" => f64::from(system.size),
+                        "alphaFactor" => f64::from(system.alpha_factor),
+                        "rate" => f64::from(system.rate),
+                        "colorn" => f64::from(system.colorn),
+                        _ => 0.0,
+                    }
+                })
+                .map_err(|e| EngineStartError::Bootstrap(format!("particle scalar getter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneGetParticleScalar", particle_get_scalar)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneGetParticleScalar: {e}"))
+                })?;
+
+            let set_scalar_particles = self.particles.clone();
+            let particle_blend_mode_diag = Rc::clone(&self.particle_blend_mode_diag);
+            let particle_set_scalar = Function::new(
+                ctx.clone(),
+                move |index: i32, prop: String, value: f64| {
+                    let Some(system) = set_scalar_particles.get(index as usize) else {
+                        return;
+                    };
+                    let mut system = system.borrow_mut();
+                    match prop.as_str() {
+                        "spawnRate" => system.spawn_rate = particles::clamp_spawn_rate(value),
+                        "life" => system.life = particles::clamp_life(value),
+                        "speedMin" => system.speed_min = particles::clamp_speed(value),
+                        "speedMax" => system.speed_max = particles::clamp_speed(value),
+                        "direction" => system.direction = particles::clamp_direction(value),
+                        "spread" => system.spread = particles::clamp_spread(value),
+                        "sizeStart" => system.size_start = particles::clamp_size(value),
+                        "sizeEnd" => system.size_end = particles::clamp_size(value),
+                        "alphaStart" => system.alpha_start = particles::clamp_alpha(value),
+                        "alphaEnd" => system.alpha_end = particles::clamp_alpha(value),
+                        "maxCount" => {
+                            let raw = if value.is_finite()
+                                && value >= 0.0
+                                && value <= f64::from(u32::MAX)
+                            {
+                                value as u64
+                            } else {
+                                1
+                            };
+                            system.max_count = particles::clamp_max_count(raw);
+                        }
+                        // M3d contract, same as layers: the blend mode
+                        // clamps to the implemented set (0/1/6/7/9), an
+                        // unimplemented write clamps to 0 with a bounded
+                        // one-time diagnostic.
+                        "blendMode" => {
+                            let raw = if value.is_finite()
+                                && value >= 0.0
+                                && value <= f64::from(u32::MAX)
+                            {
+                                value as u32
+                            } else {
+                                0
+                            };
+                            let mode = BlendMode::clamp(raw);
+                            if mode.as_u32() != raw && !particle_blend_mode_diag.replace(true) {
+                                eprintln!(
+                                    "event=renderer.scene.particle_blend_mode_clamped system={} mode={} note=not-fixed-function-clamped-to-normal",
+                                    system.name, raw
+                                );
+                            }
+                            system.blend_mode = mode;
+                        }
+                        "alpha" => system.alpha = clamp_layer_alpha(value),
+                        "brightness" => system.brightness = clamp_layer_brightness(value),
+                        "visible" => system.visible = value != 0.0,
+                        // WE IParticleSystemInstance factors: non-finite ->
+                        // identity 1.0, magnitude clamped (1e6 for
+                        // count/speed/lifetime/size/rate, 1.0 for alpha and
+                        // colorn) — see particles::clamp_instance_factor.
+                        "count" => {
+                            system.count = particles::clamp_instance_factor(value, 1e6)
+                        }
+                        "speed" => {
+                            system.speed = particles::clamp_instance_factor(value, 1e6)
+                        }
+                        "lifetime" => {
+                            system.lifetime = particles::clamp_instance_factor(value, 1e6)
+                        }
+                        "size" => system.size = particles::clamp_instance_factor(value, 1e6),
+                        "alphaFactor" => {
+                            system.alpha_factor = particles::clamp_instance_factor(value, 1.0)
+                        }
+                        "rate" => system.rate = particles::clamp_instance_factor(value, 1e6),
+                        "colorn" => {
+                            system.colorn = particles::clamp_instance_factor(value, 1.0)
+                        }
+                        _ => {}
+                    }
+                },
+            )
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle scalar setter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneSetParticleScalar", particle_set_scalar)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneSetParticleScalar: {e}"))
+                })?;
+
+            let get_vec_particles = self.particles.clone();
+            let particle_get_vec = Function::new(
+                ctx.clone(),
+                move |index: i32, prop: String, axis: String| -> f64 {
+                    let Some(system) = get_vec_particles.get(index as usize) else {
+                        return 0.0;
+                    };
+                    let system = system.borrow();
+                    match (prop.as_str(), axis.as_str()) {
+                        ("gravity", "x") => f64::from(system.gravity[0]),
+                        ("gravity", "y") => f64::from(system.gravity[1]),
+                        ("colorStart", "r") => f64::from(system.color_start[0]),
+                        ("colorStart", "g") => f64::from(system.color_start[1]),
+                        ("colorStart", "b") => f64::from(system.color_start[2]),
+                        ("colorStart", "a") => f64::from(system.color_start[3]),
+                        ("colorEnd", "r") => f64::from(system.color_end[0]),
+                        ("colorEnd", "g") => f64::from(system.color_end[1]),
+                        ("colorEnd", "b") => f64::from(system.color_end[2]),
+                        ("colorEnd", "a") => f64::from(system.color_end[3]),
+                        _ => 0.0,
+                    }
+                },
+            )
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle vector getter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneGetParticleVec", particle_get_vec)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneGetParticleVec: {e}"))
+                })?;
+
+            let set_vec_particles = self.particles.clone();
+            let particle_set_vec = Function::new(
+                ctx.clone(),
+                move |index: i32, prop: String, axis: String, value: f64| {
+                    let Some(system) = set_vec_particles.get(index as usize) else {
+                        return;
+                    };
+                    let mut system = system.borrow_mut();
+                    match (prop.as_str(), axis.as_str()) {
+                        ("gravity", "x") => system.gravity[0] = particles::clamp_gravity(value),
+                        ("gravity", "y") => system.gravity[1] = particles::clamp_gravity(value),
+                        ("colorStart", "r") => {
+                            system.color_start[0] = particles::clamp_color_component(value)
+                        }
+                        ("colorStart", "g") => {
+                            system.color_start[1] = particles::clamp_color_component(value)
+                        }
+                        ("colorStart", "b") => {
+                            system.color_start[2] = particles::clamp_color_component(value)
+                        }
+                        ("colorStart", "a") => {
+                            system.color_start[3] = particles::clamp_color_component(value)
+                        }
+                        ("colorEnd", "r") => {
+                            system.color_end[0] = particles::clamp_color_component(value)
+                        }
+                        ("colorEnd", "g") => {
+                            system.color_end[1] = particles::clamp_color_component(value)
+                        }
+                        ("colorEnd", "b") => {
+                            system.color_end[2] = particles::clamp_color_component(value)
+                        }
+                        ("colorEnd", "a") => {
+                            system.color_end[3] = particles::clamp_color_component(value)
+                        }
+                        _ => {}
+                    }
+                },
+            )
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle vector setter: {e}")))?;
+            ctx.globals()
+                .set("kweSceneSetParticleVec", particle_set_vec)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneSetParticleVec: {e}"))
+                })?;
+
+            // WE IParticleSystem playback controls (researched semantics):
+            // play() resumes emission, pause() stops emission while the
+            // live particles keep simulating, stop() clears immediately,
+            // isPlaying() is emitting || alive, emitParticles(count)
+            // bursts without requiring the system to be playing (default
+            // 1; the count is clamped at the bridge, never exceeds the
+            // particle cap).
+            let play_particles = self.particles.clone();
+            let particle_play = Function::new(ctx.clone(), move |index: i32| {
+                if let Some(system) = play_particles.get(index as usize) {
+                    system.borrow_mut().play();
+                }
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle play fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticlePlay", particle_play)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticlePlay: {e}"))
+                })?;
+
+            let pause_particles = self.particles.clone();
+            let particle_pause = Function::new(ctx.clone(), move |index: i32| {
+                if let Some(system) = pause_particles.get(index as usize) {
+                    system.borrow_mut().pause();
+                }
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle pause fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticlePause", particle_pause)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticlePause: {e}"))
+                })?;
+
+            let stop_particles = self.particles.clone();
+            let particle_stop = Function::new(ctx.clone(), move |index: i32| {
+                if let Some(system) = stop_particles.get(index as usize) {
+                    system.borrow_mut().stop();
+                }
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle stop fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticleStop", particle_stop)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticleStop: {e}"))
+                })?;
+
+            let playing_particles = self.particles.clone();
+            let particle_is_playing = Function::new(ctx.clone(), move |index: i32| -> bool {
+                playing_particles
+                    .get(index as usize)
+                    .is_some_and(|system| system.borrow().is_playing())
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle is-playing fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticleIsPlaying", particle_is_playing)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticleIsPlaying: {e}"))
+                })?;
+
+            let emit_particles = self.particles.clone();
+            let particle_emit = Function::new(ctx.clone(), move |index: i32, count: f64| {
+                let Some(system) = emit_particles.get(index as usize) else {
+                    return;
+                };
+                // Bounded: non-finite/negative -> 0 (no-op), capped at the
+                // particle cap (emit_particles saturates the burst).
+                let count = if count.is_finite() && count > 0.0 {
+                    count.min(particles::MAX_PARTICLES as f64) as u32
+                } else {
+                    0
+                };
+                system.borrow_mut().emit_particles(count);
+            })
+            .map_err(|e| EngineStartError::Bootstrap(format!("particle emit fn: {e}")))?;
+            ctx.globals()
+                .set("kweSceneParticleEmit", particle_emit)
+                .map_err(|e| {
+                    EngineStartError::Bootstrap(format!("global kweSceneParticleEmit: {e}"))
+                })?;
+
             ctx.eval::<(), &str>(LAYER_BOOTSTRAP_JS)
                 .map_err(|e| EngineStartError::Bootstrap(format!("scene bootstrap: {e}")))?;
+            ctx.eval::<(), &str>(PARTICLE_BOOTSTRAP_JS)
+                .map_err(|e| EngineStartError::Bootstrap(format!("particle bootstrap: {e}")))?;
             Ok(())
         })
     }
@@ -957,7 +1350,10 @@ impl ScriptEngine {
     /// budget, read back Engine.clearcolor. Never kills the renderer.
     pub fn step(&mut self, dt: f64) -> StepResult {
         self.frames += 1;
-        if !self.script_ok {
+        if !self.script_ok && self.has_script {
+            // A configured script failed to load/init: contained. A scene
+            // with no script file is fine — step falls through to NoUpdate
+            // so the render loop (and M3f particle sim) keeps advancing.
             return StepResult::ScriptError;
         }
         if self.frames.is_multiple_of(GC_EVERY_FRAMES) {
@@ -1206,10 +1602,23 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
 
   function findLayer(name) {
     if (typeof name === "number") {
-      return (name >= 0 && name < count) ? name : -1;
+      // Any non-negative index is a candidate: layer indices stay in the
+      // layer table, indices >= count dispatch to particle systems (WE's
+      // combined object space); getLayer turns the rest into null.
+      return name >= 0 ? name : -1;
     }
     var byName = indexByName[String(name)];
-    return typeof byName === "number" ? byName : -1;
+    if (typeof byName === "number") return byName;
+    // M3f: WE's object index space mixes layers and particles, and
+    // getLayer finds particle systems by name too (researched WE
+    // behavior). A particle name resolves to count + particleIndex so
+    // getLayer can dispatch past the layer table; the typeof guard keeps
+    // this file safe if the particle bridges are ever absent.
+    if (typeof kweSceneFindParticle === "function") {
+      var p = kweSceneFindParticle(String(name));
+      if (p >= 0) return count + p;
+    }
+    return -1;
   }
 
   function vectorProps(index, prop, axes) {
@@ -1229,6 +1638,15 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
   function getLayer(name) {
     var index = findLayer(name);
     if (index < 0) return null;
+    // M3f: WE indexes particles and layers in one object space —
+    // thisScene.getLayer(particleIndex) returns the particle system
+    // (researched WE behavior, recorded in docs/SCENE_FORMAT_V1.md).
+    // Indices at or beyond the layer table dispatch to particle systems;
+    // getParticleSystem is the dedicated M3f accessor. The guard keeps
+    // this strict-mode file safe until the particle bootstrap ran.
+    if (index >= count && typeof kweSceneGetParticleSystem === "function") {
+      return kweSceneGetParticleSystem(index - count);
+    }
     if (cache[index]) return cache[index];
     var layer = {};
     Object.defineProperty(layer, "name", {
@@ -1317,6 +1735,138 @@ const LAYER_BOOTSTRAP_JS: &str = r#"
   };
   globalThis.Scene = Scene;
   globalThis.thisScene = Scene;
+})();
+"#;
+
+/// The M3f particle-system proxies over the kweSceneParticle* bridges.
+/// `Scene.getParticleSystem(name | index)` is the task-mandated M3f
+/// extension (WE has no such call — particle systems are reached through
+/// thisScene.getLayer, and the layer bootstrap above preserves that for
+/// indices >= the layer count). The surface mirrors the researched WE
+/// API: the emitter properties, the layer-style properties, the
+/// IParticleSystemInstance factors (the WE "colorn" spelling is
+/// intentional) and the IParticleSystem controls. Every write goes
+/// through a Rust bridge and is clamped there; an out-of-range index is
+/// null, never an error.
+const PARTICLE_BOOTSTRAP_JS: &str = r#"
+"use strict";
+(function () {
+  var indexByName = {};
+  var cache = [];
+  var count = kweSceneParticleCount();
+  for (var i = 0; i < count; i++) indexByName[kweSceneParticleName(i)] = i;
+
+  function findParticle(name) {
+    if (typeof name === "number") {
+      return (name >= 0 && name < count) ? name : -1;
+    }
+    var byName = indexByName[String(name)];
+    return typeof byName === "number" ? byName : -1;
+  }
+
+  function scalarProperty(obj, index, prop, bridgeProp) {
+    // `bridgeProp` names the Rust-side scalar (defaults to `prop`); the
+    // instance factor alpha lives at "alphaFactor" so it cannot collide
+    // with the system alpha.
+    var b = bridgeProp === undefined ? prop : bridgeProp;
+    Object.defineProperty(obj, prop, {
+      get: function () { return kweSceneGetParticleScalar(index, b); },
+      set: function (value) { kweSceneSetParticleScalar(index, b, value); },
+      enumerable: true
+    });
+  }
+
+  function vectorProps(index, prop, axes) {
+    var v = {};
+    for (var i = 0; i < axes.length; i++) {
+      (function (axis) {
+        Object.defineProperty(v, axis, {
+          get: function () { return kweSceneGetParticleVec(index, prop, axis); },
+          set: function (value) { kweSceneSetParticleVec(index, prop, axis, value); },
+          enumerable: true
+        });
+      })(axes[i]);
+    }
+    return v;
+  }
+
+  function getParticleSystem(name) {
+    var index = findParticle(name);
+    if (index < 0) return null;
+    if (cache[index]) return cache[index];
+    var system = {};
+    Object.defineProperty(system, "name", {
+      get: function () { return kweSceneParticleName(index); },
+      enumerable: true
+    });
+    // Emitter properties (flat M3f model; every write clamped at the
+    // bridge). WE's component model is documented as planned.
+    scalarProperty(system, index, "spawnRate");
+    scalarProperty(system, index, "life");
+    scalarProperty(system, index, "speedMin");
+    scalarProperty(system, index, "speedMax");
+    scalarProperty(system, index, "direction");
+    scalarProperty(system, index, "spread");
+    scalarProperty(system, index, "sizeStart");
+    scalarProperty(system, index, "sizeEnd");
+    scalarProperty(system, index, "alphaStart");
+    scalarProperty(system, index, "alphaEnd");
+    scalarProperty(system, index, "maxCount");
+    scalarProperty(system, index, "blendMode");
+    scalarProperty(system, index, "alpha");
+    scalarProperty(system, index, "brightness");
+    Object.defineProperty(system, "visible", {
+      get: function () { return kweSceneGetParticleScalar(index, "visible") !== 0; },
+      set: function (value) { kweSceneSetParticleScalar(index, "visible", value ? 1 : 0); },
+      enumerable: true
+    });
+    Object.defineProperty(system, "gravity", {
+      get: function () { return vectorProps(index, "gravity", ["x", "y"]); },
+      enumerable: true
+    });
+    Object.defineProperty(system, "colorStart", {
+      get: function () { return vectorProps(index, "colorStart", ["r", "g", "b", "a"]); },
+      enumerable: true
+    });
+    Object.defineProperty(system, "colorEnd", {
+      get: function () { return vectorProps(index, "colorEnd", ["r", "g", "b", "a"]); },
+      enumerable: true
+    });
+    // WE IParticleSystemInstance factors (all default 1.0; non-finite
+    // writes fall back to the identity 1.0 at the bridge).
+    var instance = {};
+    scalarProperty(instance, index, "count");
+    scalarProperty(instance, index, "speed");
+    scalarProperty(instance, index, "lifetime");
+    scalarProperty(instance, index, "size");
+    // instance.alpha is the multiplicative alpha factor (bridge prop
+    // "alphaFactor", so it cannot collide with the system alpha).
+    scalarProperty(instance, index, "alpha", "alphaFactor");
+    scalarProperty(instance, index, "rate");
+    scalarProperty(instance, index, "colorn");
+    Object.defineProperty(system, "instance", {
+      get: function () { return instance; },
+      enumerable: true
+    });
+    // WE IParticleSystem controls. emitParticles defaults to 1 like WE;
+    // the count is clamped at the bridge (never beyond the particle cap).
+    system.play = function () { kweSceneParticlePlay(index); };
+    system.pause = function () { kweSceneParticlePause(index); };
+    system.stop = function () { kweSceneParticleStop(index); };
+    system.isPlaying = function () { return kweSceneParticleIsPlaying(index); };
+    system.emitParticles = function (n) {
+      kweSceneParticleEmit(index, n === undefined ? 1 : n);
+    };
+    cache[index] = system;
+    return system;
+  }
+
+  // The layer bootstrap's getLayer falls back to this for indices >= the
+  // layer count (WE's combined object index space), so it must be global.
+  globalThis.kweSceneGetParticleSystem = getParticleSystem;
+  var Scene = globalThis.Scene;
+  Scene.getParticleSystem = getParticleSystem;
+  Scene.getParticleSystemCount = function () { return kweSceneParticleCount(); };
 })();
 "#;
 
@@ -1956,5 +2506,222 @@ mod tests {
         // resized() ran during load with (640, 480); update() sees
         // resolution {x: 640, y: 480} and fps 24; frametime is the step dt.
         assert!(matches!(engine.step(0.25), StepResult::NewFrame(_)));
+    }
+
+    // ---- M3f: particle-system proxies ----
+
+    #[test]
+    fn particle_systems_registered_before_script_load() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function init() {
+                // init() runs after registration: the system is already
+                // reachable by name, by index, and through the WE-compatible
+                // getLayer fallback (index >= layer count and by name).
+                var byName = Scene.getParticleSystem("dust") !== null;
+                var byIndex = Scene.getParticleSystem(0) !== null;
+                var count = Scene.getParticleSystemCount() === 1;
+                var viaLayer = Scene.getLayer(1) !== null;
+                var viaLayerName = Scene.getLayer("dust") !== null;
+                var missing = Scene.getParticleSystem("nope") === null;
+                var defaults = Scene.getParticleSystem(99) === null;
+                Engine.clearcolor = {
+                    r: (byName && byIndex && count) ? 0.5 : 0,
+                    g: (viaLayer && viaLayerName && missing && defaults) ? 0.5 : 0,
+                    b: 0, a: 1
+                };
+            }"#,
+            r#"[{"name": "bg", "image": "bg.png"},
+                {"particle": {"spawnRate": 100, "life": 1, "speed": 60,
+                              "sizeStart": 8, "sizeEnd": 8,
+                              "alphaStart": 1, "alphaEnd": 1},
+                 "name": "dust"}]"#,
+        );
+        let engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(engine.script_ok());
+        // Parsed state carried into the runtime (defaults filled in).
+        let particles = engine.particles();
+        assert_eq!(particles.len(), 1);
+        let system = particles[0].borrow();
+        assert_eq!(system.name, "dust");
+        assert_eq!(system.spawn_rate, 100.0);
+        assert_eq!(system.life, 1.0);
+        assert_eq!(system.speed_min, 60.0);
+        assert_eq!(system.size_start, 8.0);
+        assert_eq!(system.color_start, [1.0, 1.0, 1.0, 1.0]);
+        assert!(system.emitting);
+        assert_eq!(engine.layers().len(), 1);
+        // init() saw the system through every accessor.
+        assert_eq!(engine.clear_color(), [0.5, 0.5, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn particle_proxy_writes_are_clamped_on_the_rust_side() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function update(dt) {
+                var p = Scene.getParticleSystem("dust");
+                p.spawnRate = 99999;            // -> 4096
+                p.life = 100;                   // -> 60
+                p.life = NaN;                   // -> 1 (default)
+                p.speedMin = -5;                // -> 0
+                p.speedMax = 2e9;               // -> 1e6
+                p.direction = 3.5;              // -> 3.5 (unbounded; f32-exact)
+                p.spread = -2;                  // -> 0
+                p.sizeStart = 0;                // -> 1
+                p.sizeEnd = 1000;               // -> 512
+                p.alphaStart = 5;               // -> 1
+                p.alphaEnd = NaN;               // -> 0
+                p.maxCount = 1e9;               // -> 4096
+                p.blendMode = 11;               // unimplemented -> 0
+                p.alpha = 2;                    // -> 1
+                p.brightness = 50;              // -> 10
+                p.visible = 0;                  // -> false
+                p.gravity.x = 1e7;              // -> 1e6
+                p.gravity.y = -5;               // -> -5
+                p.colorStart.r = 2;             // -> 1
+                p.colorStart.g = NaN;           // -> 0
+                p.colorEnd.b = 0.5;             // -> 0.5
+                p.colorEnd.a = -1;              // -> 0
+                p.instance.count = 1e9;         // -> 1e6
+                p.instance.speed = -1;          // -> 0
+                p.instance.lifetime = NaN;      // -> 1 (identity)
+                p.instance.size = 5;            // -> 5
+                p.instance.alpha = 0.5;         // -> 0.5
+                p.instance.rate = 2;            // -> 2
+                p.instance.colorn = NaN;        // -> 1 (identity)
+                var ok =
+                    p.spawnRate === 4096 && p.life === 1 &&
+                    p.speedMin === 0 && p.speedMax === 1e6 &&
+                    p.direction === 3.5 && p.spread === 0 &&
+                    p.sizeStart === 1 && p.sizeEnd === 512 &&
+                    p.alphaStart === 1 && p.alphaEnd === 0 &&
+                    p.maxCount === 4096 && p.blendMode === 0 &&
+                    p.alpha === 1 && p.brightness === 10 && p.visible === false &&
+                    p.gravity.x === 1e6 && p.gravity.y === -5 &&
+                    p.colorStart.r === 1 && p.colorStart.g === 0 &&
+                    p.colorEnd.b === 0.5 && p.colorEnd.a === 0 &&
+                    p.instance.count === 1e6 && p.instance.speed === 0 &&
+                    p.instance.lifetime === 1 && p.instance.size === 5 &&
+                    p.instance.alpha === 0.5 && p.instance.rate === 2 &&
+                    p.instance.colorn === 1;
+                Engine.clearcolor = { r: ok ? 0.5 : 0, g: 0, b: 0, a: 1 };
+            }"#,
+            r#"[{"particle": {}, "name": "dust"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert!(
+            matches!(engine.step(0.1), StepResult::NewFrame(color) if color == [0.5, 0.0, 0.0, 1.0])
+        );
+        // And the clamped values really landed on the Rust side.
+        let system = engine.particles()[0].clone();
+        let state = system.borrow();
+        assert_eq!(state.spawn_rate, 4096.0);
+        assert_eq!(state.life, 1.0);
+        assert_eq!(state.speed_min, 0.0);
+        assert_eq!(state.speed_max, 1e6);
+        assert_eq!(state.direction, 3.5);
+        assert_eq!(state.spread, 0.0);
+        assert_eq!(state.size_start, 1.0);
+        assert_eq!(state.size_end, 512.0);
+        assert_eq!(state.alpha_start, 1.0);
+        assert_eq!(state.alpha_end, 0.0);
+        assert_eq!(state.max_count, 4096);
+        assert_eq!(state.blend_mode, BlendMode::Normal);
+        assert_eq!(state.alpha, 1.0);
+        assert_eq!(state.brightness, 10.0);
+        assert!(!state.visible);
+        assert_eq!(state.gravity, [1e6, -5.0]);
+        assert_eq!(state.color_start, [1.0, 0.0, 1.0, 1.0]); // only r/g written
+        assert_eq!(state.color_end, [1.0, 1.0, 0.5, 0.0]); // only b/a written
+        assert_eq!(state.count, 1e6);
+        assert_eq!(state.speed, 0.0);
+        assert_eq!(state.lifetime, 1.0);
+        assert_eq!(state.size, 5.0);
+        assert_eq!(state.alpha_factor, 0.5);
+        assert_eq!(state.rate, 2.0);
+        assert_eq!(state.colorn, 1.0);
+    }
+
+    #[test]
+    fn particle_playback_controls_drive_rust_state() {
+        let dir = tmpdir();
+        let config = config_with_layers(
+            &dir,
+            r#"function init() {
+                // stop(): emission off, everything cleared immediately —
+                // isPlaying() goes false and emitParticles() still works.
+                var p = Scene.getParticleSystem("dust");
+                p.stop();
+                p.emitParticles(5);
+                Engine.clearcolor = {
+                    r: p.isPlaying() ? 0 : 0.5,
+                    g: (p.instance.count === 1 && p.instance.speed === 1) ? 0.5 : 0,
+                    b: 0, a: 1
+                };
+            }"#,
+            r#"[{"particle": {"spawnRate": 10, "life": 1, "speed": 60,
+                             "speedMin": 0, "speedMax": 0},
+                 "name": "dust"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        assert_eq!(engine.clear_color(), [0.5, 0.5, 0.0, 1.0]);
+        // The simulation lives in the worker (main.rs sync_particles),
+        // driven by the same dt as the script step; here we drive it
+        // manually. The burst spawns on the first simulated step even
+        // though the system is stopped (WE emitParticles semantics).
+        assert!(matches!(engine.step(0.1), StepResult::NewFrame(_)));
+        for system in engine.particles() {
+            system.borrow_mut().simulate(0.1);
+        }
+        let system = engine.particles()[0].clone();
+        let state = system.borrow();
+        assert_eq!(state.particles.len(), 5);
+        assert!(!state.emitting);
+        assert!(state.is_playing(), "alive particles count as playing");
+        drop(state);
+        // pause() keeps the live particles simulating; play() resumes.
+        let script = r#"var t = 0;
+        function update(dt) {
+            t += dt;   // 0.1, 0.2, 0.3 across the three steps
+            var p = Scene.getParticleSystem("dust");
+            if (t <= 0.1) { p.play(); }        // step 1: emits normally
+            else if (t <= 0.2) { p.pause(); }  // step 2: emission off
+            else { p.play(); }                 // step 3: resumed
+        }"#;
+        let config = config_with_layers(
+            &dir,
+            script,
+            r#"[{"particle": {"spawnRate": 10, "life": 1, "speed": 60},
+                 "name": "dust"}]"#,
+        );
+        let mut engine = ScriptEngine::new(&config, 320, 200, 30).unwrap();
+        let system = engine.particles()[0].clone();
+        let step_and_simulate = |engine: &mut ScriptEngine| {
+            assert!(matches!(engine.step(0.1), StepResult::NewFrame(_)));
+            for system in engine.particles() {
+                system.borrow_mut().simulate(0.1);
+            }
+        };
+        // Step 1 (dt 0.1): play() — one spawn (10/s × 0.1 s), alive.
+        step_and_simulate(&mut engine);
+        assert!(system.borrow().emitting);
+        assert!(system.borrow().is_playing());
+        let alive_after_pause = system.borrow().particles.len();
+        assert!(alive_after_pause > 0);
+        // Step 2 (dt 0.1): pause() — emission off, particles age in place.
+        step_and_simulate(&mut engine);
+        assert!(!system.borrow().emitting);
+        assert!(system.borrow().is_playing(), "paused with live particles");
+        assert!(
+            system.borrow().particles.len() <= alive_after_pause,
+            "pause must not spawn"
+        );
+        // Step 3 (dt 0.1): play() — emission resumes.
+        step_and_simulate(&mut engine);
+        assert!(system.borrow().emitting);
+        assert!(system.borrow().particles.len() > alive_after_pause);
     }
 }

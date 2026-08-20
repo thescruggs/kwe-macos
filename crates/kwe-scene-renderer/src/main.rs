@@ -27,10 +27,16 @@
 // layer draws as a textured quad over the same compositor path. Script
 // exceptions never kill the renderer; a soft-timeout frame is skipped by
 // re-publishing the last pixels (the supervisor only watches sequence
-// progression).
+// progression). M3f added particle systems (src/particles.rs): a bounded
+// deterministic CPU simulation (fixed 1/60 s steps, capped accumulators,
+// documented emitter-model defaults) driven by the frame loop's real dt,
+// with one batched draw per system through the same compositor (per-system
+// host-visible vertex buffers, the system's blend-mode pipeline variant,
+// and texture slots MAX_LAYERS + system_index).
 
 mod js;
 mod layers;
+mod particles;
 mod scene;
 mod text;
 mod textures;
@@ -55,7 +61,8 @@ use kwe_input_protocol::{
 };
 
 use js::{EngineStartError, ScriptEngine, StepResult};
-use layers::{LayerState, frame_draws};
+use layers::{LayerState, MAX_LAYERS, frame_draws};
+use particles::{MAX_PARTICLE_SYSTEMS, ParticleSystemState, particle_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
 use text::{MAX_TEXT_LAYERS, TextRenderer};
 use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
@@ -367,6 +374,16 @@ struct SceneWorker {
     /// Per layer: whether its texture uploaded (or it has no image at all —
     /// a model/particle object). frame_draws skips false entries.
     texture_ok: Vec<bool>,
+    /// M3f: the script-visible particle-system states, index-aligned with
+    /// the scene's `objects` array (particle entries) and with
+    /// `particle_texture_ok`. Simulated every frame (particles.rs) with
+    /// the same dt the script's update() ran under.
+    particles: Vec<Rc<RefCell<ParticleSystemState>>>,
+    /// M3f: per system, whether its texture uploaded (a system without a
+    /// texture draws nothing — the descriptor set only exists after a
+    /// successful upload, see vulkan.rs). particle_draws skips false
+    /// entries.
+    particle_texture_ok: Vec<bool>,
     published: u64,
     consecutive_render_failures: u64,
 }
@@ -425,8 +442,13 @@ impl SceneWorker {
         // is a backend rejection (exit 73), not an internal error.
         // M3e: text layers are synced before every frame's draw list, so
         // the first published frame carries any static scene text too.
+        // M3f: particle systems are seeded with one pacing interval of
+        // simulation, so the first published frame already shows particles
+        // (the burst a script queued in init() spawns on this first step).
         self.sync_text();
-        let draws = frame_draws(&self.layers, &self.texture_ok);
+        self.sync_particles(interval.as_secs_f64());
+        let mut draws = frame_draws(&self.layers, &self.texture_ok);
+        draws.extend(particle_draws(&self.particles, &self.particle_texture_ok));
         let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
             Ok(pixels) => pixels,
             Err(error) => reject_render(&error, "initial render failure"),
@@ -465,9 +487,14 @@ impl SceneWorker {
                     // or rotation since the last step. M3e: dirty text
                     // layers (text/pointsize/alignment/color changed by the
                     // script) are re-rasterized here — geometry is rebuilt
-                    // on change only, never per frame.
+                    // on change only, never per frame. M3f: particle
+                    // systems are simulated with the same dt the script's
+                    // update() ran under, and their per-frame vertex
+                    // buffers are rebuilt whenever a fixed step ran.
                     self.sync_text();
-                    let draws = frame_draws(&self.layers, &self.texture_ok);
+                    self.sync_particles(dt);
+                    let mut draws = frame_draws(&self.layers, &self.texture_ok);
+                    draws.extend(particle_draws(&self.particles, &self.particle_texture_ok));
                     match self.renderer.render(color, &draws) {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
                             // Exact-size check: the conversion is exact by
@@ -548,6 +575,35 @@ impl SceneWorker {
                 "event=renderer.scene.layer_skip layer={} detail=text-upload-failed",
                 self.layers[index].borrow().name
             );
+        }
+    }
+
+    /// M3f: step every particle system with the frame's dt (the same dt
+    /// the script's update() ran under — a script-visible write and its
+    /// simulation land in the same frame). When a fixed step ran, the
+    /// system's vertex bytes are rebuilt and uploaded (bounded: at most
+    /// MAX_PARTICLES × 6 × 40 B per system, create-or-grow buffers). A
+    /// failed vertex upload marks the system as not drawable this frame,
+    /// exactly like a failed texture; a hostile system can only degrade
+    /// rendering, never the scene.
+    fn sync_particles(&mut self, dt: f64) {
+        for (index, system) in self.particles.iter().enumerate() {
+            let mut system = system.borrow_mut();
+            if !system.simulate(dt) {
+                continue;
+            }
+            let (bytes, vertex_count) = system.build_vertex_bytes();
+            system.vertex_count = vertex_count;
+            if vertex_count == 0 {
+                continue; // all aged out: nothing to upload, no draw
+            }
+            if let Err(error) = self.renderer.upload_particle_vertices(index, &bytes) {
+                self.particle_texture_ok[index] = false;
+                eprintln!(
+                    "event=renderer.scene.particle_skip system={} detail=vertex-upload-failed: {error}",
+                    system.name
+                );
+            }
         }
     }
 }
@@ -668,6 +724,11 @@ fn main() -> Result<()> {
     let layers = engine.layers();
     let texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
 
+    // 5b. M3f: particle-system textures (slot MAX_LAYERS + system_index).
+    let particles = engine.particles();
+    let particle_texture_ok =
+        upload_particle_textures(&mut renderer, &config.particles, particles.len());
+
     // 6. M3e text subsystem: font directories come from --font-dir (the
     //    daemon spawns workers with a fixed environment, so standalone
     //    lanes use the flag) plus KWE_FONT_DIRS (colon-separated, for
@@ -704,6 +765,18 @@ fn main() -> Result<()> {
             config.text_size_ignored
         );
     }
+    if config.particle_system_skips > 0 {
+        eprintln!(
+            "event=renderer.scene.particle_system_skip count={} (cap is {MAX_PARTICLE_SYSTEMS})",
+            config.particle_system_skips
+        );
+    }
+    if config.particle_file_refs > 0 {
+        eprintln!(
+            "event=renderer.scene.particle_file_ref count={} (external particle files are planned; defaults used)",
+            config.particle_file_refs
+        );
+    }
 
     let mut worker = SceneWorker {
         arguments,
@@ -715,6 +788,8 @@ fn main() -> Result<()> {
         text,
         layers,
         texture_ok,
+        particles,
+        particle_texture_ok,
         published: 0,
         consecutive_render_failures: 0,
     };
@@ -769,7 +844,12 @@ fn load_scene(content: &Path) -> SceneConfig {
             Ok(root) => root,
             Err(error) => reject_scene(&error),
         };
-        load_layer_textures(&mut config.layers, |reference| {
+        let mut used_bytes = load_layer_textures(&mut config.layers, |reference| {
+            resolve_layer_image(&root, reference)
+        });
+        // M3f: particle-system textures share the same budget, so a
+        // texture-heavy scene degrades the same way for both kinds.
+        load_particle_textures(&mut config.particles, &mut used_bytes, |reference| {
             resolve_layer_image(&root, reference)
         });
         return config;
@@ -806,7 +886,15 @@ fn load_scene(content: &Path) -> SceneConfig {
     }
     // Image references resolve against the package entry table, never the
     // host file system; entries were already validated at package open.
-    load_layer_textures(&mut config.layers, |reference| {
+    let mut used_bytes = load_layer_textures(&mut config.layers, |reference| {
+        let index = kwe_core::image_entry(reference, reader.entries())?;
+        reader
+            .read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
+            .map_err(|error| format!("cannot read entry: {error}"))
+    });
+    // M3f: particle-system textures resolve the same way (the shared
+    // budget carries over from the layer textures above).
+    load_particle_textures(&mut config.particles, &mut used_bytes, |reference| {
         let index = kwe_core::image_entry(reference, reader.entries())?;
         reader
             .read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
@@ -878,7 +966,7 @@ fn resolve_layer_image(root: &Path, reference: &str) -> Result<Vec<u8>, String> 
 fn load_layer_textures(
     layers: &mut [scene::LayerSpec],
     mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
-) {
+) -> u64 {
     let mut used_bytes: u64 = 0;
     let mut blend_diag_emitted = false;
     for layer in layers {
@@ -926,6 +1014,56 @@ fn load_layer_textures(
         }
         layer.texture = Some(texture);
     }
+    used_bytes
+}
+
+/// M3f: fill `particles[*].texture` for every system with a texture
+/// reference (the raw reference lives in the `material` slot; `texture`
+/// won over WE's `material` at parse). The reference resolves exactly like
+/// a layer image — the caller's closure is lane-specific (file system or
+/// package), decode is bounded, and the decoded bytes count against the
+/// shared texture budget carried in `used_bytes`. A system whose texture
+/// is absent, unresolved, undecodable, or over budget keeps its defaults
+/// with a bounded one-time diagnostic and renders nothing (the compositor
+/// only allocates a descriptor set on a successful upload, see
+/// upload_particle_textures); a texture problem never rejects the scene.
+fn load_particle_textures(
+    particles: &mut [scene::ParticleSpec],
+    used_bytes: &mut u64,
+    mut resolve: impl FnMut(&str) -> Result<Vec<u8>, String>,
+) {
+    for particle in particles {
+        let Some(reference) = particle.material.as_deref() else {
+            continue; // no texture reference: the system draws nothing
+        };
+        let bytes = match resolve(reference) {
+            Ok(bytes) => bytes,
+            Err(detail) => {
+                eprintln!(
+                    "event=renderer.scene.particle_skip system={} detail={detail}",
+                    particle.name
+                );
+                continue;
+            }
+        };
+        let Some(texture) = decode_texture(&bytes) else {
+            eprintln!(
+                "event=renderer.scene.particle_skip system={} detail=undecodable-or-over-budget",
+                particle.name
+            );
+            continue;
+        };
+        let pixels = u64::from(texture.width) * u64::from(texture.height);
+        if !texture_budget_allows(*used_bytes, texture.width, texture.height) {
+            eprintln!(
+                "event=renderer.scene.particle_skip system={} detail=total-texture-budget",
+                particle.name
+            );
+            continue;
+        }
+        *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
+        particle.texture = Some(texture);
+    }
 }
 
 /// Upload the decoded layer textures into the compositor. Index-aligned
@@ -951,6 +1089,42 @@ fn upload_layer_textures(
                 eprintln!(
                     "event=renderer.scene.layer_skip layer={} detail=upload-failed: {error}",
                     layer.name
+                );
+            }
+        }
+    }
+    texture_ok
+}
+
+/// M3f: upload the decoded particle-system textures into the compositor at
+/// slot MAX_LAYERS + system_index (vulkan.rs TEXTURE_SLOT_COUNT), so a
+/// system's texture can never collide with a layer's. Index-aligned with
+/// `config.particles` and `engine.particles()`. Returns the per-system
+/// `texture_ok` table particle_draws consults: true only when the system's
+/// texture uploaded — a system without a texture (or with a failed
+/// upload) draws nothing, exactly like a layer without an image. Upload
+/// failures are bounded one-time diagnostics.
+fn upload_particle_textures(
+    renderer: &mut LayerRenderer,
+    config_particles: &[scene::ParticleSpec],
+    particle_count: usize,
+) -> Vec<bool> {
+    let mut texture_ok = vec![false; particle_count];
+    for (index, particle) in config_particles.iter().enumerate() {
+        let Some(texture) = &particle.texture else {
+            continue; // no texture loaded: the system draws nothing
+        };
+        match renderer.upload_layer(
+            MAX_LAYERS + index,
+            &texture.rgba,
+            texture.width,
+            texture.height,
+        ) {
+            Ok(()) => texture_ok[index] = true,
+            Err(error) => {
+                eprintln!(
+                    "event=renderer.scene.particle_skip system={} detail=upload-failed: {error}",
+                    particle.name
                 );
             }
         }

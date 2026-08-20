@@ -386,6 +386,145 @@ lanes (`--font-dir`, unit tests) drive the order above end-to-end.
 | sfnt pre-flight | offset table, table records, ttc offsets, and (where cheap) maxp/loca/glyf ranges validated in the shim before any stb call | hostile or truncated fonts are rejected at open (`Font::open` → None), never parsed |
 | atlas rebuild budget | 2/s (`ATLAS_REBUILDS_PER_SECOND`), 1 s window | overflow and font/pointsize changes all ride the budget; the initial load is the only unbounded path |
 
+## Particle systems (M3f)
+
+Particle systems are a WE scene object family on par with images and
+text (the OWE reference renders emitters as point-quad instanced draws
+with per-particle color/size interpolation over life; the architecture
+mirrored here, with the instancing flattened into one batched vertex
+buffer per system). M3f implements the **flat emitter model**: every
+property is a scene.json key or a script-visible scalar, the simulation
+advances on a fixed 1/60 s timestep, and each system draws through a
+per-mode blend pipeline — the M3d semantics unchanged. **Corpus
+reality**: the corpus carries zero particle systems (and zero textures —
+an emitter needs one), so the implementation is validated with synthetic
+fixtures (the `scripts/smoke-scene.sh` M3f lanes) and unit tests, never
+with byte-pinned real-content renders.
+
+### Researched reference facts
+
+- WE emitters are configured in the file through a nested `particle`
+  object; `maxcount` is the WE key for the live-particle cap, default
+  **100** (we default to 1000 and clamp 1..=4096 — documented deviation:
+  a 100 default starves every smoke fixture and hides over-spawn bugs).
+- WE emitters carry **no `direction`/`spread` fields**: launch velocity
+  comes from the velocity-random initializer (`Initializer.VELOCITY`),
+  which is not file-configurable. The flat `direction` (radians from +x,
+  y down) + `spread` (0..=2π cone) model is the M3f extension the
+  deterministic smoke oracles need (documented deviation).
+- The WE script surface is `IParticleSystem` (object accessors, plus
+  `play()` = resume emission, `pause()` = emission off with live
+  particles still simulating, `stop()` = clear immediately, `isPlaying()`
+  = emitting or alive, `emitParticles(count)`, default count 1, works
+  while stopped) and `IParticleSystemInstance` with the factors
+  `count`, `speed`, `lifetime`, `size`, `alpha`, `rate`, `colorn` (the
+  intentional WE spelling), each defaulting to 1.0; non-finite values
+  clamp to 1.0 and the range clamps to [0, 1e6] (alpha/colorn to [0, 1]).
+- WE emitter texture field is `material` (the brief's `texture` wins when
+  both are present), resolved through the M3c image-source chain
+  including the package table.
+- WE blend modes map 0/1/6/7/9 = Normal/Multiply/Add/Screen/Subtract
+  (the M3d table); `blendMode` and `colorBlendMode` are both accepted.
+- WE randomness is per-frame and non-deterministic; M3f replaces it with
+  one splitmix64 stream per system, seeded by the system index —
+  documented deviation, the same scene renders the same particles on
+  every run (spread-0 systems never touch the stream: their trajectories
+  are exact).
+
+### scene.json keys (the `particle` object)
+
+All keys in the table below live **inside** the `"particle"` dict
+(`objects[i].particle.*`) except the shared-props row (`blendMode`,
+`alpha`, `brightness`, `visible`), which sit on the object **beside**
+`particle` like every WE object (`objects[i].blendMode` — the M3c/M3d
+common path, corpus: `colorBlendMode` on image objects; `material` is
+inside the dict per the WE texture field).
+
+Missing keys take the defaults; scalar fields clamp (out-of-range →
+clamp bound, non-finite → default); vector fields (`gravity`,
+`colorStart`, `colorEnd`) reject non-vector shapes like every WE vector.
+`speedMin`/`speedMax` win over a bare `speed`; a missing `speedMax`
+falls back to the resolved minimum, and a reversed pair normalizes
+(min ≤ max) — the runtime picks launch speeds uniformly in [min, max].
+
+| Key | Range | Default | Notes |
+|---|---|---|---|
+| `spawnRate` | 0..=4096 /s | 10 | integer or numeric string |
+| `life` | 0.1..=60 s | 1.0 | |
+| `speed` / `speedMin` / `speedMax` | 0..=1e6 px/s | 0 | the pair supersedes `speed`; reversed pairs normalize |
+| `direction` | radians | 0 | from +x, y down (M3f extension, see research notes) |
+| `spread` | 0..=2π | 0 | all particles take the exact direction at 0 |
+| `gravity` | ±1e6 px/s², 1..=3 components | [0, 0] | `[g]` → `[0, g]` (y down); extra components dropped |
+| `sizeStart` / `sizeEnd` | 1..=512 px | 8 | interpolated over life |
+| `colorStart` / `colorEnd` | RGBA 0..=1 each | white | vec3 implies alpha 1; interpolated over life |
+| `alphaStart` / `alphaEnd` | 0..=1 | 1 → 0 | particles fade out by default |
+| `maxCount` | 1..=4096 | 1000 | the WE key; integer or numeric string (floats reject like every integer key); excess spawns **drop**, never evict live particles (documented deviation from WE's 100) |
+| `texture` / `material` | M3c image source | none | `texture` wins when both present; a non-string is None — the system registers and simulates but draws nothing |
+| `blendMode` / `colorBlendMode` | M3d enum | Normal | pre-clamp; the runtime clamps to the implemented set like every layer |
+| `alpha` / `brightness` / `visible` | M3c/M3d common | 1 / 1 / true | drawn effects; read-only through the script surface in M3f (the instance factors are the script knobs) |
+
+Shared properties (`origin`, `angles`, `scale`, `alpha`, `visible`,
+`blendMode`, `brightness`, `tint`) parse through the M3c/M3d path, but
+`angles`/`scale` are **not applied** in M3f — particle systems render
+world-space with `origin` only (documented deviation; the system
+transform is planned).
+
+### Simulation model
+
+One `ParticleSystemState` per registered system, stepped every frame
+with the frame's dt (`sync_particles`; also seeded with one pacing
+interval at load so the first published frame already shows particles):
+
+1. **accumulate** — `rate`-scaled dt (the WE simulation-rate factor),
+   capped at 1.0 s (60 steps) per frame, `MAX_FRAME_DT` 1.0 s wall per
+   frame; a stalled frame never unstretches.
+2. **spawn** — only while emitting or a burst is pending (`play()` /
+   `pause()` / `stop()` / `emitParticles(count)`, WE semantics); the
+   per-step due count is `spawnRate × count × h`, floored, excess
+   **dropped** (never evicted, one bounded
+   `event=renderer.scene.particles_capped` per system), accumulator
+   capped at 65536.
+3. **integrate** — explicit Euler: `v += g·h; x += v·h; age += h`.
+4. **retain** — particles with `age ≥ life` die (step 3's birth step
+   order makes a particle born at step s sit at `(n−s+1) × speed × h`
+   after n steps).
+
+Size, color and alpha interpolate over normalized age
+(`age / life`, clamped), so a `sizeStart 8, sizeEnd 4, alphaStart 1,
+alphaEnd 0` particle shrinks and fades linearly. Determinism: every op
+is f32 fixed-step; spread-0 trajectories are exact (no RNG), spread
+systems use the per-system splitmix64 stream seeded by system index.
+
+### Rendering
+
+Each system owns one host-visible vertex buffer, rebuilt only when the
+emitter properties change (`spawnRate`, `life`, speed range, direction,
+spread, gravity, sizes, colors, alphas, `maxCount`, blend mode,
+visibility); the live particles are uploaded per frame (or on change)
+and drawn as **one batched draw per system** — 6 vertices per particle
+(an axis-aligned quad expanded around the center, `tr/tl/bl/br` UVs
+covering the full texture), 40-byte stride with per-particle color and
+size folded into the vertex attributes (`shaders/particle.vert` /
+`particle.frag` — the M3f shader pair). Blend modes reuse the M3d
+per-mode pipeline variants (≤ 16 pipelines, one per mode); the texture
+rides slot `MAX_LAYERS + system_index` (272 slots total). A missing,
+over-budget or undecodable material skips the system's draw at load
+(`particle_skip`, never fatal — the system still simulates), and a
+vertex-upload failure is contained the same way.
+
+### Bounds
+
+| Bound | Value | Behavior |
+|---|---|---|
+| particle systems per scene | 16 (`MAX_PARTICLE_SYSTEMS`) | further `particle` objects are skipped (counted, `event=renderer.scene.particle_system_skip count=...`), never a rejection |
+| live particles per system | 4096 (`MAX_PARTICLES`) | `maxCount` clamps to it; excess spawns drop, never evict; one bounded `particles_capped` per system |
+| timestep | 1/60 s (`FIXED_STEP`) | fixed-step accumulator for oracle determinism |
+| sim time per frame | ≤ 1.0 s (`MAX_ACCUMULATED_SIM_SECONDS` = 60 steps) | hostile `rate` factors can never stall the frame |
+| wall dt per frame | ≤ 1.0 s (`MAX_FRAME_DT`) | a stalled frame is dropped, not stretched |
+| spawn accumulator | 65536 due particles/step (`MAX_SPAWN_ACCUMULATOR`) | excess dropped, bounded |
+| vertex buffer | 4096 × 6 verts × 40 B ≈ 983 KiB per system | one host-visible buffer, rebuilt on property change only |
+| texture slots | `MAX_LAYERS` (256) + 16 particle slots = 272 | the M3c texture budget still applies per upload |
+
 ## Image sources (M3c)
 
 - **File scenes**: the reference is resolved against the canonicalized
@@ -598,7 +737,8 @@ image compositing in M3a.
 | `SceneLayer` (`Layer`) | **implemented (M3c, M3d)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). M3d adds `blendMode` (0/1/6/7/9 select the researched modes; 11/12/24/30 clamp to Normal with a bounded diagnostic; anything else clamps silently), `brightness` (0..=10), and `tint` `{r, g, b, a}` (0..=1 each). Writes are clamped like `Engine.clearcolor`: non-finite → 0 (effects → their default 1.0), alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
 | color effects (`brightness`, `tint`) | **implemented (M3d)** | the effects apply to the sampled texel before blending; clamps absorb any out-of-range write |
 | text layers | **implemented (M3e)** | see the Text layers table below |
-| particles, 3D models, properties | *planned* (M3f–M3k) | the parse tolerates extra keys but renders none of them |
+| particles | **implemented (M3f)** | see the Particles table below |
+| 3D models, user properties | *planned* (M3g–M3k) | the parse tolerates extra keys but renders none of them |
 
 ### Text layers (M3e)
 
@@ -612,6 +752,22 @@ image compositing in M3a.
 | glyph atlas | **implemented (M3e)** | 2048² per layer, white glyphs with coverage in alpha — zero shader changes; overflow clear+repack rate-limited to 2/s |
 | `Layer.size` on a text layer | ignored | text size is automatic (layout pixels map 1:1 to scene units); the write is counted (`text_size_ignored`), resizing goes through `scale` |
 | text-bearing wallpapers | *planned* | the corpus carries **zero** text layers and zero textures — nothing real to validate against; M3e is exercised with synthetic fixtures only |
+### Particles (M3f)
+
+| API | Status | Notes |
+|---|---|---|
+| `Scene.getParticleSystem(name \| index)` | **implemented (M3f)** | returns the `ParticleSystem` proxy for a registered `particle` object, or `null` for an unknown name/index (never throws); the WE-compatible `Scene.getLayer` path reaches particle systems by name too |
+| `Scene.getParticleSystemCount()` | **implemented (M3f)** | the number of registered particle systems |
+| `ParticleSystem.spawnRate` / `life` / `speedMin` / `speedMax` / `direction` / `spread` / `sizeStart` / `sizeEnd` / `alphaStart` / `alphaEnd` / `maxCount` / `blendMode` | **implemented (M3f)** | read/write scalars, clamped on the Rust side like every proxy write (the scene.json ranges above; non-finite → default, out-of-range → the clamp bound) |
+| `ParticleSystem.instance` | **implemented (M3f)** | the WE `IParticleSystemInstance`: `count`, `speed`, `lifetime`, `size`, `alpha`, `rate`, `colorn` — multiplicative factors, default 1.0, non-finite → 1.0, clamped [0, 1e6] (alpha/colorn [0, 1]); `count` scales the spawn rate (the smoke-d lane pins it), `lifetime` scales life, `rate` scales the sim time |
+| `ParticleSystem.play()` / `pause()` / `stop()` / `isPlaying()` / `emitParticles(count)` | **implemented (M3f)** | WE semantics: play resumes emission, pause stops emission with live particles still simulating, stop clears immediately, `isPlaying()` = emitting or alive, `emitParticles` (default count 1) bursts even while stopped |
+| `ParticleSystem.alpha` / `brightness` | **implemented (M3f)** | read/write like every layer (0..=1 / 0..=10); the drawn effects (read-only in M3f only in the sense that the instance factors are the documented knobs) |
+| `particle`-object shared props | **implemented (M3f)** | `origin` positions the emitter; `angles`/`scale` parse but are **not applied** (documented deviation — systems render world-space; the transform is planned) |
+| `texture` / `material` | **implemented (M3f)** | M3c image-source resolution (content root or pkg table); `texture` wins over `material`; missing/undecodable → the system simulates but draws nothing (`particle_skip`, never fatal) |
+| emitter `direction`/`spread` | **implemented (M3f)** | the M3f extension (WE emitters have neither — launch velocity comes from the velocity-random initializer); radians from +x, spread 0..=2π cone |
+| `maxCount` > 4096 / spawn excess | **implemented (M3f)** | excess spawns drop (never evict), one bounded `particles_capped` per system |
+| particle-bearing wallpapers | *planned* | the corpus carries **zero** particle systems and zero textures — M3f is exercised with synthetic fixtures only |
+
 | `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
 | image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
 | audio/pointer/media input in script | *planned* | the worker receives and acks the wire inputs (M1a plumbing, unchanged) but exposes none of them to the script in M3a |

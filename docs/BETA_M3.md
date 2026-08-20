@@ -15,8 +15,10 @@ order), bounded image decoding from the content root or the package entry
 table, and the `Scene.getLayer` layer proxy so scripts can move, resize,
 rotate, fade, and hide layers at runtime. M3d adds the per-layer blend
 modes and color effects; M3e adds text layers (a glyph atlas rendered
-through the M3c compositor with zero shader changes). The rest of the
-scene surface (particles, 3D, user properties — M3f–M3k) and any manager
+through the M3c compositor with zero shader changes); M3f adds particle
+systems (a bounded fixed-timestep CPU simulation, one batched draw per
+system, and the `Scene.getParticleSystem` script surface). The rest of
+the scene surface (3D, user properties — M3g–M3k) and any manager
 changes are deliberately out of scope.
 
 ## Goal
@@ -343,6 +345,78 @@ never committed) and unit tests over synthetic font directories.
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 
+### M3f — particle systems (this commit)
+
+Particle systems (`particle` objects) implement the **flat emitter
+model** on the M3c/M3d render path: every property is a scene.json key or
+a script-visible scalar, the simulation advances on a fixed 1/60 s
+timestep, and each system draws as **one batched draw** of 6 vertices per
+particle from a per-system host-visible vertex buffer with per-particle
+color+size in the vertex attributes — a new shader pair
+(`shaders/particle.vert`/`particle.frag`), with the blend modes reusing
+the M3d per-mode pipeline variants (≤ 16 pipelines) and the texture
+riding slot `MAX_LAYERS + system_index` (272 slots total).
+
+Simulation (`src/particles.rs`): the frame's dt is accumulated
+rate-scaled (`instance.rate`, the WE simulation-rate factor) and capped
+at 1.0 s (60 steps) per frame; each step spawns (only while emitting or
+a burst is pending — WE `play()`/`pause()`/`stop()`/`emitParticles()`
+semantics), integrates explicit Euler (`v += g·h; x += v·h; age += h`)
+and retains `age < life`. Size, color and alpha interpolate over
+normalized age. Determinism: every op is f32 fixed-step; launch speeds
+pick uniformly in `[speedMin, speedMax]` (the pair supersedes a bare
+`speed` and normalizes), launch angles spread uniformly in `direction ±
+spread/2` through one splitmix64 stream per system seeded by the system
+index — a documented deviation from WE's per-frame randomness, it is
+what makes the smoke range oracles reproducible (spread-0 systems never
+touch the stream: their trajectories are exact).
+
+Researched WE facts (full evidence in SCENE_FORMAT_V1.md): the emitter
+config nests in a `particle` object; `maxcount` is the WE key for the
+live-particle cap (WE default 100 — we default to 1000 and clamp
+1..=4096, a documented deviation); **WE emitters have no
+`direction`/`spread` fields** (velocity comes from the velocity-random
+initializer) — the flat model is the M3f extension the deterministic
+smoke oracles need; the script surface is `IParticleSystem`
+(`play()`/`pause()`/`stop()`/`isPlaying()`/`emitParticles(count)` —
+pause stops emission but keeps particles simulating, stop clears
+immediately) plus `IParticleSystemInstance` with the factors `count`,
+`speed`, `lifetime`, `size`, `alpha`, `rate`, `colorn` (the intentional
+WE spelling), each defaulting to 1.0 and clamping non-finite to 1.0;
+the texture field is `material` (the brief's `texture` wins when both
+are present), resolved through the M3c image-source chain including the
+package table. Blend modes reuse the M3d table (0/1/6/7/9 =
+Normal/Multiply/Add/Screen/Subtract); `blendMode` and `colorBlendMode`
+are both accepted. The JS surface: `Scene.getParticleSystem(name|index)`
+(→ null for unknown, never throws), `Scene.getParticleSystemCount()`,
+and the WE-compatible `Scene.getLayer` path — a `particle` object is
+also reachable by name through `getLayer`. All scene.json keys are
+clamped at the parse (missing → documented default, out-of-range → the
+clamp bound, non-finite → default; vector fields reject non-vector
+shapes like every WE vector).
+
+**Corpus fact**: the corpus carries **zero particle systems and zero
+textures** — an emitter needs one — so M3f is validated with synthetic
+fixtures only: the smoke lanes below (generated at runtime, never
+committed) and unit tests, never with byte-pinned real-content renders.
+
+### M3f — acceptance evidence
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 401 tests pass (147 in `kwe-scene-renderer`) |
+| simulation units | fixed-step accumulate/spawn/integrate/retain, f32 determinism, capped accumulators, drop-not-evict, alpha/size/color interpolation | `simulate_fixed_dt_sequence_*` / `exact_positions_for_fixed_dt_sequence` / cap + clamp tests in particles.rs |
+| scene.json parse | defaults table, scalar clamps (numeric-string forms), speed pair normalization, gravity vector forms, maxCount clamp, material/texture precedence, common props | `particle_systems_parsed_with_defaults` / `particle_*` parse tests |
+| JS proxy | getParticleSystem by name/index, instance factors with the WE defaults and clamps (non-finite → 1.0, [0,1e6] / alpha/colorn [0,1]), play/pause/stop/isPlaying/emitParticles, property writes clamp on the Rust side | `particle_system_proxy_*` / `particle_instance_factors_*` / playback tests in js.rs |
+| smoke (a) daemon lane | deterministic trail — 100/s, life 1 s, speed 60, direction 0, spread 0: steady state 100 particles, one per scene px, the 8px quads tile the band [76,144]×[41,49] | **foreground=536** full-white px in the 69×8 band, pure-white mean (llvmpipe lane: 456 px — software-rasterizer coverage, same band) |
+| smoke (b) daemon lane | gravity differential — blue (gravity [0,80]) falls y = 40t² (mean frame-y ~15 px below the stationary red square at y 45) | red=328 blue=64, red_mean_y=69.0 blue_mean_y=44.5 — the blue trail's mean frame-y sits 24.5 px below the stationary red (≥ 3 required) |
+| smoke (c) daemon lane | spawn cap — spawnRate 4096/s with maxCount 4096 (the hard cap): the population is one aging cohort (age spread = maxCount/spawnRate = 1 s), a dense annulus sweeping outward at 30 px/s; excess spawns are dropped (never evicted), one bounded diagnostic | `event=renderer.scene.particles_capped system=dust` in the ring; **4637** white px in the whole frame (llvmpipe: 4409) — the annulus holds ≥ 4000 for ~40% of every 5 s cycle; an uncapped population would fill all 14400 px |
+| smoke (d) daemon lane | `instance.count = 8` from script multiplies pb's spawn rate — the pb/pa white ratio passes 3 | `M3F-COUNT-SET 8` in the ring; polled ratio **3.6** (pa 633 → pb 2281 white px; both lanes) |
+| smoke (e) daemon lane | blend differential over an opaque (30,30,30) clear — Add (6) is min(255, texel+bg): 106 single / 182 double-overlapped; Normal (0) draws the opaque texel 76 flat | add disc max R **255**, normal disc max R **76** (gates ≥ 150 / ≤ 100; llvmpipe lane repeats the same oracles) |
+| standalone llvmpipe lanes | every M3f case (a)-(e) repeated under the software rasterizer on the worker's own frame file | same oracles pass (a: 456 px, c: 4409 px, d: ratio 3.6); (c) also greps its log for particles_capped, (d) for M3F-COUNT-SET 8 |
+| regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
+| plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
+
 ## Run the suites
 
 ```sh
@@ -424,6 +498,20 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | layer cap / clamp units | 256 accepted, 257 rejected; clamps: non-finite→0, alpha 0..=1, \|v\| ≤ 1e6, size ≥ 0, `visible` boolean coercion; malformed model layers skip | `exactly_256_image_layers_accepted`, `rejects_257th`, `malformed_model_layers_skip_never_reject`; clamp tests in layers.rs + js.rs |
 | corpus stats (re-scan) | image-bearing objects, blendMode histogram, reference classes, property-wrapping rates | 685 objects; 432 with `colorBlendMode` (410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 — sums to 432); **620 model `.json` refs + 65 null image values, 0 textures (M3h)**; 70% (315/447) alpha / 49% (276/568) visible property-wrapped |
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4), `smoke-supervisor.sh` exit 0 |
+| plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
+
+### M3f — particle systems (this commit)
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; 401 tests pass (147 in `kwe-scene-renderer`) |
+| smoke (a): deterministic trail | 100/s, life 1 s, speed 60, direction 0, spread 0: steady state 100 particles, one per scene px, the 8px quads tile the band [76,144]×[41,49] | daemon lane **foreground=536** full-white px in the 69×8 band, mean (255,255,255); llvmpipe lane 456 px — the deterministic spread-0 trajectories (splitmix64 never consulted) |
+| smoke (b): gravity differential | blue (gravity [0,80]) falls y = 40t² from the origin; stationary red (gravity 0) stays at y 45 | red=328 blue=64, red_mean_y=69.0 blue_mean_y=44.5 — blue's mean frame-y 24.5 px below red (≥ 3 required); both lanes |
+| smoke (c): spawn cap | spawnRate 4096/s × life 5 s = 20480 demanded but maxCount 4096 (the hard cap) bounds the population; the drop policy keeps ONE aging cohort (age spread 1 s) — a dense annulus sweeping outward at 30 px/s, ≥ 4000 frame-white px for ~40% of every 5 s cycle; one bounded diagnostic at the first drop (~1 s) | `event=renderer.scene.particles_capped system=dust` in the ring (re-queried after the poll); **4637** white px in the whole frame (llvmpipe: 4409); exit-73 float `maxCount` rejection covered by the unit `maxCount` parse tests (smoke case used the integer form) |
+| smoke (d): instance.count factor | script sets `pb.instance.count = 8` at t=2 s; count multiplies the spawn accumulator — pb's sparse disc saturates while pa's stays sparse | `M3F-COUNT-SET 8` in the ring via console.log; polled pb/pa white ratio **3.6** (pa 633 → pb 2281 px, both lanes) — bash integer division would truncate 3.6 to 3, so the suite compares ×10 |
+| smoke (e): blend differential | Add (6) = min(255, texel+bg): 106 single / 182 double-overlapped / up to 255; Normal (0) draws the opaque 76 texel flat; discs r=45 at frame x 32/128 stay clear of the [80,160] seam | add box max R **255**, normal box max R **76** (gates ≥ 150 / ≤ 100; both lanes); `blendMode` is an object-level prop (the M3c/M3d shared path) — the suite fixture hoists it out of the `particle` dict, matching the WE serialization |
+| exit code parity | a malformed particle scene rejects like every bad scene | `"objects[0].maxCount" must be an integer or a numeric string` → exit 73 → `rolled_back` (the suite's run-3 fixture passed `maxCount: 1000.0` — the float rejection observed live; the fixture uses the integer form) |
+| regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 
 ## Renderer exit codes
