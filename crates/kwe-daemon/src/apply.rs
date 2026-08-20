@@ -43,7 +43,7 @@
 //! resolved through the connector -> screen -> desktop mapping above.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     io::{ErrorKind, Read},
     os::unix::fs::OpenOptionsExt,
@@ -62,6 +62,7 @@ use sha2::{Digest, Sha256};
 use kwe_core::{Catalog, CatalogItem, ProjectKind};
 
 use crate::persist::{atomic_write, ensure_private_dir, quarantine_invalid_state, unix_seconds};
+use crate::playlist_session::PlaylistApplyLane;
 use crate::supervisor::{
     ContentSpec, RendererKind, StartSpec, SupervisorHandle, WorkerPhase, validate_identity_part,
 };
@@ -583,13 +584,33 @@ pub struct OutputInfo {
     pub image: Option<String>,
 }
 
+/// How the daemon reaches the Plasma shell for one `evaluateScript` call.
+/// Production evaluates through a direct `qdbus` invocation (no shell; the
+/// script is passed as an argument). Integration smokes inject an external
+/// command run exactly the same way — `<path> <script>` with the identical
+/// bounded child machinery — so the whole Plasma boundary is stubbable
+/// without a live session. A stub must answer the read-only enumeration
+/// probe with the probe-reply JSON and run the switch/restore scripts as a
+/// recorded no-op; the stub for the smoke keeps a switch log and flips its
+/// enumeration reply once the kwe switch script has been seen, mirroring
+/// what the real shell reports after the switch.
+#[derive(Debug, Clone)]
+enum ShellEvaluator {
+    Qdbus {
+        shell_service: String,
+        qdbus_binary: Option<PathBuf>,
+    },
+    External(PathBuf),
+}
+
 /// Plasma shell probe via direct `qdbus` invocation (no shell; the script
 /// is passed as an argument). The qdbus binary is resolved from PATH on
 /// every call — `qdbus` first, `qdbus6` fallback — so the daemon starts
 /// fine on systems without either and reports `shell_unreachable` lazily.
+/// `--plasma-switch-command` replaces the whole evaluation boundary with an
+/// external command for integration tests.
 pub struct QdbusShellProbe {
-    shell_service: String,
-    qdbus_binary: Option<PathBuf>,
+    evaluator: ShellEvaluator,
     kscreen_binary: PathBuf,
     timeout: Duration,
 }
@@ -598,41 +619,61 @@ impl QdbusShellProbe {
     pub fn new(
         shell_service: String,
         qdbus_binary: Option<PathBuf>,
+        switch_command: Option<PathBuf>,
         kscreen_binary: PathBuf,
         timeout: Duration,
     ) -> Self {
         Self {
-            shell_service,
-            qdbus_binary,
+            evaluator: match switch_command {
+                Some(path) => ShellEvaluator::External(path),
+                None => ShellEvaluator::Qdbus {
+                    shell_service,
+                    qdbus_binary,
+                },
+            },
             kscreen_binary,
             timeout,
         }
     }
+}
 
-    fn qdbus_command(&self) -> Result<PathBuf, ProbeError> {
-        if let Some(path) = &self.qdbus_binary {
-            return Ok(path.clone());
-        }
-        find_in_path(std::env::var_os("PATH").as_deref(), &["qdbus", "qdbus6"])
-            .ok_or_else(|| ProbeError::Unreachable("qdbus (or qdbus6) is not on PATH".into()))
+/// Resolves the qdbus binary: an explicit path wins, else `qdbus` then
+/// `qdbus6` from PATH.
+fn resolve_qdbus(qdbus_binary: &Option<PathBuf>) -> Result<PathBuf, ProbeError> {
+    if let Some(path) = qdbus_binary {
+        return Ok(path.clone());
     }
+    find_in_path(std::env::var_os("PATH").as_deref(), &["qdbus", "qdbus6"])
+        .ok_or_else(|| ProbeError::Unreachable("qdbus (or qdbus6) is not on PATH".into()))
 }
 
 impl ShellProbe for QdbusShellProbe {
     fn evaluate_script(&self, script: &str) -> Result<String, ProbeError> {
-        let qdbus = self.qdbus_command()?;
-        let mut command = Command::new(qdbus);
-        command
-            .arg(&self.shell_service)
-            .arg("/PlasmaShell")
-            .arg("evaluateScript")
-            .arg(script);
-        let outcome = run_bounded(&mut command, self.timeout)
-            .map_err(|error| classify_probe_failure(&error))?;
+        let outcome = match &self.evaluator {
+            ShellEvaluator::Qdbus {
+                shell_service,
+                qdbus_binary,
+            } => {
+                let mut command = Command::new(resolve_qdbus(qdbus_binary)?);
+                command
+                    .arg(shell_service)
+                    .arg("/PlasmaShell")
+                    .arg("evaluateScript")
+                    .arg(script);
+                run_bounded(&mut command, self.timeout)
+                    .map_err(|error| classify_probe_failure(&error))?
+            }
+            ShellEvaluator::External(path) => {
+                let mut command = Command::new(path);
+                command.arg(script);
+                run_bounded(&mut command, self.timeout)
+                    .map_err(|error| classify_probe_failure(&error))?
+            }
+        };
         if !outcome.status.success() {
             let detail = String::from_utf8_lossy(&outcome.stderr).trim().to_string();
             return Err(ProbeError::Rejected(if detail.is_empty() {
-                format!("qdbus exited {}", outcome.status)
+                format!("evaluateScript exited {}", outcome.status)
             } else {
                 detail
             }));
@@ -969,6 +1010,11 @@ pub struct ApplyConfig {
     pub shell_service: String,
     /// Explicit qdbus binary; None resolves `qdbus` then `qdbus6` on PATH.
     pub qdbus_binary: Option<PathBuf>,
+    /// Replace the whole Plasma evaluation boundary with this command,
+    /// run as `<path> <script>` (default: qdbus). Integration smokes use a
+    /// stub here so no live Plasma is touched; live enablement (M4d) runs
+    /// the real qdbus path by leaving it unset.
+    pub switch_command: Option<PathBuf>,
     pub kscreen_binary: PathBuf,
     /// Deadline for every probe (enumeration, switch, restore).
     pub probe_timeout: Duration,
@@ -1116,6 +1162,7 @@ impl ApplyService {
         let probe: Arc<dyn ShellProbe> = Arc::new(QdbusShellProbe::new(
             config.shell_service,
             config.qdbus_binary,
+            config.switch_command,
             config.kscreen_binary,
             config.probe_timeout,
         ));
@@ -1279,32 +1326,78 @@ impl ApplyHandle {
         // 4+. Start the renderer; EVERY failure from here on rolls back.
         let result = self.complete_apply(&spec, &content, &output.name, desktop_index, previous);
         if let Err(error) = result {
-            // Rollback: stop the renderer we started — but only while it
-            // is still ours; an ownership change means the playlist
-            // session owns the supervisor now, and stopping it would kill
-            // their renderer — and revert the store to the pre-apply
-            // record (set the old record back, never just remove, so the
-            // original previous survives a failed re-apply).
-            if let Ok(status) = self.supervisor.status() {
-                let ours = status.requested_wallpaper_id.as_deref() == Some(&spec.wallpaper_id)
-                    && status.requested_content_hash.as_deref() == Some(&spec.content_hash);
-                if ours {
-                    let _ = self.supervisor.stop();
-                }
-            }
-            if let Ok(mut store) = self.store.lock() {
-                match old_assignment {
-                    Some(old) => {
-                        let _ = store.set(&output.name, old);
-                    }
-                    None => {
-                        let _ = store.remove(&output.name);
-                    }
-                }
-            }
+            self.rollback_after_failure(&spec, &output.name, old_assignment);
             return Err(error);
         }
         result
+    }
+
+    /// Rolls back a failed transaction after the renderer started: stop
+    /// the renderer — but only while it is still ours; an ownership change
+    /// means another thread owns the supervisor now, and stopping it would
+    /// kill their renderer — and revert the store to the pre-apply record
+    /// (set the old record back, never just remove, so the original
+    /// previous survives a failed re-apply).
+    fn rollback_after_failure(
+        &self,
+        spec: &StartSpec,
+        output_name: &str,
+        old_assignment: Option<Assignment>,
+    ) {
+        if let Ok(status) = self.supervisor.status() {
+            let ours = status.requested_wallpaper_id.as_deref() == Some(&spec.wallpaper_id)
+                && status.requested_content_hash.as_deref() == Some(&spec.content_hash);
+            if ours {
+                let _ = self.supervisor.stop();
+            }
+        }
+        if let Ok(mut store) = self.store.lock() {
+            match old_assignment {
+                Some(old) => {
+                    let _ = store.set(output_name, old);
+                }
+                None => {
+                    let _ = store.remove(output_name);
+                }
+            }
+        }
+    }
+
+    /// Resolves the output a playlist applies to. An explicitly configured
+    /// output (`--playlist-output`) wins and is validated like every other
+    /// output identity; otherwise the last assigned output whose wallpaper
+    /// is a member of the active playlist (the display the user already
+    /// attached to this playlist through the UI — per-display playlist
+    /// intent, docs/UX_DESIGN.md), else the first enabled and connected
+    /// output on the bus, else `OutputMissing` (nothing is applied). The
+    /// resolution runs on every apply attempt, so an output that returns
+    /// to the bus is picked up without a daemon restart.
+    fn resolve_playlist_output(
+        &self,
+        output: Option<&str>,
+        playlist_entries: &BTreeSet<String>,
+    ) -> Result<String, ApplyError> {
+        if let Some(output) = output {
+            validate_identity_part("output", output)
+                .map_err(|error| ApplyError::Invalid(error.to_string()))?;
+            return Ok(output.to_string());
+        }
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
+        for (name, assignment) in store.all() {
+            if playlist_entries.contains(&assignment.wallpaper_id) {
+                return Ok(name.clone());
+            }
+        }
+        drop(store);
+        let outputs = self.enumerate_fresh()?;
+        outputs
+            .iter()
+            .find(|info| info.enabled && info.connected)
+            .map(|info| info.name.clone())
+            .ok_or_else(|| ApplyError::OutputMissing("no enabled, connected output".into()))
     }
 
     /// The post-start half of the apply transaction. Every failure here is
@@ -1600,6 +1693,90 @@ impl ApplyHandle {
             )));
         }
         Ok(())
+    }
+}
+
+/// The playlist session's apply lane: the full M4a apply transaction, with
+/// the kind/content/width/height/fps derived FROM THE CATALOG (a playlist
+/// entry is applied exactly as the catalog describes it — the RPC-style
+/// client-supplied content match rule does not apply), and the output
+/// resolved from the session's configured output or the last assignment of
+/// this playlist's entries. The transaction, its single-transaction lock,
+/// and its rollback are shared with `wallpaper.apply` — an entry change
+/// and a user apply can never run concurrently.
+impl PlaylistApplyLane for ApplyHandle {
+    fn apply_playlist(
+        &self,
+        output: Option<String>,
+        wallpaper_id: String,
+        playlist_entries: &BTreeSet<String>,
+    ) -> Result<Value, ApplyError> {
+        // The lane shares the single apply transaction lock with
+        // wallpaper.apply: a user apply in flight wins the slot and the
+        // session backs off instead of interleaving start/ensure_ours
+        // steps. User-apply precedence comes from the session's verdict
+        // (yield while a foreign renderer is live); this lock only closes
+        // the mid-transaction race.
+        let _guard = self.acquire_apply_lock()?;
+        let resolved_output = self.resolve_playlist_output(output.as_deref(), playlist_entries)?;
+
+        // Catalog lookup: the single validation point shared with
+        // wallpaper.apply. A playlist entry is always applied as the
+        // catalog says it is — there is no client-supplied kind/content.
+        let item = self.catalog_item(&wallpaper_id)?;
+        let kind = renderer_kind_for(&item).ok_or_else(|| {
+            ApplyError::Incompatible(format!(
+                "{} is not an apply-able project kind",
+                item.workshop_id
+            ))
+        })?;
+        let content = catalog_content_path(&item, kind);
+        if content.to_string_lossy().chars().count() > MAX_CONTENT_CHARS {
+            return Err(ApplyError::Invalid(format!(
+                "catalog content path exceeds {MAX_CONTENT_CHARS} characters"
+            )));
+        }
+        let mut spec = StartSpec {
+            wallpaper_id: wallpaper_id.clone(),
+            content_hash: "pending".into(),
+            width: default_apply_width(),
+            height: default_apply_height(),
+            fps: default_apply_fps(),
+            kind,
+            content: Some(content_spec_for(kind, &content)),
+            test_fault: None,
+            stderr_lines: None,
+        }
+        .into_validated()
+        .map_err(|error| ApplyError::Invalid(error.to_string()))?;
+        spec.content_hash = content_hash_for(&item, &content);
+
+        // Fresh enumeration; the resolved output must be live and have a
+        // desktop (same rule as wallpaper.apply).
+        let outputs = self.enumerate_fresh()?;
+        let output_info = outputs
+            .iter()
+            .find(|info| info.name == resolved_output)
+            .ok_or_else(|| ApplyError::OutputMissing(resolved_output.clone()))?;
+        let desktop_index = output_info.desktop_index.ok_or_else(|| {
+            ApplyError::Transaction(format!(
+                "output {} has no desktop containment",
+                output_info.name
+            ))
+        })?;
+        let previous = self.previous_for(output_info)?;
+
+        // 4+. Start the renderer; EVERY failure from here on rolls back
+        // exactly like wallpaper.apply (same ownership guard, same store
+        // revert).
+        let old_assignment = self.stored_assignment(&resolved_output)?;
+        let result =
+            self.complete_apply(&spec, &content, &resolved_output, desktop_index, previous);
+        if let Err(error) = result {
+            self.rollback_after_failure(&spec, &resolved_output, old_assignment);
+            return Err(error);
+        }
+        result
     }
 }
 
@@ -2454,5 +2631,49 @@ mod tests {
         assert_ne!(target.wallpaper_plugin, KWE_PLUGIN);
         let target = restore_target(Some(sample_assignment()), None);
         assert_ne!(target.wallpaper_plugin, KWE_PLUGIN);
+    }
+
+    #[test]
+    fn external_evaluator_runs_the_script_as_its_single_argument() {
+        // `--plasma-switch-command <path>` replaces the whole evaluation
+        // boundary: the command is spawned with the evaluateScript script
+        // as its sole argument and its stdout is the probe reply, through
+        // the same bounded-run machinery as qdbus.
+        use std::os::unix::fs::PermissionsExt;
+        let root = temporary_directory("external-evaluator");
+        std::fs::create_dir_all(&root).unwrap();
+        let stub = root.join("plasma-stub.sh");
+        std::fs::write(&stub, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            Some(stub),
+            PathBuf::from("kscreen-doctor"),
+            Duration::from_secs(5),
+        );
+        // Enumeration and switch scripts both pass through the same
+        // boundary; the stub chooses by content.
+        let script = "var d = desktops(); print(1);";
+        assert_eq!(probe.evaluate_script(script).unwrap(), script);
+        let switch = "var d = desktops()[1]; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";";
+        assert_eq!(probe.evaluate_script(switch).unwrap(), switch);
+        // A failing stub maps onto ProbeError::Rejected with its stderr.
+        let failing = root.join("failing-stub.sh");
+        std::fs::write(&failing, "#!/bin/sh\necho 'nope' >&2\nexit 3\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            Some(failing),
+            PathBuf::from("kscreen-doctor"),
+            Duration::from_secs(5),
+        );
+        let error = probe.evaluate_script("print(1);").unwrap_err();
+        assert!(
+            matches!(error, ProbeError::Rejected(ref detail) if detail == "nope"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

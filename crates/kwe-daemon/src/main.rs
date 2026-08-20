@@ -186,6 +186,13 @@ struct Arguments {
     /// systems without either.
     #[arg(long)]
     qdbus_binary: Option<PathBuf>,
+    /// Replace the whole Plasma shell evaluation boundary (enumeration and
+    /// switch scripts alike) with this executable, run as `<path> <script>`
+    /// (default: qdbus). Integration smokes stub the Plasma boundary with
+    /// it so no live session is touched; live enablement (BETA_M4d) leaves
+    /// it unset and runs the real qdbus.
+    #[arg(long)]
+    plasma_switch_command: Option<PathBuf>,
     /// kscreen-doctor binary used for the read-only output enumeration.
     #[arg(long, default_value = "kscreen-doctor")]
     kscreen_doctor_binary: PathBuf,
@@ -195,6 +202,11 @@ struct Arguments {
     /// Deadline for the renderer to reach a live phase after wallpaper.apply.
     #[arg(long, default_value_t = 15000, value_parser = clap::value_parser!(u64).range(1000..=60000))]
     apply_promotion_timeout_ms: u64,
+    /// Output that playlist-driven assignments target (BETA_M4c). None
+    /// resolves at apply time to the last assigned output of the active
+    /// playlist, else the first enabled and connected output.
+    #[arg(long)]
+    playlist_output: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,11 +343,35 @@ fn main() -> Result<()> {
         }
         Arc::new(RwLock::new(initial_catalog))
     };
+    // The apply service must exist before the playlist session: the session
+    // drives the same apply transaction the wallpaper.* API uses (BETA_M4c),
+    // sharing its transaction lock so a playlist entry change and a user
+    // apply never run concurrently.
+    let apply_service = ApplyService::new(
+        ApplyConfig {
+            state_dir: apply_state_dir,
+            shell_service: arguments.plasma_shell_service,
+            qdbus_binary: arguments.qdbus_binary,
+            switch_command: arguments.plasma_switch_command,
+            kscreen_binary: arguments.kscreen_doctor_binary,
+            probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
+            promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
+        },
+        catalog.clone(),
+        supervisor.clone(),
+    )?;
+    let apply = apply_service.handle();
+    if let Some(output) = &arguments.playlist_output {
+        validate_identity_part("output", output)
+            .with_context(|| format!("invalid --playlist-output {output:?}"))?;
+    }
     let playlist_service = PlaylistSessionService::start(PlaylistSessionConfig {
         state_dir: playlist_state_dir,
         tick_ms: arguments.playlist_tick_ms,
         supervisor: Some(supervisor.clone()),
         valid_ids: compute_valid_ids(&catalog),
+        output: arguments.playlist_output,
+        apply: Some(Arc::new(apply.clone())),
     });
     let playlist = playlist_service.handle();
     // The audio capture service always runs so `audio.status` stays
@@ -353,19 +389,6 @@ fn main() -> Result<()> {
     })?;
     let audio = audio_service.handle();
     let worker_pid = audio_service.worker_pid();
-    let apply_service = ApplyService::new(
-        ApplyConfig {
-            state_dir: apply_state_dir,
-            shell_service: arguments.plasma_shell_service,
-            qdbus_binary: arguments.qdbus_binary,
-            kscreen_binary: arguments.kscreen_doctor_binary,
-            probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
-            promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
-        },
-        catalog.clone(),
-        supervisor.clone(),
-    )?;
-    let apply = apply_service.handle();
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -1290,6 +1313,9 @@ fn validate_socket_parent(socket: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use kwe_core::{Playlist, PlaylistDecision};
+    use playlist_session::PlaylistApplyLane;
+
     use super::*;
     use supervisor::WorkerPhase;
 
@@ -1449,6 +1475,8 @@ mod tests {
             tick_ms: 50,
             supervisor: None,
             valid_ids: Arc::new(BTreeSet::new()),
+            output: None,
+            apply: None,
         })
     }
 
@@ -2247,9 +2275,28 @@ with open(args.output, "wb") as frame:
 
     /// Fake steam root with one subscribed scene project (workshop id "1").
     fn scene_catalog() -> Arc<RwLock<Catalog>> {
+        scene_catalog_with(&["1"])
+    }
+
+    /// Fake steam root with subscribed scene projects for `ids` (workshop
+    /// ids). Every project carries the runnable scene.json inside its
+    /// content root (the resolved catalog content, BETA_M4a review fix 5:
+    /// the renderer runs the catalog content, and a client-supplied
+    /// content must match it).
+    fn scene_catalog_with(ids: &[&str]) -> Arc<RwLock<Catalog>> {
         let root = temp_dir("apply-catalog");
-        let content_dir = root.join("steamapps/workshop/content/431960/1");
-        std::fs::create_dir_all(&content_dir).unwrap();
+        let mut subscriptions = String::new();
+        for id in ids {
+            let content_dir = root.join(format!("steamapps/workshop/content/431960/{id}"));
+            std::fs::create_dir_all(&content_dir).unwrap();
+            std::fs::write(
+                content_dir.join("project.json"),
+                format!(r#"{{"title":"Synthetic {id}","type":"scene","tags":[]}}"#),
+            )
+            .unwrap();
+            std::fs::write(content_dir.join("scene.json"), br#"{"general":{}}"#).unwrap();
+            subscriptions.push_str(&format!(" \"{id}\" \"1\""));
+        }
         std::fs::write(
             root.join("steamapps/libraryfolders.vdf"),
             "\"LibraryFolders\" { }\n",
@@ -2257,28 +2304,24 @@ with open(args.output, "wb") as frame:
         .unwrap();
         std::fs::write(
             root.join("steamapps/appworkshop_431960.acf"),
-            "\"AppWorkshop\" { \"WorkshopItems\" { \"1\" \"1\" } }\n",
+            format!("\"AppWorkshop\" {{ \"WorkshopItems\" {{ {subscriptions} }} }}\n"),
         )
         .unwrap();
-        std::fs::write(
-            content_dir.join("project.json"),
-            r#"{"title":"Synthetic One","type":"scene","tags":[]}"#,
-        )
-        .unwrap();
-        // The runnable scene.json inside the content root (the resolved
-        // catalog content, BETA_M4a review fix 5: the renderer runs the
-        // catalog content, and a client-supplied content must match it).
-        std::fs::write(content_dir.join("scene.json"), br#"{"general":{}}"#).unwrap();
         Arc::new(RwLock::new(scan_installed(&[root], &ScanLimits::default())))
     }
 
     /// The resolved catalog content path for the fixture item "1".
     fn fixture_scene_path(catalog: &Catalog) -> PathBuf {
+        fixture_scene_path_for(catalog, "1")
+    }
+
+    /// The resolved catalog content path for a fixture item.
+    fn fixture_scene_path_for(catalog: &Catalog, id: &str) -> PathBuf {
         let item = catalog
             .items
             .iter()
-            .find(|item| item.workshop_id == "1")
-            .expect("fixture item 1");
+            .find(|item| item.workshop_id == id)
+            .unwrap_or_else(|| panic!("fixture item {id}"));
         item.content_root.join("scene.json")
     }
 
@@ -3112,5 +3155,274 @@ with open(args.output, "wb") as frame:
             assert!(!ok, "{method} must fail closed");
             assert_eq!(result["error"], "apply_unavailable", "{method}");
         }
+    }
+
+    // --- BETA_M4c: playlist renderer assignment through the apply lane ----
+
+    /// A three-entry 10 s daily playlist over the scene fixture.
+    fn daily_scene_playlist() -> Playlist {
+        let mut playlist = Playlist::new("daily".into(), "Daily".into()).unwrap();
+        for id in ["1", "2", "3"] {
+            playlist.add(id.into()).unwrap();
+        }
+        playlist.duration_seconds = 10;
+        playlist
+    }
+
+    /// The wallpaper id of a decision serialized over the API (the state
+    /// machine drives `maybe_apply` from the same serde shape the protocol
+    /// exposes).
+    fn decision_wallpaper(decision: &PlaylistDecision) -> String {
+        serde_json::to_value(decision).unwrap()["wallpaper_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A session wired to the real apply lane (50 ms tick).
+    fn session_with_apply(
+        dir: PathBuf,
+        supervisor: SupervisorHandle,
+        lane: Arc<dyn PlaylistApplyLane>,
+        valid: &[&str],
+    ) -> PlaylistSessionService {
+        PlaylistSessionService::start(PlaylistSessionConfig {
+            state_dir: dir,
+            tick_ms: 50,
+            supervisor: Some(supervisor),
+            valid_ids: Arc::new(valid.iter().map(|id| id.to_string()).collect()),
+            output: None,
+            apply: Some(lane),
+        })
+    }
+
+    /// Poll renderer.status until the supervisor is live on `wallpaper_id`
+    /// AND the apply transaction has reached (and passed) its switch
+    /// script: `expected_switches` scripts evaluated. Promotion alone can
+    /// return while the transaction is still between persist and switch,
+    /// so every side effect the assertions read (store write precedes the
+    /// switch) is settled once this returns.
+    fn wait_for_settled(
+        supervisor: &SupervisorHandle,
+        probe: &apply::StubProbe,
+        wallpaper_id: &str,
+        expected_switches: usize,
+    ) -> WorkerStatus {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = supervisor.status().unwrap();
+            let switches = kwe_switch_count(probe);
+            if status.requested_wallpaper_id.as_deref() == Some(wallpaper_id)
+                && matches!(status.phase, WorkerPhase::Live | WorkerPhase::AwaitingAck)
+                && switches >= expected_switches
+            {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for renderer {wallpaper_id} to settle (switch count {switches}/{expected_switches}): {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Number of kwe switch scripts the stub probe evaluated so far.
+    fn kwe_switch_count(probe: &apply::StubProbe) -> usize {
+        probe
+            .scripts()
+            .iter()
+            .filter(|script| script.contains("wallpaperPlugin = \"org.kde.kwe.wallpaper\""))
+            .count()
+    }
+
+    /// The scene catalog with entries 1..=3 shared by the playlist tests.
+    fn playlist_catalog() -> Arc<RwLock<Catalog>> {
+        scene_catalog_with(&["1", "2", "3"])
+    }
+
+    #[test]
+    fn playlist_entry_change_applies_through_the_real_transaction() {
+        let root = temp_dir("playlist-apply");
+        let catalog = playlist_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let lane: Arc<dyn PlaylistApplyLane> = Arc::new(handle.clone());
+        let session = session_with_apply(
+            temp_dir("playlist-apply-state"),
+            supervisor.clone(),
+            lane,
+            &["1", "2", "3"],
+        );
+        let session_handle = session.handle();
+        session_handle.put(daily_scene_playlist()).unwrap();
+        let activate = session_handle.activate(Some("daily".into())).unwrap();
+        assert_eq!(decision_wallpaper(activate.decision.as_ref().unwrap()), "1");
+
+        // The session applies the first entry through the shared apply
+        // transaction: the fake scene renderer goes live on 1, the switch
+        // stub runs, and the assignment store records DP-1 -> 1 (scene).
+        wait_for_settled(&supervisor, &probe, "1", 1);
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(assignments["outputs"]["DP-1"]["wallpaper_id"], "1");
+        assert_eq!(assignments["outputs"]["DP-1"]["kind"], "scene");
+        assert_eq!(kwe_switch_count(&probe), 1);
+
+        // Timer advance drives the next entry: once the 10 s entry expires
+        // on the real clock, the session displaces its own stale renderer
+        // with a hard cut through the same transaction. debug_clock_skip is
+        // unusable here — it freezes remaining time (suspend simulation),
+        // so the advance must be real.
+        std::thread::sleep(Duration::from_millis(10_800));
+        wait_for_settled(&supervisor, &probe, "2", 2);
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(assignments["outputs"]["DP-1"]["wallpaper_id"], "2");
+
+        std::thread::sleep(Duration::from_millis(10_800));
+        wait_for_settled(&supervisor, &probe, "3", 3);
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(assignments["outputs"]["DP-1"]["wallpaper_id"], "3");
+
+        // Exactly one apply per entry change (1 + 1 + 1 switch scripts).
+        assert_eq!(kwe_switch_count(&probe), 3);
+
+        // Steady state: while the entry is live the session never re-applies
+        // (no churn on the supervisor slot, no extra switch scripts).
+        let before = supervisor.status().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let after = supervisor.status().unwrap();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.requested_wallpaper_id, before.requested_wallpaper_id);
+        assert_eq!(after.restart_count, before.restart_count);
+        assert_eq!(kwe_switch_count(&probe), 3);
+    }
+
+    #[test]
+    fn user_apply_takes_precedence_and_the_playlist_reasserts_after_stop() {
+        let root = temp_dir("playlist-precedence");
+        let catalog = playlist_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let lane: Arc<dyn PlaylistApplyLane> = Arc::new(handle.clone());
+        let session = session_with_apply(
+            temp_dir("playlist-precedence-state"),
+            supervisor.clone(),
+            lane,
+            &["1", "2", "3"],
+        );
+        let session_handle = session.handle();
+        session_handle.put(daily_scene_playlist()).unwrap();
+        session_handle.activate(Some("daily".into())).unwrap();
+        wait_for_settled(&supervisor, &probe, "1", 1);
+
+        // The USER applies wallpaper 2 through the API on the same
+        // transaction: it displaces the session's renderer and stays live.
+        let user_apply = handle.apply(ApplyWallpaperParams {
+            output: "DP-1".into(),
+            wallpaper_id: "2".into(),
+            kind: RendererKind::Scene,
+            content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
+            width: 320,
+            height: 180,
+            fps: 30,
+        });
+        assert!(
+            user_apply.is_ok(),
+            "user apply must succeed: {user_apply:?}"
+        );
+        wait_for_settled(&supervisor, &probe, "2", 2);
+
+        // The session yields: the user's renderer stays live and the
+        // playlist does not fight it (no third switch script while the
+        // user's wallpaper is live).
+        std::thread::sleep(Duration::from_millis(700));
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.requested_wallpaper_id.as_deref(), Some("2"));
+        assert!(matches!(
+            status.phase,
+            WorkerPhase::Live | WorkerPhase::AwaitingAck
+        ));
+        assert_eq!(kwe_switch_count(&probe), 2);
+
+        // When the user's renderer stops, the session re-asserts its entry
+        // through the lane (manual-stop re-assert path).
+        supervisor.stop().unwrap();
+        wait_for_settled(&supervisor, &probe, "1", 3);
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(assignments["outputs"]["DP-1"]["wallpaper_id"], "1");
+    }
+
+    #[test]
+    fn playlist_restart_restore_reapplies_the_entry_once() {
+        let root = temp_dir("playlist-restart");
+        let catalog = playlist_catalog();
+        let state_dir = temp_dir("playlist-restart-state");
+
+        // First daemon: the session applies entry 1; the runtime persists
+        // its position (entry 1) at shutdown.
+        let (first_switches, first_assignments) = {
+            let supervisor_service = fast_scene_supervisor(&root);
+            let supervisor = supervisor_service.handle();
+            let probe = stub_probe_with_switch(vec![dp1_output()]);
+            let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+            let lane: Arc<dyn PlaylistApplyLane> = Arc::new(handle.clone());
+            let session = session_with_apply(
+                state_dir.clone(),
+                supervisor.clone(),
+                lane,
+                &["1", "2", "3"],
+            );
+            let session_handle = session.handle();
+            session_handle.put(daily_scene_playlist()).unwrap();
+            session_handle.activate(Some("daily".into())).unwrap();
+            wait_for_settled(&supervisor, &probe, "1", 1);
+            // The block's drop order is reverse declaration: the session
+            // drops before the supervisor service, so its shutdown tick
+            // persists the runtime before the renderer is torn down.
+            let probes = kwe_switch_count(&probe);
+            let assignments = handle.assignments().unwrap();
+            (probes, assignments)
+        };
+        assert_eq!(first_switches, 1);
+        assert_eq!(first_assignments["outputs"]["DP-1"]["wallpaper_id"], "1");
+
+        // Second daemon on the same state: the supervisor is fresh (the
+        // restored renderer is dead) even though the assignment store still
+        // records DP-1 -> 1 — the session must re-apply its restored entry
+        // exactly once.
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let lane: Arc<dyn PlaylistApplyLane> = Arc::new(handle.clone());
+        let session = session_with_apply(state_dir, supervisor.clone(), lane, &["1", "2", "3"]);
+        let session_handle = session.handle();
+        session_handle.activate(Some("daily".into())).unwrap();
+        wait_for_settled(&supervisor, &probe, "1", 1);
+
+        // The restored renderer is live and the assignment matches; exactly
+        // one new switch script ran and nothing re-applied afterwards.
+        let status = supervisor.status().unwrap();
+        assert!(matches!(
+            status.phase,
+            WorkerPhase::Live | WorkerPhase::AwaitingAck
+        ));
+        assert_eq!(status.requested_wallpaper_id.as_deref(), Some("1"));
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(assignments["outputs"]["DP-1"]["wallpaper_id"], "1");
+        assert_eq!(kwe_switch_count(&probe), 1);
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(kwe_switch_count(&probe), 1);
+        assert_eq!(
+            supervisor
+                .status()
+                .unwrap()
+                .requested_wallpaper_id
+                .as_deref(),
+            Some("1")
+        );
     }
 }

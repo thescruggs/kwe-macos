@@ -345,6 +345,25 @@ only, bounded 5 s deadline, 64 KiB output caps; the daemon never embeds
 wallpaper content in a script, and the pure script builders are
 unit-tested for exact strings and escaping.
 
+*(BETA_M4c:)* `--plasma-switch-command <path>` replaces the **whole**
+Plasma shell evaluation boundary — enumeration and switch scripts alike —
+with `<path> <script>` run through the same bounded machinery (5 s
+deadline, 64 KiB caps, no shell, no environment mutation). Integration
+smokes stub the boundary with it so no live session is touched; live
+enablement (BETA_M4d) leaves it unset and runs the real qdbus.
+
+*(BETA_M4c:)* `--playlist-output <output>` — the output playlist-driven
+assignments target. The playlist session drives the same apply transaction
+on entry changes (timer advance, policy switch, manual play,
+resume-after-restart); there is **no new RPC method** — the output is a
+daemon flag, not a client param. When unset, the lane resolves the output
+at apply time: the last assigned output whose wallpaper is a member of the
+active playlist, else the first enabled and connected output, else
+`output_missing`. A failed playlist apply rolls back exactly like
+`wallpaper.apply` and backs off exponentially (1 s doubling to a 30 s cap)
+with the previous assignment kept; while a foreign (user) renderer is live
+the session yields to it.
+
 ## Lifecycle and recovery
 
 The daemon starts each worker in a new process group with `no_new_privs` and a

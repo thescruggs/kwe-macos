@@ -339,6 +339,68 @@ the mirror is in flight), failed-enumeration retry (Try Again hidden,
 invalid-input rejection without traffic. `smoke-ui.sh` is intentionally
 unchanged (the live smoke flips in M4d).
 
+## M4c — playlist renderer assignment (this commit)
+
+When the playlist session's active entry changes — timer advance, policy
+switch, manual play, resume-after-restart — the session drives the **apply
+transaction** (M4a) for the entry's wallpaper on the assigned output. No new
+RPC method: the surface stays `playlist.*` + the M4a `wallpaper.*` lane; the
+output is a daemon flag, not a client param.
+
+### Output scoping
+
+Saved profiles are snapshots of **per-display** wallpaper/playlist
+assignments (docs/UX_DESIGN.md), so the session carries
+`--playlist-output <output>` and, when unset, resolves the output **at apply
+time** in the lane:
+
+1. the last assigned output whose wallpaper is a member of the active
+   playlist (the assignment store is the source of per-display intent), else
+2. the first enabled and connected output from a fresh enumeration, else
+3. `output_missing`.
+
+### Transition semantics
+
+Entry changes are **hard cuts through the apply transaction**: the M4a
+transaction displaces the session's own stale renderer (stop + start +
+switch) and the supervisor's keepalive covers the gap. Crossfade transitions
+remain open (they need two live renderers on one output).
+
+### Failure and precedence
+
+- Quarantined/unavailable entries are skipped before the lane runs (the
+  existing `try_quarantined_ids` decision path).
+- A failed apply rolls back exactly like `wallpaper.apply` (renderer stopped
+  if ours, assignment store reverted), logs one bounded line, and backs off
+  exponentially — 1 s doubling to a 30 s cap — with the previous assignment
+  kept live.
+- The lane shares the apply transaction's single lock: a user apply in
+  flight wins the slot and the session backs off instead of interleaving.
+  While a foreign renderer is live the session **yields** (user choice
+  wins); it re-asserts its entry when nothing is live (manual stop, crash)
+  or when the entry changes (its own stale renderer is displaced).
+- Restart restore re-applies the entry **once**: the supervisor is fresh and
+  idle at boot, so the session's first tick sees no live renderer and drives
+  the lane (the store is the source for restore, the supervisor is the
+  source of live).
+
+### Test surface
+
+Unit (stub lane, no live Plasma): the apply-verdict pure matrix
+(satisfied/own-stale-displace/foreign-yield across every live phase,
+manual-stop re-assert, restart restore), backoff bounds (1 s → 30 s cap),
+entry change applies through the lane with the configured output and full
+entry set, quarantined entries never reach the lane, failing applies back
+off without storming (3 failing attempts in 3.6 s, not dozens), restart
+restore re-applies once. Integration (real lane, real supervisor, fake
+scene renderer, stub switch boundary): entry changes drive the real
+transaction (store write + switch script per entry), user apply takes
+precedence and the session re-asserts after stop, restart re-applies once
+(exactly one switch script on the second daemon). Smoke: scenario 9 of
+`scripts/smoke-playlist-restart.sh` runs the real daemon with the fake
+scene renderer and a stubbed Plasma boundary and asserts the store and
+switch-script counts across a timer advance and a restart.
+
 ## Run the suites
 
 ```sh
@@ -346,6 +408,10 @@ scripts/smoke-apply.sh       # M4a: live apply smoke; SKIPPED with exit 0
                              #   unless KWE_LIVE_APPLY=1 (M4d flips it on);
                              #   the M4a run is read-only against the live
                              #   Plasma session — no wallpaper switch
+scripts/smoke-playlist-restart.sh  # M5k regression + M4c scenario 9:
+                             #   renderer assignment through the real apply
+                             #   transaction with the fake scene renderer
+                             #   and a stubbed Plasma boundary
 scripts/smoke-supervisor.sh  # unchanged (M1a regression lane)
 scripts/smoke-video.sh       # unchanged (M1 regression lane)
 ```
@@ -394,6 +460,22 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
 | smoke-ui | `./scripts/smoke-ui.sh` unchanged (no apply-flow assertions here by design; M4d adds the live smoke) | passes |
 | UI honesty | alpha "Applying disabled" banner and stale "Display assignment is not enabled yet" line replaced with the true current state; Apply gated on kind/content/compatibility/output | verified in QML + docs |
 | live config | M4b executes no live wallpaper switch (development-only stub tests) | no `evaluateScript` switch against the live session |
+
+### M4c — playlist renderer assignment (this commit)
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; all unit/RPC tests pass (121 daemon tests, incl. 6 new apply-verdict/backoff unit tests, 3 new playlist integration tests, and 1 new external-evaluator test) |
+| apply verdict (pure) | desired-live satisfied (all live phases); own-stale renderer displaced; foreign renderer yields (all live phases); idle/stopped/quarantined re-assert once the backoff gate opens; closed gate holds the previous assignment | all pass |
+| backoff bounds | 1 s → 2 s → 4 s → 8 s → 16 s → 30 s cap; failing lane makes exactly the failing attempts within the window, never a storm; retry succeeds after the gate opens | all pass |
+| entry change (unit) | timer advance applies the next entry through the lane with the configured output and the full entry set | passes |
+| quarantine skip | persisted quarantine record for entry 1 → the lane only ever sees entry 2 | passes |
+| restart restore (unit) | second session on the same state re-applies the restored entry once | passes |
+| integration: entry changes | real transaction: fake scene renderer `Live` on 1 → 2 → 3 across real timer advances; assignment store tracks DP-1; exactly 3 switch scripts, no steady-state churn | passes |
+| integration: user precedence | user apply of another wallpaper displaces the session; the session yields (no extra switch while the user's renderer is live); after `renderer.stop` the session re-asserts its entry through the lane | passes |
+| integration: restart restore | second daemon on the same state re-applies the restored entry exactly once (one switch script) and stays live | passes |
+| smoke-playlist-restart | M5k scenarios 1–8 regression + M4c scenario 9: renderer.status wallpaper/kind, assignments store (DP-1), timer-advance flip, restart re-applies once, switch-script counts | all pass |
+| live config | M4c executes no live wallpaper switch (stub `--plasma-switch-command` in every smoke; live enablement is M4d) | no `evaluateScript` switch against the live session |
 
 ## Open risks
 

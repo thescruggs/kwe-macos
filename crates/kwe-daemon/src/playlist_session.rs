@@ -29,10 +29,12 @@ use kwe_core::{
     PlaylistTransition,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
+    apply::ApplyError,
     persist::{atomic_write, quarantine_invalid_state},
-    supervisor::SupervisorHandle,
+    supervisor::{SupervisorHandle, WorkerPhase, WorkerStatus},
 };
 
 const COMMAND_CAPACITY: usize = 16;
@@ -47,8 +49,28 @@ const MAX_CLOCK_SKIP_MS: u64 = 60 * 60 * 1000;
 const RUNTIME_STATE_SCHEMA_VERSION: u32 = 1;
 const RUNTIME_STATE_FILE: &str = "playlist-runtime-v1.json";
 const DEFINITIONS_FILE: &str = "playlists-v1.json";
+/// Exponential backoff between playlist apply attempts (BETA_M4c): a
+/// failing entry-change must never become an apply storm.
+const APPLY_BACKOFF_BASE: Duration = Duration::from_millis(1000);
+const APPLY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
+/// The lane a playlist session drives wallpaper assignment through
+/// (BETA_M4c). The daemon's implementation is `apply::ApplyHandle` — the
+/// full M4a apply transaction, sharing its single-transaction lock, its
+/// rollback, and its bounded probes. Tests inject a recording stub. The
+/// lane receives the session's configured output (None resolves at apply
+/// time from the playlist's entries and the assignment store) and the
+/// active playlist's entry ids.
+pub trait PlaylistApplyLane: Send + Sync {
+    fn apply_playlist(
+        &self,
+        output: Option<String>,
+        wallpaper_id: String,
+        playlist_entries: &BTreeSet<String>,
+    ) -> Result<Value, ApplyError>;
+}
+
+#[derive(Clone)]
 pub struct PlaylistSessionConfig {
     pub state_dir: PathBuf,
     pub tick_ms: u64,
@@ -56,6 +78,15 @@ pub struct PlaylistSessionConfig {
     /// Catalog-derived ids that are installed and usable. Pushed by `main`
     /// at startup and refreshed after every rescan.
     pub valid_ids: Arc<BTreeSet<String>>,
+    /// The output playlists apply to (BETA_M4c). None resolves at apply
+    /// time inside the lane: the last assigned output whose wallpaper is a
+    /// member of the active playlist, else the first enabled and connected
+    /// output (docs/BETA_M4.md M4c). Per-display playlist intent comes from
+    /// docs/UX_DESIGN.md.
+    pub output: Option<String>,
+    /// The apply lane driving renderer assignment on entry changes; None
+    /// keeps the session a pure timer (no renderer is ever started).
+    pub apply: Option<Arc<dyn PlaylistApplyLane>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +277,8 @@ struct SessionRuntime {
     state_path: PathBuf,
     tick_duration: Duration,
     supervisor: Option<SupervisorHandle>,
+    output: Option<String>,
+    apply: Option<Arc<dyn PlaylistApplyLane>>,
     playlists: Vec<Playlist>,
     store_error: Option<String>,
     runtimes: BTreeMap<String, PlaylistRuntime>,
@@ -255,6 +288,14 @@ struct SessionRuntime {
     last_waiting_persist: Instant,
     valid_ids: Arc<BTreeSet<String>>,
     quarantined_ids: BTreeSet<String>,
+    /// The wallpaper the session last applied successfully (or satisfied
+    /// itself was live). Distinguishes the session's OWN stale renderer
+    /// from a foreign (user) one: the session displaces its own stale
+    /// renderer on an entry change, but yields to a foreign one. Cleared
+    /// when a foreign renderer takes the slot.
+    applied_wallpaper: Option<String>,
+    apply_failures: u32,
+    next_apply_retry: Instant,
     clock_offset_ms: u64,
     clock_skipped_ms: u64,
     start_instant: Instant,
@@ -283,6 +324,8 @@ impl SessionRuntime {
             state_path: state_dir.join(RUNTIME_STATE_FILE),
             tick_duration: Duration::from_millis(config.tick_ms),
             supervisor: config.supervisor,
+            output: config.output,
+            apply: config.apply,
             playlists,
             store_error,
             runtimes: BTreeMap::new(),
@@ -292,6 +335,9 @@ impl SessionRuntime {
             last_waiting_persist: Instant::now(),
             valid_ids: config.valid_ids,
             quarantined_ids: BTreeSet::new(),
+            applied_wallpaper: None,
+            apply_failures: 0,
+            next_apply_retry: Instant::now(),
             clock_offset_ms: 0,
             clock_skipped_ms: 0,
             start_instant: Instant::now(),
@@ -388,6 +434,109 @@ impl SessionRuntime {
         }
     }
 
+    /// Drives renderer assignment for the active entry (BETA_M4c): when
+    /// the session's desired wallpaper is not already live, it applies
+    /// through the lane — the full M4a apply transaction (hard cut; the
+    /// keepalive re-publication covers the gap, docs/BETA_M4.md M4c). The
+    /// policy is conservative and bounded:
+    ///
+    /// * the desired renderer wins: when the supervisor already runs (or
+    ///   is transitioning to) the desired wallpaper, this tick does
+    ///   nothing — the apply transaction or the supervisor's own lifecycle
+    ///   owns the slot, and a user apply of the SAME wallpaper satisfies
+    ///   the session too;
+    /// * the session displaces its OWN stale renderer on an entry change
+    ///   (the timer advanced: the old entry's renderer must go, hard cut);
+    /// * a user/manager apply wins: when a DIFFERENT, foreign renderer is
+    ///   live (Starting/Canary/Live/AwaitingAck/Restarting/RolledBack),
+    ///   the session yields — it never fights the user's choice — and
+    ///   re-asserts its desired entry once the foreign renderer is no
+    ///   longer live (manual stop, crash, or the next entry change);
+    /// * a manual stop of the session's own renderer is re-asserted on the
+    ///   next tick (the supervisor is Stopped/Idle, nothing is live);
+    /// * failures back off (1 s doubling to a 30 s cap) so a broken output
+    ///   or shell cannot turn the session into an apply storm; the failure
+    ///   is logged once per attempt with bounded detail;
+    /// * a successful apply resets the backoff.
+    ///
+    /// Restart restore is covered by the same rules: after a daemon
+    /// restart the supervisor is Idle, so the rehydrated entry is applied
+    /// once even though the assignment store still records it — the store
+    /// is the source for restore, the supervisor is the source of live.
+    fn maybe_apply(&mut self, playlist: &Playlist, decision: &PlaylistDecision) {
+        let Some(wallpaper_id) = decision_wallpaper_id(decision) else {
+            return;
+        };
+        let Some(apply) = &self.apply else {
+            return;
+        };
+        let Some(supervisor) = &self.supervisor else {
+            return;
+        };
+        let status = match supervisor.status() {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("event=playlist.apply_status_failed detail={error}");
+                return;
+            }
+        };
+        let retry_ready = Instant::now() >= self.next_apply_retry;
+        let verdict = apply_verdict(
+            self.applied_wallpaper.as_deref(),
+            wallpaper_id,
+            &status,
+            retry_ready,
+        );
+        match verdict {
+            ApplyVerdict::Satisfied => {
+                self.applied_wallpaper = Some(wallpaper_id.to_string());
+                return;
+            }
+            ApplyVerdict::Yield => {
+                // A foreign renderer owns the slot; the session lost it.
+                self.applied_wallpaper = None;
+                return;
+            }
+            ApplyVerdict::Hold => {
+                // The session's own stale renderer holds the slot but the
+                // failure backoff gate is closed: keep the applied identity
+                // (dropping it would reclassify our own renderer as foreign
+                // and the session would never displace it).
+                return;
+            }
+            ApplyVerdict::Apply => {}
+        }
+        let entries: BTreeSet<String> = playlist.entries.iter().cloned().collect();
+        match apply.apply_playlist(self.output.clone(), wallpaper_id.to_string(), &entries) {
+            Ok(_) => {
+                self.applied_wallpaper = Some(wallpaper_id.to_string());
+                self.apply_failures = 0;
+                self.next_apply_retry = Instant::now();
+                eprintln!("event=playlist.assigned wallpaper_id={wallpaper_id}");
+            }
+            Err(error) => {
+                self.apply_failures = self.apply_failures.saturating_add(1);
+                let delay = apply_backoff(self.apply_failures);
+                self.next_apply_retry = Instant::now() + delay;
+                eprintln!(
+                    "event=playlist.apply_failed wallpaper_id={wallpaper_id} failures={} detail={} next_retry_ms={}",
+                    self.apply_failures,
+                    error.detail().unwrap_or_else(|| error.code()),
+                    delay.as_millis(),
+                );
+            }
+        }
+    }
+
+    /// Resets the apply state (playlist switch, deactivation, or the active
+    /// playlist disappearing): the new session's first decision applies
+    /// immediately.
+    fn reset_apply(&mut self) {
+        self.applied_wallpaper = None;
+        self.apply_failures = 0;
+        self.next_apply_retry = Instant::now();
+    }
+
     /// Persists the active runtime's snapshot if the given decision changed
     /// state (or periodically while waiting). `remaining_ms` changes every
     /// tick, so change detection compares the stable signature only.
@@ -430,6 +579,7 @@ impl SessionRuntime {
         let Some(playlist) = self.playlists.iter().find(|p| p.id == playlist_id).cloned() else {
             self.active = None;
             self.last_decision = None;
+            self.reset_apply();
             self.persist_state();
             eprintln!("event=playlist.active_removed playlist_id={playlist_id}");
             return;
@@ -444,7 +594,14 @@ impl SessionRuntime {
             runtime.tick(&playlist, now_ms, &unavailable)
         };
         match decision {
-            Ok(decision) => self.maybe_persist(playlist_id, &decision, now_ms),
+            Ok(decision) => {
+                self.maybe_persist(playlist_id, &decision, now_ms);
+                // Renderer assignment runs AFTER persistence: the entry
+                // position is on disk before the (bounded) apply blocks
+                // the session thread, and a crash mid-apply cannot lose
+                // the position.
+                self.maybe_apply(&playlist, &decision);
+            }
             Err(error) => {
                 // Monotonic regression cannot happen through this clock path.
                 eprintln!("event=playlist.tick_error playlist_id={playlist_id} detail={error}");
@@ -609,6 +766,7 @@ impl SessionRuntime {
         let Some(id) = id else {
             self.active = None;
             self.last_decision = None;
+            self.reset_apply();
             self.persist_state();
             return Ok(self.status());
         };
@@ -616,6 +774,9 @@ impl SessionRuntime {
             return Err(SessionError::NotFound(id));
         };
         if self.active.as_deref() != Some(&id) {
+            // A different (or fresh) active session starts its apply state
+            // clean: the new entry's first decision applies immediately.
+            self.reset_apply();
             let unavailable = self.unavailable_for(&playlist);
             let now_ms = self.now_ms();
             let (decision, snapshot) = {
@@ -747,6 +908,103 @@ impl SessionRuntime {
         }
         Ok(self.status())
     }
+}
+
+/// The wallpaper a decision wants on the output; Exhausted and NoEligible
+/// want nothing (the session never applies for them).
+fn decision_wallpaper_id(decision: &PlaylistDecision) -> Option<&str> {
+    match decision {
+        PlaylistDecision::Started { wallpaper_id, .. }
+        | PlaylistDecision::Waiting { wallpaper_id, .. }
+        | PlaylistDecision::Advanced { wallpaper_id, .. }
+        | PlaylistDecision::Paused { wallpaper_id, .. } => Some(wallpaper_id),
+        PlaylistDecision::Exhausted | PlaylistDecision::NoEligible => None,
+    }
+}
+
+/// Phases where a renderer is live or on its way; a foreign one must
+/// never be displaced by the playlist mid-flight.
+fn phase_has_live_worker(phase: WorkerPhase) -> bool {
+    matches!(
+        phase,
+        WorkerPhase::Starting
+            | WorkerPhase::Canary
+            | WorkerPhase::Live
+            | WorkerPhase::AwaitingAck
+            | WorkerPhase::Restarting
+            | WorkerPhase::RolledBack
+    )
+}
+
+/// What the session should do for the desired wallpaper this tick. Pure so
+/// the user-apply precedence (the foreign-renderer yield), the entry-change
+/// displacement of the session's own stale renderer, and the manual-stop
+/// re-assertion are unit-testable with fabricated worker state
+/// (`WorkerStatus` is fully constructible).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyVerdict {
+    /// The desired wallpaper is already live or on its way: remember it as
+    /// applied (the apply transaction, the supervisor's own lifecycle, or
+    /// a user apply of the same wallpaper all satisfy the session).
+    Satisfied,
+    /// A FOREIGN renderer owns the slot: the user's choice wins this tick.
+    Yield,
+    /// The slot is held by the session's OWN stale renderer (the timer
+    /// advanced), but the failure backoff gate is still closed: do nothing
+    /// this tick and keep the applied identity so the stale renderer stays
+    /// recognizable as ours once the gate opens.
+    Hold,
+    /// Apply the desired wallpaper through the lane (unless the failure
+    /// backoff gate is still closed).
+    Apply,
+}
+
+fn apply_verdict(
+    applied: Option<&str>,
+    desired: &str,
+    status: &WorkerStatus,
+    retry_ready: bool,
+) -> ApplyVerdict {
+    // The desired renderer is already live or on its way.
+    if status.requested_wallpaper_id.as_deref() == Some(desired)
+        && phase_has_live_worker(status.phase)
+    {
+        return ApplyVerdict::Satisfied;
+    }
+    // A renderer is live but it is not the desired one.
+    if phase_has_live_worker(status.phase) {
+        // The session's OWN stale renderer (the timer advanced): the entry
+        // change must displace it — hard cut through the apply transaction.
+        // The displacement is gated like every other apply: without the
+        // gate, a start blocked by a pending display handoff (the previous
+        // renderer is retired for the handoff window) would be re-fired on
+        // every tick — an apply storm against the same blocked transaction.
+        if status.requested_wallpaper_id.as_deref() == applied {
+            return if retry_ready {
+                ApplyVerdict::Apply
+            } else {
+                ApplyVerdict::Hold
+            };
+        }
+        // Anything else live is a user/manager apply: yield.
+        return ApplyVerdict::Yield;
+    }
+    // Nothing is live (Idle, Stopped, Quarantined with a different
+    // request): apply unless the failure backoff gate is still closed.
+    if retry_ready {
+        ApplyVerdict::Apply
+    } else {
+        ApplyVerdict::Yield
+    }
+}
+
+/// Exponential backoff between playlist apply attempts: 1 s doubling to a
+/// 30 s cap. A failing entry-change must never become an apply storm.
+fn apply_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    APPLY_BACKOFF_BASE
+        .saturating_mul(1u32 << shift)
+        .min(APPLY_BACKOFF_MAX)
 }
 
 /// Stable identity of a decision: state, wallpaper, and index. `remaining_ms`
@@ -888,6 +1146,12 @@ impl Drop for PlaylistSessionService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use crate::supervisor::SupervisorService;
+
     use super::*;
 
     fn temporary_state_dir(label: &str) -> PathBuf {
@@ -920,6 +1184,209 @@ mod tests {
             tick_ms: 50,
             supervisor: None,
             valid_ids: valid_ids(valid),
+            output: None,
+            apply: None,
+        }
+    }
+
+    fn config_with(
+        state_dir: PathBuf,
+        valid: &[&str],
+        supervisor: SupervisorHandle,
+        output: Option<String>,
+        apply: Option<Arc<dyn PlaylistApplyLane>>,
+    ) -> PlaylistSessionConfig {
+        PlaylistSessionConfig {
+            state_dir,
+            tick_ms: 50,
+            supervisor: Some(supervisor),
+            valid_ids: valid_ids(valid),
+            output,
+            apply,
+        }
+    }
+
+    /// One recorded apply request: (output, wallpaper id, entry set).
+    type ApplyCall = (Option<String>, String, BTreeSet<String>);
+
+    /// A recording test lane: records every apply request (output +
+    /// wallpaper id + playlist entries). `remaining_failures` lets a test
+    /// fail the first N applies and then succeed. A stub lane cannot
+    /// manufacture supervisor-live state, so the session re-applies its
+    /// entry every tick after a success — the real lane makes the
+    /// supervisor non-idle, which the steady-state no-reapply is tested
+    /// against (main.rs integration tests).
+    #[derive(Clone)]
+    struct RecordingLane {
+        calls: Arc<Mutex<Vec<ApplyCall>>>,
+        remaining_failures: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl RecordingLane {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                remaining_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+
+        fn failing(self, failures: u64) -> Self {
+            self.remaining_failures
+                .store(failures, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        fn calls(&self) -> Vec<ApplyCall> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl PlaylistApplyLane for RecordingLane {
+        fn apply_playlist(
+            &self,
+            output: Option<String>,
+            wallpaper_id: String,
+            playlist_entries: &BTreeSet<String>,
+        ) -> Result<Value, ApplyError> {
+            self.calls.lock().unwrap().push((
+                output,
+                wallpaper_id.clone(),
+                playlist_entries.clone(),
+            ));
+            if self
+                .remaining_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(ApplyError::Transaction("stub lane failed".into()));
+            }
+            Ok(json!({ "applied": wallpaper_id }))
+        }
+    }
+
+    /// A fresh supervisor dir for one session test.
+    fn supervisor_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kwe-playlist-sup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    /// A real supervisor service on `state_dir`: the test binary is a valid
+    /// renderer path and no worker is ever launched — the session never
+    /// starts one through the stub lane, and the foreign-yield tests
+    /// fabricate worker state through the real supervisor's own API (or
+    /// the pure verdict tests).
+    fn start_supervisor(state_dir: PathBuf) -> (SupervisorService, SupervisorHandle) {
+        let limits = crate::supervisor::RendererResourceLimits {
+            address_space_mib: 4096,
+            file_size_mib: 160,
+            open_files: 256,
+            processes: 1024,
+            core_dump_bytes: 0,
+        };
+        let service = SupervisorService::start(crate::supervisor::SupervisorConfig {
+            renderer_paths: BTreeMap::from([(
+                crate::supervisor::RendererKind::Test,
+                std::env::current_exe().unwrap(),
+            )]),
+            runtime_dir: supervisor_dir(),
+            state_dir,
+            startup_timeout_ms_by_kind: BTreeMap::from([
+                (crate::supervisor::RendererKind::Test, 3000),
+                (crate::supervisor::RendererKind::Video, 6000),
+                (crate::supervisor::RendererKind::Web, 10_000),
+                (crate::supervisor::RendererKind::Scene, 3000),
+            ]),
+            frame_timeout: Duration::from_secs(2),
+            stop_grace: Duration::from_millis(500),
+            restart_delay: Duration::from_millis(250),
+            canary_duration: Duration::from_secs(1),
+            handoff_timeout: Duration::from_secs(5),
+            max_failures: 3,
+            web_heartbeat_ms: 5000,
+            web_heartbeat_max_failures: 3,
+            resource_limits_by_kind: BTreeMap::from([
+                (crate::supervisor::RendererKind::Test, limits),
+                (crate::supervisor::RendererKind::Video, limits),
+                (crate::supervisor::RendererKind::Web, limits),
+                (crate::supervisor::RendererKind::Scene, limits),
+            ]),
+        })
+        .unwrap();
+        let handle = service.handle();
+        (service, handle)
+    }
+
+    /// A fresh, empty supervisor service.
+    fn idle_supervisor() -> (SupervisorService, SupervisorHandle) {
+        start_supervisor(supervisor_dir().join("state"))
+    }
+
+    /// A fresh supervisor service whose persisted state already quarantines
+    /// `wallpaper_id` (legacy identity without a kind suffix, matching what
+    /// pre-M4b daemons wrote). Written before the supervisor starts so the
+    /// session's quarantine refresh sees the record on its first tick.
+    fn quarantined_supervisor(
+        wallpaper_id: &str,
+        content_hash: &str,
+    ) -> (SupervisorService, SupervisorHandle) {
+        let state_dir = supervisor_dir().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let fixture = json!({
+            "schema_version": 1,
+            "forced_kill_count": 0,
+            "records": {
+                format!("{wallpaper_id}:{content_hash}"): {
+                    "wallpaper_id": wallpaper_id,
+                    "content_hash": content_hash,
+                    "failures": 3,
+                    "quarantined": true,
+                    "last_failure": "frame_timeout",
+                    "last_detail": "session test fixture",
+                    "updated_unix_seconds": 1,
+                }
+            },
+            "last_good": null,
+        });
+        std::fs::write(
+            state_dir.join("supervisor-v1.json"),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+        start_supervisor(state_dir)
+    }
+
+    /// Waits until the lane recorded an apply for `wallpaper_id`; returns
+    /// the first matching call.
+    fn wait_for_apply(lane: &RecordingLane, wallpaper_id: &str) -> ApplyCall {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(call) = lane
+                .calls()
+                .into_iter()
+                .find(|(_, id, _)| id == wallpaper_id)
+            {
+                return call;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the lane to apply {wallpaper_id}; calls={:?}",
+                lane.calls()
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -1144,5 +1611,310 @@ mod tests {
             }
             other => panic!("expected Waiting, got {other:?}"),
         }
+    }
+
+    // --- BETA_M4c: renderer assignment through the apply lane ------------
+
+    /// A fabricated worker state with only the fields the apply verdict
+    /// reads (phase + requested wallpaper); the rest are inert defaults.
+    /// `WorkerStatus` is fully constructible, which is what makes the pure
+    /// precedence matrix below possible.
+    fn fabricated_status(phase: WorkerPhase, requested: Option<&str>) -> WorkerStatus {
+        let limits = crate::supervisor::RendererResourceLimits {
+            address_space_mib: 4096,
+            file_size_mib: 160,
+            open_files: 256,
+            processes: 1024,
+            core_dump_bytes: 0,
+        };
+        WorkerStatus {
+            phase,
+            kind: crate::supervisor::RendererKind::Test,
+            wallpaper_id: requested.map(str::to_string),
+            content_hash: None,
+            pid: None,
+            frame_file: None,
+            last_good_file: None,
+            sequence: 0,
+            failures: 0,
+            restart_count: 0,
+            forced_kill_count: 0,
+            last_failure: None,
+            last_failure_detail: None,
+            requested_wallpaper_id: requested.map(str::to_string),
+            requested_content_hash: None,
+            candidate_pid: None,
+            candidate_frame_file: None,
+            candidate_sequence: 0,
+            previous_pid: None,
+            previous_frame_file: None,
+            display_generation: 0,
+            awaiting_display_ack: false,
+            resource_limits: limits,
+            input_sequence: 0,
+            input_ack_sequence: 0,
+            input_pending: false,
+            input_coalesced: 0,
+            input_protocol_errors: 0,
+            pointer_inside: false,
+            pointer_x: 0,
+            pointer_y: 0,
+            audio_pending: false,
+            audio_coalesced: 0,
+            audio_grant_dropped: 0,
+            media_pending: false,
+            media_coalesced: 0,
+            stderr_tail: Vec::new(),
+            stderr_dropped_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn apply_verdict_satisfied_yield_apply_matrix() {
+        // The desired wallpaper is live or on its way: satisfied without a
+        // re-apply — whether the session itself, the apply transaction, or
+        // a user apply of the same wallpaper produced the state.
+        for phase in [
+            WorkerPhase::Starting,
+            WorkerPhase::Canary,
+            WorkerPhase::Live,
+            WorkerPhase::AwaitingAck,
+            WorkerPhase::Restarting,
+            WorkerPhase::RolledBack,
+        ] {
+            let status = fabricated_status(phase, Some("1"));
+            assert_eq!(
+                apply_verdict(Some("1"), "1", &status, true),
+                ApplyVerdict::Satisfied,
+                "live {phase:?} on the desired wallpaper must satisfy"
+            );
+            assert_eq!(
+                apply_verdict(None, "1", &status, true),
+                ApplyVerdict::Satisfied,
+                "a user apply of the desired wallpaper must satisfy in {phase:?}"
+            );
+        }
+
+        // The session's OWN stale renderer (the timer advanced): the entry
+        // change must displace it — hard cut through the apply transaction.
+        let stale = fabricated_status(WorkerPhase::Live, Some("1"));
+        assert_eq!(
+            apply_verdict(Some("1"), "2", &stale, true),
+            ApplyVerdict::Apply,
+            "own stale renderer must be displaced with the backoff gate open"
+        );
+        // While the gate is closed (a previous apply failed), the
+        // displacement must not storm the blocked transaction: hold the
+        // tick and keep the applied identity — dropping it would reclassify
+        // the session's own renderer as foreign and it would never be
+        // displaced.
+        assert_eq!(
+            apply_verdict(Some("1"), "2", &stale, false),
+            ApplyVerdict::Hold,
+            "own stale renderer with a closed backoff gate must hold"
+        );
+
+        // A foreign (user/manager) renderer wins at any live phase: the
+        // session yields and never fights it.
+        for phase in [
+            WorkerPhase::Starting,
+            WorkerPhase::Canary,
+            WorkerPhase::Live,
+            WorkerPhase::AwaitingAck,
+            WorkerPhase::Restarting,
+            WorkerPhase::RolledBack,
+        ] {
+            let foreign = fabricated_status(phase, Some("2"));
+            assert_eq!(
+                apply_verdict(Some("1"), "1", &foreign, true),
+                ApplyVerdict::Yield,
+                "a foreign renderer in {phase:?} must win"
+            );
+        }
+
+        // Nothing live: apply when the backoff gate is open (manual-stop
+        // re-assert, restart restore, post-rollback retry)...
+        let idle = fabricated_status(WorkerPhase::Idle, None);
+        assert_eq!(
+            apply_verdict(Some("1"), "1", &idle, true),
+            ApplyVerdict::Apply,
+            "idle with an open gate must apply"
+        );
+        let stopped = fabricated_status(WorkerPhase::Stopped, Some("1"));
+        assert_eq!(
+            apply_verdict(Some("1"), "1", &stopped, true),
+            ApplyVerdict::Apply,
+            "a stopped own renderer must be re-asserted"
+        );
+        let quarantined = fabricated_status(WorkerPhase::Quarantined, Some("2"));
+        assert_eq!(
+            apply_verdict(Some("1"), "1", &quarantined, true),
+            ApplyVerdict::Apply,
+            "a quarantined candidate must be retried once the gate opens"
+        );
+        // ...and the previous assignment is kept while the gate is closed.
+        assert_eq!(
+            apply_verdict(Some("1"), "1", &idle, false),
+            ApplyVerdict::Yield,
+            "a closed backoff gate must hold the previous assignment"
+        );
+        assert_eq!(
+            apply_verdict(None, "1", &idle, false),
+            ApplyVerdict::Yield,
+            "a closed backoff gate must not apply for a fresh entry either"
+        );
+    }
+
+    #[test]
+    fn apply_backoff_doubles_to_the_thirty_second_cap() {
+        assert_eq!(apply_backoff(1), Duration::from_secs(1));
+        assert_eq!(apply_backoff(2), Duration::from_secs(2));
+        assert_eq!(apply_backoff(3), Duration::from_secs(4));
+        assert_eq!(apply_backoff(4), Duration::from_secs(8));
+        assert_eq!(apply_backoff(5), Duration::from_secs(16));
+        assert_eq!(apply_backoff(6), Duration::from_secs(30));
+        assert_eq!(apply_backoff(99), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn entry_change_applies_through_the_lane_with_the_right_params() {
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new();
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("entry-change"),
+            &["1", "2", "3"],
+            supervisor,
+            Some("DP-1".into()),
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+
+        // The first eligible entry is applied with the configured output
+        // and the full entry set (the lane resolves the store against it).
+        let (output, wallpaper_id, entries) = wait_for_apply(&lane, "1");
+        assert_eq!(output.as_deref(), Some("DP-1"));
+        assert_eq!(wallpaper_id, "1");
+        assert_eq!(
+            entries,
+            BTreeSet::from(["1".into(), "2".into(), "3".into()])
+        );
+
+        // Timer advance applies the next entry with the same parameters:
+        // once the 10 s entry expires on the real clock (clock skip freezes
+        // remaining time by design and cannot advance the entry), the
+        // session displaces its own stale renderer through the lane.
+        std::thread::sleep(Duration::from_millis(11_000));
+        let (output, wallpaper_id, entries) = wait_for_apply(&lane, "2");
+        assert_eq!(output.as_deref(), Some("DP-1"));
+        assert_eq!(wallpaper_id, "2");
+        assert_eq!(
+            entries,
+            BTreeSet::from(["1".into(), "2".into(), "3".into()])
+        );
+    }
+
+    #[test]
+    fn quarantined_entry_is_never_applied() {
+        let (_service, supervisor) = quarantined_supervisor("1", "hash-1");
+        let lane = RecordingLane::new();
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("quarantine-skip"),
+            &["1", "2", "3"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+
+        // The decision skips the quarantined entry: the first apply is for
+        // entry 2, and entry 1 never reaches the lane.
+        let (_, wallpaper_id, _) = wait_for_apply(&lane, "2");
+        assert_eq!(wallpaper_id, "2", "quarantined entry 1 must be skipped");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            lane.calls().iter().all(|(_, id, _)| id == "2"),
+            "quarantined entry 1 must never reach the lane: {:?}",
+            lane.calls()
+        );
+    }
+
+    #[test]
+    fn failing_apply_backs_off_without_storming() {
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new().failing(3);
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("backoff"),
+            &["1"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+
+        // The first attempt fails immediately; the retries back off 1 s,
+        // 2 s, 4 s. Within the first ~3.6 s exactly the three failing
+        // attempts happen (a storm at the 50 ms tick would be dozens).
+        wait_for_apply(&lane, "1");
+        std::thread::sleep(Duration::from_millis(3600));
+        let count = lane.call_count();
+        assert!(
+            (3..=4).contains(&count),
+            "backoff must bound applies to 3..=4 within 3.6 s, saw {count}"
+        );
+
+        // The 4 s gate then opens and the next attempt succeeds.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lane.call_count() < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(lane.call_count() >= 4, "a retry must eventually succeed");
+    }
+
+    #[test]
+    fn restart_restore_reapplies_the_entry_once() {
+        let state_dir = temporary_state_dir("restart-restore");
+        // First session: entry 1 applies; dropping the session persists the
+        // runtime position (the drop order is reverse declaration, so the
+        // session shuts down before the supervisor service).
+        {
+            let (_service, supervisor) = idle_supervisor();
+            let lane = RecordingLane::new();
+            let session = PlaylistSessionService::start(config_with(
+                state_dir.clone(),
+                &["1", "2", "3"],
+                supervisor,
+                None,
+                Some(Arc::new(lane.clone())),
+            ));
+            let handle = session.handle();
+            handle.put(daily_playlist()).unwrap();
+            handle.activate(Some("daily".into())).unwrap();
+            wait_for_apply(&lane, "1");
+        }
+        // Second session on the same state: the runtime restores entry 1,
+        // the fresh supervisor is idle, and the session re-applies the
+        // restored entry once through the lane.
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new();
+        let _session = PlaylistSessionService::start(config_with(
+            state_dir,
+            &["1", "2", "3"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let (_, wallpaper_id, _) = wait_for_apply(&lane, "1");
+        assert_eq!(wallpaper_id, "1", "the restored entry must be re-applied");
+        assert!(
+            lane.calls().iter().all(|(_, id, _)| id == "1"),
+            "the restored session must stay on entry 1: {:?}",
+            lane.calls()
+        );
     }
 }
