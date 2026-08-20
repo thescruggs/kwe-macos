@@ -8,9 +8,11 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+hex.workspace = true
 kwe-core = { path = "../kwe-core" }
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true

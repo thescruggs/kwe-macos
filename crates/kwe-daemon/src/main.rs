@@ -2,6 +2,7 @@
 //! Small Alpha control service. The newline-delimited protocol is deliberately
 //! bounded and versioned so the UI never parses Workshop content itself.
 
+mod apply;
 mod audio;
 mod grants;
 mod persist;
@@ -25,6 +26,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use apply::{ApplyConfig, ApplyHandle, ApplyService, ApplyWallpaperParams, RestoreWallpaperParams};
 use audio::{AudioCaptureConfig, AudioCaptureHandle, AudioCaptureService};
 use clap::Parser;
 use grants::GrantPatch;
@@ -174,6 +176,25 @@ struct Arguments {
     /// real default sink.
     #[arg(long)]
     audio_capture_node: Option<String>,
+    /// Plasma shell D-Bus service name for the wallpaper apply scripts.
+    /// Plasma 6 registers org.kde.plasmashell (the Plasma 5-era
+    /// org.kde.PlasmaShell alias no longer exists).
+    #[arg(long, default_value = "org.kde.plasmashell")]
+    plasma_shell_service: String,
+    /// qdbus binary for the apply/restore scripts. Defaults to qdbus, then
+    /// qdbus6, resolved from PATH at call time so the daemon starts fine on
+    /// systems without either.
+    #[arg(long)]
+    qdbus_binary: Option<PathBuf>,
+    /// kscreen-doctor binary used for the read-only output enumeration.
+    #[arg(long, default_value = "kscreen-doctor")]
+    kscreen_doctor_binary: PathBuf,
+    /// Deadline for every live Plasma probe (enumeration, switch, restore).
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(500..=30000))]
+    apply_probe_timeout_ms: u64,
+    /// Deadline for the renderer to reach a live phase after wallpaper.apply.
+    #[arg(long, default_value_t = 15000, value_parser = clap::value_parser!(u64).range(1000..=60000))]
+    apply_promotion_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +273,7 @@ fn main() -> Result<()> {
         None => default_state_dir()?,
     };
     let playlist_state_dir = state_dir.clone();
+    let apply_state_dir = state_dir.clone();
     let startup_timeout_ms_by_kind = BTreeMap::from([
         (RendererKind::Test, arguments.renderer_startup_timeout_ms),
         (
@@ -331,6 +353,19 @@ fn main() -> Result<()> {
     })?;
     let audio = audio_service.handle();
     let worker_pid = audio_service.worker_pid();
+    let apply_service = ApplyService::new(
+        ApplyConfig {
+            state_dir: apply_state_dir,
+            shell_service: arguments.plasma_shell_service,
+            qdbus_binary: arguments.qdbus_binary,
+            kscreen_binary: arguments.kscreen_doctor_binary,
+            probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
+            promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
+        },
+        catalog.clone(),
+        supervisor.clone(),
+    )?;
+    let apply = apply_service.handle();
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
@@ -358,6 +393,7 @@ fn main() -> Result<()> {
                     &workshop_cache,
                     &audio,
                     &worker_pid,
+                    &apply,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -447,6 +483,7 @@ fn handle_client(
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     audio: &AudioCaptureHandle,
     worker_pid: &Arc<AtomicU32>,
+    apply: &ApplyHandle,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
@@ -474,6 +511,7 @@ fn handle_client(
         Some(playlist),
         workshop_cache,
         Some(audio),
+        Some(apply),
         peer,
         worker_pid,
         allow_test_faults,
@@ -501,6 +539,7 @@ fn process_request(
     playlist: Option<&PlaylistSessionHandle>,
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     audio: Option<&AudioCaptureHandle>,
+    apply: Option<&ApplyHandle>,
     peer: PeerCred,
     worker_pid: &Arc<AtomicU32>,
     allow_test_faults: bool,
@@ -764,6 +803,24 @@ fn process_request(
                     }
                 }
             }
+            "wallpaper.outputs" => apply_call(apply, |handle| handle.outputs()),
+            "wallpaper.apply" => {
+                match serde_json::from_value::<ApplyWallpaperParams>(request.params.clone()) {
+                    Ok(params) => apply_call(apply, |handle| handle.apply(params)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "wallpaper.restore" => {
+                match serde_json::from_value::<RestoreWallpaperParams>(request.params.clone()) {
+                    Ok(params) => apply_call(apply, |handle| handle.restore(params.output)),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            "wallpaper.assignments" => apply_call(apply, |handle| handle.assignments()),
             _ => json!({"error": "unknown_method"}),
         }
     };
@@ -1024,6 +1081,24 @@ fn permissions_call<T: Serialize>(
     }
 }
 
+/// Live wallpaper apply RPC helper (BETA_M4a): maps the transaction result
+/// to the wire contract error codes (docs/SUPERVISOR_API_V1.md).
+fn apply_call(
+    apply: Option<&ApplyHandle>,
+    call: impl FnOnce(&ApplyHandle) -> Result<Value, apply::ApplyError>,
+) -> Value {
+    let Some(apply) = apply else {
+        return json!({"error": "apply_unavailable"});
+    };
+    match call(apply) {
+        Ok(value) => value,
+        Err(error) => match error.detail() {
+            Some(detail) => json!({"error": error.code(), "detail": detail}),
+            None => json!({"error": error.code()}),
+        },
+    }
+}
+
 fn supervisor_call(
     supervisor: Option<&SupervisorHandle>,
     call: impl FnOnce(&SupervisorHandle) -> Result<WorkerStatus>,
@@ -1216,6 +1291,7 @@ fn validate_socket_parent(socket: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use supervisor::WorkerPhase;
 
     fn empty_catalog() -> Arc<RwLock<Catalog>> {
         Arc::new(RwLock::new(scan_installed(&[], &ScanLimits::default())))
@@ -1389,6 +1465,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             false,
@@ -1411,6 +1488,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             PeerCred::default(),
             &empty_worker_pid(),
@@ -1435,6 +1513,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             PeerCred::default(),
             &empty_worker_pid(),
@@ -1462,6 +1541,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             PeerCred::default(),
             &empty_worker_pid(),
@@ -1587,6 +1667,7 @@ mod tests {
             playlist,
             &cache_for_tests(),
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             true,
@@ -1605,6 +1686,74 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
+            None,
+            PeerCred::default(),
+            &empty_worker_pid(),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-daemon-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An apply handle for the wallpaper.* RPC tests: a stub probe over a
+    /// temporary assignment store (tests that need a real catalog or
+    /// supervisor construct their own).
+    fn apply_handle(
+        probe: Arc<dyn apply::ShellProbe>,
+        catalog: &Arc<RwLock<Catalog>>,
+        supervisor: SupervisorHandle,
+    ) -> apply::ApplyHandle {
+        let dir = temp_dir("apply");
+        apply_handle_with_store(
+            probe,
+            catalog,
+            supervisor,
+            apply::AssignmentStore::open(&dir).unwrap(),
+        )
+    }
+
+    fn apply_handle_with_store(
+        probe: Arc<dyn apply::ShellProbe>,
+        catalog: &Arc<RwLock<Catalog>>,
+        supervisor: SupervisorHandle,
+        store: apply::AssignmentStore,
+    ) -> apply::ApplyHandle {
+        apply::ApplyHandle::for_test(
+            store,
+            probe,
+            catalog.clone(),
+            supervisor,
+            Duration::from_millis(1500),
+        )
+    }
+
+    fn process_with_apply(
+        request_json: &str,
+        handle: &apply::ApplyHandle,
+        catalog: &Arc<RwLock<Catalog>>,
+    ) -> (bool, Value) {
+        let request: Request = serde_json::from_str(request_json).unwrap();
+        process_request(
+            &request,
+            catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            None,
+            Some(handle),
             PeerCred::default(),
             &empty_worker_pid(),
             true,
@@ -1732,6 +1881,7 @@ mod tests {
             None,
             Some(&handle),
             &cache_for_tests(),
+            None,
             None,
             PeerCred::default(),
             &empty_worker_pid(),
@@ -2001,6 +2151,7 @@ mod tests {
             None,
             &cache_for_tests(),
             Some(&handle),
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             false,
@@ -2020,6 +2171,7 @@ mod tests {
             None,
             &cache_for_tests(),
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             false,
@@ -2027,5 +2179,587 @@ mod tests {
         .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "audio_unavailable");
+    }
+
+    // -------------------------------------------------------------------
+    // wallpaper.* (BETA_M4a): the daemon apply transaction
+    // -------------------------------------------------------------------
+
+    /// A fake scene renderer for the promotion path: creates the frame
+    /// protocol file at --output and publishes frames (odd generation ->
+    /// slot toggle -> even generation) every 50 ms for 8 s, giving the
+    /// supervisor a canary sequence of >= 3. Runs under the supervisor's
+    /// env allowlist (PATH=/usr/bin:/usr/sbin:/bin), hence the env shebang.
+    const FAKE_SCENE_RENDERER: &str = r#"#!/usr/bin/env python3
+import argparse
+import os
+import struct
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--output", required=True)
+parser.add_argument("--width", type=int, default=320)
+parser.add_argument("--height", type=int, default=180)
+parser.add_argument("--fps", type=int, default=30)
+parser.add_argument("--content")
+args = parser.parse_args()
+
+width = args.width
+height = args.height
+stride = width * 4
+slot_bytes = stride * height
+file_bytes = 64 + 2 * slot_bytes
+
+header = bytearray(64)
+struct.pack_into("<8s", header, 0, b"KWEFRM1\0")
+struct.pack_into("<I", header, 8, 1)      # version
+struct.pack_into("<I", header, 12, 64)    # header bytes
+struct.pack_into("<Q", header, 16, file_bytes)
+struct.pack_into("<I", header, 24, width)
+struct.pack_into("<I", header, 28, height)
+struct.pack_into("<I", header, 32, stride)
+struct.pack_into("<I", header, 36, 1)     # BGRA premultiplied
+struct.pack_into("<I", header, 40, 2)     # slot count
+struct.pack_into("<Q", header, 48, 0)     # generation (even)
+struct.pack_into("<I", header, 56, 0)     # active slot
+struct.pack_into("<I", header, 60, 2)     # producer state: Running
+
+with open(args.output, "wb") as frame:
+    frame.write(bytes(header) + bytes(slot_bytes * 2))
+    frame.flush()
+    os.fsync(frame.fileno())
+    generation = 0
+    active = 0
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        generation += 1          # odd
+        struct.pack_into("<Q", header, 48, generation)
+        active = 1 - active
+        struct.pack_into("<I", header, 56, active)
+        generation += 1          # even
+        struct.pack_into("<Q", header, 48, generation)
+        frame.seek(48)
+        frame.write(header[48:64])
+        frame.flush()
+        os.fsync(frame.fileno())
+        time.sleep(0.05)
+"#;
+
+    /// Fake steam root with one subscribed scene project (workshop id "1").
+    fn scene_catalog() -> Arc<RwLock<Catalog>> {
+        let root = temp_dir("apply-catalog");
+        std::fs::create_dir_all(root.join("steamapps/workshop/content/431960/1")).unwrap();
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            "\"LibraryFolders\" { }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/appworkshop_431960.acf"),
+            "\"AppWorkshop\" { \"WorkshopItems\" { \"1\" \"1\" } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/workshop/content/431960/1/project.json"),
+            r#"{"title":"Synthetic One","type":"scene","tags":[]}"#,
+        )
+        .unwrap();
+        Arc::new(RwLock::new(scan_installed(&[root], &ScanLimits::default())))
+    }
+
+    /// A supervisor fast enough for the promotion wait (150 ms canary) with
+    /// the python3 fake renderer wired as the scene kind.
+    fn fast_scene_supervisor(root: &Path) -> SupervisorService {
+        let script = root.join("fake-scene-renderer.py");
+        std::fs::write(&script, FAKE_SCENE_RENDERER).unwrap();
+        std::fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = root.join("supervisor");
+        let limits = sample_limits(1024);
+        SupervisorService::start(SupervisorConfig {
+            renderer_paths: BTreeMap::from([(RendererKind::Scene, script)]),
+            runtime_dir: dir.join("runtime"),
+            state_dir: dir.join("state"),
+            startup_timeout_ms_by_kind: BTreeMap::from([
+                (RendererKind::Test, 3000),
+                (RendererKind::Video, 6000),
+                (RendererKind::Web, 10_000),
+                (RendererKind::Scene, 3000),
+            ]),
+            frame_timeout: Duration::from_secs(2),
+            stop_grace: Duration::from_millis(500),
+            restart_delay: Duration::from_millis(250),
+            canary_duration: Duration::from_millis(150),
+            handoff_timeout: Duration::from_secs(5),
+            max_failures: 3,
+            web_heartbeat_ms: 5000,
+            web_heartbeat_max_failures: 3,
+            resource_limits_by_kind: BTreeMap::from([
+                (RendererKind::Test, limits),
+                (RendererKind::Video, limits),
+                (RendererKind::Web, limits),
+                (RendererKind::Scene, limits),
+            ]),
+        })
+        .unwrap()
+    }
+
+    /// One stub system output on "DP-1".
+    fn dp1_output() -> apply::SystemOutput {
+        apply::SystemOutput {
+            name: "DP-1".into(),
+            enabled: true,
+            connected: true,
+            geometry: Some([0, 0, 2926, 823]),
+        }
+    }
+
+    /// Probe reply matching dp1_output: desktop 111 on screen 0 with the
+    /// stock image plugin and a saved Image value.
+    const DP1_PROBE_REPLY: &str = r#"{"desktops":[{"index":1,"id":111,"screen":0,"wp":"org.kde.image","image":"file:///usr/share/wallpapers/fallback.png"}],"connectors":{"DP-1":0}}"#;
+
+    fn stub_probe(outputs: Vec<apply::SystemOutput>, reply: Option<&str>) -> Arc<apply::StubProbe> {
+        Arc::new(apply::StubProbe::new(outputs, reply.map(str::to_string)))
+    }
+
+    #[test]
+    fn wallpaper_outputs_enumerates_and_caches_for_five_seconds() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.handle());
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.outputs"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        let outputs = result["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["name"], "DP-1");
+        assert_eq!(outputs[0]["screen"], 0);
+        assert_eq!(outputs[0]["desktop_id"], 111);
+        assert_eq!(outputs[0]["desktop_index"], 1);
+        assert_eq!(outputs[0]["geometry"], json!([0, 0, 2926, 823]));
+        assert_eq!(outputs[0]["enabled"], true);
+        assert_eq!(outputs[0]["connected"], true);
+        assert_eq!(outputs[0]["wallpaper_plugin"], "org.kde.image");
+        assert_eq!(
+            outputs[0]["config_group"],
+            json!(["Wallpaper", "org.kde.image", "General"])
+        );
+        assert_eq!(
+            outputs[0]["image"],
+            "file:///usr/share/wallpapers/fallback.png"
+        );
+        // The enumeration is cached for OUTPUT_CACHE_TTL: a second call
+        // probes the shell again only after the window expires.
+        let before = probe.scripts().len();
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.outputs"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(
+            probe.scripts().len(),
+            before,
+            "cache must absorb the second call"
+        );
+        assert_eq!(result["outputs"][0]["name"], "DP-1");
+        // The probe script is the exact enumeration template with the
+        // validated connector map.
+        assert!(
+            probe
+                .scripts()
+                .last()
+                .unwrap()
+                .contains("screenForConnector(\"DP-1\")")
+        );
+    }
+
+    #[test]
+    fn apply_unknown_wallpaper_id_fails_closed_without_touching_the_shell() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.handle());
+        // The scene content must pass preflight before the catalog lookup
+        // (the spec validation order is part of the contract).
+        let root = temp_dir("apply-unknown-id");
+        let scene = root.join("scene.json");
+        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_unknown_wallpaper");
+        assert!(result["detail"].as_str().unwrap().contains("1"));
+        // The shell was never probed and no renderer was started.
+        assert!(probe.scripts().is_empty());
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn apply_unknown_output_reports_output_missing() {
+        let catalog = scene_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        let root = temp_dir("apply-unknown-output");
+        let scene = root.join("scene.json");
+        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "output_missing");
+    }
+
+    #[test]
+    fn apply_incompatible_kind_reports_apply_incompatible() {
+        let catalog = scene_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        // The catalog item "1" is a scene; asking for a video is
+        // incompatible (the content file must exist for video preflight,
+        // so it is created first).
+        let root = temp_dir("apply-video");
+        let video = root.join("clip.mp4");
+        fs::write(&video, b"not really a video").unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"video","content":"{}"}}}}"#,
+                video.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_incompatible");
+        let detail = result["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("scene") && detail.contains("video"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn apply_invalid_params_are_rejected_at_the_boundary() {
+        let catalog = scene_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        // The test renderer kind is never assignable.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"test"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Unknown fields fail closed.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"/tmp/x.json","bogus":1}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        // Zero dimensions fail the StartSpec validation rules.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"/tmp/x.json","width":0,"height":540,"fps":30}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+    }
+
+    #[test]
+    fn concurrent_apply_reports_apply_busy() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        let _guard = handle.acquire_apply_lock().unwrap();
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"/tmp/scene.json"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_busy");
+    }
+
+    #[test]
+    fn apply_promotes_persists_and_switches_the_plasma_config() {
+        let root = temp_dir("apply-happy");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let scene = root.join("scene.json");
+        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","width":320,"height":180,"fps":30}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply failed: {result}");
+        assert_eq!(result["output"], "DP-1");
+        assert_eq!(result["applied"]["wallpaper_id"], "1");
+        assert_eq!(result["applied"]["kind"], "scene");
+        assert_eq!(result["applied"]["width"], 320);
+        assert_eq!(
+            result["applied"]["previous"]["wallpaper_plugin"],
+            "org.kde.image"
+        );
+        assert_eq!(
+            result["applied"]["previous"]["config_group"],
+            json!(["Wallpaper", "org.kde.image", "General"])
+        );
+        assert!(
+            result["applied"]["applied_at_unix_seconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        // The renderer really promoted (Live phase), not just started.
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+        assert_eq!(status.wallpaper_id.as_deref(), Some("1"));
+        // The switch script was the exact pure function of the desktop
+        // index and the kwe plugin — never wallpaper content. (The
+        // enumeration probe also mentions wallpaperPlugin, so the switch
+        // is the recorded script that is not a probe.)
+        let switch = probe
+            .scripts()
+            .into_iter()
+            .find(|script| !script.contains("screenForConnector"))
+            .expect("the switch script must have been evaluated");
+        assert_eq!(
+            switch,
+            "var d = desktops()[1]; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";"
+        );
+        // Wallpaper content never reaches the script.
+        assert!(!switch.contains("scene.json"));
+        // The assignment is persisted and round-trips.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        let record = &result["outputs"]["DP-1"];
+        assert_eq!(record["wallpaper_id"], "1");
+        assert_eq!(record["kind"], "scene");
+        assert_eq!(
+            record["previous"]["image"],
+            "file:///usr/share/wallpapers/fallback.png"
+        );
+    }
+
+    #[test]
+    fn apply_switch_failure_rolls_back_the_transaction() {
+        let root = temp_dir("apply-rollback");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        probe
+            .reject_scripts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let scene = root.join("scene.json");
+        fs::write(&scene, br#"{"general":{}}"#).unwrap();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "shell_unreachable");
+        // The renderer was stopped and the assignment was dropped.
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Stopped);
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"].as_object().unwrap().len(), 0);
+        // The switch script was attempted (the probe recorded it).
+        assert!(
+            probe
+                .scripts()
+                .iter()
+                .any(|s| s.contains("wallpaperPlugin"))
+        );
+    }
+
+    #[test]
+    fn restore_without_assignment_falls_back_to_the_stock_image() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.handle());
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.restore","params":{"output":"DP-1"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["mode"], "stock");
+        assert_eq!(result["restored"]["wallpaper_plugin"], "org.kde.image");
+        let scripts = probe.scripts();
+        let restore = scripts.last().unwrap();
+        match result["stock_image"].as_str() {
+            // A stock image present on this system was recorded and
+            // scripted into the restore.
+            Some(stock) => {
+                assert!(
+                    stock.starts_with("/usr/share/"),
+                    "unexpected stock image: {stock}"
+                );
+                assert!(
+                    restore.contains(&format!("d.writeConfig(\"Image\", \"{stock}\")")),
+                    "{restore}"
+                );
+            }
+            // No stock image on this system: the plugin still restores via
+            // its theme default, with no Image write at all.
+            None => assert!(!restore.contains("writeConfig"), "{restore}"),
+        }
+        assert!(restore.ends_with("d.wallpaperPlugin = \"org.kde.image\";"));
+        assert!(!restore.contains("kwe.wallpaper"));
+    }
+
+    #[test]
+    fn restore_with_stored_assignment_reverts_and_clears_it() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let dir = temp_dir("apply-restore");
+        let mut store = apply::AssignmentStore::open(&dir).unwrap();
+        store
+            .set(
+                "DP-1",
+                apply::Assignment {
+                    wallpaper_id: "1".into(),
+                    kind: RendererKind::Scene,
+                    content: "/tmp/scene.json".into(),
+                    width: 320,
+                    height: 180,
+                    fps: 30,
+                    applied_at_unix_seconds: 42,
+                    previous: Some(apply::PreviousWallpaper {
+                        wallpaper_plugin: "org.kde.image".into(),
+                        config_group: vec![
+                            "Wallpaper".into(),
+                            "org.kde.image".into(),
+                            "General".into(),
+                        ],
+                        image: Some("file:///usr/share/wallpapers/old.png".into()),
+                    }),
+                },
+            )
+            .unwrap();
+        let handle = apply_handle_with_store(probe.clone(), &catalog, supervisor.handle(), store);
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.restore","params":{"output":"DP-1"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["mode"], "assignment");
+        assert_eq!(
+            result["restored"]["image"],
+            "file:///usr/share/wallpapers/old.png"
+        );
+        let scripts = probe.scripts();
+        let restore = scripts.last().unwrap();
+        assert!(
+            restore.contains("d.writeConfig(\"Image\", \"file:///usr/share/wallpapers/old.png\")"),
+            "{restore}"
+        );
+        // The assignment is cleared once the restore script ran.
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn restore_unknown_output_reports_output_missing() {
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let probe = stub_probe(vec![], Some(DP1_PROBE_REPLY));
+        let handle = apply_handle(probe, &catalog, supervisor.handle());
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.restore","params":{"output":"DP-1"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "output_missing");
+    }
+
+    #[test]
+    fn wallpaper_methods_fail_closed_without_an_apply_handle() {
+        let catalog = empty_catalog();
+        let requests = [
+            r#"{"version":1,"method":"wallpaper.outputs"}"#,
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"/tmp/scene.json"}}"#,
+            r#"{"version":1,"method":"wallpaper.restore","params":{"output":"DP-1"}}"#,
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+        ];
+        for request_json in requests {
+            let request: Request = serde_json::from_str(request_json).unwrap();
+            let method = request.method.clone();
+            let (ok, result) = process_request(
+                &request,
+                &catalog,
+                &[],
+                None,
+                None,
+                &cache_for_tests(),
+                None,
+                None,
+                PeerCred::default(),
+                &empty_worker_pid(),
+                false,
+            )
+            .unwrap();
+            assert!(!ok, "{method} must fail closed");
+            assert_eq!(result["error"], "apply_unavailable", "{method}");
+        }
     }
 }

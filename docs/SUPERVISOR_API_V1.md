@@ -22,6 +22,10 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `permissions.get` *(BETA_M2c)*
 - `permissions.set` *(BETA_M2c)*
 - `permissions.list` *(BETA_M2c)*
+- `wallpaper.outputs` *(BETA_M4a)*
+- `wallpaper.apply` *(BETA_M4a)*
+- `wallpaper.restore` *(BETA_M4a)*
+- `wallpaper.assignments` *(BETA_M4a)*
 
 ## Start and retry
 
@@ -298,6 +302,48 @@ Producer contract (`kwe-audio-worker`):
   (pw-dump missing/unparsable/no sink), 75 capture failure (pw-record missing,
   failed to start, or died). The daemon's restart policy treats every exit
   while running as unexpected except its own shutdown SIGTERM.
+
+## Wallpaper apply and assignment control *(BETA_M4a)*
+
+The live-apply lane gives clients a bounded transaction that maps an output
+name to a catalog wallpaper: validate, start the renderer through the
+supervisor, wait (bounded) for promotion to a live phase, persist the
+assignment, then switch the Plasma wallpaper plugin via the KDE wallpaper
+scripting API. The transaction semantics, exact script templates, store
+format, and safe-mode restore contract are documented in
+`docs/BETA_M4.md`; this section is the wire contract.
+
+- `wallpaper.outputs` — live output enumeration. No params. Returns
+  `{"outputs": [{"name", "screen", "desktop_id", "desktop_index",
+  "geometry", "enabled", "connected", "wallpaper_plugin", "config_group",
+  "image"}]}`. The enumeration combines one bounded `kscreen-doctor` run
+  (geometry/enabled/connected) with one read-only `evaluateScript` probe
+  (desktop mapping) and is cached 5 s per call — never indefinitely, and
+  the apply transaction always probes fresh.
+- `wallpaper.apply` — params `{"output", "wallpaper_id", "kind", "content",
+  "width"?, "height"?, "fps"?}` (`width` 960 / `height` 540 / `fps` 30
+  defaults). `kind`/`content` follow the `renderer.start` rules; the `test`
+  kind is not assignable. Completes on renderer *promotion* (phase `live`
+  or `awaiting_ack`), not on display acknowledgement. Success returns the
+  persisted assignment with `applied_at_unix_seconds`.
+- `wallpaper.restore` — params `{"output"}`. Reverts the saved previous
+  plugin/config-group/image, or restores the stock `org.kde.image` plugin
+  with the first present stock image when no assignment exists; returns
+  `{"output", "mode": "assignment"|"stock", "wallpaper_plugin",
+  "image"}`. Always succeeds on a real output.
+- `wallpaper.assignments` — the full bounded assignment store. No params.
+
+Error responses (all fail closed; detail is bounded): `invalid_params`,
+`apply_unknown_wallpaper`, `apply_incompatible`, `output_missing`,
+`apply_busy` (no detail), `shell_unreachable`, `apply_failed` (already
+rolled back), `restore_failed`, and `apply_unavailable` when the daemon
+has no apply lane.
+
+The switch/restore/probe scripts are executed with
+`qdbus <service> /PlasmaShell evaluateScript <script>` — no shell, argv
+only, bounded 5 s deadline, 64 KiB output caps; the daemon never embeds
+wallpaper content in a script, and the pure script builders are
+unit-tested for exact strings and escaping.
 
 ## Lifecycle and recovery
 

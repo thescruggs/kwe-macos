@@ -374,12 +374,14 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
  "kwe-core",
  "kwe-frame-protocol",
  "kwe-input-protocol",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
