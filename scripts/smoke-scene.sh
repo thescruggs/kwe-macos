@@ -929,26 +929,31 @@ PY
 echo "scene smoke: M3e fixtures generated"
 
 # ---------------------------------------------------------------------------
-# M3f fixtures: particle systems (BETA_M3f). Cases (a)-(e) cover the
+# M3f fixtures: particle systems (BETA_M3f). Cases (a)-(f) cover the
 # deterministic motion trail, the gravity differential, the spawn cap
-# (particles_capped), the instance.count factor from script, and the
-# blend-mode differential. Every scene is one or two particle systems over
-# a fullscreen clear; scene (0,0) = frame (80,45) (the M3c convention),
-# particles draw after the clear in object order. The particle texture is
-# the runtime-generated 8x8 solid PNG (m3f-white.png / m3f-gray.png) — the
-# same png_solid writer as M3c. All cases use opaque textures and system
-# alpha 1, so the readback premultiply is the identity (the M3c/M3d
-# convention): Normal (0) = src-over = the texture color, Add (6) =
-# min(255, texture + bg) per the researched WE semantics.
+# (particles_capped), the instance.count factor from script, the
+# blend-mode differential, and the cross-kind draw order (a particle
+# system under an image listed after it in the file). Every scene is one
+# or two particle systems over a fullscreen clear; scene (0,0) = frame
+# (80,45) (the M3c convention); draws interleave in the FILE's object
+# order across kinds (merged_draws — case (f) pins it). The particle
+# texture is the runtime-generated 8x8 solid PNG (m3f-white.png /
+# m3f-gray.png / m3f-red.png) — the same png_solid writer as M3c. All
+# cases use opaque textures and system alpha 1, so the readback
+# premultiply is the identity (the M3c/M3d convention): Normal (0) =
+# src-over = the texture color, Add (6) = min(255, texture + bg) per the
+# researched WE semantics.
 m3f_white="$smoke_root/m3f-white.png"
 m3f_gray="$smoke_root/m3f-gray.png"
+m3f_red="$smoke_root/m3f-red.png"
 m3f_a_scene="$smoke_root/m3f-a.json"
 m3f_b_scene="$smoke_root/m3f-b.json"
 m3f_c_scene="$smoke_root/m3f-c.json"
 m3f_d_scene="$smoke_root/m3f-d.json"
 m3f_d_script="$smoke_root/m3f-d.js"
 m3f_e_scene="$smoke_root/m3f-e.json"
-python3 - "$m3f_white" "$m3f_gray" "$m3f_a_scene" "$m3f_b_scene" "$m3f_c_scene" "$m3f_d_scene" "$m3f_d_script" "$m3f_e_scene" <<'PY'
+m3f_f_scene="$smoke_root/m3f-f.json"
+python3 - "$m3f_white" "$m3f_gray" "$m3f_red" "$m3f_a_scene" "$m3f_b_scene" "$m3f_c_scene" "$m3f_d_scene" "$m3f_d_script" "$m3f_e_scene" "$m3f_f_scene" <<'PY'
 import json
 import struct
 import sys
@@ -974,9 +979,10 @@ def png_solid(r, g, b, a=255):
     )
 
 
-white, gray = sys.argv[1], sys.argv[2]
+white, gray, red = sys.argv[1], sys.argv[2], sys.argv[3]
 open(white, "wb").write(png_solid(255, 255, 255))
 open(gray, "wb").write(png_solid(76, 76, 76))
+open(red, "wb").write(png_solid(255, 0, 0))
 
 
 def scene(objects, clear=(0.0, 0.0, 0.0, 1.0), script=None):
@@ -1034,7 +1040,7 @@ json.dump(
             )
         ]
     ),
-    open(sys.argv[3], "w"),
+    open(sys.argv[4], "w"),
 )
 # (b): gravity differential — blue with gravity [0,80] falls from the
 # origin; red without stays at the center. Red drawn LAST so its 8x8
@@ -1069,15 +1075,25 @@ json.dump(
             ),
         ]
     ),
-    open(sys.argv[4], "w"),
+    open(sys.argv[5], "w"),
 )
 # (c): the spawn cap — 4096/s would fill 20480 over one life (5 s) but
 # maxCount 4096 (the hard cap) clamps the population; excess spawns are
 # dropped (never evicting live particles) with the one-time
-# particles_capped diagnostic. The drop policy keeps the population ONE
-# aging cohort (age spread = maxCount/spawnRate = 1 s): a dense annulus
-# sweeping outward at 30 px/s (radius ~30 t), frame-white 4k-8.4k px for
-# ~40% of every 5 s cycle — the whole-frame oracle converges quickly.
+# particles_capped diagnostic. The drop policy (spawn -> integrate ->
+# retain, floored accumulator) suppresses ALL births while the cap is
+# full and no particle has died, so the population is ONE sliding cohort
+# of 4096 whose age spread stays exactly maxCount/spawnRate = 1 s. The
+# exact-step cycle (period = life = 5 s, verified by sim):
+#   [0,1]   ramp: a uniform-age disc, radius 0 -> 30 px (white 0 -> ~3.9k)
+#   [1,~3]  the cohort is a SOLID annulus [30(t-1), 30t] sweeping outward
+#           at 30 px/s: fully in frame near t = 2 (max ~8.7-8.8k white px,
+#           the annulus area pi(60^2-30^2) = 8482 + quad overhang);
+#           frame-white >= 4k px for ~40% of every cycle
+#   [~3.7,5] the annulus leaves the 160x90 frame (inner radius > 92): 0 px
+#   [5,6]   the cohort dies at 4096/s while fresh births replace it 1:1:
+#           the disc regrows to ~3.9k at t = 6 = t = 1 (mod 5)
+# The whole-frame poll converges on the first >= 4k crossing (~1.0 s).
 json.dump(
     scene(
         [
@@ -1091,7 +1107,7 @@ json.dump(
             )
         ]
     ),
-    open(sys.argv[5], "w"),
+    open(sys.argv[6], "w"),
 )
 # (d): the instance.count factor from script — two identical systems at
 # origins (-50,0) and (50,0) (frame x 30 and 130), spawnRate 100, life
@@ -1125,9 +1141,9 @@ json.dump(
         ],
         script="m3f-d.js",
     ),
-    open(sys.argv[6], "w"),
+    open(sys.argv[7], "w"),
 )
-open(sys.argv[7], "w").write(
+open(sys.argv[8], "w").write(
     "var t = 0, logged = false;\n"
     "function update(dt) {\n"
     "  t += dt;\n"
@@ -1144,18 +1160,19 @@ open(sys.argv[7], "w").write(
 # Normal (0) is src-over — an opaque gray (76,76,76) texture draws 76
 # regardless of overlap; Add (6) is min(255, texture + bg) = 106 single,
 # 182 double-overlapped, up to 255 — the add disc's max channel value
-# clearly exceeds the normal disc's. Origins (-48,0) and (48,0) (frame x
-# 32 / 128), discs r=45 (speed 30, life 1.5): add's right edge at scene
-# x 77 stays clear of the [80,160] normal box, and the boxes' max-R
-# gates (>= 150 / <= 100) separate the modes. blendMode is an OBJECT
-# prop (the M3c/M3d shared path), hoisted by the system() helper.
+# clearly exceeds the normal disc's. Origins (-52,0) and (52,0) (frame x
+# 28 / 132), discs r=45 (speed 30, life 1.5): add's right edge at frame
+# x 73 and normal's left edge at 87 keep 7 px margins from the
+# [80,160] box seam, and the boxes' max-R gates (>= 150 / <= 100)
+# separate the modes. blendMode is an OBJECT prop (the M3c/M3d shared
+# path), hoisted by the system() helper.
 json.dump(
     scene(
         [
             system(
                 "add",
                 "m3f-gray.png",
-                origin=(-48.0, 0.0),
+                origin=(-52.0, 0.0),
                 spawnRate=30.0,
                 life=1.5,
                 speed=30.0,
@@ -1164,7 +1181,7 @@ json.dump(
             system(
                 "normal",
                 "m3f-gray.png",
-                origin=(48.0, 0.0),
+                origin=(52.0, 0.0),
                 spawnRate=30.0,
                 life=1.5,
                 speed=30.0,
@@ -1173,7 +1190,37 @@ json.dump(
         ],
         clear=(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0),
     ),
-    open(sys.argv[8], "w"),
+    open(sys.argv[9], "w"),
+)
+# (f): the cross-kind draw order — the file's objects array is [particle,
+# image]. The particle system (dust, at objects[0]) saturates to a SOLID
+# uniform-age disc of radius 30 (4096/s x life 1, cap 4096 — the disc
+# phase of the capped steady state: ages uniform [0,1], radii [0,30],
+# ~3.9k white px, persistent because births = deaths 1:1 from t = 1 on).
+# The opaque 30x30 red image (overlay, at objects[1]) sits at the same
+# origin and must draw ON TOP: with merged_draws the frame center reads
+# red; the old draws.extend() bug painted every particle draw last and
+# the center read white (the smoke regression this case pins).
+json.dump(
+    scene(
+        [
+            system(
+                "dust",
+                "m3f-white.png",
+                spawnRate=4096.0,
+                life=1.0,
+                speed=30.0,
+                maxCount=4096,
+            ),
+            {
+                "name": "overlay",
+                "image": "m3f-red.png",
+                "origin": [0.0, 0.0],
+                "size": [30.0, 30.0],
+            },
+        ]
+    ),
+    open(sys.argv[10], "w"),
 )
 PY
 echo "scene smoke: M3f fixtures generated"
@@ -2006,11 +2053,17 @@ echo "scene smoke passed (M3f b): gravity differential — blue fell, mean frame
 # life (5 s) but maxCount 4096 (the hard cap) caps the population; excess
 # spawns are dropped (live particles are never evicted) and the bounded
 # one-time diagnostic fires at the first drop (~1 s sim). The drop policy
-# keeps the population ONE aging cohort (its age spread is
-# maxCount/spawnRate = 1 s): a dense annulus sweeping outward at 30 px/s,
-# frame-white 4k-8.4k px for ~40% of every 5 s cycle — the whole-frame
-# poll converges in a few samples. (An uncapped population would fill the
-# whole 14400 px frame.)
+# (spawn -> integrate -> retain, floored accumulator) suppresses ALL
+# births while the cap is full and nothing has died, so the population is
+# ONE sliding cohort of 4096 with age spread maxCount/spawnRate = 1 s.
+# Exact-step sim (period = life = 5 s): a uniform-age disc phase (radius
+# 0->30, white 0->~3.9k), then the cohort as a SOLID annulus
+# [30(t-1), 30t] sweeping outward at 30 px/s — max ~8.7-8.8k white px at
+# t~2 (annulus area pi(60^2-30^2) = 8482 + quad overhang), frame-white
+# >= 4k for ~40% of every cycle — then the annulus leaves the frame
+# (~3.7 s, 0 px), and the cohort dies 1:1 into fresh births ([5,6],
+# regrowing the disc). The poll converges on the first >= 4k crossing
+# (~1.0 s: 4637 measured — a ramp value, not the cycle max).
 call_daemon renderer.start "$(jq -cn --arg content "$m3f_c_scene" \
     '{wallpaper_id:"scene-m3f-c",content_hash:"hash-m3f-c",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3f_c_status="$(wait_phase live)"
@@ -2073,7 +2126,8 @@ echo "scene smoke passed (M3f d): instance.count from script — pb/pa white rat
 # opaque texture draws 76 regardless of overlap; Add (6) is
 # min(255, texture + bg): 106 single, 182 double-overlapped, up to 255.
 # The add disc's max R sits well above the normal disc's; each box
-# [0,80]x[15,75] / [80,80]x[15,75] holds one disc (r=45 at frame x 32/128).
+# [0,80]x[15,75] / [80,80]x[15,75] holds one disc (r=45 at frame x 28/132,
+# 7 px margins from the seam).
 call_daemon renderer.start "$(jq -cn --arg content "$m3f_e_scene" \
     '{wallpaper_id:"scene-m3f-e",content_hash:"hash-m3f-e",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3f_e_status="$(wait_phase live)"
@@ -2090,6 +2144,46 @@ done
 scene_region_max "$m3f_e_frame" 0 15 80 60 "30,30,30,255" 20 150 255
 scene_region_max "$m3f_e_frame" 80 15 80 60 "30,30,30,255" 20 0 100
 echo "scene smoke passed (M3f e): blend differential — add disc max R >= 150, normal disc max R <= 100"
+
+# Case M3f-f: the draw order across kinds — the file's objects array is
+# [particle, image]; with the merged painter order (merged_draws) the
+# opaque 30x30 red image (objects[1]) draws ON TOP of the solid white
+# particle disc (objects[0], a capped 4096/s x life 1 steady disc of
+# radius 30 — the center pixel is always particle-covered). The old
+# draws.extend() bug painted every particle draw LAST: the frame center
+# read white instead of red. The poll waits for red at the center, then
+# checks a disc-only pixel left of the image is still white (the
+# particles really are under the image, not missing).
+call_daemon renderer.start "$(jq -cn --arg content "$m3f_f_scene" \
+    '{wallpaper_id:"scene-m3f-f",content_hash:"hash-m3f-f",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3f_f_status="$(wait_phase live)"
+m3f_f_frame="$(jq -r '.result.frame_file' <<<"$m3f_f_status")"
+m3f_f_red_seen=0
+for _attempt in {1..120}; do
+    if m3f_f_probe="$(scene_region_probe "$m3f_f_frame" 80 45 1 1 "0,0,255,255" 30 2>/dev/null)"; then
+        m3f_f_fg="${m3f_f_probe#foreground=}"
+        (( m3f_f_fg >= 1 )) && { m3f_f_red_seen=1; break; }
+    fi
+    sleep 0.25
+done
+[[ "$m3f_f_red_seen" == "1" ]] || {
+    echo "M3f-f failure: frame center never read red (particles drawing over the image?) frame=$m3f_f_frame" >&2
+    call_daemon renderer.status | jq -r '.result | "phase=\(.phase) frame_file=\(.frame_file) last_failure_detail=\(.last_failure_detail)", (.stderr_tail | join("\n"))' >&2
+    exit 1
+}
+m3f_f_white_seen=0
+for _attempt in {1..120}; do
+    if m3f_f_white="$(scene_region_probe "$m3f_f_frame" 50 45 1 1 "255,255,255,255" 30 2>/dev/null)"; then
+        (( ${m3f_f_white#foreground=} >= 1 )) && { m3f_f_white_seen=1; break; }
+    fi
+    sleep 0.25
+done
+[[ "$m3f_f_white_seen" == "1" ]] || {
+    echo "M3f-f failure: disc probe (50,45) never read white (particle disc missing under the image?) probe=$m3f_f_white frame=$m3f_f_frame" >&2
+    call_daemon renderer.status | jq -r '.result | "phase=\(.phase) frame_file=\(.frame_file) last_failure_detail=\(.last_failure_detail)", (.stderr_tail | join("\n"))' >&2
+    exit 1
+}
+echo "scene smoke passed (M3f f): draw order — particle system under the image listed after it (center red, disc white at x 50)"
 
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
@@ -2198,14 +2292,17 @@ echo "scene smoke passed: standalone llvmpipe lane — M3c blend oracle (106,77,
 # device unit tests proved them byte-exact on this same llvmpipe driver, so
 # the smoke lane pins the same bytes. lane_start waits for the canary
 # (KWEFRM1 header) with the early-exit guard; lane_stop SIGTERMs and waits
-# for exit 0.
+# for exit 0. The canary window is 1200 x 0.05 s = 60 s: llvmpipe's first
+# frame can take 20+ s under load (measured — the last lane of a full
+# suite crossing a 20 s window), and the window only delays failure
+# detection, never the passing path.
 lane_start() {
     local output="$1" content="$2" log="$3"
     VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
         --output "$output" --width 160 --height 90 --fps 30 \
         --content "$content" --device llvmpipe >"$log" 2>&1 &
     lane_pid=$!
-    for _attempt in {1..400}; do
+    for _attempt in {1..1200}; do
         [[ -f "$output" ]] && head -c 8 "$output" | grep -q KWEFRM1 && break
         kill -0 "$lane_pid" 2>/dev/null || {
             echo "standalone lane exited early" >&2
@@ -2338,7 +2435,7 @@ else
     echo "scene smoke SKIP (M3e a): no system fonts under /usr/share/fonts — text lane needs real fonts"
 fi
 
-# The M3f oracles on the llvmpipe lane: the same five cases, run directly
+# The M3f oracles on the llvmpipe lane: the same six cases, run directly
 # against the worker's own frame file. The canary wait (lane_start) covers
 # startup; each lane then polls its steady-state signal exactly like the
 # daemon lane above (tolerances identical — the region/gravity/max oracles
@@ -2377,7 +2474,9 @@ echo "scene smoke passed: standalone llvmpipe lane — M3f b gravity oracle"
 
 # (c): the spawn cap — the diagnostic fires in the lane's own log (first
 # dropped spawn, ~1.0 s sim — after the whole-frame poll below, like the
-# daemon lane) and the annulus saturates the frame.
+# daemon lane). The poll converges on the first >= 4k crossing: the
+# sliding 1-s cohort's solid annulus phase (max ~8.7-8.8k px at t ~ 2, on
+# frame >= 4k for ~40% of every 5 s cycle — see the (c) fixture comment).
 lane_start "$smoke_root/standalone-m3f-c.bin" "$m3f_c_scene" "$smoke_root/standalone-m3f-c.log"
 m3f_c_lane_fg=0
 for _attempt in {1..120}; do
@@ -2427,5 +2526,37 @@ scene_region_max "$smoke_root/standalone-m3f-e.bin" 0 15 80 60 "30,30,30,255" 20
 scene_region_max "$smoke_root/standalone-m3f-e.bin" 80 15 80 60 "30,30,30,255" 20 0 100
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3f e blend differential oracle"
+
+# (f): the cross-kind draw order — red at the frame center (the image
+# listed after the particle system draws on top of its disc) plus white
+# left of the image (the disc itself).
+lane_start "$smoke_root/standalone-m3f-f.bin" "$m3f_f_scene" "$smoke_root/standalone-m3f-f.log"
+m3f_f_lane_red_seen=0
+for _attempt in {1..120}; do
+    if m3f_f_lane_probe="$(scene_region_probe "$smoke_root/standalone-m3f-f.bin" 80 45 1 1 "0,0,255,255" 30 2>/dev/null)"; then
+        m3f_f_lane_fg="${m3f_f_lane_probe#foreground=}"
+        (( m3f_f_lane_fg >= 1 )) && { m3f_f_lane_red_seen=1; break; }
+    fi
+    sleep 0.25
+done
+if [[ "$m3f_f_lane_red_seen" != "1" ]]; then
+    echo "M3f-f failure: standalone lane frame center never read red (particles drawing over the image?) frame=$smoke_root/standalone-m3f-f.bin" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3f-f.log" >&2
+    exit 1
+fi
+m3f_f_lane_white_seen=0
+for _attempt in {1..120}; do
+    if m3f_f_lane_white="$(scene_region_probe "$smoke_root/standalone-m3f-f.bin" 50 45 1 1 "255,255,255,255" 30 2>/dev/null)"; then
+        (( ${m3f_f_lane_white#foreground=} >= 1 )) && { m3f_f_lane_white_seen=1; break; }
+    fi
+    sleep 0.25
+done
+if [[ "$m3f_f_lane_white_seen" != "1" ]]; then
+    echo "M3f-f failure: standalone lane disc probe (50,45) never read white (disc missing?) probe=$m3f_f_lane_white" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3f-f.log" >&2
+    exit 1
+fi
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3f f draw-order oracle (image over particle system)"
 
 echo "all scene smoke cases passed"

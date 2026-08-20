@@ -2113,6 +2113,7 @@ mod tests {
         let draws = [LayerDraw {
             kind: DrawKind::Image,
             layer_index: 0,
+            scene_order: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 1.0,
@@ -2170,6 +2171,7 @@ mod tests {
         let draws = [LayerDraw {
             kind: DrawKind::Image,
             layer_index: 0,
+            scene_order: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 1.0,
@@ -2256,6 +2258,7 @@ mod tests {
         let draws = [LayerDraw {
             kind: DrawKind::Image,
             layer_index: 0,
+            scene_order: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 191.0 / 255.0,
@@ -2437,6 +2440,7 @@ mod tests {
             let draws = [LayerDraw {
                 kind: DrawKind::Image,
                 layer_index: 0,
+                scene_order: 0,
                 m: [[64.0, 0.0], [0.0, 48.0]],
                 t: [0.0, 0.0],
                 alpha: 1.0,
@@ -2473,6 +2477,7 @@ mod tests {
         let draws = [LayerDraw {
             kind: DrawKind::Image,
             layer_index: 0,
+            scene_order: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 1.0,
@@ -2519,6 +2524,7 @@ mod tests {
         let draws = [LayerDraw {
             kind: DrawKind::Image,
             layer_index: 0,
+            scene_order: 0,
             m: [[64.0, 0.0], [0.0, 48.0]],
             t: [0.0, 0.0],
             alpha: 0.5,

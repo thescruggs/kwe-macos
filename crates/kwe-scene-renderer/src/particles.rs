@@ -78,11 +78,16 @@ pub const MAX_PARTICLE_LIFE: f32 = 60.0;
 pub const DEFAULT_PARTICLE_LIFE: f32 = 1.0;
 pub const MAX_PARTICLE_SPEED: f32 = 1e6;
 pub const DEFAULT_PARTICLE_SPEED: f32 = 0.0;
-/// Direction is an angle in radians from +x (y down); the WE emitters have
-/// no direction/spread fields (velocity comes from the velocity-random
-/// initializer) — this flat model is the M3f extension the deterministic
-/// smoke oracles need (documented deviation).
+/// Direction is an angle in radians from +x (y down), clamped to ±1e6;
+/// the WE emitters have no direction/spread fields (velocity comes from
+/// the velocity-random initializer) — this flat model is the M3f extension
+/// the deterministic smoke oracles need (documented deviation).
 pub const DEFAULT_PARTICLE_DIRECTION: f32 = 0.0;
+/// Direction range bound (radians), mirroring the layer scalars' ±1e6:
+/// clamp_direction bounds finite inputs to this range IN f64 before the
+/// f32 cast — a huge-but-finite f64 like 1e300 would otherwise cast to
+/// f32::INFINITY, and sin/cos(∞) is NaN, permanently poisoning the system.
+pub const MAX_PARTICLE_DIRECTION: f32 = 1e6;
 pub const MAX_PARTICLE_SPREAD: f32 = std::f32::consts::TAU;
 pub const DEFAULT_PARTICLE_SPREAD: f32 = 0.0;
 pub const MAX_PARTICLE_GRAVITY: f32 = 1e6;
@@ -100,11 +105,14 @@ pub const DEFAULT_PARTICLE_MAX_COUNT: u32 = 1000;
 /// (40 bytes, 10 floats — see shaders/particle.vert).
 pub const PARTICLE_VERTEX_BYTES: usize = 40;
 
-/// Seed for the per-system splitmix64 stream. Deterministic by system
-/// index (documented deviation from WE's per-frame randomness): the same
-/// scene renders the same particles on every run, which is what makes the
-/// range oracles reproducible. Systems with spread 0 and a fixed speed
-/// never touch the stream at all (their trajectories are exact).
+/// Seed for the per-system splitmix64 stream. The stream itself is
+/// deterministic: seeded by the system index (documented deviation from
+/// WE's per-frame randomness), so the same spawn sequence repeats in the
+/// same order. BUT the fixed-step schedule derives from wall-clock dt, so
+/// the scene's live population still depends on real time, not on the
+/// scene alone. Systems with spread 0 and a fixed speed never touch the
+/// stream at all (their trajectories are exact) — that is what makes the
+/// smoke oracles reproducible.
 const PRNG_SEED: u64 = 0x9E3779B97F4A7C15;
 
 /// splitmix64: a small, fast, deterministic PRNG (public domain algorithm
@@ -156,6 +164,11 @@ pub(crate) struct Particle {
 #[derive(Debug)]
 pub struct ParticleSystemState {
     pub name: String,
+    /// Position in the scene.json `objects` array — the global painter's
+    /// order across kinds (main.rs merges the layer and particle draw
+    /// lists by it, so a particle system that appears before an image in
+    /// the file draws under it).
+    pub scene_order: usize,
     /// Spawn position in scene units; (0,0) is the scene center, +y down.
     pub origin: [f32; 2],
     /// Particles per second, clamped 0..=4096 at parse (default 10).
@@ -233,10 +246,12 @@ pub struct ParticleSystemState {
 
 impl ParticleSystemState {
     /// Build the runtime state from the parsed spec. `system_index` is the
-    /// system's position in the scene (the deterministic PRNG seed).
+    /// system's position in the scene (the deterministic PRNG seed — the
+    /// draw-order merge uses spec.scene_order instead).
     pub fn from_spec(spec: &ParticleSpec, system_index: usize) -> Self {
         Self {
             name: spec.name.clone(),
+            scene_order: spec.scene_order,
             origin: spec.origin,
             spawn_rate: spec.spawn_rate,
             life: spec.life,
@@ -409,15 +424,19 @@ impl ParticleSystemState {
         self.burst = self.burst.saturating_add(count).min(MAX_PARTICLES as u32);
     }
 
-    /// Rebuild the vertex bytes for the current particles: 6 vertices per
-    /// particle of {pos.xy, uv.xy, color.rgba, size, pad} (40-byte stride,
-    /// shaders/particle.vert). The quad is expanded around the particle
-    /// center in scene pixels; size and color are interpolated over the
-    /// age/life fraction and the instance size/colorn/alpha factors are
-    /// folded in here (the draw pushes no per-particle state). Returns the
-    /// bytes and the vertex count (6 × alive).
-    pub fn build_vertex_bytes(&self) -> (Vec<u8>, u32) {
-        let mut bytes = Vec::with_capacity(self.particles.len() * 6 * PARTICLE_VERTEX_BYTES);
+    /// Rebuild the vertex bytes for the current particles into `scratch`
+    /// (cleared and reused — the worker passes one Vec for every system
+    /// every frame, so this allocates only when a system grows past its
+    /// previous high-water mark): 6 vertices per particle of {pos.xy,
+    /// uv.xy, color.rgba, size, pad} (40-byte stride, shaders/particle.vert).
+    /// The quad is expanded around the particle center in scene pixels;
+    /// size and color are interpolated over the age/life fraction and the
+    /// instance size/colorn/alpha factors are folded in here (the draw
+    /// pushes no per-particle state). Returns the vertex count (6 × alive);
+    /// the bytes live in `scratch` until the next call.
+    pub fn build_vertex_bytes(&self, scratch: &mut Vec<u8>) -> u32 {
+        scratch.clear();
+        scratch.reserve(self.particles.len() * 6 * PARTICLE_VERTEX_BYTES);
         let mut vertex_count = 0u32;
         for particle in &self.particles {
             let k = (particle.age / particle.life).clamp(0.0, 1.0);
@@ -441,19 +460,19 @@ impl ParticleSystemState {
                 (x0, y1, 0.0_f32, 1.0_f32),
                 (x0, y0, 0.0_f32, 0.0_f32),
             ] {
-                bytes.extend_from_slice(&px.to_le_bytes());
-                bytes.extend_from_slice(&py.to_le_bytes());
-                bytes.extend_from_slice(&u.to_le_bytes());
-                bytes.extend_from_slice(&v.to_le_bytes());
+                scratch.extend_from_slice(&px.to_le_bytes());
+                scratch.extend_from_slice(&py.to_le_bytes());
+                scratch.extend_from_slice(&u.to_le_bytes());
+                scratch.extend_from_slice(&v.to_le_bytes());
                 for channel in color {
-                    bytes.extend_from_slice(&channel.to_le_bytes());
+                    scratch.extend_from_slice(&channel.to_le_bytes());
                 }
-                bytes.extend_from_slice(&size.to_le_bytes());
-                bytes.extend_from_slice(&0.0f32.to_le_bytes()); // stride pad
+                scratch.extend_from_slice(&size.to_le_bytes());
+                scratch.extend_from_slice(&0.0f32.to_le_bytes()); // stride pad
             }
             vertex_count += 6;
         }
-        (bytes, vertex_count)
+        vertex_count
     }
 }
 
@@ -474,6 +493,7 @@ pub fn particle_draws(
         }
         draws.push(LayerDraw {
             layer_index: MAX_LAYERS + index,
+            scene_order: system.scene_order,
             m: [[1.0, 0.0], [0.0, 1.0]],
             t: [0.0, 0.0],
             alpha: system.alpha,
@@ -525,7 +545,14 @@ pub fn clamp_direction(value: f64) -> f32 {
     if !value.is_finite() {
         DEFAULT_PARTICLE_DIRECTION
     } else {
-        value as f32
+        // Clamp in f64 BEFORE the f32 cast: a finite f64 like 1e300 casts
+        // to f32::INFINITY, and sin/cos(∞) is NaN — the per-particle
+        // launch angle would be NaN and the system would be poisoned
+        // permanently (NaN positions never integrate out).
+        value.clamp(
+            -f64::from(MAX_PARTICLE_DIRECTION),
+            f64::from(MAX_PARTICLE_DIRECTION),
+        ) as f32
     }
 }
 
@@ -595,6 +622,7 @@ mod tests {
     fn spec_with(f: impl FnOnce(&mut ParticleSpec)) -> ParticleSpec {
         let mut spec = ParticleSpec {
             name: "dust".to_string(),
+            scene_order: 0,
             origin: [0.0, 0.0],
             spawn_rate: DEFAULT_PARTICLE_SPAWN_RATE,
             life: DEFAULT_PARTICLE_LIFE,
@@ -750,44 +778,46 @@ mod tests {
             age: 0.5, // k = 0.5
             life: 1.0,
         });
-        let (bytes, count) = state.build_vertex_bytes();
+        let mut scratch = Vec::new();
+        let count = state.build_vertex_bytes(&mut scratch);
         assert_eq!(count, 6);
-        assert_eq!(bytes.len(), 6 * PARTICLE_VERTEX_BYTES);
+        assert_eq!(scratch.len(), 6 * PARTICLE_VERTEX_BYTES);
         // Vertex 0: x0 = 0 - size/2 (size = 15 at k=0.5), y0 = -7.5, uv (0,0),
         // color = (0.5, 0.5, 0, 0.5), size 15, pad 0.
-        let v = |i: usize, f: usize| {
+        let v = |bytes: &[u8], i: usize, f: usize| {
             let off = i * PARTICLE_VERTEX_BYTES + f * 4;
             f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
         };
-        assert_eq!(v(0, 0), -7.5);
-        assert_eq!(v(0, 1), -7.5);
-        assert_eq!(v(0, 2), 0.0);
-        assert_eq!(v(0, 3), 0.0);
-        assert!((v(0, 4) - 0.5).abs() < 1e-6); // r
-        assert!((v(0, 5) - 0.5).abs() < 1e-6); // g
-        assert_eq!(v(0, 6), 0.0); // b
-        assert!((v(0, 7) - 0.5).abs() < 1e-6); // a
-        assert_eq!(v(0, 8), 15.0); // size
-        assert_eq!(v(0, 9), 0.0); // pad
+        assert_eq!(v(&scratch, 0, 0), -7.5);
+        assert_eq!(v(&scratch, 0, 1), -7.5);
+        assert_eq!(v(&scratch, 0, 2), 0.0);
+        assert_eq!(v(&scratch, 0, 3), 0.0);
+        assert!((v(&scratch, 0, 4) - 0.5).abs() < 1e-6); // r
+        assert!((v(&scratch, 0, 5) - 0.5).abs() < 1e-6); // g
+        assert_eq!(v(&scratch, 0, 6), 0.0); // b
+        assert!((v(&scratch, 0, 7) - 0.5).abs() < 1e-6); // a
+        assert_eq!(v(&scratch, 0, 8), 15.0); // size
+        assert_eq!(v(&scratch, 0, 9), 0.0); // pad
         // Corner 3 (index 3) is br at (7.5, 7.5) with uv (1,1).
-        assert_eq!(v(3, 0), 7.5);
-        assert_eq!(v(3, 1), 7.5);
-        assert_eq!(v(3, 2), 1.0);
-        assert_eq!(v(3, 3), 1.0);
-        // Endpoints: k=0 and k=1 with exact sizes.
+        assert_eq!(v(&scratch, 3, 0), 7.5);
+        assert_eq!(v(&scratch, 3, 1), 7.5);
+        assert_eq!(v(&scratch, 3, 2), 1.0);
+        assert_eq!(v(&scratch, 3, 3), 1.0);
+        // Endpoints: k=0 and k=1 with exact sizes (scratch is cleared and
+        // reused by each build — the worker's per-frame pattern).
         state.particles[0].age = 0.0;
-        let (bytes, _) = state.build_vertex_bytes();
+        let _ = state.build_vertex_bytes(&mut scratch);
         // Corner 0 x: bytes 0..4 (8..12 would be its uv).
-        assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), -5.0);
+        assert_eq!(f32::from_le_bytes(scratch[0..4].try_into().unwrap()), -5.0);
         state.particles[0].age = state.particles[0].life;
-        let (bytes, _) = state.build_vertex_bytes();
-        let half = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let _ = state.build_vertex_bytes(&mut scratch);
+        let half = f32::from_le_bytes(scratch[0..4].try_into().unwrap());
         assert!((half + 10.0).abs() < 1e-6, "half = {half}");
         // Aged past life: the fraction clamps to 1 (compaction removes the
         // particle next step; build must still be well-defined).
         state.particles[0].age = 2.0;
-        let (bytes, _) = state.build_vertex_bytes();
-        let half = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let _ = state.build_vertex_bytes(&mut scratch);
+        let half = f32::from_le_bytes(scratch[0..4].try_into().unwrap());
         assert!((half + 10.0).abs() < 1e-6);
     }
 
@@ -811,12 +841,15 @@ mod tests {
             age: 0.0,
             life: 1.0,
         });
-        let (bytes, _) = state.build_vertex_bytes();
-        let v = |f: usize| f32::from_le_bytes(bytes[f * 4..f * 4 + 4].try_into().unwrap());
-        assert_eq!(v(8), 16.0, "size factor doubles the quad extent");
-        assert_eq!(v(7), 0.25, "alpha factor scales the vertex alpha");
-        assert_eq!(v(4), 0.5, "colorn scales RGB");
-        assert_eq!(v(6), 0.5);
+        let mut scratch = Vec::new();
+        let _ = state.build_vertex_bytes(&mut scratch);
+        let v = |bytes: &[u8], f: usize| {
+            f32::from_le_bytes(bytes[f * 4..f * 4 + 4].try_into().unwrap())
+        };
+        assert_eq!(v(&scratch, 8), 16.0, "size factor doubles the quad extent");
+        assert_eq!(v(&scratch, 7), 0.25, "alpha factor scales the vertex alpha");
+        assert_eq!(v(&scratch, 4), 0.5, "colorn scales RGB");
+        assert_eq!(v(&scratch, 6), 0.5);
     }
 
     #[test]
@@ -885,11 +918,12 @@ mod tests {
                 }),
                 seed as usize,
             );
+            let mut scratch = Vec::new();
             for _ in 0..200 {
                 state.simulate(1.0 / 30.0);
             }
-            let (bytes, count) = state.build_vertex_bytes();
-            (bytes, count, state.particles.len())
+            let count = state.build_vertex_bytes(&mut scratch);
+            (scratch, count, state.particles.len())
         };
         assert_eq!(run(3), run(3));
         // Different seeds give different streams (the system index seeds
@@ -1038,6 +1072,13 @@ mod tests {
             std::f32::consts::FRAC_PI_2
         );
         assert_eq!(clamp_direction(f64::NAN), 0.0);
+        // Finite but huge: the f64 -> f32 cast of 1e300 overflows to
+        // f32::INFINITY, and sin/cos(INFINITY) is NaN — the launch angle
+        // must clamp to ±1e6 in f64 before the cast instead.
+        assert_eq!(clamp_direction(1e300), MAX_PARTICLE_DIRECTION);
+        assert_eq!(clamp_direction(-1e300), -MAX_PARTICLE_DIRECTION);
+        assert_eq!(clamp_direction(f64::INFINITY), 0.0);
+        assert!(clamp_direction(1e300).is_finite());
     }
 
     #[test]
@@ -1061,6 +1102,7 @@ mod tests {
         assert_eq!(draws.len(), 1);
         let draw = &draws[0];
         assert_eq!(draw.layer_index, MAX_LAYERS);
+        assert_eq!(draw.scene_order, 0, "the spec's objects-array position");
         assert_eq!(draw.blend_mode, BlendMode::Add);
         assert_eq!(draw.kind, DrawKind::Particles { vertex_count: 6 });
         assert_eq!(draw.m, [[1.0, 0.0], [0.0, 1.0]]);

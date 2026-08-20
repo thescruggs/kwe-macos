@@ -146,6 +146,11 @@ pub struct SceneConfig {
 pub struct LayerSpec {
     /// The script's identity for this layer (`Scene.getLayer(name)`).
     pub name: String,
+    /// Position in the scene.json `objects` array — the file's object
+    /// order. The per-kind draw lists merge by this key (layers.rs
+    /// merged_draws), so an image that appears after a particle system in
+    /// the file draws on top of it.
+    pub scene_order: usize,
     /// Raw `image` reference exactly as written: a path relative to the
     /// content root (file scenes) or a package entry path (pkg scenes).
     /// `None` when the field is present but not a string (a
@@ -217,6 +222,10 @@ pub struct ParticleSpec {
     /// The script's identity (`Scene.getParticleSystem(name)`; also
     /// reachable through Scene.getLayer, WE-style).
     pub name: String,
+    /// Position in the scene.json `objects` array — the file's object
+    /// order (the draw-order merge key, layers.rs merged_draws; NOT the
+    /// PRNG seed — the runtime seeds by system index).
+    pub scene_order: usize,
     /// Spawn position in scene units; (0,0) = scene center, +y down. The
     /// object's `angles`/`scale` are parsed (shared props) but NOT applied
     /// in M3f — particle systems render world-space (documented deviation;
@@ -774,6 +783,7 @@ fn parse_image_layer(
 
     Ok(LayerSpec {
         name: common.name,
+        scene_order: index,
         image,
         origin: common.origin,
         angles: common.angles,
@@ -873,6 +883,7 @@ fn parse_text_layer(
 
     Ok(LayerSpec {
         name: common.name.clone(),
+        scene_order: index,
         image: None,
         origin: common.origin,
         angles: common.angles,
@@ -897,10 +908,12 @@ fn parse_text_layer(
 }
 
 /// A particle spec with every flat emitter-model field at its documented
-/// default (common props land from the shared parse path).
-fn particle_spec_defaults(common: CommonProps) -> ParticleSpec {
+/// default (common props land from the shared parse path). `index` is the
+/// object's position in the `objects` array (the draw-order merge key).
+fn particle_spec_defaults(common: CommonProps, index: usize) -> ParticleSpec {
     ParticleSpec {
         name: common.name,
+        scene_order: index,
         origin: common.origin,
         spawn_rate: particles::DEFAULT_PARTICLE_SPAWN_RATE,
         life: particles::DEFAULT_PARTICLE_LIFE,
@@ -942,7 +955,7 @@ fn parse_particle_system(
     index: usize,
 ) -> Result<ParticleSpec, SceneError> {
     let common = parse_common_props(object, index, "particle")?;
-    let mut spec = particle_spec_defaults(common);
+    let mut spec = particle_spec_defaults(common, index);
     let Value::Object(definition) = property_value(object.get("particle").expect("caller checked"))
     else {
         return Ok(spec); // file reference or malformed value: defaults
@@ -2641,6 +2654,53 @@ mod tests {
         assert_eq!(spec.size_end, particles::MAX_PARTICLE_SIZE);
         assert_eq!(spec.color_start, [1.0, 0.0, 0.5, 1.0]);
         assert_eq!(spec.max_count, particles::MAX_PARTICLES as u32);
+
+        // Direction 1e300: finite but huge — the bare f64 -> f32 cast
+        // would overflow to f32::INFINITY and sin/cos(INFINITY) is NaN,
+        // permanently poisoning the system. The parse must clamp to ±1e6
+        // (the adversarial-review hole).
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {"direction": 1e300}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].direction, particles::MAX_PARTICLE_DIRECTION);
+        assert!(particles[0].direction.is_finite());
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {"direction": -1e300}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].direction, -particles::MAX_PARTICLE_DIRECTION);
+    }
+
+    #[test]
+    fn scene_order_records_the_objects_array_position_across_kinds() {
+        // M3f draw order: every parsed kind records its position in the
+        // scene.json `objects` array, and each kind list stays ascending —
+        // the merge precondition for main.rs's merged_draws (a particle
+        // system listed BEFORE an image draws UNDER it, whatever the mix).
+        let value: Value = serde_json::from_str(
+            r#"{"objects": [
+                {"name": "imgA", "image": "a.png"},
+                {"name": "dust", "particle": {}},
+                {"name": "imgB", "image": "b.png"},
+                {"name": "snow", "particle": {}},
+                {"name": "label", "text": "hi"},
+                {"name": "song.mp3", "audio": "song.mp3"}
+            ]}"#,
+        )
+        .unwrap();
+        let (layers, particles, _) = parse_objects(value.as_object().unwrap()).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert_eq!(particles.len(), 2);
+        assert_eq!(layers[0].scene_order, 0);
+        assert_eq!(particles[0].scene_order, 1);
+        assert_eq!(layers[1].scene_order, 2);
+        assert_eq!(particles[1].scene_order, 3);
+        assert_eq!(layers[2].scene_order, 4);
+        let layer_orders: Vec<usize> = layers.iter().map(|l| l.scene_order).collect();
+        assert_eq!(layer_orders, [0, 2, 4]);
+        let particle_orders: Vec<usize> = particles.iter().map(|p| p.scene_order).collect();
+        assert_eq!(particle_orders, [1, 3]);
     }
 
     #[test]

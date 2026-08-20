@@ -130,6 +130,11 @@ pub const MAX_LAYER_BRIGHTNESS: f32 = 10.0;
 #[derive(Debug, Clone)]
 pub struct LayerState {
     pub name: String,
+    /// Position in the scene.json `objects` array — the global painter's
+    /// order across kinds: merged_draws sorts the layer and particle draw
+    /// lists by it, so an image that appears after a particle system in
+    /// the file draws on top of it.
+    pub scene_order: usize,
     /// Straight alpha in 0..=1 (WE default 1.0).
     pub alpha: f32,
     pub visible: bool,
@@ -190,6 +195,7 @@ impl LayerState {
     pub fn from_spec(spec: &LayerSpec) -> Self {
         Self {
             name: spec.name.clone(),
+            scene_order: spec.scene_order,
             alpha: spec.alpha,
             visible: spec.visible,
             angles: spec.angles,
@@ -296,9 +302,14 @@ pub enum DrawKind {
 /// (text layers map their layout-pixel quads 1:1 through size (1, 1)).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerDraw {
-    /// Index into the renderer's texture/descriptor table — the layer's
-    /// position in the scene.json `objects` array.
+    /// Index into the renderer's texture/descriptor table: the layer's
+    /// slot, or MAX_LAYERS + system_index for a particle draw.
     pub layer_index: usize,
+    /// The object's position in the scene.json `objects` array — the
+    /// painter's order ACROSS kinds. The draw lists are merged by it
+    /// (merged_draws), so the compositor draws in the file's object order:
+    /// an image after a particle system in the file draws on top of it.
+    pub scene_order: usize,
     /// Linear part: [[m00, m01], [m10, m11]] (x = m00·x + m01·y + tx).
     pub m: [[f32; 2]; 2],
     /// Translation in scene units: the layer's origin.
@@ -361,6 +372,7 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
             let (m, t) = layer_model(state.angles[2], state.scale, state.size, state.origin);
             Some(LayerDraw {
                 layer_index,
+                scene_order: state.scene_order,
                 m,
                 t,
                 alpha: state.alpha,
@@ -373,6 +385,33 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
         .collect()
 }
 
+/// Merge the per-kind draw lists into one painter-ordered list. Each input
+/// is already ascending by `scene_order` (parse_objects pushes every kind
+/// in the scene.json `objects` array's order, and both builders skip
+/// non-drawable entries in that same pass), so a two-list merge restores
+/// the FILE's object order across kinds: an image that appears after a
+/// particle system draws on top of it, exactly as the file says. Ties
+/// cannot happen (one draw per object); layers win the impossible tie for
+/// stability. Pure — unit-tested; main.rs calls it once per render.
+pub fn merged_draws(layers: Vec<LayerDraw>, particles: Vec<LayerDraw>) -> Vec<LayerDraw> {
+    let mut merged = Vec::with_capacity(layers.len() + particles.len());
+    let mut layers = layers.into_iter().peekable();
+    let mut particles = particles.into_iter().peekable();
+    while layers.peek().is_some() || particles.peek().is_some() {
+        let take_layer = match (layers.peek(), particles.peek()) {
+            (Some(layer), Some(particle)) => layer.scene_order <= particle.scene_order,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if take_layer {
+            merged.push(layers.next().expect("peeked Some"));
+        } else {
+            merged.push(particles.next().expect("peeked Some"));
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +419,7 @@ mod tests {
     fn state(name: &str, visible: bool) -> Rc<RefCell<LayerState>> {
         Rc::new(RefCell::new(LayerState {
             name: name.into(),
+            scene_order: 0,
             alpha: 1.0,
             visible,
             angles: [0.0, 0.0, 0.0],
@@ -401,6 +441,7 @@ mod tests {
     ) -> Rc<RefCell<LayerState>> {
         Rc::new(RefCell::new(LayerState {
             name: name.into(),
+            scene_order: 0,
             alpha: 1.0,
             visible: true,
             angles: [0.0, 0.0, 0.0],
@@ -604,6 +645,60 @@ mod tests {
         assert!(m[1][1].abs() < 1e-4, "cos term on y: {}", m[1][1]);
     }
 
+    // ---- M3f: draw-order merge across kinds ----
+
+    #[test]
+    fn merged_draws_restore_the_file_object_order_across_kinds() {
+        // parse_objects pushes each kind in the file's objects order, so
+        // the two lists are individually ascending; merged_draws must
+        // interleave them so an image that appears AFTER a particle system
+        // in the file draws ON TOP of it — the adversarial-review
+        // regression: the old `draws.extend(...)` put every particle draw
+        // last, whatever the file said.
+        let image = |scene_order| LayerDraw {
+            layer_index: scene_order,
+            scene_order,
+            m: [[1.0, 0.0], [0.0, 1.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            kind: DrawKind::Image,
+        };
+        let particle = |scene_order| LayerDraw {
+            layer_index: MAX_LAYERS + scene_order,
+            scene_order,
+            m: [[1.0, 0.0], [0.0, 1.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            kind: DrawKind::Particles { vertex_count: 6 },
+        };
+        // File: [particle @0, image @1, particle @2, image @3] — an
+        // invisible layer @4 and an untextured system @5 are absent from
+        // both lists, as the builders already skipped them.
+        let merged = merged_draws(vec![image(1), image(3)], vec![particle(0), particle(2)]);
+        let orders: Vec<usize> = merged.iter().map(|draw| draw.scene_order).collect();
+        assert_eq!(orders, [0, 1, 2, 3]);
+        assert_eq!(merged[0].kind, DrawKind::Particles { vertex_count: 6 });
+        assert_eq!(merged[1].kind, DrawKind::Image);
+        assert_eq!(merged[2].kind, DrawKind::Particles { vertex_count: 6 });
+        assert_eq!(merged[3].kind, DrawKind::Image);
+        // The smoke fixture's pair: [particle @0, image @1] — the image
+        // (red square) must draw LAST, i.e. ON TOP of the particles.
+        let merged = merged_draws(vec![image(1)], vec![particle(0)]);
+        assert_eq!(merged[0].kind, DrawKind::Particles { vertex_count: 6 });
+        assert_eq!(merged[1].kind, DrawKind::Image);
+        assert_eq!(merged[1].layer_index, 1, "slots survive the merge");
+        // Empty sides.
+        assert_eq!(merged_draws(vec![], vec![]).len(), 0);
+        assert_eq!(merged_draws(vec![image(0)], vec![]).len(), 1);
+        assert_eq!(merged_draws(vec![], vec![particle(0)]).len(), 1);
+    }
+
     // ---- M3e: text layers ----
 
     #[test]
@@ -663,6 +758,7 @@ mod tests {
         };
         let layer = LayerState::from_spec(&LayerSpec {
             name: "t".into(),
+            scene_order: 0,
             image: None,
             origin: [1.0, 2.0],
             angles: [0.0, 0.0, 0.0],

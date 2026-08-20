@@ -2568,7 +2568,10 @@ mod tests {
                 p.life = NaN;                   // -> 1 (default)
                 p.speedMin = -5;                // -> 0
                 p.speedMax = 2e9;               // -> 1e6
-                p.direction = 3.5;              // -> 3.5 (unbounded; f32-exact)
+                p.direction = 3.5;              // -> 3.5 (bounded ±1e6; f32-exact)
+                p.direction = 1e300;            // -> 1e6 (finite-but-huge:
+                //     the f64->f32 cast would overflow to INFINITY, so the
+                //     write path clamps in f64 first — never a NaN angle)
                 p.spread = -2;                  // -> 0
                 p.sizeStart = 0;                // -> 1
                 p.sizeEnd = 1000;               // -> 512
@@ -2595,7 +2598,7 @@ mod tests {
                 var ok =
                     p.spawnRate === 4096 && p.life === 1 &&
                     p.speedMin === 0 && p.speedMax === 1e6 &&
-                    p.direction === 3.5 && p.spread === 0 &&
+                    p.direction === 1e6 && p.spread === 0 &&
                     p.sizeStart === 1 && p.sizeEnd === 512 &&
                     p.alphaStart === 1 && p.alphaEnd === 0 &&
                     p.maxCount === 4096 && p.blendMode === 0 &&
@@ -2622,7 +2625,10 @@ mod tests {
         assert_eq!(state.life, 1.0);
         assert_eq!(state.speed_min, 0.0);
         assert_eq!(state.speed_max, 1e6);
-        assert_eq!(state.direction, 3.5);
+        // The 1e300 write landed clamped to ±1e6, NOT f32::INFINITY (the
+        // NaN-angle poison the adversarial review flagged).
+        assert_eq!(state.direction, 1e6);
+        assert!(state.direction.is_finite());
         assert_eq!(state.spread, 0.0);
         assert_eq!(state.size_start, 1.0);
         assert_eq!(state.size_end, 512.0);

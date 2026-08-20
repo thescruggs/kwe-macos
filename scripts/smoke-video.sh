@@ -48,6 +48,12 @@ call_daemon() {
 # RLIMIT_NPROC check counts every thread of the uid (user->processes) and a
 # desktop session commonly exceeds the global 1024 default — this lane
 # running without an override IS the proof (docs/BETA_M1.md risk 1).
+# The kill -9 case (below) must OBSERVE the transient "restarting" phase
+# to assert failures==1 and the signal_9 detail. The restart window is
+# restart-delay + canary (150 ms): at 20 ms the window is ~170 ms —
+# shorter than a status round-trip under load, so the poll missed it and
+# the case failed spuriously. 800 ms widens the window to ~950 ms,
+# reliably observable.
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
         --socket "$socket" \
@@ -57,7 +63,7 @@ start_daemon() {
         --renderer-video-startup-timeout-ms 8000 \
         --renderer-frame-timeout-ms 1000 \
         --renderer-stop-grace-ms 80 \
-        --renderer-restart-delay-ms 20 \
+        --renderer-restart-delay-ms 800 \
         --renderer-canary-ms 150 \
         --renderer-handoff-timeout-ms 1000 \
         --renderer-max-failures 3 \

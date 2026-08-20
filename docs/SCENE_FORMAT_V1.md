@@ -426,10 +426,13 @@ with byte-pinned real-content renders.
 - WE blend modes map 0/1/6/7/9 = Normal/Multiply/Add/Screen/Subtract
   (the M3d table); `blendMode` and `colorBlendMode` are both accepted.
 - WE randomness is per-frame and non-deterministic; M3f replaces it with
-  one splitmix64 stream per system, seeded by the system index —
-  documented deviation, the same scene renders the same particles on
-  every run (spread-0 systems never touch the stream: their trajectories
-  are exact).
+  one splitmix64 stream per system, seeded by the system index — a
+  documented deviation. The stream itself is deterministic (the same
+  spawn sequence repeats in the same order), BUT the fixed-step schedule
+  derives from wall-clock dt, so the scene's live population depends on
+  real time, not on the scene alone. Spread-0 systems never touch the
+  stream at all (their trajectories are exact — what the range oracles
+  rely on).
 
 ### scene.json keys (the `particle` object)
 
@@ -452,7 +455,7 @@ falls back to the resolved minimum, and a reversed pair normalizes
 | `spawnRate` | 0..=4096 /s | 10 | integer or numeric string |
 | `life` | 0.1..=60 s | 1.0 | |
 | `speed` / `speedMin` / `speedMax` | 0..=1e6 px/s | 0 | the pair supersedes `speed`; reversed pairs normalize |
-| `direction` | radians | 0 | from +x, y down (M3f extension, see research notes) |
+| `direction` | ±1e6 | 0 | radians from +x, y down (M3f extension, see research notes); clamped in f64 BEFORE the f32 cast — a huge finite value like 1e300 must never overflow to f32::INFINITY (sin/cos of infinity is NaN, permanently poisoning the system) |
 | `spread` | 0..=2π | 0 | all particles take the exact direction at 0 |
 | `gravity` | ±1e6 px/s², 1..=3 components | [0, 0] | `[g]` → `[0, g]` (y down); extra components dropped |
 | `sizeStart` / `sizeEnd` | 1..=512 px | 8 | interpolated over life |
@@ -497,20 +500,23 @@ systems use the per-system splitmix64 stream seeded by system index.
 
 ### Rendering
 
-Each system owns one host-visible vertex buffer, rebuilt only when the
-emitter properties change (`spawnRate`, `life`, speed range, direction,
-spread, gravity, sizes, colors, alphas, `maxCount`, blend mode,
-visibility); the live particles are uploaded per frame (or on change)
-and drawn as **one batched draw per system** — 6 vertices per particle
-(an axis-aligned quad expanded around the center, `tr/tl/bl/br` UVs
-covering the full texture), 40-byte stride with per-particle color and
-size folded into the vertex attributes (`shaders/particle.vert` /
-`particle.frag` — the M3f shader pair). Blend modes reuse the M3d
-per-mode pipeline variants (≤ 16 pipelines, one per mode); the texture
-rides slot `MAX_LAYERS + system_index` (272 slots total). A missing,
-over-budget or undecodable material skips the system's draw at load
-(`particle_skip`, never fatal — the system still simulates), and a
-vertex-upload failure is contained the same way.
+Each system owns one host-visible vertex buffer — **create-or-grow**:
+uploaded on the first draw, grown when the vertex count exceeds the
+current capacity, never shrunk. The buffer CONTENTS are rebuilt AND
+re-uploaded every frame a fixed step ran (that is how often the live
+particles can have changed — the sim's step order; a frame without a
+step leaves the buffer untouched). The rebuild writes 6 vertices per
+particle (an axis-aligned quad expanded around the center,
+`tr/tl/bl/br` UVs covering the full texture), 40-byte stride with
+per-particle color and size folded into the vertex attributes
+(`shaders/particle.vert` / `particle.frag` — the M3f shader pair), via
+one scratch Vec the worker reuses across systems and frames (no
+per-frame allocation churn). Blend modes reuse the M3d per-mode pipeline
+variants (≤ 16 pipelines, one per mode); the texture rides slot
+`MAX_LAYERS + system_index` (272 slots total). A missing, over-budget or
+undecodable material skips the system's draw at load (`particle_skip`,
+never fatal — the system still simulates), and a vertex-upload failure
+is contained the same way.
 
 ### Bounds
 
@@ -522,7 +528,7 @@ vertex-upload failure is contained the same way.
 | sim time per frame | ≤ 1.0 s (`MAX_ACCUMULATED_SIM_SECONDS` = 60 steps) | hostile `rate` factors can never stall the frame |
 | wall dt per frame | ≤ 1.0 s (`MAX_FRAME_DT`) | a stalled frame is dropped, not stretched |
 | spawn accumulator | 65536 due particles/step (`MAX_SPAWN_ACCUMULATOR`) | excess dropped, bounded |
-| vertex buffer | 4096 × 6 verts × 40 B ≈ 983 KiB per system | one host-visible buffer, rebuilt on property change only |
+| vertex buffer | 4096 × 6 verts × 40 B ≈ 983 KiB per system | one host-visible buffer, create-or-grow; contents rebuilt + re-uploaded every frame a fixed step ran |
 | texture slots | `MAX_LAYERS` (256) + 16 particle slots = 272 | the M3c texture budget still applies per upload |
 
 ## Image sources (M3c)

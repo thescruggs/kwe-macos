@@ -61,7 +61,7 @@ use kwe_input_protocol::{
 };
 
 use js::{EngineStartError, ScriptEngine, StepResult};
-use layers::{LayerState, MAX_LAYERS, frame_draws};
+use layers::{LayerState, MAX_LAYERS, frame_draws, merged_draws};
 use particles::{MAX_PARTICLE_SYSTEMS, ParticleSystemState, particle_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
 use text::{MAX_TEXT_LAYERS, TextRenderer};
@@ -447,8 +447,14 @@ impl SceneWorker {
         // (the burst a script queued in init() spawns on this first step).
         self.sync_text();
         self.sync_particles(interval.as_secs_f64());
-        let mut draws = frame_draws(&self.layers, &self.texture_ok);
-        draws.extend(particle_draws(&self.particles, &self.particle_texture_ok));
+        // M3f draw order: the layer and particle lists are merged by the
+        // scene.json objects-array order, so a particle system and an
+        // image interleave exactly as the file says (an image listed after
+        // a particle system draws on top of it).
+        let draws = merged_draws(
+            frame_draws(&self.layers, &self.texture_ok),
+            particle_draws(&self.particles, &self.particle_texture_ok),
+        );
         let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
             Ok(pixels) => pixels,
             Err(error) => reject_render(&error, "initial render failure"),
@@ -493,8 +499,10 @@ impl SceneWorker {
                     // buffers are rebuilt whenever a fixed step ran.
                     self.sync_text();
                     self.sync_particles(dt);
-                    let mut draws = frame_draws(&self.layers, &self.texture_ok);
-                    draws.extend(particle_draws(&self.particles, &self.particle_texture_ok));
+                    let draws = merged_draws(
+                        frame_draws(&self.layers, &self.texture_ok),
+                        particle_draws(&self.particles, &self.particle_texture_ok),
+                    );
                     match self.renderer.render(color, &draws) {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
                             // Exact-size check: the conversion is exact by
@@ -587,17 +595,22 @@ impl SceneWorker {
     /// exactly like a failed texture; a hostile system can only degrade
     /// rendering, never the scene.
     fn sync_particles(&mut self, dt: f64) {
+        // One scratch Vec reused across systems AND frames: build_vertex_bytes
+        // clears and refills it, and the upload copies it into the system's
+        // own host-visible buffer — so a frame with steps allocates only
+        // when a system grows past its previous high-water mark.
+        let mut scratch = Vec::new();
         for (index, system) in self.particles.iter().enumerate() {
             let mut system = system.borrow_mut();
             if !system.simulate(dt) {
                 continue;
             }
-            let (bytes, vertex_count) = system.build_vertex_bytes();
+            let vertex_count = system.build_vertex_bytes(&mut scratch);
             system.vertex_count = vertex_count;
             if vertex_count == 0 {
                 continue; // all aged out: nothing to upload, no draw
             }
-            if let Err(error) = self.renderer.upload_particle_vertices(index, &bytes) {
+            if let Err(error) = self.renderer.upload_particle_vertices(index, &scratch) {
                 self.particle_texture_ok[index] = false;
                 eprintln!(
                     "event=renderer.scene.particle_skip system={} detail=vertex-upload-failed: {error}",
@@ -1349,6 +1362,7 @@ mod tests {
     fn layer(name: &str, image: Option<&str>) -> scene::LayerSpec {
         scene::LayerSpec {
             name: name.into(),
+            scene_order: 0,
             image: image.map(Into::into),
             origin: [0.0, 0.0],
             angles: [0.0, 0.0, 0.0],
