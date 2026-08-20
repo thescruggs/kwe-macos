@@ -31,11 +31,14 @@ qt_add_qml_module(kwe-manager
     URI org.kde.kwe
     VERSION 1.0
     NO_IMPORT_SCAN
-    # CatalogClient, PackageInstaller, and PermissionsClient carry
-    # QML_UNCREATABLE so their Q_ENUM State values are reachable from QML as
-    # CatalogClient.Ready / PackageInstaller.Installed /
-    # PermissionsClient.Ready (instance-based enum access is gone).
+    # CatalogClient, PackageInstaller, PermissionsClient, and ApplyClient
+    # carry QML_UNCREATABLE so their Q_ENUM State values are reachable from
+    # QML as CatalogClient.Ready / PackageInstaller.Installed /
+    # PermissionsClient.Ready / ApplyClient.Applied (instance-based enum
+    # access is gone).
     SOURCES
+        src/applyclient.cpp
+        src/applyclient.h
         src/catalogclient.cpp
         src/catalogclient.h
         src/daemonactivator.cpp

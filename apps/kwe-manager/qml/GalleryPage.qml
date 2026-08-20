@@ -234,7 +234,10 @@ Kirigami.Page {
                     }
                 }
                 Controls.Label {
-                    text: qsTr("Display assignment is not enabled yet")
+                    // Single-wallpaper display assignment exists since BETA_M4b
+                    // (the details pane Apply flow); playlist-to-display
+                    // assignment is a later milestone.
+                    text: qsTr("Playlist display assignment arrives in a later milestone")
                     opacity: 0.7
                 }
             }
@@ -267,7 +270,10 @@ Kirigami.Page {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Information
             visible: catalogClient.state === CatalogClient.Ready
-            text: qsTr("Alpha 0.1 indexes installed content safely. Applying wallpapers stays disabled until the isolated Plasma frame bridge is ready.")
+            // BETA_M4b: applying is no longer alpha-gated; the daemon's apply
+            // transaction is what the details pane drives, and every switch
+            // is reversible from the same page.
+            text: qsTr("Applying wallpapers is available for video, web, and scene content. Use Restore on the wallpaper details page to switch back to the image wallpaper.")
             showCloseButton: true
         }
 

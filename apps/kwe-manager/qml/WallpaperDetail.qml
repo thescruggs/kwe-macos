@@ -22,14 +22,47 @@ Kirigami.ScrollablePage {
             permissionsClient.requestPermissions(WallpaperSelection.selectedId);
     }
 
+    // BETA_M4b: the live apply lane. The daemon owns the transaction; these
+    // gates mirror its contract (docs/SUPERVISOR_API_V1.md) so Apply only
+    // enables for content the service can actually start.
+    readonly property bool applyableKind: WallpaperSelection.selectedKind === "video"
+        || WallpaperSelection.selectedKind === "web"
+        || WallpaperSelection.selectedKind === "scene"
+    readonly property bool contentResolvable: detailPage.applyContentUrl() !== ""
+    readonly property bool rendererCompatible: WallpaperSelection.selectedCompatibility === "renderer_dependent"
+    // currentIndex alone is not enough: a ComboBox with an empty model must
+    // not read as a valid target.
+    readonly property bool hasOutput: outputPicker.currentIndex >= 0 && applyClient.outputs.length > 0
+    readonly property bool canApply: detailPage.applyableKind && detailPage.contentResolvable
+        && detailPage.rendererCompatible && detailPage.hasOutput
+
+    // The daemon's catalog content path per kind: the runnable entry file for
+    // video/scene, the content root for web (the renderer serves the whole
+    // root). Empty means unresolvable; the client then omits content and the
+    // daemon starts its own catalog content.
+    function applyContentUrl() {
+        if (WallpaperSelection.selectedKind === "web")
+            return WallpaperSelection.selectedContentRoot;
+        return WallpaperSelection.selectedEntry;
+    }
+
     onVisibleChanged: {
-        if (visible)
+        if (visible) {
             refreshPermissions();
+            // Outputs are loaded on demand: the daemon caches its
+            // enumeration for 5 s, so re-listing on every appearance is
+            // cheap and picks up hotplugs.
+            if (!applyClient.busy)
+                applyClient.listOutputs();
+        }
     }
 
     Connections {
         target: WallpaperSelection
         function onSelectedIdChanged() {
+            // A result (confirmation or failure) belongs to the wallpaper
+            // that produced it; never let it read as the next selection's.
+            applyClient.resetStatus();
             if (detailPage.visible)
                 refreshPermissions();
         }
@@ -60,7 +93,7 @@ Kirigami.ScrollablePage {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId === ""
             text: qsTr("Select a wallpaper")
-            explanation: qsTr("Compatibility and diagnostic details appear here before Apply is enabled in a future alpha.")
+            explanation: qsTr("Compatibility, apply, and restore controls appear here.")
             icon.name: "preferences-desktop-wallpaper-symbolic"
         }
 
@@ -151,15 +184,122 @@ Kirigami.ScrollablePage {
             color: Kirigami.Theme.negativeTextColor
             wrapMode: Text.Wrap
         }
+        // BETA_M4b: the live apply lane. Outputs are enumerated on demand by
+        // the daemon; Apply runs its bounded transaction (validate -> start ->
+        // promote -> persist -> switch); Restore is the safe-mode lane back to
+        // the previous (or stock) image wallpaper. Every failure surfaces the
+        // daemon's detail in text — never color alone — and the daemon reverts
+        // the desktop on its own failure path.
+        Controls.Label {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== ""
+            text: qsTr("Apply to display")
+            font.bold: true
+        }
+        Controls.ComboBox {
+            id: outputPicker
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== ""
+            model: applyClient.outputs
+            // Disabled while the enumeration is loading or while any apply-lane
+            // operation is in flight (the lane is strictly serialized).
+            enabled: !applyClient.busy && applyClient.outputs.length > 0
+            Accessible.name: qsTr("Output to apply the wallpaper to")
+            Accessible.description: qsTr("The wallpaper is applied to the selected display output")
+            Controls.ToolTip.visible: hovered
+            Controls.ToolTip.text: applyClient.outputs.length === 0
+                ? qsTr("No display outputs are available yet")
+                : Accessible.description
+        }
+        Controls.Label {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length === 0
+            text: applyClient.state === ApplyClient.ListingOutputs
+                ? qsTr("Enumerating display outputs…")
+                : qsTr("No display outputs are available.")
+            opacity: 0.75
+            wrapMode: Text.Wrap
+        }
         Controls.Button {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== ""
-            enabled: false
-            text: qsTr("Apply (available after safe bridge)")
+            text: applyClient.state === ApplyClient.Applying
+                ? qsTr("Applying…")
+                : detailPage.hasOutput
+                    ? qsTr("Apply to %1").arg(outputPicker.currentText)
+                    : qsTr("Apply")
             icon.name: "dialog-ok-apply-symbolic"
-            Accessible.description: qsTr("Disabled in Alpha 0.1 to protect the Plasma desktop")
-            Controls.ToolTip.visible: hovered
-            Controls.ToolTip.text: Accessible.description
+            enabled: detailPage.canApply && !applyClient.busy
+            Accessible.description: !detailPage.applyableKind
+                ? qsTr("This wallpaper type cannot be applied")
+                : !detailPage.contentResolvable
+                    ? qsTr("The wallpaper content path is not available")
+                    : !detailPage.rendererCompatible
+                        ? qsTr("This wallpaper is not marked renderer-dependent; applying is disabled")
+                        : qsTr("Apply this wallpaper to the selected display output")
+            onClicked: applyClient.applyWallpaper(outputPicker.currentText,
+                WallpaperSelection.selectedId, WallpaperSelection.selectedKind,
+                detailPage.applyContentUrl())
+        }
+        Controls.Label {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && detailPage.applyableKind && !detailPage.canApply
+            text: !detailPage.rendererCompatible
+                ? qsTr("Applying is disabled: this wallpaper is not marked renderer-dependent.")
+                : !detailPage.contentResolvable
+                    ? qsTr("Applying is disabled: the wallpaper content path is not available.")
+                    : qsTr("Applying is disabled: no display output is selected.")
+            opacity: 0.75
+            wrapMode: Text.Wrap
+        }
+        Controls.Button {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== ""
+            text: applyClient.state === ApplyClient.Restoring
+                ? qsTr("Restoring…")
+                : qsTr("Restore KDE wallpaper")
+            icon.name: "edit-undo-symbolic"
+            enabled: detailPage.hasOutput && !applyClient.busy
+            Accessible.description: qsTr("Restore the previous image wallpaper on the selected display (safe mode)")
+            onClicked: applyClient.restoreWallpaper(outputPicker.currentText)
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && applyClient.state === ApplyClient.Applied
+                && applyClient.appliedWallpaperId === WallpaperSelection.selectedId
+                && applyClient.appliedOutput === outputPicker.currentText
+            type: Kirigami.MessageType.Positive
+            text: qsTr("Applied %1 to %2")
+                .arg(WallpaperSelection.selectedTitle)
+                .arg(applyClient.appliedOutput)
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== ""
+                && applyClient.restoredOutput !== ""
+                && applyClient.restoredOutput === outputPicker.currentText
+            type: Kirigami.MessageType.Information
+            text: applyClient.restoreMode === "stock"
+                ? qsTr("Restored the image wallpaper on %1 (stock image fallback)")
+                    .arg(applyClient.restoredOutput)
+                : qsTr("Restored the image wallpaper on %1").arg(applyClient.restoredOutput)
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && applyClient.state === ApplyClient.Failed
+            type: Kirigami.MessageType.Error
+            text: applyClient.errorMessage
+            actions: [
+                Kirigami.Action {
+                    // Re-runs the operation that failed (apply or restore),
+                    // never a different one.
+                    text: qsTr("Try Again")
+                    icon.name: "view-refresh-symbolic"
+                    visible: applyClient.failedMethod !== ""
+                    enabled: !applyClient.busy
+                    onTriggered: applyClient.retry()
+                }
+            ]
         }
         Controls.Button {
             Layout.fillWidth: true

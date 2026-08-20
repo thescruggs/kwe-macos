@@ -30,7 +30,12 @@ QVariant CatalogModel::data(const QModelIndex &index, int role) const {
     case CompatibilityRole: return item.compatibility;
     case CompatibilityDetailRole: return item.detail;
     case PreviewUrlRole: return item.previewUrl;
-    case ContentRootRole: return item.contentRoot;
+    case ContentRootRole: {
+        // Exposed as a URL (like entryUrl) so the apply lane can pass it as
+        // the web content root through the same QUrl -> local path path.
+        const QString root = item.contentRoot;
+        return root.isEmpty() ? QVariant{} : QUrl::fromLocalFile(root);
+    }
     case DiagnosticCountRole: return item.diagnosticCount;
     case WorkshopStateRole: return item.workshopState;
     case WorkshopProgressRole: return item.workshopProgress;

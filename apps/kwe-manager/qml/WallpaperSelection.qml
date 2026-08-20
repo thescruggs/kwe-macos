@@ -14,10 +14,11 @@ QtObject {
     property url selectedPreview: ""
     property var selectedTags: []
     property url selectedEntry: ""
+    property url selectedContentRoot: ""
     property string selectedDiagnosticSummary: ""
     property var selectedPermissions: []
 
-    function select(title, id, kind, compatibility, detail, preview, tags, entry, diagnosticSummary, permissions) {
+    function select(title, id, kind, compatibility, detail, preview, tags, entry, contentRoot, diagnosticSummary, permissions) {
         selectedTitle = title
         selectedId = id
         selectedKind = kind
@@ -26,6 +27,7 @@ QtObject {
         selectedPreview = preview
         selectedTags = tags
         selectedEntry = entry
+        selectedContentRoot = contentRoot
         selectedDiagnosticSummary = diagnosticSummary
         selectedPermissions = permissions
     }

@@ -26,6 +26,7 @@ Item {
     required property bool favorite
     required property var tags
     required property url entryUrl
+    required property url contentRoot
     required property string diagnosticSummary
     required property var requestedPermissions
 
@@ -42,7 +43,7 @@ Item {
         Accessible.name: qsTr("%1, %2 wallpaper, %3")
             .arg(cardRoot.title).arg(cardRoot.kind)
             .arg(WallpaperSelection.compatibilityLabel(cardRoot.compatibility))
-        onClicked: WallpaperSelection.select(cardRoot.title, cardRoot.workshopId, cardRoot.kind, cardRoot.compatibility, cardRoot.compatibilityDetail, cardRoot.previewUrl, cardRoot.tags, cardRoot.entryUrl, cardRoot.diagnosticSummary, cardRoot.requestedPermissions)
+        onClicked: WallpaperSelection.select(cardRoot.title, cardRoot.workshopId, cardRoot.kind, cardRoot.compatibility, cardRoot.compatibilityDetail, cardRoot.previewUrl, cardRoot.tags, cardRoot.entryUrl, cardRoot.contentRoot, cardRoot.diagnosticSummary, cardRoot.requestedPermissions)
 
         background: Rectangle {
             radius: Kirigami.Units.cornerRadius

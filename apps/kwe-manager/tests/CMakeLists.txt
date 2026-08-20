@@ -41,6 +41,14 @@ qt_add_executable(kwe-permissions-client-test
 target_link_libraries(kwe-permissions-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Qml Qt6::Test)
 add_test(NAME kwe-permissions-client-test COMMAND kwe-permissions-client-test)
 
+qt_add_executable(kwe-apply-client-test
+    applyclienttest.cpp
+    ../src/applyclient.cpp
+    ../src/applyclient.h
+)
+target_link_libraries(kwe-apply-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Qml Qt6::Test)
+add_test(NAME kwe-apply-client-test COMMAND kwe-apply-client-test)
+
 qt_add_executable(kwe-web-preview-test
     webpreviewtest.cpp
     ../src/webpreview.cpp

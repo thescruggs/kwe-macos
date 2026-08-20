@@ -228,6 +228,107 @@ Daemon flags: `--plasma-shell-service` (default `org.kde.plasmashell`),
 `--apply-probe-timeout-ms` (5000, range 500–30000),
 `--apply-promotion-timeout-ms` (15000, range 1000–60000).
 
+## M4b — manager Apply UI (this commit)
+
+M4b is the manager slice of BETA_M4: the details pane drives the daemon's
+M4a transaction through a new `ApplyClient` (`apps/kwe-manager/src/
+applyclient.{h,cpp}`, exposed as the `applyClient` context property), with an
+output picker, a gated Apply action, and safe-mode restore. No wallpaper is
+switched during development: M4b runs no live tests — the C++ test suite
+drives a stub daemon only, and the live smoke stays gated behind
+`KWE_LIVE_APPLY=1` until M4d.
+
+### The client (`ApplyClient`)
+
+Mirrors `PermissionsClient`'s QLocalSocket pattern: one request per
+connection, newline-delimited JSON, bounded responses; requests queue
+(bounded, 64) and retry with exponential backoff (5 s → 30 s) so an
+apply/restore survives a daemon restart. The lane is **strictly
+serialized** — the daemon rejects a concurrent apply with `apply_busy` and
+restore takes no transaction lock, so the client never issues a second
+`wallpaper.*` operation while one is in flight, and the UI disables the
+picker and both actions whenever `busy` holds.
+
+State machine (`State` enum, reachable from QML as `ApplyClient.Applied`
+etc.):
+
+| State | Meaning | UI |
+|---|---|---|
+| `Idle` | nothing in flight; last op (or its mirror refresh) succeeded | picker + actions enabled when eligible |
+| `ListingOutputs` | `wallpaper.outputs` in flight | picker disabled, "Enumerating display outputs…" |
+| `Applying` | `wallpaper.apply` in flight | Apply shows "Applying…", disabled |
+| `Restoring` | `wallpaper.restore` in flight | Restore shows "Restoring…", disabled |
+| `Applied` | apply succeeded (fields: `appliedWallpaperId`, `appliedOutput`) | Positive InlineMessage "Applied \<title\> to \<output\>" |
+| `Failed` | apply/restore/list failed | Error InlineMessage with the mapped detail + Try Again |
+
+Result honesty rules: a result belongs to the operation that produced it —
+`resetStatus()` runs on selection change, a new user-facing operation clears
+the previous confirmation, and the Applied message only shows when the
+current selection still matches `appliedWallpaperId`/`appliedOutput`. The
+assignment mirror (`refreshAssignments()`/`assignments`, auto-refreshed
+after every successful apply/restore) is a background lane: its failures
+never clobber the user-facing state.
+
+Daemon error mapping (actionable text, detail included when the daemon
+bounded one):
+
+| Wire code | User-facing |
+|---|---|
+| `output_missing` | "Output not found: \<name\>" |
+| `apply_busy` | "Another apply is in progress; wait for it to finish." |
+| `apply_unknown_wallpaper` | "This wallpaper is not available to apply: \<id\>" |
+| `apply_incompatible` | "This wallpaper cannot be applied in its current form: \<detail\>" |
+| `shell_unreachable` | "The Plasma desktop could not be reached: \<detail\>; nothing was changed." |
+| `apply_failed` | "Applying failed: \<detail\>" |
+| `restore_failed` | "Restoring the previous wallpaper failed: \<detail\>" |
+| `invalid_params` / `apply_unavailable` | rejected-request / no-apply-lane wording |
+
+### The UI flow (WallpaperDetail.qml)
+
+- **Output picker** — a ComboBox over `applyClient.outputs`, loaded on
+  demand when the details pane becomes visible (`wallpaper.outputs` is
+  cached 5 s daemon-side, so re-listing is cheap and picks up hotplugs);
+  disabled + explanatory text while empty or listing, and disabled during
+  any in-flight operation.
+- **Apply button** — enabled only when (a) an output is selected,
+  (b) the kind is `video`/`web`/`scene` with a resolvable catalog content
+  path (entry file for video/scene, content root for web — the content
+  root now flows from `CatalogModel::ContentRootRole` as a URL through
+  `WallpaperCard`/`WallpaperSelection`), (c) compatibility is
+  `renderer_dependent`, and (d) no apply-lane operation is in flight.
+  Text "Apply to \<output\>", busy text "Applying…".
+- **Preflight line** — the existing compatibility InlineMessage
+  (compatibility label + `compatibility_detail` from the catalog) serves
+  as the per-kind preflight summary; a hint label states which gate blocks
+  Apply when it is disabled.
+- **Failure** — Error InlineMessage with the mapped daemon detail (text +
+  icon; never color alone) and a **Try Again** affordance that re-runs
+  *exactly* the operation that failed (`retry()` re-sends the recorded
+  apply or restore), never a different one.
+- **Safe mode** — a "Restore KDE wallpaper" action on the same page,
+  always available when an output is selected, calling
+  `applyClient.restoreWallpaper`; success shows the Information InlineMessage
+  "Restored the image wallpaper on \<output\>" (with a "(stock image
+  fallback)" suffix when the daemon restored the stock image rather than a
+  saved assignment).
+- **Gallery banner** — the alpha "Applying stays disabled" framing is
+  replaced by the honest current state; the playlist frame's stale
+  "Display assignment is not enabled yet" line now reads "Playlist display
+  assignment arrives in a later milestone".
+
+### Test surface
+
+`kwe-apply-client-test` (stub daemon answering the `wallpaper.*` wire
+protocol, mirroring `kwe-permissions-client-test`): listOutputs round-trip,
+apply success state machine, web content-root param, apply failure surfaces
+the daemon detail, restore round-trip (stock + assignment modes), the error
+mapping table, queue serialization (second op waits, drain in order after a
+daemon loss), queue bound (66th op fails immediately, least-urgent drop on
+daemon loss), assignments round-trip, background-failure isolation, retry
+re-runs the exact failed op, resetStatus, invalid-input rejection without
+traffic. `smoke-ui.sh` is intentionally unchanged (the live smoke flips in
+M4d).
+
 ## Run the suites
 
 ```sh
@@ -271,6 +372,18 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
 | smoke-apply (live) | `KWE_LIVE_APPLY=1`: read-only enumeration shows the real outputs; error cases fail closed; seeded assignments round-trip | all pass — `output DP-1 screen=0 desktop_id=111 plugin=org.kde.kwe.wallpaper`; "all apply smoke cases passed" |
 | smoke-apply (gated) | without the env flag: SKIPPED note, exit 0 | passes |
 | live config | no wallpaper switch executed by M4a (M4d flips the gate) | no `evaluateScript` switch against the live session; only read-only enumeration |
+
+### M4b — manager Apply UI (this commit)
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets` | clean; all unit/RPC tests pass |
+| manager build | `cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build build/cmake --parallel` | builds clean |
+| ApplyClient unit suite | `ctest` `kwe-apply-client-test`: listOutputs round-trip; apply state machine (Idle→Applying→Applied, wire params incl. web content root); apply failure surfaces the daemon detail + `failedMethod`; restore round-trip (stock/assignment modes); error mapping table (`output_missing`→"Output not found", `apply_busy`, `apply_unknown_wallpaper`, `shell_unreachable`, `apply_failed`, `restore_failed`, `apply_unavailable`); serialized queue (second op waits; daemon loss re-queues in order); queue bound (66th op immediate failure, least-urgent drop); assignments round-trip; background mirror failures isolated; retry re-runs the exact failed op; resetStatus; invalid input rejected without traffic | all pass |
+| qmllint | `qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager apps/kwe-manager/qml/*.qml` | clean |
+| smoke-ui | `./scripts/smoke-ui.sh` unchanged (no apply-flow assertions here by design; M4d adds the live smoke) | passes |
+| UI honesty | alpha "Applying disabled" banner and stale "Display assignment is not enabled yet" line replaced with the true current state; Apply gated on kind/content/compatibility/output | verified in QML + docs |
+| live config | M4b executes no live wallpaper switch (development-only stub tests) | no `evaluateScript` switch against the live session |
 
 ## Open risks
 

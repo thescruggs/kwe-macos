@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "applyclient.h"
 #include "catalogclient.h"
 #include "catalogmodel.h"
 #include "daemonactivator.h"
@@ -98,6 +99,10 @@ int main(int argc, char *argv[]) {
     // BETA_M2c: daemon-owned per-wallpaper permission grants. Grant state
     // comes from the daemon (permissions-v1.json), never from local settings.
     PermissionsClient permissionsClient(socketPath);
+    // BETA_M4b: the live apply lane (wallpaper.outputs/apply/restore/
+    // assignments). All requests are serialized and bounded; the daemon owns
+    // the switch transaction and its rollback.
+    ApplyClient applyClient(socketPath);
     // BETA_M2d: the web preview asks the grant client for the wallpaper's
     // network decision and launches the windowed sandbox accordingly
     // (relaunching once if the loaded record differs).
@@ -141,6 +146,7 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("workshopModel"), &workshopFiltered);
     engine.rootContext()->setContextProperty(QStringLiteral("catalogStats"), client.sourceModel());
     engine.rootContext()->setContextProperty(QStringLiteral("permissionsClient"), &permissionsClient);
+    engine.rootContext()->setContextProperty(QStringLiteral("applyClient"), &applyClient);
     engine.rootContext()->setContextProperty(QStringLiteral("packageInstaller"), &packageInstaller);
     engine.rootContext()->setContextProperty(QStringLiteral("packageSource"), packageSource);
     engine.rootContext()->setContextProperty(QStringLiteral("workshopClient"), &workshopClient);
