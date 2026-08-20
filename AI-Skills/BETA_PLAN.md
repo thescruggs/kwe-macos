@@ -44,8 +44,8 @@
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
-| BETA_M3 (scene, a–k) | M3a–M3e done, M3f in_progress, M3g–M3k paused until after M4 (maintainer reorder) |
-| BETA_M4 (live apply) | NEXT after M3f merges |
+| BETA_M3 (scene, a–k) | M3a–M3f done, M3g–M3k paused until after M4 (maintainer reorder) |
+| BETA_M4 (live apply) | M4a in_progress, M4b–M4d next |
 | BETA_M5 (release) | pending |
 
 ## Context
