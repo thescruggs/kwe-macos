@@ -38,6 +38,7 @@
 - 2026-08-19 — **Packaging bug fixed (CachyOS-specific):** makepkg failed to link kwe-scene-renderer — undefined JS_*/kwe_font_* symbols. Root cause: the CachyOS toolchain env carries `-flto=auto` in CFLAGS/CXXFLAGS/LDFLAGS (plus RUSTFLAGS=-C target-cpu=native); the cc-built C archives (bundled QuickJS, stb shim) compile as GCC-LTO objects and rust-lld cannot LTO-link them. Reproductions outside makepkg passed because the env vars are absent from plain shells — the delta was the env, found by dumping makepkg's build() environment. Fix: PKGBUILD build()/check() strip `-flto=auto` from CFLAGS/CXXFLAGS/LDFLAGS for the cargo steps (with an explanatory comment).
 - 2026-08-19 — **REORDER (maintainer-requested):** M4 (live apply) moves to IMMEDIATELY AFTER M3f — the maintainer wants to apply wallpapers from the UI now, and video/web renderers are complete and apply-ready. New order: M3a–M3f → **M4** → M3g–M3k (scene completion) → M5. Scene apply is enabled when the scene renderer passes its M3k gate. Rationale documented: M4 was already maintainer-authorized for live-session work; the blocking preconditions (renderer workers, grants, preflight, apply-capable daemon) all exist.
 - 2026-08-19 — **M4a done** (`cffb7cd` + `f3376c7`). Daemon apply transaction: assignments-v1.json, wallpaper.outputs/apply/restore/assignments, injection-safe Plasma switch scripts (pure builders, unit-tested, no shell), promotion-wait semantics (completes on promotion; the live bridge acks), safe-mode restore to the captured previous config or the CachyOS stock image. Live research: Wayland, Plasma 6.7.4, org.kde.plasmashell, qdbus6, DP-1↔desktop 1; **desktopForScreen(-1) SIGSEGVs plasmashell — never used**. Review caught 2 HIGH reversibility bugs (re-apply destroyed the original previous config; post-start failures left the renderer running unassigned) + the orphan-desktop match via connector→−1 — all fixed with the should-fix set (post-switch verification, catalog content matching, ownership fail-fast, boundary rejections). 453 tests, smoke-apply green incl. the live read-only lane.
+- 2026-08-19 — **M4b done** (`eb83966` + `e6152bd`). ApplyClient + output picker + Apply/Reset-to-image buttons + per-kind preflight gating + actionable error mapping; alpha strings replaced honestly. Review: 3 must-fix (Assignments mirror clobbered a just-confirmed apply on socket loss; dead Try Again on enumeration failures; retry could silently apply to a previously-selected output) + 4 recommended (reset-button honesty re: stock fallback, stacked empty-state messages, content-declared wording, test gaps) — all fixed; 19 apply-client tests.
 
 ## Status at a glance
 
@@ -46,7 +47,7 @@
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
 | BETA_M3 (scene, a–k) | M3a–M3f done, M3g–M3k paused until after M4 (maintainer reorder) |
-| BETA_M4 (live apply) | M4a done (`cffb7cd`, `f3376c7`), M4b in_progress, M4c–M4d next |
+| BETA_M4 (live apply) | M4a+M4b done, M4c in_progress, M4d next |
 | BETA_M5 (release) | pending |
 
 ## Context
