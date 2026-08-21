@@ -53,6 +53,12 @@ const DEFINITIONS_FILE: &str = "playlists-v1.json";
 /// failing entry-change must never become an apply storm.
 const APPLY_BACKOFF_BASE: Duration = Duration::from_millis(1000);
 const APPLY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// The apply worker's request/completion queue bound (Finding 2): at most
+/// one apply is ever queued or in flight — a second dispatch busy-skips.
+const APPLY_QUEUE_CAPACITY: usize = 1;
+/// Bounded join for the apply worker at shutdown (Finding 7): a mid-flight
+/// apply is bounded on its own, and shutdown never waits for it beyond this.
+const APPLY_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The lane a playlist session drives wallpaper assignment through
 /// (BETA_M4c). The daemon's implementation is `apply::ApplyHandle` — the
@@ -62,11 +68,17 @@ const APPLY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// time from the playlist's entries and the assignment store) and the
 /// active playlist's entry ids.
 pub trait PlaylistApplyLane: Send + Sync {
+    /// `applied` is the wallpaper the session last applied (or satisfied
+    /// itself was live). The lane uses it to tell the session's OWN stale
+    /// renderer (which an entry change may displace) from a foreign one
+    /// (which a user apply of a different wallpaper left live after the
+    /// verdict; the lane yields to it).
     fn apply_playlist(
         &self,
         output: Option<String>,
         wallpaper_id: String,
         playlist_entries: &BTreeSet<String>,
+        applied: Option<&str>,
     ) -> Result<Value, ApplyError>;
 }
 
@@ -272,6 +284,61 @@ impl PlaylistSessionHandle {
     }
 }
 
+/// One apply request handed to the apply worker (Finding 2). `applied` is
+/// the session's applied identity at dispatch time; the lane's post-lock
+/// foreign-renderer check needs it to tell the session's own stale renderer
+/// from a user apply that won the slot.
+struct ApplyRequest {
+    output: Option<String>,
+    wallpaper_id: String,
+    playlist_entries: BTreeSet<String>,
+    applied: Option<String>,
+}
+
+/// The outcome of one worker apply, folded back into session state on a
+/// later tick. `result` is the lane's `Result` verbatim, so the session can
+/// tell a real failure (back off) from a transient yield (`Busy`/`Yielded`).
+struct ApplyOutcome {
+    wallpaper_id: String,
+    result: Result<Value, ApplyError>,
+}
+
+/// The apply worker: consumes one request at a time off a bound-1 queue,
+/// runs the (bounded) apply transaction on its OWN thread so the session
+/// tick thread never blocks on it, and posts the outcome back on the
+/// completion channel (drained by the session on a later tick). Shutdown is
+/// signaled by the session dropping its request sender: the blocking `recv`
+/// returns `Disconnected` and the worker exits after finishing any in-flight
+/// transaction.
+fn apply_worker_loop(
+    apply: Arc<dyn PlaylistApplyLane>,
+    requests: Receiver<ApplyRequest>,
+    completions: SyncSender<ApplyOutcome>,
+) {
+    loop {
+        let request = match requests.recv() {
+            Ok(request) => request,
+            Err(_) => return,
+        };
+        let result = apply.apply_playlist(
+            request.output,
+            request.wallpaper_id.clone(),
+            &request.playlist_entries,
+            request.applied.as_deref(),
+        );
+        if completions
+            .send(ApplyOutcome {
+                wallpaper_id: request.wallpaper_id,
+                result,
+            })
+            .is_err()
+        {
+            // The session is gone: nothing to report back to.
+            return;
+        }
+    }
+}
+
 struct SessionRuntime {
     store: PlaylistStore,
     state_path: PathBuf,
@@ -296,6 +363,17 @@ struct SessionRuntime {
     applied_wallpaper: Option<String>,
     apply_failures: u32,
     next_apply_retry: Instant,
+    /// The apply worker's request lane (None keeps the session a pure timer).
+    apply_sender: Option<SyncSender<ApplyRequest>>,
+    /// The apply worker's completion lane, drained every tick.
+    apply_completions: Option<Receiver<ApplyOutcome>>,
+    /// An apply request has been handed to the worker and its outcome has
+    /// not yet been folded: the verdict logic must not dispatch another.
+    apply_in_flight: bool,
+    /// The last supervisor.status() error already logged (Finding 6): the
+    /// apply_status_failed event is emitted once per error-state change, not
+    /// once per 50-100 ms tick.
+    last_status_error: Option<String>,
     clock_offset_ms: u64,
     clock_skipped_ms: u64,
     start_instant: Instant,
@@ -338,6 +416,10 @@ impl SessionRuntime {
             applied_wallpaper: None,
             apply_failures: 0,
             next_apply_retry: Instant::now(),
+            apply_sender: None,
+            apply_completions: None,
+            apply_in_flight: false,
+            last_status_error: None,
             clock_offset_ms: 0,
             clock_skipped_ms: 0,
             start_instant: Instant::now(),
@@ -370,6 +452,27 @@ impl SessionRuntime {
             }
         }
         runtime
+    }
+
+    /// Spawns the apply worker (Finding 2): the apply lane runs on its own
+    /// thread, so the session tick thread never blocks on a transaction
+    /// (which could stall every `playlist.*` RPC for its whole 15-35 s).
+    /// Returns the worker's join handle for the service to bound at drop;
+    /// returns None (no worker) when the session has no apply lane.
+    fn start_apply_worker(&mut self) -> Option<JoinHandle<()>> {
+        let apply = self.apply.clone()?;
+        let (request_sender, request_receiver) =
+            mpsc::sync_channel::<ApplyRequest>(APPLY_QUEUE_CAPACITY);
+        let (completion_sender, completion_receiver) =
+            mpsc::sync_channel::<ApplyOutcome>(APPLY_QUEUE_CAPACITY);
+        self.apply_sender = Some(request_sender);
+        self.apply_completions = Some(completion_receiver);
+        Some(
+            thread::Builder::new()
+                .name("kwe-playlist-apply".into())
+                .spawn(move || apply_worker_loop(apply, request_receiver, completion_sender))
+                .expect("spawn playlist apply worker"),
+        )
     }
 
     fn now_ms(&self) -> u64 {
@@ -467,16 +570,27 @@ impl SessionRuntime {
         let Some(wallpaper_id) = decision_wallpaper_id(decision) else {
             return;
         };
-        let Some(apply) = &self.apply else {
-            return;
-        };
+        // Fold any completed apply transaction from the worker FIRST so the
+        // verdict below reads the freshest applied/failure state.
+        self.fold_apply_completions();
         let Some(supervisor) = &self.supervisor else {
             return;
         };
         let status = match supervisor.status() {
-            Ok(status) => status,
+            Ok(status) => {
+                // The status boundary recovered; a later error logs again.
+                self.last_status_error = None;
+                status
+            }
             Err(error) => {
-                eprintln!("event=playlist.apply_status_failed detail={error}");
+                // Log once per error-state change (Finding 6): while
+                // supervisor.status() keeps erroring on every 50-100 ms tick
+                // this stays silent instead of spamming apply_status_failed.
+                let detail = error.to_string();
+                if self.last_status_error.as_deref() != Some(detail.as_str()) {
+                    self.last_status_error = Some(detail);
+                    eprintln!("event=playlist.apply_status_failed detail={error}");
+                }
                 return;
             }
         };
@@ -490,42 +604,128 @@ impl SessionRuntime {
         match verdict {
             ApplyVerdict::Satisfied => {
                 self.applied_wallpaper = Some(wallpaper_id.to_string());
+                self.reset_backoff();
                 return;
             }
             ApplyVerdict::Yield => {
-                // A foreign renderer owns the slot; the session lost it.
-                self.applied_wallpaper = None;
+                // A foreign renderer owns the slot; the user's choice wins.
+                // The backoff is cleared so re-assertion is prompt once the
+                // foreign renderer stops (Finding 1).
+                self.yield_to_foreign();
                 return;
             }
-            ApplyVerdict::Hold => {
-                // The session's own stale renderer holds the slot but the
-                // failure backoff gate is closed: keep the applied identity
-                // (dropping it would reclassify our own renderer as foreign
-                // and the session would never displace it).
+            ApplyVerdict::Hold | ApplyVerdict::Wait => {
+                // Hold: the failure backoff gate is still closed — keep the
+                // applied identity (dropping it would reclassify our own
+                // renderer as foreign and the session would never displace
+                // it). Wait: the supervisor is recovering the requested
+                // renderer (crash-restore); its own bounded recovery or
+                // quarantine resolves it. Neither dispatches, neither
+                // touches the backoff.
                 return;
             }
             ApplyVerdict::Apply => {}
         }
+        // While an apply is in flight (or queued), never dispatch another:
+        // the worker consumes one request at a time and the outcome folds on
+        // a later tick (Finding 2).
+        if self.apply_in_flight {
+            return;
+        }
         let entries: BTreeSet<String> = playlist.entries.iter().cloned().collect();
-        match apply.apply_playlist(self.output.clone(), wallpaper_id.to_string(), &entries) {
-            Ok(_) => {
-                self.applied_wallpaper = Some(wallpaper_id.to_string());
-                self.apply_failures = 0;
-                self.next_apply_retry = Instant::now();
-                eprintln!("event=playlist.assigned wallpaper_id={wallpaper_id}");
-            }
-            Err(error) => {
-                self.apply_failures = self.apply_failures.saturating_add(1);
-                let delay = apply_backoff(self.apply_failures);
-                self.next_apply_retry = Instant::now() + delay;
-                eprintln!(
-                    "event=playlist.apply_failed wallpaper_id={wallpaper_id} failures={} detail={} next_retry_ms={}",
-                    self.apply_failures,
-                    error.detail().unwrap_or_else(|| error.code()),
-                    delay.as_millis(),
-                );
+        self.dispatch_apply(wallpaper_id.to_string(), entries);
+    }
+
+    /// Folds every completed apply outcome from the worker back into session
+    /// state. Runs at the top of each tick so the verdict below sees the
+    /// freshest applied/failure state. Non-failure outcomes (`Busy` from a
+    /// user apply holding the transaction lock, `Yielded` from the lane's
+    /// post-lock foreign-renderer check) are treated like a yield — no
+    /// failure count, no backoff.
+    fn fold_apply_completions(&mut self) {
+        // Take the receiver out of `self` while folding so the mutations
+        // below (which call `&mut self` helpers) never hold a borrow of it.
+        // At most one completion can be pending (the in-flight invariant),
+        // so the drain is trivially bounded.
+        let Some(completions) = self.apply_completions.take() else {
+            return;
+        };
+        while let Ok(outcome) = completions.try_recv() {
+            let ApplyOutcome {
+                wallpaper_id,
+                result,
+            } = outcome;
+            self.apply_in_flight = false;
+            match result {
+                Ok(_) => {
+                    self.applied_wallpaper = Some(wallpaper_id.clone());
+                    self.reset_backoff();
+                    eprintln!("event=playlist.assigned wallpaper_id={wallpaper_id}");
+                }
+                Err(ApplyError::Busy) => {
+                    // A user's wallpaper.apply holds the transaction lock: a
+                    // transient yield, never a failure (Finding 1).
+                    self.yield_to_foreign();
+                }
+                Err(ApplyError::Yielded(detail)) => {
+                    // A foreign renderer took the slot between the session's
+                    // verdict and the lock (TOCTOU): yield, never a failure.
+                    self.yield_to_foreign();
+                    eprintln!("event=playlist.apply_yielded detail={detail}");
+                }
+                Err(error) => {
+                    self.apply_failures = self.apply_failures.saturating_add(1);
+                    let delay = apply_backoff(self.apply_failures);
+                    self.next_apply_retry = Instant::now() + delay;
+                    eprintln!(
+                        "event=playlist.apply_failed wallpaper_id={wallpaper_id} failures={} detail={} next_retry_ms={}",
+                        self.apply_failures,
+                        error.detail().unwrap_or_else(|| error.code()),
+                        delay.as_millis(),
+                    );
+                }
             }
         }
+        self.apply_completions = Some(completions);
+    }
+
+    /// Hands one apply request to the worker (bound queue of 1, busy-skip):
+    /// the worker runs the (bounded) transaction off the tick thread. The
+    /// in-flight flag prevents a second dispatch until the outcome folds.
+    fn dispatch_apply(&mut self, wallpaper_id: String, entries: BTreeSet<String>) {
+        let Some(sender) = &self.apply_sender else {
+            return;
+        };
+        let request = ApplyRequest {
+            output: self.output.clone(),
+            wallpaper_id,
+            playlist_entries: entries,
+            applied: self.applied_wallpaper.clone(),
+        };
+        match sender.try_send(request) {
+            Ok(()) => self.apply_in_flight = true,
+            Err(TrySendError::Full(_)) => {
+                // A request is already queued; the in-flight flag already
+                // blocks the next dispatch, so nothing else to do.
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // The worker exited (shutdown); nothing to dispatch to.
+            }
+        }
+    }
+
+    /// The user/manager choice wins the slot: forget the session's applied
+    /// identity and clear the failure backoff so re-assertion is prompt once
+    /// the foreign renderer is no longer live (Finding 1).
+    fn yield_to_foreign(&mut self) {
+        self.applied_wallpaper = None;
+        self.reset_backoff();
+    }
+
+    /// Clears the failure backoff gate: the next tick applies immediately.
+    fn reset_backoff(&mut self) {
+        self.apply_failures = 0;
+        self.next_apply_retry = Instant::now();
     }
 
     /// Resets the apply state (playlist switch, deactivation, or the active
@@ -533,8 +733,7 @@ impl SessionRuntime {
     /// immediately.
     fn reset_apply(&mut self) {
         self.applied_wallpaper = None;
-        self.apply_failures = 0;
-        self.next_apply_retry = Instant::now();
+        self.reset_backoff();
     }
 
     /// Persists the active runtime's snapshot if the given decision changed
@@ -596,10 +795,11 @@ impl SessionRuntime {
         match decision {
             Ok(decision) => {
                 self.maybe_persist(playlist_id, &decision, now_ms);
-                // Renderer assignment runs AFTER persistence: the entry
-                // position is on disk before the (bounded) apply blocks
-                // the session thread, and a crash mid-apply cannot lose
-                // the position.
+                // Renderer assignment is dispatched AFTER persistence: the
+                // entry position is on disk before an apply is handed to the
+                // worker, and a crash mid-apply cannot lose the position.
+                // The apply worker keeps the transaction off this tick thread
+                // (Finding 2).
                 self.maybe_apply(&playlist, &decision);
             }
             Err(error) => {
@@ -938,9 +1138,9 @@ fn phase_has_live_worker(phase: WorkerPhase) -> bool {
 
 /// What the session should do for the desired wallpaper this tick. Pure so
 /// the user-apply precedence (the foreign-renderer yield), the entry-change
-/// displacement of the session's own stale renderer, and the manual-stop
-/// re-assertion are unit-testable with fabricated worker state
-/// (`WorkerStatus` is fully constructible).
+/// displacement of the session's own stale renderer, the crash-restore wait,
+/// and the manual-stop re-assertion are unit-testable with fabricated worker
+/// state (`WorkerStatus` is fully constructible).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplyVerdict {
     /// The desired wallpaper is already live or on its way: remember it as
@@ -949,11 +1149,18 @@ enum ApplyVerdict {
     Satisfied,
     /// A FOREIGN renderer owns the slot: the user's choice wins this tick.
     Yield,
-    /// The slot is held by the session's OWN stale renderer (the timer
-    /// advanced), but the failure backoff gate is still closed: do nothing
-    /// this tick and keep the applied identity so the stale renderer stays
-    /// recognizable as ours once the gate opens.
+    /// The failure backoff gate is closed, so this tick must not apply —
+    /// whether the session's OWN stale renderer still holds the slot (the
+    /// timer advanced) or nothing is live. Do nothing and keep the applied
+    /// identity so the stale renderer stays recognizable as ours once the
+    /// gate opens.
     Hold,
+    /// The supervisor is recovering the requested renderer (crash-restore:
+    /// Restarting/RolledBack with an active worker that renders a DIFFERENT
+    /// wallpaper, or none). Do not claim Satisfied and do not dispatch a
+    /// competing apply — the supervisor's own bounded recovery or quarantine
+    /// resolves it, and a quarantine flows through the existing skip logic.
+    Wait,
     /// Apply the desired wallpaper through the lane (unless the failure
     /// backoff gate is still closed).
     Apply,
@@ -969,6 +1176,18 @@ fn apply_verdict(
     if status.requested_wallpaper_id.as_deref() == Some(desired)
         && phase_has_live_worker(status.phase)
     {
+        // Crash-restore (Finding 4): during a supervisor recovery phase the
+        // requested worker is dead and the ACTIVE worker renders a different
+        // wallpaper (or nothing). Claiming Satisfied would leave the session
+        // parked on an entry that is not actually displayed and would never
+        // advance once the supervisor quarantines it — so wait instead.
+        if matches!(
+            status.phase,
+            WorkerPhase::RolledBack | WorkerPhase::Restarting
+        ) && status.wallpaper_id.as_deref() != Some(desired)
+        {
+            return ApplyVerdict::Wait;
+        }
         return ApplyVerdict::Satisfied;
     }
     // A renderer is live but it is not the desired one.
@@ -994,8 +1213,24 @@ fn apply_verdict(
     if retry_ready {
         ApplyVerdict::Apply
     } else {
-        ApplyVerdict::Yield
+        ApplyVerdict::Hold
     }
+}
+
+/// Post-lock precedence check for the apply lane (Finding 1): once the
+/// transaction lock is held, a live worker whose request is neither the
+/// desired wallpaper nor the session's own previously-applied renderer is a
+/// user/manager apply that won the slot between the session's verdict and the
+/// lock (the TOCTOU window). The session must yield to it, not displace the
+/// user's fresh renderer.
+pub(crate) fn foreign_renderer_live(
+    status: &WorkerStatus,
+    desired: &str,
+    applied: Option<&str>,
+) -> bool {
+    phase_has_live_worker(status.phase)
+        && status.requested_wallpaper_id.as_deref() != Some(desired)
+        && status.requested_wallpaper_id.as_deref() != applied
 }
 
 /// Exponential backoff between playlist apply attempts: 1 s doubling to a
@@ -1103,12 +1338,17 @@ fn load_runtime_state(
 pub struct PlaylistSessionService {
     handle: PlaylistSessionHandle,
     thread: Option<JoinHandle<()>>,
+    apply_worker: Option<JoinHandle<()>>,
 }
 
 impl PlaylistSessionService {
     pub fn start(config: PlaylistSessionConfig) -> Self {
         let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
-        let runtime = SessionRuntime::new(config);
+        let mut runtime = SessionRuntime::new(config);
+        // The apply worker (Finding 2) is spawned before the session thread
+        // so the request/completion channels it owns are in place when the
+        // session starts ticking.
+        let apply_worker = runtime.start_apply_worker();
         let thread = thread::Builder::new()
             .name("kwe-playlist-session".into())
             .spawn(move || runtime.run(receiver))
@@ -1116,6 +1356,7 @@ impl PlaylistSessionService {
         Self {
             handle: PlaylistSessionHandle { sender },
             thread: Some(thread),
+            apply_worker,
         }
     }
 
@@ -1138,6 +1379,20 @@ impl Drop for PlaylistSessionService {
         if let Some(thread) = self.thread.take() {
             let deadline = Instant::now() + Duration::from_secs(5);
             while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // Finding 7: the final position persist runs on the session (tick)
+        // thread above and never waits for the worker. When the session
+        // thread returns it drops its request sender, which signals the
+        // worker to stop after finishing any in-flight apply. The join is
+        // polled with the same bounded deadline as the session thread; a
+        // worker still mid-transaction (bounded on its own) is detached and
+        // exits as soon as its completion send fails against the dropped
+        // receiver — shutdown never waits for a full in-flight apply.
+        if let Some(worker) = self.apply_worker.take() {
+            let deadline = Instant::now() + APPLY_WORKER_JOIN_TIMEOUT;
+            while !worker.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
@@ -1211,7 +1466,10 @@ mod tests {
 
     /// A recording test lane: records every apply request (output +
     /// wallpaper id + playlist entries). `remaining_failures` lets a test
-    /// fail the first N applies and then succeed. A stub lane cannot
+    /// fail the first N applies with a transaction error, `remaining_busy`
+    /// with `ApplyError::Busy` (a user apply holding the lock), and
+    /// `remaining_yielded` with `ApplyError::Yielded` (the post-lock foreign
+    /// check) — each before falling through to success. A stub lane cannot
     /// manufacture supervisor-live state, so the session re-applies its
     /// entry every tick after a success — the real lane makes the
     /// supervisor non-idle, which the steady-state no-reapply is tested
@@ -1220,6 +1478,8 @@ mod tests {
     struct RecordingLane {
         calls: Arc<Mutex<Vec<ApplyCall>>>,
         remaining_failures: Arc<std::sync::atomic::AtomicU64>,
+        remaining_busy: Arc<std::sync::atomic::AtomicU64>,
+        remaining_yielded: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl RecordingLane {
@@ -1227,12 +1487,26 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
                 remaining_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                remaining_busy: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                remaining_yielded: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
 
         fn failing(self, failures: u64) -> Self {
             self.remaining_failures
                 .store(failures, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        fn busy(self, count: u64) -> Self {
+            self.remaining_busy
+                .store(count, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        fn yielded(self, count: u64) -> Self {
+            self.remaining_yielded
+                .store(count, std::sync::atomic::Ordering::SeqCst);
             self
         }
 
@@ -1251,6 +1525,7 @@ mod tests {
             output: Option<String>,
             wallpaper_id: String,
             playlist_entries: &BTreeSet<String>,
+            _applied: Option<&str>,
         ) -> Result<Value, ApplyError> {
             self.calls.lock().unwrap().push((
                 output,
@@ -1267,6 +1542,28 @@ mod tests {
                 .is_ok()
             {
                 return Err(ApplyError::Transaction("stub lane failed".into()));
+            }
+            if self
+                .remaining_busy
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(ApplyError::Busy);
+            }
+            if self
+                .remaining_yielded
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(ApplyError::Yielded("stub lane foreign renderer".into()));
             }
             Ok(json!({ "applied": wallpaper_id }))
         }
@@ -1388,6 +1685,21 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits until the lane recorded at least `count` applies (the worker
+    /// runs the lane off the tick thread, so tests poll for the recorded
+    /// count instead of assuming a synchronous apply).
+    fn wait_for_calls(lane: &RecordingLane, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lane.call_count() < count && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            lane.call_count() >= count,
+            "expected at least {count} lane calls, saw {}",
+            lane.call_count()
+        );
     }
 
     fn decision_wallpaper(decision: Option<&PlaylistDecision>) -> Option<(String, usize)> {
@@ -1752,17 +2064,125 @@ mod tests {
             ApplyVerdict::Apply,
             "a quarantined candidate must be retried once the gate opens"
         );
-        // ...and the previous assignment is kept while the gate is closed.
+        // ...and the previous assignment is kept while the gate is closed
+        // (a Hold, not a Yield: a Yield clears the session's applied identity
+        // AND its backoff, which would re-fire the failed apply on the next
+        // tick — the exact storm the gate exists to prevent).
         assert_eq!(
             apply_verdict(Some("1"), "1", &idle, false),
-            ApplyVerdict::Yield,
+            ApplyVerdict::Hold,
             "a closed backoff gate must hold the previous assignment"
         );
         assert_eq!(
             apply_verdict(None, "1", &idle, false),
-            ApplyVerdict::Yield,
+            ApplyVerdict::Hold,
             "a closed backoff gate must not apply for a fresh entry either"
         );
+    }
+
+    #[test]
+    fn crash_restore_recovery_is_not_satisfied() {
+        // The session requested "1"; the worker crashed and the supervisor is
+        // recovering. requested == desired, but the ACTIVE worker renders a
+        // different wallpaper (or none): claiming Satisfied would park the
+        // session on an entry that is not actually displayed and would never
+        // advance once the supervisor quarantines it. The session waits —
+        // the supervisor's own bounded recovery or quarantine resolves it.
+        for phase in [WorkerPhase::RolledBack, WorkerPhase::Restarting] {
+            // The active worker renders a DIFFERENT wallpaper (the retired
+            // worker survives the rollback).
+            let mut status = fabricated_status(phase, Some("1"));
+            status.wallpaper_id = Some("0".into());
+            assert_eq!(
+                apply_verdict(Some("1"), "1", &status, true),
+                ApplyVerdict::Wait,
+                "{phase:?} with a different active wallpaper must wait"
+            );
+            assert_eq!(
+                apply_verdict(None, "1", &status, true),
+                ApplyVerdict::Wait,
+                "{phase:?} with a different active wallpaper must wait (fresh session too)"
+            );
+            // No active worker at all (the crashed worker was taken down and
+            // nothing was retired).
+            let mut status = fabricated_status(phase, Some("1"));
+            status.wallpaper_id = None;
+            assert_eq!(
+                apply_verdict(Some("1"), "1", &status, true),
+                ApplyVerdict::Wait,
+                "{phase:?} with no active worker must wait"
+            );
+        }
+        // Once the ACTIVE worker really renders the desired wallpaper, a
+        // recovery phase is still Satisfied.
+        let status = fabricated_status(WorkerPhase::Restarting, Some("1"));
+        assert_eq!(
+            apply_verdict(Some("1"), "1", &status, true),
+            ApplyVerdict::Satisfied
+        );
+        // A desired renderer on its way (Starting/Canary) is not recovery:
+        // it is Satisfied — the worker being started IS the desired one.
+        for phase in [WorkerPhase::Starting, WorkerPhase::Canary] {
+            let status = fabricated_status(phase, Some("1"));
+            assert_eq!(
+                apply_verdict(Some("1"), "1", &status, true),
+                ApplyVerdict::Satisfied
+            );
+        }
+        // The entry-change displacement of the session's own stale renderer
+        // is unchanged during recovery: the timer advanced, so the hard cut
+        // applies (never a competing apply DURING recovery of the desired
+        // wallpaper — that is the Wait case above).
+        let mut status = fabricated_status(WorkerPhase::Restarting, Some("1"));
+        status.wallpaper_id = Some("1".into());
+        assert_eq!(
+            apply_verdict(Some("1"), "2", &status, true),
+            ApplyVerdict::Apply,
+            "own stale renderer is still displaced on an entry change during recovery"
+        );
+    }
+
+    #[test]
+    fn foreign_renderer_live_matrix() {
+        // A live worker whose request is neither the desired wallpaper nor
+        // the session's own applied one is a user/manager apply that won the
+        // slot between the verdict and the lock: the lane must yield.
+        for phase in [
+            WorkerPhase::Starting,
+            WorkerPhase::Canary,
+            WorkerPhase::Live,
+            WorkerPhase::AwaitingAck,
+            WorkerPhase::Restarting,
+            WorkerPhase::RolledBack,
+        ] {
+            let status = fabricated_status(phase, Some("2"));
+            assert!(
+                foreign_renderer_live(&status, "1", None),
+                "live foreign {phase:?} (no applied identity) must be foreign"
+            );
+            assert!(
+                foreign_renderer_live(&status, "1", Some("3")),
+                "live foreign {phase:?} (applied 3) must be foreign"
+            );
+            // The session's own stale renderer (requested == applied) is NOT
+            // foreign: the entry-change displacement must proceed.
+            assert!(
+                !foreign_renderer_live(&status, "1", Some("2")),
+                "own stale renderer in {phase:?} is not foreign"
+            );
+            // The desired renderer itself is not foreign.
+            assert!(
+                !foreign_renderer_live(&status, "2", None),
+                "the desired renderer in {phase:?} is not foreign"
+            );
+        }
+        // No live worker is never foreign.
+        let idle = fabricated_status(WorkerPhase::Idle, None);
+        assert!(!foreign_renderer_live(&idle, "1", None));
+        let stopped = fabricated_status(WorkerPhase::Stopped, Some("2"));
+        assert!(!foreign_renderer_live(&stopped, "1", None));
+        let quarantined = fabricated_status(WorkerPhase::Quarantined, Some("2"));
+        assert!(!foreign_renderer_live(&quarantined, "1", None));
     }
 
     #[test]
@@ -1874,6 +2294,100 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(lane.call_count() >= 4, "a retry must eventually succeed");
+    }
+
+    #[test]
+    fn busy_apply_is_a_transient_yield_that_never_arms_backoff() {
+        // A user's wallpaper.apply holds the transaction lock; the lane
+        // reports `Busy`. That is a transient yield (Finding 1), never a
+        // failure: it must NOT count toward apply_failures or arm the
+        // exponential backoff. A failure would delay the next attempt by the
+        // 1 s base; the Busy yield leaves the gate open, so the re-assert
+        // lands well inside that window.
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new().busy(1);
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("busy-yield"),
+            &["1"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+        // Call 1 is the Busy; the re-assert (call 2) must follow promptly.
+        wait_for_calls(&lane, 1);
+        let start = Instant::now();
+        wait_for_calls(&lane, 2);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "Busy must not arm the backoff gate; the re-assert took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn yielded_outcome_clears_the_backoff_gate_for_prompt_reassertion() {
+        // Two real failures arm the backoff (1 s then 2 s), then the lane
+        // reports the post-lock foreign-yield outcome (`Yielded`). The yield
+        // must CLEAR the armed backoff (Finding 1): the re-assert after it
+        // lands promptly instead of waiting out the failure backoff that the
+        // two failures armed (which would be ~2 s more).
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new().failing(2).yielded(1);
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("yield-clears-backoff"),
+            &["1"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+        // Call 1 (fail) then call 2 (fail after the 1 s gate): both arm the
+        // backoff; call 3 (Yielded) only dispatches once the 2 s gate opens.
+        wait_for_calls(&lane, 3);
+        // After the Yielded fold clears the backoff, call 4 (success) is
+        // prompt — well inside the ~2 s the armed failure backoff would have
+        // imposed.
+        let start = Instant::now();
+        wait_for_calls(&lane, 4);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the Yielded fold must clear the backoff gate for a prompt re-assert, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn yield_clears_the_apply_backoff_state() {
+        // The yield path (whether reached through the verdict for a live
+        // foreign renderer or through the fold of a Busy/Yielded outcome)
+        // must clear BOTH the applied identity AND the failure backoff gate
+        // (Finding 1): after a foreign renderer stops, re-assertion is
+        // prompt instead of delayed by failures the session accumulated
+        // before the user took the slot.
+        let dir = temporary_state_dir("yield-backoff-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut runtime = SessionRuntime::new(config(dir, &["1"]));
+        runtime.applied_wallpaper = Some("1".into());
+        runtime.apply_failures = 3;
+        runtime.next_apply_retry = Instant::now() + Duration::from_secs(30);
+        runtime.yield_to_foreign();
+        assert_eq!(
+            runtime.applied_wallpaper, None,
+            "a yield forgets the applied identity"
+        );
+        assert_eq!(
+            runtime.apply_failures, 0,
+            "a yield clears the failure count"
+        );
+        assert!(
+            Instant::now() >= runtime.next_apply_retry,
+            "a yield must reopen the backoff gate for a prompt re-assert"
+        );
     }
 
     #[test]

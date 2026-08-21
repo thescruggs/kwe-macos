@@ -463,6 +463,12 @@ echo "playlist renderer assignment timer advance passed"
 # Daemon restart: the session restores its position and re-applies the
 # restored entry exactly once (fresh supervisor, one more switch script),
 # then stays put (no churn).
+# TIMING DEPENDENCY: entry 3 runs on the real clock for its full 10 s
+# duration. The stop below (and the restart re-apply + 1 s no-churn check)
+# must all complete well inside entry 3's window — otherwise the runtime
+# advances past entry 3 before shutdown and the persisted position is no
+# longer entry 3, breaking the assertion that the restored session is on
+# entry 3. The whole block completes in ~2 s, comfortably inside the window.
 stop_daemon
 start_daemon --playlist-output DP-1
 call_daemon health >/dev/null

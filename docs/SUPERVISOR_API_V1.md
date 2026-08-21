@@ -360,9 +360,12 @@ daemon flag, not a client param. When unset, the lane resolves the output
 at apply time: the last assigned output whose wallpaper is a member of the
 active playlist, else the first enabled and connected output, else
 `output_missing`. A failed playlist apply rolls back exactly like
-`wallpaper.apply` and backs off exponentially (1 s doubling to a 30 s cap)
-with the previous assignment kept; while a foreign (user) renderer is live
-the session yields to it.
+`wallpaper.apply` (renderer stopped if ours, assignment store reverted; the
+display freezes on the supervisor's last-known-good frame until the next
+successful apply) and backs off exponentially (1 s doubling to a 30 s cap);
+while a foreign (user) renderer is live the session yields to it — a `Busy`
+from the shared transaction lock or a foreign renderer live after the lock
+is a transient yield, never a failure, and clears any armed backoff.
 
 ## Lifecycle and recovery
 

@@ -3299,6 +3299,104 @@ with open(args.output, "wb") as frame:
     }
 
     #[test]
+    fn playlist_output_resolution_falls_through_when_the_stored_output_is_stale() {
+        // Finding 3: the store-derived output (per-display intent) must be
+        // validated against the fresh enumeration. A hotplugged-away display
+        // falls through to the first enabled+connected output instead of
+        // failing with output_missing + backoff as the docs promise.
+        let catalog = empty_catalog();
+        let supervisor = supervisor_service();
+        let store_dir = temp_dir("playlist-stale-store");
+        let mut store = apply::AssignmentStore::open(&store_dir).unwrap();
+        store
+            .set(
+                "DP-1",
+                apply::Assignment {
+                    wallpaper_id: "1".into(),
+                    kind: RendererKind::Scene,
+                    content: "/tmp/scene.json".into(),
+                    width: 320,
+                    height: 180,
+                    fps: 30,
+                    applied_at_unix_seconds: 1,
+                    previous: None,
+                },
+            )
+            .unwrap();
+        // The live bus no longer has DP-1 (hotplugged away); DP-2 is the
+        // first enabled+connected output.
+        let dp2 = apply::SystemOutput {
+            name: "DP-2".into(),
+            enabled: true,
+            connected: true,
+            geometry: Some([0, 0, 1920, 1080]),
+        };
+        let probe = stub_probe(
+            vec![dp2],
+            Some(
+                r#"{"desktops":[{"index":1,"id":112,"screen":0,"wp":"org.kde.image","image":null}],"connectors":{"DP-2":0}}"#,
+            ),
+        );
+        let handle = apply_handle_with_store(probe, &catalog, supervisor.handle(), store);
+        let entries: BTreeSet<String> = ["1", "2", "3"].iter().map(|id| id.to_string()).collect();
+        let resolved = handle
+            .resolve_playlist_output(None, &entries)
+            .expect("the stale stored output must fall through to a live output");
+        assert_eq!(
+            resolved, "DP-2",
+            "a hotplugged-away stored output must fall through to the first enabled+connected output"
+        );
+    }
+
+    #[test]
+    fn playlist_lane_yields_to_a_live_foreign_renderer_after_the_lock() {
+        // Finding 1 (TOCTOU): the session computes its verdict from a
+        // supervisor.status() read taken BEFORE the apply lock. If a user
+        // apply completes in that window, the lane's post-lock re-read must
+        // catch the now-live foreign renderer and yield (a non-failure
+        // `Yielded`), not displace the user's fresh renderer.
+        let root = temp_dir("playlist-lane-yield");
+        let catalog = playlist_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        // A user apply brings wallpaper 2 live through the shared transaction.
+        handle
+            .apply(ApplyWallpaperParams {
+                output: "DP-1".into(),
+                wallpaper_id: "2".into(),
+                kind: RendererKind::Scene,
+                content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
+                width: 320,
+                height: 180,
+                fps: 30,
+            })
+            .unwrap();
+        wait_for_settled(&supervisor, &probe, "2", 1);
+        // The lane must yield to the foreign renderer instead of displacing
+        // it: a Yielded outcome, no new switch script, the user's renderer
+        // stays live.
+        let entries: BTreeSet<String> = ["1", "2", "3"].iter().map(|id| id.to_string()).collect();
+        let result = handle.apply_playlist(None, "1".into(), &entries, None);
+        assert!(
+            matches!(result, Err(apply::ApplyError::Yielded(_))),
+            "the lane must yield to a live foreign renderer, got {result:?}"
+        );
+        let status = supervisor.status().unwrap();
+        assert_eq!(
+            status.requested_wallpaper_id.as_deref(),
+            Some("2"),
+            "the user's renderer must stay live after the playlist yields"
+        );
+        assert_eq!(
+            kwe_switch_count(&probe),
+            1,
+            "the lane must not switch when it yields to a foreign renderer"
+        );
+    }
+
+    #[test]
     fn user_apply_takes_precedence_and_the_playlist_reasserts_after_stop() {
         let root = temp_dir("playlist-precedence");
         let catalog = playlist_catalog();

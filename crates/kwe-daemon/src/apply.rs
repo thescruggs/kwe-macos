@@ -62,7 +62,7 @@ use sha2::{Digest, Sha256};
 use kwe_core::{Catalog, CatalogItem, ProjectKind};
 
 use crate::persist::{atomic_write, ensure_private_dir, quarantine_invalid_state, unix_seconds};
-use crate::playlist_session::PlaylistApplyLane;
+use crate::playlist_session::{PlaylistApplyLane, foreign_renderer_live};
 use crate::supervisor::{
     ContentSpec, RendererKind, StartSpec, SupervisorHandle, WorkerPhase, validate_identity_part,
 };
@@ -1036,6 +1036,11 @@ pub enum ApplyError {
     OutputMissing(String),
     /// Another apply transaction is in flight.
     Busy,
+    /// A user/manager apply took the slot between the playlist session's
+    /// verdict and this transaction's lock (the post-lock re-read, Finding
+    /// 1): a NON-failure yield the session treats exactly like a foreign
+    /// renderer winning the tick.
+    Yielded(String),
     /// The Plasma shell or its tooling could not be reached.
     ShellUnreachable(String),
     /// A step of the apply transaction failed (already rolled back).
@@ -1052,6 +1057,7 @@ impl ApplyError {
             ApplyError::Incompatible(_) => "apply_incompatible",
             ApplyError::OutputMissing(_) => "output_missing",
             ApplyError::Busy => "apply_busy",
+            ApplyError::Yielded(_) => "apply_yielded",
             ApplyError::ShellUnreachable(_) => "shell_unreachable",
             ApplyError::Transaction(_) => "apply_failed",
             ApplyError::RestoreFailed(_) => "restore_failed",
@@ -1064,6 +1070,7 @@ impl ApplyError {
             | ApplyError::UnknownWallpaper(detail)
             | ApplyError::Incompatible(detail)
             | ApplyError::OutputMissing(detail)
+            | ApplyError::Yielded(detail)
             | ApplyError::ShellUnreachable(detail)
             | ApplyError::Transaction(detail)
             | ApplyError::RestoreFailed(detail) => Some(detail),
@@ -1372,7 +1379,7 @@ impl ApplyHandle {
     /// output on the bus, else `OutputMissing` (nothing is applied). The
     /// resolution runs on every apply attempt, so an output that returns
     /// to the bus is picked up without a daemon restart.
-    fn resolve_playlist_output(
+    pub(crate) fn resolve_playlist_output(
         &self,
         output: Option<&str>,
         playlist_entries: &BTreeSet<String>,
@@ -1382,17 +1389,29 @@ impl ApplyHandle {
                 .map_err(|error| ApplyError::Invalid(error.to_string()))?;
             return Ok(output.to_string());
         }
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
-        for (name, assignment) in store.all() {
-            if playlist_entries.contains(&assignment.wallpaper_id) {
-                return Ok(name.clone());
-            }
-        }
-        drop(store);
+        // The store records the last output a playlist member was assigned
+        // to (per-display intent). It is validated against the FRESH
+        // enumeration used by the transaction (Finding 3): a hotplugged-away
+        // display falls through to the first enabled and connected output
+        // instead of failing with output_missing + backoff. The store lock is
+        // scoped so no probe runs while it is held.
+        let stored = {
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| ApplyError::Transaction("assignment store lock poisoned".into()))?;
+            store
+                .all()
+                .iter()
+                .find(|(_, assignment)| playlist_entries.contains(&assignment.wallpaper_id))
+                .map(|(name, _)| name.clone())
+        };
         let outputs = self.enumerate_fresh()?;
+        if let Some(stored) = stored
+            && outputs.iter().any(|info| info.name == stored)
+        {
+            return Ok(stored);
+        }
         outputs
             .iter()
             .find(|info| info.enabled && info.connected)
@@ -1710,6 +1729,7 @@ impl PlaylistApplyLane for ApplyHandle {
         output: Option<String>,
         wallpaper_id: String,
         playlist_entries: &BTreeSet<String>,
+        applied: Option<&str>,
     ) -> Result<Value, ApplyError> {
         // The lane shares the single apply transaction lock with
         // wallpaper.apply: a user apply in flight wins the slot and the
@@ -1718,6 +1738,20 @@ impl PlaylistApplyLane for ApplyHandle {
         // (yield while a foreign renderer is live); this lock only closes
         // the mid-transaction race.
         let _guard = self.acquire_apply_lock()?;
+        // TOCTOU closure (Finding 1): the session computed its verdict from
+        // a supervisor.status() read taken BEFORE the lock. A user apply that
+        // completed in that window is now live — re-read the state with the
+        // lock held and yield to it instead of displacing a fresh user
+        // renderer. The session's own stale renderer (`requested == applied`)
+        // is NOT foreign: the entry-change hard cut must still displace it.
+        if let Ok(status) = self.supervisor.status()
+            && foreign_renderer_live(&status, &wallpaper_id, applied)
+        {
+            return Err(ApplyError::Yielded(format!(
+                "foreign renderer {} is live; the playlist yields",
+                status.requested_wallpaper_id.as_deref().unwrap_or("none")
+            )));
+        }
         let resolved_output = self.resolve_playlist_output(output.as_deref(), playlist_entries)?;
 
         // Catalog lookup: the single validation point shared with

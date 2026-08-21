@@ -370,15 +370,33 @@ remain open (they need two live renderers on one output).
 
 - Quarantined/unavailable entries are skipped before the lane runs (the
   existing `try_quarantined_ids` decision path).
-- A failed apply rolls back exactly like `wallpaper.apply` (renderer stopped
-  if ours, assignment store reverted), logs one bounded line, and backs off
-  exponentially — 1 s doubling to a 30 s cap — with the previous assignment
-  kept live.
-- The lane shares the apply transaction's single lock: a user apply in
-  flight wins the slot and the session backs off instead of interleaving.
-  While a foreign renderer is live the session **yields** (user choice
+- A failed apply rolls back exactly like `wallpaper.apply` — renderer
+  stopped if it is still ours, assignment store reverted, Plasma config
+  untouched (a failure before the switch step leaves the previous plugin in
+  place; the switch step never ran). The previous renderer is **not** kept
+  live: the display freezes on the supervisor's last-known-good frame for
+  that wallpaper until the session's next successful apply. The failure
+  logs one bounded line and backs off exponentially — 1 s doubling to a
+  30 s cap.
+- The apply runs on a dedicated worker thread (one apply at a time, bound
+  queue of 1); the session tick thread never blocks on a transaction, so
+  `playlist.*` RPCs stay responsive while an apply is in flight. The lane
+  shares the apply transaction's single lock: a user apply in flight wins
+  the slot. A `Busy` from that lock — or a foreign renderer that became
+  live between the session's verdict and the lock (the lane re-checks
+  supervisor state after taking the lock, closing the TOCTOU window) — is a
+  **transient yield, never a failure**: no backoff is armed, and the yield
+  clears any previously-armed backoff, so re-assertion is prompt once the
+  user's renderer stops.
+- While a foreign renderer is live the session **yields** (user choice
   wins); it re-asserts its entry when nothing is live (manual stop, crash)
   or when the entry changes (its own stale renderer is displaced).
+- Crash-restore: when the supervisor is recovering the requested wallpaper
+  (Restarting/RolledBack) but the active worker renders a different
+  wallpaper (or none), the session does **not** claim the entry satisfied
+  and does not dispatch a competing apply — it waits while the supervisor's
+  own bounded recovery or quarantine resolves it (a quarantine then flows
+  through the existing skip logic).
 - Restart restore re-applies the entry **once**: the supervisor is fresh and
   idle at boot, so the session's first tick sees no live renderer and drives
   the lane (the store is the source for restore, the supervisor is the
