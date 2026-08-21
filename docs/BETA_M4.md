@@ -419,13 +419,78 @@ precedence and the session re-asserts after stop, restart re-applies once
 scene renderer and a stubbed Plasma boundary and asserts the store and
 switch-script counts across a timer advance and a restart.
 
+## M4d — live enablement (this commit)
+
+M4d turns the M4a transaction into a real desktop switch on this machine and
+proves it with a DESTRUCTIVE live smoke (`scripts/smoke-live-apply.sh`,
+opt-in via `KWE_RUN_LIVE_APPLY_SMOKE=1`). The smoke runs the REAL daemon
+against the REAL Plasma session (authorized; AGENTS.md's no-live-session
+rule is waived for BETA_M4), switches the live desktop to real video and web
+wallpapers, fails a hostile scene with containment, and restores — with the
+plasmashell PID asserted unchanged across every destructive step.
+
+### The enablement decision
+
+The installed `org.kde.kwe.wallpaper` plugin's `DisplaySession` polls the
+daemon at the default runtime socket (`$XDG_RUNTIME_DIR/kwe/daemon-v1.sock`).
+A smoke that runs its own daemon on a private socket (the smoke-apply
+pattern) would therefore switch the desktop's plugin but never show frames:
+the plugin would keep talking to the idle system daemon. So **the M4d smoke
+daemon binds the REAL runtime socket**: the system `kwe-daemon.service` is
+stopped first (if running), the smoke daemon takes the socket, and the exit
+trap kills the smoke daemon, restores the pre-test wallpaper plugin/config,
+and restarts the system daemon. This exactly mirrors the real deployment —
+the daemon the plugin connects to is the daemon that applied the wallpaper —
+and "frames reach the desktop" is proven by the plasmashell process holding
+the smoke renderer's frame file open (`/proc/<plasmashell-pid>/fd`) while the
+frame sequence advances.
+
+The pre-test wallpaper plugin/config is captured at script start with the
+documented read-only probe (never `desktopForScreen`) and restored on EVERY
+exit path (trap, registered for EXIT/INT/TERM, idempotent and bounded).
+The desktop ends the run exactly as it began.
+
+**Suite split decision:** `smoke-apply.sh`'s `KWE_LIVE_APPLY=1` lane stays
+the READ-ONLY live lane (enumeration + fail-closed error cases); the
+DESTRUCTIVE live lane is `smoke-live-apply.sh`. They are intentionally
+separate suites.
+
+**Machine state investigated and handled honestly:** desktop 111 on this
+machine already carried `org.kde.kwe.wallpaper` (the M4a research found the
+same) with the system daemon idle and no assignments. The pre-test capture
+therefore records plugin `org.kde.kwe.wallpaper`, and the smoke's restore
+(assignment mode) returns exactly to it — the "already assigned" state is
+treated as the pre-test baseline, not assumed to be `org.kde.image`.
+
+### The smoke case table (observed, 2026-08-20, Plasma 6.7.4 Wayland)
+
+| Case | Step | Expected containment | Observed result |
+|---|---|---|---|
+| — | pre-test capture | plasmashell PID + target output (DP-1) plugin/config recorded; system daemon state recorded | plasmashell 919019; DP-1 → desktop index 1, plugin `org.kde.kwe.wallpaper`, image none; system daemon running |
+| 1 | VIDEO apply (synthetic `#3366CC` mp4, 320x180) | transaction ok, assignment persists, plugin `org.kde.kwe.wallpaper`, plasmashell consumes the renderer's frame file, frames advance, PID unchanged | apply ok; store `DP-1 → 1` kind video; probe plugin `org.kde.kwe.wallpaper`; plasmashell opened `frame-<daemon>-1.bin`; frame pixel (50,102,203) vs expected (51,102,204) within tolerance; PID 919019 |
+| 2 | WEB apply (synthetic self-contained page, 320x180) | same as case 1 for the web kind | apply ok; store `DP-1 → 2`; probe plugin `org.kde.kwe.wallpaper`; plasmashell opened `frame-<daemon>-2.bin`; frames advancing; PID unchanged |
+| 3 | BAD SCENE apply (`{"general": 42}` — passes preflight, renderer rejects at parse, exit 73) | renderer fails, transaction rolls back (`apply_failed`), desktop stays operable, no plasmashell crash, previous assignment preserved | `apply_failed`; plugin stays `org.kde.kwe.wallpaper`; renderer not live; store still records the web assignment (rollback preserved it); PID unchanged |
+| 4 | RESTORE | assignment-mode restore to the pre-test plugin/config, store cleared | mode `assignment`; restored plugin `org.kde.kwe.wallpaper`; store cleared; final probe identical to pre-test |
+| 5 | end state | desktop exactly as it began; plasmashell PID unchanged across the whole run | pre-test and final probes byte-identical; plasmashell PID 919019 throughout |
+| — | failure/recovery | a failed assertion still restores the desktop | injected mid-run assertion failure → exit 1 → trap restored the wallpaper, restarted the system daemon, removed the smoke root, plasmashell unchanged |
+
+The whole suite runs in ~4 s on this machine (renderer cold starts are fast
+here) and is safe to re-run: the pre-test capture is taken fresh every run
+and the trap restore is idempotent.
+
 ## Run the suites
 
 ```sh
-scripts/smoke-apply.sh       # M4a: live apply smoke; SKIPPED with exit 0
-                             #   unless KWE_LIVE_APPLY=1 (M4d flips it on);
-                             #   the M4a run is read-only against the live
-                             #   Plasma session — no wallpaper switch
+scripts/smoke-apply.sh       # M4a: READ-ONLY live apply smoke; SKIPPED
+                             #   with exit 0 unless KWE_LIVE_APPLY=1; never
+                             #   switches a live wallpaper (M4d decision:
+                             #   this lane stays read-only)
+scripts/smoke-live-apply.sh  # M4d: DESTRUCTIVE live smoke — applies real
+                             #   video/web wallpapers + a hostile scene to
+                             #   the live desktop, then restores; requires
+                             #   KWE_RUN_LIVE_APPLY_SMOKE=1 (authorized on
+                             #   this machine only); plasmashell PID must be
+                             #   unchanged throughout
 scripts/smoke-playlist-restart.sh  # M5k regression + M4c scenario 9:
                              #   renderer assignment through the real apply
                              #   transaction with the fake scene renderer
@@ -495,6 +560,20 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
 | smoke-playlist-restart | M5k scenarios 1–8 regression + M4c scenario 9: renderer.status wallpaper/kind, assignments store (DP-1), timer-advance flip, restart re-applies once, switch-script counts | all pass |
 | live config | M4c executes no live wallpaper switch (stub `--plasma-switch-command` in every smoke; live enablement is M4d) | no `evaluateScript` switch against the live session |
 
+### M4d — live enablement (this commit)
+
+| Case | Expected containment | Result |
+|---|---|---|
+| workspace gates | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace --all-targets`; `./scripts/check.sh` | clean (see the acceptance gates section below) |
+| pre-test capture | plasmashell PID (exactly one), target output plugin/config via the read-only probe, system daemon state recorded before any change | DP-1 → desktop index 1, plugin `org.kde.kwe.wallpaper`, image none; system `kwe-daemon.service` running |
+| case 1: video apply (live) | apply ok; store `DP-1 → 1` kind video; probe plugin `org.kde.kwe.wallpaper`; plasmashell holds the renderer frame file open; frame pixel matches `#3366CC`; PID unchanged | all pass (pixel (50,102,203) vs (51,102,204), tolerance 6) |
+| case 2: web apply (live) | apply ok; store `DP-1 → 2`; plugin `org.kde.kwe.wallpaper`; plasmashell holds the web frame file open; frames advancing; PID unchanged | all pass |
+| case 3: hostile scene (live containment) | renderer rejects the scene (exit 73) → `apply_failed`; desktop stays on the kwe plugin; renderer not live; rollback preserves the previous assignment; PID unchanged | all pass |
+| case 4: restore | assignment-mode restore to the pre-test plugin/config; store cleared; final probe identical to pre-test | all pass |
+| case 5: end state | plasmashell PID unchanged across every destructive step; desktop exactly as it began | pre-test and final probes byte-identical; PID 919019 throughout |
+| failure/recovery | a failed assertion still restores the desktop; trap idempotent | injected mid-run assertion failure → exit 1 → wallpaper restored, system daemon restarted, smoke root removed, plasmashell unchanged |
+| system daemon | the smoke daemon takes the real socket and the system service is restored on exit | system daemon stopped during the run, restarted by the trap (new MainPID); socket ownership returned to the system daemon |
+
 ## Open risks
 
 - `evaluateScript` traffic depends on the shell being reachable and
@@ -516,3 +595,20 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
   (appletsrc retains the `[Wallpaper][org.kde.image][General]` group under
   the kwe plugin); a Plasma change that prunes orphaned groups would leave
   restore to the stock-image fallback instead of the saved image.
+- A user `wallpaper.apply` runs synchronously on the daemon's single accept
+  loop for the transaction duration (M4c moved only the playlist lane onto
+  its worker thread), so the live plugin's 500 ms `renderer.status` polls can
+  time out during a multi-second apply and show a transient "service
+  unavailable" state, then recover once the renderer is live. Bounded and
+  self-healing; moving the user apply onto the same worker lane is a
+  follow-up.
+- The M4d smoke stops/restarts the system `kwe-daemon.service` to take the
+  real socket. The EXIT/INT/TERM trap always restores it; a SIGKILL of the
+  smoke script itself (untrappable) would leave the service stopped until
+  the next run's fresh capture or a manual `systemctl --user start
+  kwe-daemon`.
+- Frames-reach-desktop is asserted via `/proc/<plasmashell-pid>/fd` (the
+  plugin holds the frame file open) plus the frame sequence advancing; this
+  relies on plasmashell running un-sandboxed (no `PrivateTmp`) so it can
+  open the renderer's frame file — true on this system, and the reason the
+  smoke refuses to run without a live plasmashell.

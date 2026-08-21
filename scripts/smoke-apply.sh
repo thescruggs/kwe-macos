@@ -18,8 +18,11 @@
 # live wallpaper config, which is BETA_M4d territory. The contract is
 # documented in docs/BETA_M4.md.
 #
-# Gated behind KWE_LIVE_APPLY=1 (flipped on by BETA_M4d); without it the
-# script exits 0 with a SKIPPED note so acceptance runs stay green.
+# Gated behind KWE_LIVE_APPLY=1; without it the script exits 0 with a
+# SKIPPED note so acceptance runs stay green. BETA_M4d decision: this lane
+# stays the READ-ONLY live lane (enumeration + fail-closed error cases);
+# the DESTRUCTIVE live smoke (apply/rollback/safe-mode on the real session)
+# lives in scripts/smoke-live-apply.sh under KWE_RUN_LIVE_APPLY_SMOKE=1.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
