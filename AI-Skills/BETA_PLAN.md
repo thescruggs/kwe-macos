@@ -49,7 +49,7 @@
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
-| BETA_M3 (scene, a–k) | M3a–M3f done, M3g–M3k paused until after M4 (maintainer reorder) |
+| BETA_M3 (scene, a–k) | M3a–M3f done; M4 complete so the pause is over — M3g (VideoLayer via libmpv) is next |
 | BETA_M4 (live apply) | M4a–M4d done |
 | BETA_M5 (release) | pending |
 
