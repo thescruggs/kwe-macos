@@ -474,9 +474,14 @@ treated as the pre-test baseline, not assumed to be `org.kde.image`.
 | 5 | end state | desktop exactly as it began; plasmashell PID unchanged across the whole run | pre-test and final probes byte-identical; plasmashell PID 919019 throughout |
 | — | failure/recovery | a failed assertion still restores the desktop | injected mid-run assertion failure → exit 1 → trap restored the wallpaper, restarted the system daemon, removed the smoke root, plasmashell unchanged |
 
-The whole suite runs in ~4 s on this machine (renderer cold starts are fast
-here) and is safe to re-run: the pre-test capture is taken fresh every run
-and the trap restore is idempotent.
+The whole suite runs in ~4 s on this machine with a warm `target/` (the
+first run after a clean build adds compile time; renderer cold starts are
+fast here) and is safe to re-run: the pre-test capture is taken fresh every
+run and the trap restore is idempotent. The trap's restore is verified with
+a fresh probe (plugin, config group, and Image compared to the pre-test
+capture), not trusted on `evaluateScript` exit 0 alone, and the config group
+is replayed member-for-member (each identity-validated) rather than assumed
+to be `["Wallpaper", plugin, "General"]`.
 
 ## Run the suites
 
@@ -573,6 +578,9 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
 | case 5: end state | plasmashell PID unchanged across every destructive step; desktop exactly as it began | pre-test and final probes byte-identical; PID 919019 throughout |
 | failure/recovery | a failed assertion still restores the desktop; trap idempotent | injected mid-run assertion failure → exit 1 → wallpaper restored, system daemon restarted, smoke root removed, plasmashell unchanged |
 | system daemon | the smoke daemon takes the real socket and the system service is restored on exit | system daemon stopped during the run, restarted by the trap (new MainPID); socket ownership returned to the system daemon |
+| restore verification | the trap restore re-probes and compares plugin/config-group/Image to the pre-test capture (not just `evaluateScript` exit 0); config group replayed member-for-member with identity validation | "pre-test wallpaper restored and verified (plugin org.kde.kwe.wallpaper, group [\"Wallpaper\",\"org.kde.kwe.wallpaper\",\"General\"])" on every run |
+| pre-flight fail-closed | a live non-system kwe-daemon bound to the real socket while the service is inactive fails before any change, with the recovery steps, without touching the orphan | verified: orphan daemon placed on the real socket → FAILED `kill <pid>, then: systemctl --user start kwe-daemon`; orphan untouched; system daemon + plasmashell restored |
+| system daemon start | bounded `is-active` poll after the trap restart, loud WARNING if inactive | active after every run (including the fail-closed test cleanup) |
 
 ## Open risks
 
@@ -603,10 +611,14 @@ Validated on 2026-08-19 (CachyOS, Plasma 6.7.4 Wayland; shared
   self-healing; moving the user apply onto the same worker lane is a
   follow-up.
 - The M4d smoke stops/restarts the system `kwe-daemon.service` to take the
-  real socket. The EXIT/INT/TERM trap always restores it; a SIGKILL of the
-  smoke script itself (untrappable) would leave the service stopped until
-  the next run's fresh capture or a manual `systemctl --user start
-  kwe-daemon`.
+  real socket. The EXIT/INT/TERM trap always restores it (a bounded
+  `is-active` poll after the start, with a loud WARNING plus the manual
+  recovery command if it stays inactive). A SIGKILL of the smoke script
+  itself (untrappable) would leave an orphaned smoke daemon holding the real
+  socket; the next run FAILS CLOSED in a pre-flight check (a live
+  non-system kwe-daemon bound to the socket while the service is inactive)
+  with the recovery steps — `kill <orphan-pid>`, then
+  `systemctl --user start kwe-daemon` — and never touches the orphan.
 - Frames-reach-desktop is asserted via `/proc/<plasmashell-pid>/fd` (the
   plugin holds the frame file open) plus the frame sequence advancing; this
   relies on plasmashell running un-sandboxed (no `PrivateTmp`) so it can

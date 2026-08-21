@@ -54,6 +54,7 @@ command -v jq >/dev/null
 command -v ffmpeg >/dev/null
 command -v qdbus6 >/dev/null
 command -v systemctl >/dev/null
+command -v ss >/dev/null
 
 if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
     echo "FAILED: XDG_RUNTIME_DIR is not set; the live smoke needs the runtime socket" >&2
@@ -61,6 +62,13 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
 fi
 
 live_socket="${XDG_RUNTIME_DIR}/kwe/daemon-v1.sock"
+
+# The daemon's identity rule (supervisor.rs validate_identity_part): 1..=128
+# ASCII letters/digits/'.'/'_'/'-'. Every interpolated plugin/config-group
+# value in an evaluateScript payload must match it.
+identity_part_ok() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+}
 smoke_root="$(mktemp -d -t kwe-live-apply-smoke.XXXXXX)"
 runtime_dir="$smoke_root/runtime"
 state_dir="$smoke_root/state"
@@ -85,6 +93,27 @@ fi
 socket_taken=0
 system_daemon_stopped=0
 
+# Pre-flight (SIGKILL recovery): a live socket bound by a kwe-daemon that is
+# NOT the system service means a previous smoke run was SIGKILLed before its
+# trap ran, leaving an orphaned daemon holding the real socket. Starting the
+# system service would then fail EADDRINUSE, and a re-run's capture would
+# see the service inactive and never restart it. Fail closed with the
+# recovery steps instead of silently displacing the orphan.
+if [[ -S "$live_socket" && "$system_daemon_was_running" == "0" ]]; then
+    owner="$(ss -xlp 2>/dev/null | grep -F "$live_socket" \
+        | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\),fd=[0-9]*)).*/\1 \2/p' | head -1)"
+    if [[ -n "$owner" ]]; then
+        owner_name="${owner%% *}"
+        owner_pid="${owner##* }"
+        if [[ "$owner_name" == "kwe-daemon" ]] && kill -0 "$owner_pid" 2>/dev/null; then
+            echo "FAILED: the real socket $live_socket is held by an orphaned smoke daemon" >&2
+            echo "        (a previous smoke-live-apply.sh run was SIGKILLed before its trap ran)." >&2
+            echo "        Recovery: kill $owner_pid, then: systemctl --user start kwe-daemon" >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Read-only probe template (the documented M4a enumeration template, fixed;
 # never desktopForScreen). Read back via print() as the shell's only output.
 probe_script() {
@@ -104,7 +133,7 @@ for (var i = 0; i < d.length; i++) {
     } catch (e) { }
     d[i].currentConfigGroup = g;
   }
-  out.push({index: i, id: d[i].id, screen: d[i].screen, wp: wp, image: image});
+  out.push({index: i, id: d[i].id, screen: d[i].screen, wp: wp, image: image, group: g});
 }
 EOF
 )
@@ -147,10 +176,24 @@ pretest_plugin="$(jq -r --argjson screen "$target_screen" \
     '.desktops[] | select(.screen == $screen) | .wp' <<<"$pretest_probe" | head -1)"
 pretest_image="$(jq -r --argjson screen "$target_screen" \
     '.desktops[] | select(.screen == $screen) | .image // ""' <<<"$pretest_probe" | head -1)"
-if [[ -z "$pretest_plugin" || ! "$pretest_plugin" =~ ^[A-Za-z0-9._-]+$ ]]; then
+# The desktop's actual config group (the daemon's probe captures it the same
+# way); restore replays these members, never a hardcoded shape. Falls back to
+# the synthesized wallpaper group when the probe reports none.
+pretest_group_json="$(jq -c --argjson screen "$target_screen" \
+    '.desktops[] | select(.screen == $screen) | .group' <<<"$pretest_probe" | head -1)"
+if [[ "$pretest_group_json" == "null" || -z "$pretest_group_json" ]]; then
+    pretest_group_json="$(jq -cn --arg plugin "$pretest_plugin" '["Wallpaper", $plugin, "General"]')"
+fi
+identity_part_ok "$pretest_plugin" || {
     echo "FAILED: target desktop has no usable wallpaper plugin ('$pretest_plugin')" >&2
     exit 1
-fi
+}
+while IFS= read -r _member; do
+    identity_part_ok "$_member" || {
+        echo "FAILED: captured config-group member is not a valid identity part: '$_member'" >&2
+        exit 1
+    }
+done <<<"$(jq -r '.[]' <<<"$pretest_group_json")"
 
 echo "live smoke: target output $target_output (desktop index $pretest_desktop_index,"
 echo "            pre-test plugin $pretest_plugin, image '${pretest_image:-none}')"
@@ -161,24 +204,55 @@ echo "live smoke: plasmashell PID $plasmashell_pid; system kwe-daemon $([ "$syst
 # capture then reflects the interrupted state, and the restore replays the
 # same script). plasmashell is never touched; only the wallpaper plugin and
 # the daemon service are reverted.
-js_escape() {
-    local value="$1"
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    printf '%s' "$value"
+build_restore_script() {
+    # Pure builder mirroring apply.rs restore_script: the plugin and every
+    # config-group member are identity parts (validated); the Image value is
+    # JSON-escaped via jq (the daemon's six-character escape set); wallpaper
+    # content never reaches the script.
+    local member literal="" image_clause="" image_literal
+    while IFS= read -r member; do
+        identity_part_ok "$member" || return 1
+        literal="${literal:+$literal, }\"$member\""
+    done <<<"$(jq -r '.[]' <<<"$pretest_group_json")"
+    if [[ -n "${pretest_image:-}" ]]; then
+        image_literal="$(jq -n --arg v "$pretest_image" '$v')"
+        image_clause="d.writeConfig(\"Image\", $image_literal);"$'\n'
+    fi
+    printf 'var d = desktops()[%s];\nif (!d) throw "no desktop %s";\nd.currentConfigGroup = [%s];\n%s d.wallpaperPlugin = "%s";' \
+        "$pretest_desktop_index" "$pretest_desktop_index" "$literal" "$image_clause" "$pretest_plugin"
 }
 
 restore_live_wallpaper() {
-    local script
-    script="var d = desktops()[$pretest_desktop_index];"
-    script+=$'\n'"if (!d) throw \"no desktop $pretest_desktop_index\";"$'\n'
-    script+="d.currentConfigGroup = [\"Wallpaper\", \"$pretest_plugin\", \"General\"];"$'\n'
-    if [[ -n "${pretest_image:-}" ]]; then
-        script+="d.writeConfig(\"Image\", \"$(js_escape "$pretest_image")\");"$'\n'
+    # Rebuild the exact pre-test wallpaper config, then verify with a fresh
+    # probe instead of trusting evaluateScript's exit 0. Best-effort and
+    # bounded: the trap must never hang on a wedged shell.
+    local script post post_plugin post_image post_group
+    script="$(build_restore_script)" || {
+        echo "WARNING: could not build the pre-test restore script" >&2
+        return 1
+    }
+    if ! timeout 10 qdbus6 org.kde.plasmashell /PlasmaShell evaluateScript "$script" >/dev/null 2>&1; then
+        echo "WARNING: the pre-test wallpaper restore evaluateScript failed" >&2
+        return 1
     fi
-    script+="d.wallpaperPlugin = \"$pretest_plugin\";"
-    # Bounded, best-effort: the trap must never hang on a wedged shell.
-    timeout 10 qdbus6 org.kde.plasmashell /PlasmaShell evaluateScript "$script" >/dev/null 2>&1 || true
+    post="$(run_probe "$target_output" 2>/dev/null || true)"
+    if [[ -z "$post" ]]; then
+        echo "WARNING: could not re-probe the desktop to verify the restore" >&2
+        return 1
+    fi
+    post_plugin="$(jq -r --argjson screen "$target_screen" '.desktops[] | select(.screen == $screen) | .wp' <<<"$post" | head -1)"
+    post_image="$(jq -r --argjson screen "$target_screen" '.desktops[] | select(.screen == $screen) | .image // ""' <<<"$post" | head -1)"
+    post_group="$(jq -c --argjson screen "$target_screen" '.desktops[] | select(.screen == $screen) | .group' <<<"$post" | head -1)"
+    if [[ "$post_plugin" != "$pretest_plugin" \
+        || "$post_image" != "${pretest_image:-}" \
+        || "$post_group" != "$pretest_group_json" ]]; then
+        echo "WARNING: pre-test wallpaper restore verification failed:" >&2
+        echo "        plugin $post_plugin (want $pretest_plugin); image '$post_image'" >&2
+        echo "        (want '${pretest_image:-}'); group $post_group (want $pretest_group_json)" >&2
+        return 1
+    fi
+    echo "live smoke: pre-test wallpaper restored and verified (plugin $post_plugin, group $post_group)"
+    return 0
 }
 
 cleanup() {
@@ -196,11 +270,20 @@ cleanup() {
         rm -f -- "$live_socket"
     fi
     if [[ "${pretest_captured:-0}" == "1" ]]; then
-        restore_live_wallpaper
+        restore_live_wallpaper || true
     fi
     if [[ "${system_daemon_was_running:-0}" == "1" ]] \
         && [[ "$(systemctl --user is-active kwe-daemon 2>/dev/null || true)" != "active" ]]; then
-        systemctl --user start kwe-daemon 2>/dev/null || true
+        systemctl --user start kwe-daemon >/dev/null 2>&1 || true
+        # Bounded wait; a start that stays inactive needs manual recovery.
+        for _attempt in {1..50}; do
+            [[ "$(systemctl --user is-active kwe-daemon 2>/dev/null || true)" == "active" ]] && break
+            sleep 0.1
+        done
+        if [[ "$(systemctl --user is-active kwe-daemon 2>/dev/null || true)" != "active" ]]; then
+            echo "WARNING: kwe-daemon.service did not come back up." >&2
+            echo "WARNING: recovery: systemctl --user start kwe-daemon" >&2
+        fi
     fi
     rm -rf -- "$smoke_root"
 }
@@ -228,10 +311,13 @@ call_daemon() {
 
 assert_pid_unchanged() {
     local label="$1"
-    local now
-    now="$(pgrep -x plasmashell | head -1 || true)"
-    [[ -n "$now" && "$now" == "$plasmashell_pid" ]] \
-        || fail "plasmashell PID changed after $label (was $plasmashell_pid, now ${now:-dead})"
+    local -a now
+    now=( $(pgrep -x plasmashell 2>/dev/null || true) )
+    if (( ${#now[@]} != 1 )); then
+        fail "plasmashell process count changed after $label (was exactly 1 at pid $plasmashell_pid, now ${#now[@]}: ${now[*]:-none})"
+    fi
+    [[ "${now[0]}" == "$plasmashell_pid" ]] \
+        || fail "plasmashell PID changed after $label (was $plasmashell_pid, now ${now[0]})"
     kill -0 "$plasmashell_pid" 2>/dev/null || fail "plasmashell $plasmashell_pid is no longer alive after $label"
 }
 
@@ -273,11 +359,13 @@ cat >"$steam_root/steamapps/appworkshop_431960.acf" <<'EOF'
 EOF
 
 # Video item 1: a flat #3366CC mp4 (the M1e oracle color) at the apply target.
+# 30 s so the clip cannot end mid-assertion on a slow machine (a solid color
+# compresses tiny, so the file stays small).
 video_content="$steam_root/steamapps/workshop/content/431960/1/fixture.mp4"
 cat >"$steam_root/steamapps/workshop/content/431960/1/project.json" <<'EOF'
 {"title":"Synthetic Live Video","type":"video","file":"fixture.mp4","tags":[]}
 EOF
-ffmpeg -loglevel error -f lavfi -i "color=c=0x3366CC:s=320x180:r=30" -t 2 \
+ffmpeg -loglevel error -f lavfi -i "color=c=0x3366CC:s=320x180:r=30" -t 30 \
     -c:v libx264 -pix_fmt yuv420p "$video_content" -y
 
 # Web item 2: a self-contained animated page (no network) over a solid base.
@@ -369,7 +457,7 @@ echo "live smoke: smoke daemon bound the real socket $live_socket"
 # --- Case 1: VIDEO apply (destructive, live) --------------------------------
 apply_params="$(jq -cn --arg out "$target_output" --arg content "$video_content" \
     '{output:$out,wallpaper_id:"1",kind:"video",content:$content,width:320,height:180,fps:30}')"
-video_result="$(call_daemon wallpaper.apply "$apply_params")"
+video_result="$(call_daemon wallpaper.apply "$apply_params" || true)"
 [[ "$(jq -r '.ok' <<<"$video_result")" == "true" ]] \
     || fail "video apply failed: $(jq -c . <<<"$video_result")"
 assignments="$(call_daemon wallpaper.assignments)"
@@ -394,7 +482,7 @@ echo "live smoke: case 1 video apply passed (live frames on the desktop)"
 # --- Case 2: WEB apply (destructive, live) ----------------------------------
 apply_params="$(jq -cn --arg out "$target_output" --arg content "$web_content" \
     '{output:$out,wallpaper_id:"2",kind:"web",content:$content,width:320,height:180,fps:30}')"
-web_result="$(call_daemon wallpaper.apply "$apply_params")"
+web_result="$(call_daemon wallpaper.apply "$apply_params" || true)"
 [[ "$(jq -r '.ok' <<<"$web_result")" == "true" ]] \
     || fail "web apply failed: $(jq -c . <<<"$web_result")"
 assignments="$(call_daemon wallpaper.assignments)"
