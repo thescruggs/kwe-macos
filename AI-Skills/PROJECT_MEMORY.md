@@ -1,11 +1,11 @@
 # AI-Skills — Project Memory
 
-**Current as of:** 2026-08-19 (session 6). Read `INSTRUCTIONS.md` first; `BETA_PLAN.md` is the living plan.
+**Current as of:** 2026-08-20 (session 7). Read `INSTRUCTIONS.md` first; `BETA_PLAN.md` is the living plan.
 
 ## Current repo state
 
 - **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS. **Beta work happens in per-slice worktrees** (`/home/qcv123/gitProjects/kwe-*`, deleted after merge); the trunk branch is `fix/qt611-gallery-delegates` (no upstream).
-- **History (all ff-merged into the trunk):** `1833331` Qt 6.11 fix → `db8563d` AI-Skills → M1a `cd2d61e`+`62bdbdc` → M1b `7a2b402`+`3e83d2e` → M1c `51cb469`+`219ebbd` → M1d `b208465`+`2b2ebd8` → M1e `36c7856`+`ba0a288`. HEAD = `ba0a288`; working tree clean; no active worktree right now.
+- **History (all ff-merged into the trunk):** `1833331` Qt 6.11 fix → `db8563d` AI-Skills → BETA_M1 (M1a–M1e) → BETA_M2 (M2a–M2e, `dc125d8`) → M3a–M3f (`d4ea8c2`+`5abc800`; M3g–M3k paused by maintainer reorder) → M4a `cffb7cd`+`f3376c7` → M4b `eb83966`+`e6152bd` → M4c `e5d69e0`+`520b2d7`. HEAD = `520b2d7` + docs commit; working tree clean; the `kwe-m4c` worktree is removed after merge. Full per-slice detail lives in BETA_PLAN.md's change log.
 - **Installed:** `kde-wallpaper-engine-0.1.0.alpha.1-1` built from local HEAD and installed on this CachyOS machine (2026-08-18). Alpha gallery works; Apply disabled; video/web/scene shown as "planned".
 - **Graphify:** `graphify-out/` knowledge graph rebuilt 2026-08-18 (1,497 nodes / 3,224 edges / 70 communities). Query with `graphify query "<question>"`. Known integrity notes: 180 dangling-endpoint edges, `metadata.json` produces zero AST nodes.
 
@@ -45,10 +45,10 @@ Qt is 6.11.1; `kwe-package-installer-test` needs `Qt6::Qml` linked (fixed in 183
 
 | Milestone | Status | Next slice |
 |---|---|---|
-| BETA_M1 — contract generalization + video renderer | done (M1a–M1e, 2026-08-19) | M2a (CDP spike + kwe-cdp client) |
-| BETA_M2 — web renderer (Chromium+CDP) | pending | after M1 |
-| BETA_M3 — scene renderer (QuickJS + ash, slices a–k) | pending | after M2 |
-| BETA_M4 — live apply + manager UI | pending | after M3 |
+| BETA_M1 — contract generalization + video renderer | done (M1a–M1e, 2026-08-19) | — |
+| BETA_M2 — web renderer (Chromium+CDP) | done (M2a–M2e, 2026-08-19) | — |
+| BETA_M3 — scene renderer (QuickJS + ash, slices a–k) | M3a–M3f done; M3g–M3k paused until after M4 (maintainer reorder) | resume after M4 |
+| BETA_M4 — live apply + manager UI (pulled ahead of M3g–M3k) | M4a–M4c done | M4d (live enablement + smoke-live-apply) |
 | BETA_M5 — beta release 0.1.0-beta.1 | pending | last |
 
 Known code gaps the plan resolves (details in BETA_PLAN.md §Found gaps): renderer stderr discarded (G1), env_clear breaks helpers (G2), RLIMIT_AS too small for Chromium (G3), systemd MemoryMax=1G too small (G4), 3s/2s timeouts too tight for real backends (G5), playlists never start renderers (G7), grants not daemon-enforced (G8), missing THIRD_PARTY entries for shipped mpv/bwrap/chromium previews (G9).
@@ -73,3 +73,4 @@ Known code gaps the plan resolves (details in BETA_PLAN.md §Found gaps): render
 | 2026-08-18 | Claude + sub-agents | BETA_M1b done (`7a2b402`+`3e83d2e`): `kwe-video-renderer` (libmpv SW render API, bgr0→BGRA8888 premultiplied, paced publish, keepalive, media-state pause/seek, exit 70/71/72/73), smoke-video.sh through the daemon. Review: 3 must-fix + 4 recommended, all fixed; M1a bug surfaced (media/audio acks rejected) fixed with last-wins ack acceptance. | M1b done |
 | 2026-08-18/19 | Claude + sub-agents | BETA_M1c done (`51cb469`+`219ebbd`): static `preflight_video` (extension allowlist, ≤2 GiB, non-symlink), scan Video→RendererDependent, `kwe preflight --video`, smoke split (extension reject vs worker-side exit 73); 24 h duration bound implemented for real (fails open on unreadable). BETA_M1d done (`b208465`+`2b2ebd8`): `kwe-audio-worker` + daemon `--audio-capture`/`audio.status` (3 restarts/10 min, then disable), SO_PEERCRED silent-drop. Review: 2 HIGH fixed (nonblocking pw-dump read; ack ceiling max() never decreases). | M1c+M1d done |
 | 2026-08-19 | Claude (this session) | BETA_M1e close-out in worktree `kwe-m1e` (branch `beta-m1e-m1-evidence`): per-kind video NPROC knob `--renderer-video-processes` (default 32768, video kind only; smoke workaround removed); `mpv` crate dropped (explicit `extern "C"` + `#[link(name = "mpv")]`, Cargo.lock −201 lines, rust-mpv THIRD_PARTY entry removed); deterministic pixel oracle (solid `#3366CC` mp4 through the daemon, seqlock frame-file parse, 9 pixels within 2 of expected BGRA, tolerance 4; empirical: libmpv aspect-letterboxes); `--probe` → `{"backend":"libmpv","client_api_version":"2.5","libmpv_supports_sw_render":true}`; `kwe diagnose` video lane; FEATURE_COMPATIBILITY content.video implemented; M1 exit gate (92-item corpus clean, 0 global diagnostics); docs updated (SUPERVISOR_API_V1, BETA_M1, FEATURE_COMPATIBILITY, THIRD_PARTY). Gates: 146 tests, smoke-video 11 / supervisor 17 / audio 5. Commit `feat(m1e): ...` at session end. | BETA_M1 done; next BETA_M2a |
+| 2026-08-20 | Claude Fable + sub-agents (session 7) | **M4c done** (`e5d69e0` feat by prior session + this session's review cycle): adversarial reviewer (sonnet) found 1 MUST-FIX (user-apply precedence: Busy-as-failure backoff + TOCTOU displacing a fresh user renderer) + 4 recommended + 3 nits; implementer (sonnet) fixed all 8 in `520b2d7` — post-lock `foreign_renderer_live` check with non-failure `ApplyError::Yielded`, apply lane moved to a dedicated bound-1 worker thread (tick thread/API never blocks), stale-store output fallthrough, `Wait` verdict during supervisor recovery, rollback doc honesty; deviation: nothing-live+gate-closed verdict Yield→Hold (anti-storm). Verifier re-review: all CLOSED, 0 new MUST-FIX. Orchestrator independently ran check.sh + smoke-playlist-restart (green, 128 daemon/458 workspace tests), ff-merged, updated plan + this file. NOTE: sessions 2026-08-19 (BETA_M2, M3a–M3f, M4a, M4b) updated BETA_PLAN.md's change log but not this file — see the change log for those details. | M4c merged; M4d next |
