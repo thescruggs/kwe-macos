@@ -716,7 +716,15 @@ impl QdbusShellProbe {
         let binary = resolve_systemctl(&self.systemctl_binary)?;
         let mut command = Command::new(binary);
         command.arg("--user").arg("show-environment");
-        let outcome = run_bounded(&mut command, self.timeout).map_err(|error| {
+        // Deliberately shorter than the probe budget: this recovery is an
+        // extra child on the enumeration path, and the probe deadline is
+        // already spent twice there (kscreen-doctor, then evaluateScript).
+        // Reading the local user manager's environment is a millisecond
+        // operation; a systemctl that cannot answer in RECOVERY_TIMEOUT is
+        // not going to, and the manager has its own request deadline to
+        // respect.
+        let budget = self.timeout.min(RECOVERY_TIMEOUT);
+        let outcome = run_bounded(&mut command, budget).map_err(|error| {
             ProbeError::DisplayUnavailable(format!(
                 "{DISPLAY_UNAVAILABLE_HINT} (systemctl show-environment: {error})"
             ))
@@ -764,6 +772,10 @@ impl AmbientDisplay {
 /// first. Both are forwarded when both are known: `kscreen-doctor` picks
 /// the platform plugin itself, and guessing for it is what hangs.
 const DISPLAY_ENV_KEYS: [&str; 2] = ["WAYLAND_DISPLAY", "DISPLAY"];
+
+/// Deadline for the display-environment recovery child, capped again by
+/// the probe timeout so a tighter configured budget still wins.
+const RECOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Longest display value accepted from the manager environment. A Wayland
 /// display is a socket name or a path to one; anything longer is not a
@@ -3035,6 +3047,45 @@ mod tests {
                 if detail.contains("exited") && detail.contains("restart kwe-daemon")),
             "{error}"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn display_recovery_stays_inside_the_probe_budget() {
+        // The recovery is an EXTRA child on the enumeration path, which
+        // already spends the probe deadline twice. A systemctl that will
+        // not answer must not extend enumeration past what the manager's
+        // own request deadline allows, so the budget is capped.
+        let root = temporary_directory("display-budget");
+        std::fs::create_dir_all(&root).unwrap();
+        // Sleeps only for the real invocation, so write_stub's warm-up
+        // call returns at once.
+        let slow = write_stub(
+            &root,
+            "slow.sh",
+            "#!/bin/sh\n[ \"$1\" = --user ] && sleep 30\n",
+        );
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            None,
+            PathBuf::from("kscreen-doctor"),
+            Some(slow),
+            Duration::from_millis(120),
+        )
+        .without_ambient_display();
+        let started = Instant::now();
+        let error = probe.display_env().unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(error, ProbeError::DisplayUnavailable(ref detail)
+                if detail.contains("timed out") && detail.contains("restart kwe-daemon")),
+            "{error}"
+        );
+        // The configured probe timeout wins when it is the smaller of the
+        // two; either way the wait is bounded, not the stub's 30 seconds.
+        assert!(elapsed < Duration::from_secs(2), "waited {elapsed:?}");
+        assert!(RECOVERY_TIMEOUT < Duration::from_secs(5));
         std::fs::remove_dir_all(root).unwrap();
     }
 

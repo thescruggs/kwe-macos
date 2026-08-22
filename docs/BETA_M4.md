@@ -225,7 +225,9 @@ all four methods fail closed with `apply_unavailable`.
 
 Daemon flags: `--plasma-shell-service` (default `org.kde.plasmashell`),
 `--qdbus-binary`, `--kscreen-doctor-binary` (default `kscreen-doctor`),
-`--apply-probe-timeout-ms` (5000, range 500–30000),
+`--systemctl-binary` (default `systemctl` on PATH; used only to recover a
+display environment for the enumeration child when the daemon's own has
+none — BETA B1), `--apply-probe-timeout-ms` (5000, range 500–30000),
 `--apply-promotion-timeout-ms` (15000, range 1000–60000).
 
 ## M4b — manager Apply UI (this commit)
