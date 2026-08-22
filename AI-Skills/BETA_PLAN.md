@@ -8,6 +8,7 @@
 
 ## Change log
 
+- 2026-08-22 — **B2 fixed** (`77c6d3e` feat + `e6fff36` review on `beta-b2-scene-honesty`, ff-merged into the trunk). Applying a scene showed a blank desktop. The diagnosis (model-only scene, no honesty signal) was half the story; confirming the reported `scene.pkg` at fix time found a **second, larger defect**: `parse_objects` classified an object as an image layer whenever it carried an `image` KEY, ignoring the value — and the WE editor writes `"image": null` on every particle object, so **all 65 null-image objects in the 60-package corpus** (5 of the 7 in the reported scene) registered as textureless image layers and their particle systems vanished. Both are fixed through one new owner of the rule, `kwe_core::sceneobjects`: `image` classifies only when its unwrapped value is a string, and the same classifier answers "can this object draw in this build?" for BOTH gates — `preflight_scene`/`preflight_pkg` refuse a scene that declares objects and can draw none of them (`invalid_params`, no worker spawns, the wallpaper on screen untouched, one named reason per missing feature), and the worker re-checks the same STATIC rule before its first publish (exit 74). Static on purpose: a layer whose content fails to decode still degrades rather than rejecting (the M3c/M3g skip-never-reject contract). `model_layer_skips` is counted and reported like the other skips; the manager shows a feature gap ("needs features this version cannot render yet … your current wallpaper is unchanged"), not a rejected request. **Honest scope this exposed:** 46 of the 60 local scenes render nothing at all today — every visual in them is a model layer whose texture is a TEXV `.tex` container (M3h) or a particle system whose definition lives in an external file that is not read yet (380 of 380 corpus systems). Those 46 are now refused with a reason instead of applying flat. Review found 1 real issue: preflight and the worker disagreed on a textureless-only scene (worker refused, preflight passed → a rollback instead of a clean refusal) — every registering-but-undrawable kind is now named, with the rule written on the function. Gates: check.sh exit 0, ctest 8/8, `smoke-scene.sh` green end to end with new cases B2-a/b/d; it also fixes a pre-existing flake it exposed (the standalone M3e lane sampled the frame file before the first publish and read an all-zero slot). `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md`.
 - 2026-08-22 — **Alpha package release 4 built** (`abd8c47`): `pkgrel` 3→4 carrying the B1 fix, application version unchanged at `0.1.0-alpha.1` (the coordinated `0.1.0-beta.1` change stays with M5); `.SRCINFO` regenerated via `KWE_FORCE_AUR_SOURCE=1 makepkg --printsrcinfo`. Clean `makepkg -Ccf` green, release-profile workspace tests included (137 daemon tests). Archive `kde-wallpaper-engine-0.1.0.alpha.1-4-x86_64.pkg.tar.zst`, SHA-256 `84800a9fc62756d6f10ca97396870b9f8633a6b59109b8e7bd7a46a2ad17cc80`. Verified **from the archive** the way `-3` was: the packaged unit carries all three graphical-session directives, and the packaged daemon run under `env -i` with only the unit's variables — the environment that made `-3` SIGABRT — enumerates `DP-1`. Not installed; the maintainer runs `sudo pacman -U` and then the one-time re-enable (`systemctl --user disable kwe-daemon && systemctl --user enable --now kwe-daemon`), which the `post_upgrade` hook prints. Known cosmetic carry-over, not new: makepkg warns that `kwe-scene-renderer` references `$srcdir` — the `-3` archive has the same four references.
 - 2026-08-22 — **B1 fixed** (`3d29272` feat + `1d332a9` review fixes on `beta-b1-display-env`, ff-merged into the trunk). No display outputs after a reboot: the unit was `WantedBy=default.target`, reached ~6 s before `graphical-session.target` and long before Plasma imports the session environment, so the boot-started daemon had no `WAYLAND_DISPLAY` and its `kscreen-doctor` child — a `QGuiApplication` — died on SIGABRT behind an empty picker. Fixed twice over, deliberately: (1) the probe now recovers a display environment from `systemctl --user show-environment` when the daemon's own has none, lazily and per call like `resolve_qdbus`, caching only successes and dropping a cached value the moment a child fails with it — this fixes existing installs and hand-started daemons with no user action; (2) the unit is `PartOf`/`After`/`WantedBy` `graphical-session.target`, so it starts with a display in reach and stops with the session (existing installs must re-enable once — README + pacman `post_upgrade` say so). A real failure now answers with a new `display_unavailable` code carrying the restart the user can run, instead of `shell_unreachable` behind an empty list. **Two measurements pinned in code:** `WAYLAND_DISPLAY` alone suffices, and `QT_QPA_PLATFORM=offscreen` must never be substituted — `kscreen-doctor` then HANGS instead of failing fast. Review found 1 real issue: the recovery added a full probe timeout to a path that already spends it twice and answers a manager request with a 10 s deadline → bounded to `min(probe timeout, 1500 ms)` with a test. Gates: nine unit tests, a stripped-environment case in `smoke-apply.sh` **verified to reproduce B1 against the pre-fix binary** plus a `display_unavailable` negative control, and a `check.sh` assertion on the unit's ordering (verified both ways). check.sh exit 0 (137 daemon tests), ctest 8/8. Also fixed a latent ETXTBSY flake this work surfaced in the pre-existing external-evaluator test. Reboot confirmation is the maintainer's, on their schedule. `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md`.
 - 2026-08-22 — **Three user reports triaged into the plan** (this session, no code changes): (1) **B1 outputs empty after reboot** — a *new* daemon-side defect, not a regression of `a747064`. `kwe-daemon.service` is `WantedBy=default.target` with no graphical-session ordering, so at boot the daemon starts before Plasma imports the session environment and has no `WAYLAND_DISPLAY`; the `kscreen-doctor -o` shell-out in `apply.rs:685` inherits that environment, cannot load a Qt platform plugin, and SIGABRTs → `wallpaper.outputs` answers `shell_unreachable` and the picker is empty. Confirmed live both ways (boot-started PID has no display env and fails; `systemctl --user restart kwe-daemon` after login enumerates `DP-1` fine — that restart is the workaround). Every apply test to date ran a terminal-started daemon inside the session, which is why no gate saw it. `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md`. (2) **B2 scene apply renders a blank desktop** — applying Workshop scene 1725674512 ("Aurora Borealis", scene.pkg) promoted cleanly and drew *nothing*: both `last-good-{a,b}.ppm` are 960x540 of a single colour `b2b2b2` = the scene's own 0.7 clearcolor, 518400/518400 pixels identical. Cause: model-referencing layers are skipped at parse (`scene.rs:551`, pinned by `model_json_references_skipped_as_m3h`) because scene3d is M3h — a scene built only from model layers registers zero drawables. Two defects follow: model skips are counted and logged **nowhere** (unlike text/video/particle skips), and a zero-drawable composite is accepted as a good frame and promoted. The honesty fix outlives M3h. `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md`. (3) **F1 scaling modes** (stretch/fill/aspect) — accepted; `FrameItem::imageDestination()` hardcodes `Qt::KeepAspectRatio`, and the surrounding work (pointer-coordinate mapping, an additive `scaling` field in `assignments-v1.json`, display-session transport, manager selector, and the 960x540-vs-output-geometry question) is the real scope. `docs/backlog/WALLPAPER_SCALING_MODES.md`.
@@ -58,10 +59,10 @@
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
-| BETA_M3 (scene, a–k) | M3a–M3g done; M4 complete — M3h (scene3d P1) is next |
+| BETA_M3 (scene, a–k) | M3a–M3g done; M4 complete — M3h (scene3d P1) after F1, and B2 made it the gate on 46 of 60 local scenes |
 | BETA_M4 (live apply) | M4a–M4d done |
 | BETA_M5 (release) | pending |
-| Open user-reported queue | B1 fixed; B2 next; F1 accepted — see below |
+| Open user-reported queue | B1 and B2 fixed; F1 next — see below |
 
 ## Open work queue (user-reported, ahead of M3h)
 
@@ -71,18 +72,21 @@ branch + adversarial review pass, same as a milestone slice.
 | # | Item | Kind | Status | Doc |
 |---|---|---|---|---|
 | B1 | No display outputs enumerated after a reboot | bug (high) | **fixed and merged** (`3d29272`+`1d332a9`); reboot confirmation pending | `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md` |
-| B2 | Applying a scene shows a blank/white background | bug (high) | diagnosed from the left-behind state | `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md` |
+| B2 | Applying a scene shows a blank/white background | bug (high) | **fixed and merged** (`77c6d3e`+`e6fff36`) | `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md` |
 | F1 | Wallpaper scaling modes (stretch / fill / aspect) | feature | accepted, unscheduled | `docs/backlog/WALLPAPER_SCALING_MODES.md` |
 
 **B1 first** — it blocks every boot, and it blocks testing the other two on a
-freshly booted machine. **Done 2026-08-22.** **B2 next** — the honesty half (count and report
-model-layer skips, refuse or visibly degrade a zero-drawable scene) is
-independent of M3h and should land before it, so M3h ships against a build
-that can already say what it does not support. **F1 third**, and it wants the
-render-resolution decision settled with it.
+freshly booted machine. **Done 2026-08-22.** **B2 second — done 2026-08-22**:
+the policy chosen was *refuse, not degrade to blank* (one drawable object is
+enough to apply; zero is a refusal), and it landed with the classification
+defect it uncovered. **F1 is next**, and it wants the render-resolution
+decision settled with it.
 
-BETA_M3h (scene3d P1) resumes after B1 and B2; F1 can be sequenced either side
-of it.
+BETA_M3h (scene3d P1) resumes after F1 — and B2 raised its priority: the
+refusal now tells 46 of 60 local scenes that this build cannot draw them,
+and M3h (with TEXV texture decoding, which it must carry) is what shrinks
+that set. External particle-definition files are the other half and are not
+in M3h's scope as written.
 
 ## Context
 
@@ -142,7 +146,7 @@ Format research contract first (docs/BETA_M3.md + docs/SCENE_FORMAT_V1.md): scen
 - **M3e** TextLayer via stb_truetype, bounded glyph atlas.
 - **M3f** ParticleSystem CPU-sim, bounded count (~4096).
 - **M3g done 2026-08-21** VideoLayer textures via libmpv (≤2 concurrent), synthetic frame/native-size/cap/bad-source evidence, bounded local/package policy, media transport, and compositor refresh safety.
-- **M3h** scene3d P1: .obj/.mtl parser, camera/lights, naga shader subset with fail-closed default.
+- **M3h** scene3d P1: .obj/.mtl parser, camera/lights, naga shader subset with fail-closed default. **B2 scope note (2026-08-22):** the corpus stores model textures as TEXV0005 `.tex` containers, so a TEXV decoder is on M3h's critical path — parsing models without it still draws nothing. Until then, model-only scenes are refused at preflight with a named reason rather than applied blank.
 - **M3i** AudioAnalyser (16/32/64 bands from daemon 64-band frames) + mouse/buttons/keyboard; `runtime.audio-scene-16-32-64` evidence.
 - **M3j** Properties: IProperty objects, `property_set` wire message (additive, protocol doc update), per-wallpaper persistence; manager property UI deferred to M4 (flagged in docs).
 - **M3k** Exit gate: bad scene → rollback → quarantine → reproducible report (`renderer_report` side file ≤8 KiB read by daemon); destructive suite (infinite loop, OOM, shader bomb, corrupt/oversized pkg); `runtime.scenescript` per-class coverage matrix; `plasmashell` PID unchanged.
