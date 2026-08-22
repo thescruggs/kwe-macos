@@ -1,8 +1,9 @@
 pkgbase = kde-wallpaper-engine
 	pkgdesc = Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon
 	pkgver = 0.1.0.alpha.1
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/kde-wallpaper-engine/kde-wallpaper-engine
+	install = kde-wallpaper-engine.install
 	arch = x86_64
 	license = Apache-2.0
 	makedepends = rust
