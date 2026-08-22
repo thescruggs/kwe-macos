@@ -470,7 +470,9 @@ QString ApplyClient::mapError(const QString &code, const QString &detail) {
     // B2: the daemon refuses a scene whose every layer needs a feature this
     // build does not have yet. The raw detail is a preflight sentence with a
     // file path in it; the user needs the "why", not the path, and they need
-    // to know their current wallpaper is untouched.
+    // to know their current wallpaper is untouched. The matched phrase is a
+    // contract with kwe-core preflight (no_drawable_content_reasons) — the
+    // refusal has no error code of its own, it arrives as invalid_params.
     if (detail.contains(QStringLiteral("draws nothing in this build"))) {
         const auto because = detail.section(QStringLiteral("draws nothing in this build:"), 1)
                                  .trimmed();

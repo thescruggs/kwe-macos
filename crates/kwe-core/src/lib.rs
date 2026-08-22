@@ -42,7 +42,7 @@ pub use scan::{
     ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,
 };
 pub use sceneobjects::{
-    SceneObjectKind, SceneObjectSummary, classify_scene_object, property_value,
+    SceneObjectKind, SceneObjectSummary, classify_scene_object, scene_property_value,
     summarize_scene_objects,
 };
 pub use webpreflight::{WebPreflight, preflight_web};

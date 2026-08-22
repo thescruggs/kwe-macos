@@ -70,8 +70,8 @@ impl SceneObjectKind {
 
 /// The property wrapper (`{"user": ..., "value": ...}`) the editor writes
 /// around user-bindable fields. Unwrapped before any field is read; the
-/// renderer's own `property_value` is the same rule.
-pub fn property_value(value: &Value) -> &Value {
+/// renderer's own `scene_property_value` is the same rule.
+pub fn scene_property_value(value: &Value) -> &Value {
     match value.as_object().and_then(|object| object.get("value")) {
         Some(inner) => inner,
         None => value,
@@ -82,7 +82,7 @@ pub fn property_value(value: &Value) -> &Value {
 /// classification order (image, video, particle, text), with the
 /// non-string `image` fall-through described in the module docs.
 pub fn classify_scene_object(object: &Map<String, Value>) -> SceneObjectKind {
-    let image = object.get("image").map(property_value);
+    let image = object.get("image").map(scene_property_value);
     if let Some(reference) = image.and_then(Value::as_str) {
         let lowercase = reference.to_ascii_lowercase();
         return if lowercase.ends_with(".json") {
@@ -96,13 +96,13 @@ pub fn classify_scene_object(object: &Map<String, Value>) -> SceneObjectKind {
     if object.contains_key("video") {
         return SceneObjectKind::Video;
     }
-    if let Some(definition) = object.get("particle").map(property_value) {
+    if let Some(definition) = object.get("particle").map(scene_property_value) {
         return match definition.as_object() {
             Some(fields)
                 if fields
                     .get("texture")
                     .or_else(|| fields.get("material"))
-                    .map(property_value)
+                    .map(scene_property_value)
                     .and_then(Value::as_str)
                     .is_some() =>
             {
@@ -144,8 +144,16 @@ impl SceneObjectSummary {
 
     /// Why a scene with no drawable object draws nothing, one clause per
     /// unsupported feature it actually uses. Empty when the scene has
-    /// drawable content or declares no objects at all — an empty scene is
-    /// the author's choice, not a missing feature.
+    /// drawable content, or when the only objects it declares are ones the
+    /// build ignores outright (audio, unknown kinds): an empty or
+    /// audio-only scene is the author's choice — and its script may still
+    /// animate the clear colour — not a missing feature.
+    ///
+    /// Every kind that REGISTERS something and still cannot draw must be
+    /// named here, or the two gates disagree: the worker refuses any scene
+    /// that registers objects and draws none of them, so a scene preflight
+    /// passed on silence would bounce a worker and roll back instead of
+    /// being refused cleanly.
     pub fn unsupported_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
         if self.models > 0 {
@@ -158,6 +166,12 @@ impl SceneObjectSummary {
             reasons.push(format!(
                 "{} layer(s) use TEXV (.tex) textures, which this build cannot decode yet",
                 self.texv_images
+            ));
+        }
+        if self.textureless_images > 0 {
+            reasons.push(format!(
+                "{} layer(s) have no image reference and draw nothing",
+                self.textureless_images
             ));
         }
         if self.particle_files > 0 {
@@ -313,6 +327,36 @@ mod tests {
 
     /// A scene with no objects at all is empty by authorship, not by
     /// missing features: no reasons to report.
+    /// The two gates must agree: the worker refuses a scene that registers
+    /// layers and draws none of them, so preflight must refuse the
+    /// textureless-only scene too rather than passing it into a rollback.
+    #[test]
+    fn textureless_only_scene_is_named_as_a_reason() {
+        let root: Value =
+            serde_json::from_str(r#"{"objects": [{"name": "ghost", "image": null}]}"#)
+                .expect("test scene");
+        let summary = summarize_scene_objects(&root);
+        assert_eq!(summary.drawable(), 0);
+        assert_eq!(summary.textureless_images, 1);
+        assert!(
+            summary.unsupported_reasons()[0].contains("no image reference"),
+            "{:?}",
+            summary.unsupported_reasons()
+        );
+    }
+
+    /// An audio-only scene registers nothing, so neither gate fires: the
+    /// scene is empty by authorship and its script may animate the clear
+    /// colour.
+    #[test]
+    fn audio_only_scene_reports_no_reasons() {
+        let root: Value =
+            serde_json::from_str(r#"{"objects": [{"sound": "s.mp3"}]}"#).expect("test scene");
+        let summary = summarize_scene_objects(&root);
+        assert_eq!(summary.other, 1);
+        assert!(summary.unsupported_reasons().is_empty());
+    }
+
     #[test]
     fn empty_scene_reports_no_reasons() {
         let root: Value = serde_json::from_str(r#"{"objects": []}"#).expect("test scene");

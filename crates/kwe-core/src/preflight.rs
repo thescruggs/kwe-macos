@@ -40,6 +40,12 @@ pub(crate) fn no_drawable_content_reasons(root: &serde_json::Value) -> Vec<Strin
     if unsupported.is_empty() {
         return Vec::new();
     }
+    // CONTRACT: the manager matches the "draws nothing in this build"
+    // phrase in the daemon's invalid_params detail to present this as a
+    // feature gap ("your current wallpaper is unchanged") instead of a
+    // rejected request (apps/kwe-manager/src/applyclient.cpp mapError).
+    // Rewording the prefix silently downgrades that message; change both
+    // sides together, or give the refusal its own error code first.
     vec![format!(
         "scene draws nothing in this build: {}",
         unsupported.join("; ")

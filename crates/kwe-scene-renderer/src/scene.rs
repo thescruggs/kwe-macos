@@ -18,7 +18,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use kwe_core::{SceneObjectKind, classify_scene_object};
+use kwe_core::{SceneObjectKind, classify_scene_object, scene_property_value};
 use serde_json::Value;
 
 use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
@@ -642,7 +642,8 @@ fn parse_objects(
                     counts.particle_system_skips += 1;
                     continue;
                 }
-                if property_value(object.get("particle").expect("caller checked")).is_string() {
+                if scene_property_value(object.get("particle").expect("caller checked")).is_string()
+                {
                     counts.particle_file_refs += 1;
                 }
                 particles.push(parse_particle_system(object, index)?);
@@ -723,7 +724,7 @@ fn parse_common_props(
         None => [0.0, 0.0],
         Some(value) => {
             let vector = parse_vector(
-                property_value(value),
+                scene_property_value(value),
                 &field(index, "origin"),
                 &[2, 3],
                 false,
@@ -738,7 +739,7 @@ fn parse_common_props(
         None => [0.0, 0.0, 0.0],
         Some(value) => {
             let mut vector = parse_vector(
-                property_value(value),
+                scene_property_value(value),
                 &field(index, "angles"),
                 &[2, 3],
                 false,
@@ -758,7 +759,7 @@ fn parse_common_props(
         None => [1.0, 1.0],
         Some(value) => {
             let vector = parse_vector(
-                property_value(value),
+                scene_property_value(value),
                 &field(index, "scale"),
                 &[2, 3],
                 false,
@@ -770,7 +771,7 @@ fn parse_common_props(
     let alpha = match object.get("alpha") {
         None => 1.0,
         Some(value) => {
-            let alpha = property_value(value).as_f64().ok_or_else(|| {
+            let alpha = scene_property_value(value).as_f64().ok_or_else(|| {
                 SceneError::new(
                     SceneErrorKind::Shape,
                     format!("scene.json \"{}\" must be a float", field(index, "alpha")),
@@ -791,7 +792,7 @@ fn parse_common_props(
 
     let visible = match object.get("visible") {
         None => true,
-        Some(value) => match property_value(value) {
+        Some(value) => match scene_property_value(value) {
             Value::Bool(visible) => *visible,
             _ => {
                 return Err(SceneError::new(
@@ -815,7 +816,7 @@ fn parse_common_props(
         .or_else(|| object.get("colorBlendMode"))
     {
         None => 0,
-        Some(value) => match property_value(value).as_f64() {
+        Some(value) => match scene_property_value(value).as_f64() {
             Some(mode) if mode.is_finite() && mode >= 0.0 && mode <= f64::from(u32::MAX) => {
                 mode as u32
             }
@@ -833,7 +834,7 @@ fn parse_common_props(
     let brightness = match object.get("brightness") {
         None => 1.0,
         Some(value) => {
-            let value = property_value(value);
+            let value = scene_property_value(value);
             let brightness = if let Some(number) = value.as_f64() {
                 number
             } else if let Some(text) = value.as_str() {
@@ -887,7 +888,7 @@ fn parse_image_layer(
     // until user properties arrive (M3j); the wrapper is unwrapped here,
     // and a wrapped scalar without a value rejects like any malformed
     // scalar.
-    let image = match property_value(object.get("image").expect("caller checked")) {
+    let image = match scene_property_value(object.get("image").expect("caller checked")) {
         Value::String(reference) => Some(reference.clone()),
         _ => None,
     };
@@ -895,7 +896,12 @@ fn parse_image_layer(
     let size = match object.get("size") {
         None => [0.0, 0.0],
         Some(value) => {
-            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
+            let vector = parse_vector(
+                scene_property_value(value),
+                &field(index, "size"),
+                &[2],
+                true,
+            )?;
             [vector[0], vector[1]]
         }
     };
@@ -906,8 +912,12 @@ fn parse_image_layer(
     let tint = match object.get("tint").or_else(|| object.get("color")) {
         None => [1.0, 1.0, 1.0, 1.0],
         Some(value) => {
-            let vector =
-                parse_vector(property_value(value), &field(index, "tint"), &[3, 4], false)?;
+            let vector = parse_vector(
+                scene_property_value(value),
+                &field(index, "tint"),
+                &[3, 4],
+                false,
+            )?;
             let mut tint = [1.0, 1.0, 1.0, 1.0];
             for (slot, component) in tint.iter_mut().zip(vector.iter()) {
                 *slot = crate::layers::clamp_layer_tint(f64::from(*component));
@@ -949,11 +959,11 @@ fn parse_text_layer(
 ) -> Result<LayerSpec, SceneError> {
     let common = parse_common_props(object, index, "text")?;
 
-    let text = match property_value(object.get("text").expect("caller checked")) {
+    let text = match scene_property_value(object.get("text").expect("caller checked")) {
         Value::String(s) => s.clone(),
         _ => String::new(),
     };
-    let font = match object.get("font").map(property_value) {
+    let font = match object.get("font").map(scene_property_value) {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     };
@@ -964,7 +974,7 @@ fn parse_text_layer(
     let pointsize = match object.get("pointsize") {
         None => crate::text::DEFAULT_POINT_SIZE * crate::text::POINT_TO_PX,
         Some(value) => {
-            let value = property_value(value);
+            let value = scene_property_value(value);
             let pointsize = if let Some(number) = value.as_f64() {
                 number
             } else if let Some(text) = value.as_str() {
@@ -1002,7 +1012,7 @@ fn parse_text_layer(
         None => [1.0, 1.0, 1.0, 1.0],
         Some(value) => {
             let vector = parse_vector(
-                property_value(value),
+                scene_property_value(value),
                 &field(index, "color"),
                 &[3, 4],
                 false,
@@ -1061,7 +1071,7 @@ fn parse_video_layer(
 ) -> Result<LayerSpec, SceneError> {
     let common = parse_common_props(object, index, "video")?;
 
-    let source = match property_value(object.get("video").expect("caller checked")) {
+    let source = match scene_property_value(object.get("video").expect("caller checked")) {
         Value::String(reference) => Some(reference.clone()),
         _ => None,
     };
@@ -1069,7 +1079,12 @@ fn parse_video_layer(
     let size = match object.get("size") {
         None => [0.0, 0.0],
         Some(value) => {
-            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
+            let vector = parse_vector(
+                scene_property_value(value),
+                &field(index, "size"),
+                &[2],
+                true,
+            )?;
             [vector[0], vector[1]]
         }
     };
@@ -1079,8 +1094,12 @@ fn parse_video_layer(
     let tint = match object.get("tint").or_else(|| object.get("color")) {
         None => [1.0, 1.0, 1.0, 1.0],
         Some(value) => {
-            let vector =
-                parse_vector(property_value(value), &field(index, "tint"), &[3, 4], false)?;
+            let vector = parse_vector(
+                scene_property_value(value),
+                &field(index, "tint"),
+                &[3, 4],
+                false,
+            )?;
             let mut tint = [1.0, 1.0, 1.0, 1.0];
             for (slot, component) in tint.iter_mut().zip(vector.iter()) {
                 *slot = crate::layers::clamp_layer_tint(f64::from(*component));
@@ -1093,7 +1112,7 @@ fn parse_video_layer(
     // hostile or sloppy `rate` costs the user a speed, never the scene. A
     // non-boolean `loop` falls back to the default rather than rejecting,
     // for the same reason.
-    let loop_playback = match object.get("loop").map(property_value) {
+    let loop_playback = match object.get("loop").map(scene_property_value) {
         None | Some(Value::Null) => true,
         Some(Value::Bool(value)) => *value,
         // The editor serializes some scalars as strings; accept the two
@@ -1105,7 +1124,7 @@ fn parse_video_layer(
         Some(Value::Number(number)) => number.as_f64().is_none_or(|value| value != 0.0),
         Some(_) => true,
     };
-    let rate = match object.get("rate").map(property_value) {
+    let rate = match object.get("rate").map(scene_property_value) {
         None | Some(Value::Null) => 1.0,
         Some(value) => {
             let raw = value
@@ -1189,7 +1208,8 @@ fn parse_particle_system(
 ) -> Result<ParticleSpec, SceneError> {
     let common = parse_common_props(object, index, "particle")?;
     let mut spec = particle_spec_defaults(common, index);
-    let Value::Object(definition) = property_value(object.get("particle").expect("caller checked"))
+    let Value::Object(definition) =
+        scene_property_value(object.get("particle").expect("caller checked"))
     else {
         return Ok(spec); // file reference or malformed value: defaults
     };
@@ -1200,7 +1220,7 @@ fn parse_particle_system(
         let Some(value) = definition.get(name) else {
             return Ok(clamp(fallback));
         };
-        let value = property_value(value);
+        let value = scene_property_value(value);
         let number = if let Some(number) = value.as_f64() {
             number
         } else if let Some(text) = value.as_str() {
@@ -1293,7 +1313,7 @@ fn parse_particle_system(
         None => particles::DEFAULT_PARTICLE_GRAVITY,
         Some(value) => {
             let vector = parse_vector(
-                property_value(value),
+                scene_property_value(value),
                 &field(index, "gravity"),
                 &[1, 2, 3],
                 false,
@@ -1312,7 +1332,7 @@ fn parse_particle_system(
 
     // maxCount (the WE key): the live-particle cap, 1..=MAX_PARTICLES.
     if let Some(value) = definition.get("maxCount") {
-        let value = property_value(value);
+        let value = scene_property_value(value);
         let count = if let Some(number) = value.as_u64() {
             number
         } else if let Some(text) = value.as_str() {
@@ -1344,7 +1364,7 @@ fn parse_particle_system(
     let material = definition
         .get("texture")
         .or_else(|| definition.get("material"));
-    spec.material = match material.map(property_value) {
+    spec.material = match material.map(scene_property_value) {
         Some(Value::String(reference)) => Some(reference.clone()),
         _ => None,
     };
@@ -1364,7 +1384,12 @@ fn parse_particle_color(
     let Some(value) = definition.get(name) else {
         return Ok([1.0, 1.0, 1.0, 1.0]);
     };
-    let vector = parse_vector(property_value(value), &field(index, name), &[3, 4], false)?;
+    let vector = parse_vector(
+        scene_property_value(value),
+        &field(index, name),
+        &[3, 4],
+        false,
+    )?;
     let mut color = [1.0, 1.0, 1.0, 1.0];
     for (slot, component) in color.iter_mut().zip(vector.iter()) {
         *slot = particles::clamp_color_component(f64::from(*component));
@@ -1397,14 +1422,14 @@ fn parse_text_align(
     };
     let resolve =
         |s: &str| -> HorizontalAlign { HorizontalAlign::parse(s).unwrap_or_else(|| polarity(s)) };
-    if let Some(Some(value)) = object.get(key).map(property_value).map(Value::as_str)
+    if let Some(Some(value)) = object.get(key).map(scene_property_value).map(Value::as_str)
         && !value.is_empty()
     {
         return resolve(value);
     }
     if let Some(Some(alignment)) = object
         .get("alignment")
-        .map(property_value)
+        .map(scene_property_value)
         .map(Value::as_str)
     {
         return resolve(alignment);
@@ -1416,7 +1441,7 @@ fn parse_text_align(
 fn parse_text_align_v(object: &serde_json::Map<String, Value>, key: &str) -> VerticalAlign {
     // Exact vertical words first; combined strings ("top-left") fall
     // through to the shared polarity parser (top -> Left -> Top).
-    if let Some(Some(value)) = object.get(key).map(property_value).map(Value::as_str)
+    if let Some(Some(value)) = object.get(key).map(scene_property_value).map(Value::as_str)
         && !value.is_empty()
         && let Some(align) = VerticalAlign::parse(value)
     {
@@ -1431,12 +1456,6 @@ fn parse_text_align_v(object: &serde_json::Map<String, Value>, key: &str) -> Ver
 
 fn field(index: usize, name: &str) -> String {
     format!("objects[{index}].{name}")
-}
-
-/// Unwrap a property-wrapped value (`{"user": ..., "value": ...}`) to its
-/// `value`; anything else passes through unchanged.
-fn property_value(value: &Value) -> &Value {
-    kwe_core::property_value(value)
 }
 
 /// Parse a WE vector field: the space-separated string form the editor
