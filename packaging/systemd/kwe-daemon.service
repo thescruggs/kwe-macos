@@ -4,15 +4,25 @@ Description=KDE Wallpaper Engine user service
 Documentation=man:kwe-daemon(1)
 StartLimitIntervalSec=30s
 StartLimitBurst=5
+# Session-scoped, per systemd.special(7). The daemon enumerates outputs by
+# running kscreen-doctor, a Qt GUI program that needs WAYLAND_DISPLAY in its
+# environment; a unit started from default.target comes up before the session
+# imports that environment, so the enumeration aborted and Apply had no
+# outputs to offer (docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md). Ordering after
+# graphical-session.target starts the daemon with a display already in hand,
+# and PartOf= stops it with the session it belongs to.
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/kwe-daemon --state-dir=${STATE_DIRECTORY}
-# Restart=always, not on-failure: a clean stop at session teardown is not a
-# failure, yet the desktop must not lose its wallpaper service when the next
-# session starts. StartLimitBurst/IntervalSec in [Unit] bound restart loops,
-# and an explicit `systemctl --user stop kwe-daemon` still wins because
-# systemd does not restart a unit stopped by the administrator.
+# Restart=always, not on-failure: the desktop must not lose its wallpaper
+# service to a crash, and a clean exit is not automatically a deliberate one.
+# Session teardown is no longer this directive's problem — PartOf= in [Unit]
+# stops the unit with the session, and a unit systemd stopped is not
+# restarted. StartLimitBurst/IntervalSec in [Unit] bound restart loops, and an
+# explicit `systemctl --user stop kwe-daemon` still wins.
 Restart=always
 RestartSec=2s
 RuntimeDirectory=kwe
@@ -51,4 +61,9 @@ TimeoutStopSec=5s
 # DRM render nodes and graphics drivers may need executable shader mappings.
 
 [Install]
-WantedBy=default.target
+# graphical-session.target, not default.target: default.target is reached at
+# login before any display exists (see the [Unit] comment). Upgrades from a
+# release that installed into default.target must re-enable the unit —
+# `systemctl --user disable kwe-daemon && systemctl --user enable --now
+# kwe-daemon` — because the old symlink lives in the user's own config.
+WantedBy=graphical-session.target

@@ -7,4 +7,10 @@ post_install() {
 
 post_upgrade() {
     post_install
+    echo ":: If you enabled the service before this release, re-enable it once:"
+    echo "     systemctl --user disable kwe-daemon.service"
+    echo "     systemctl --user enable --now kwe-daemon.service"
+    echo ":: The unit moved from default.target to graphical-session.target so"
+    echo ":: it starts with a display in reach; the old symlink starts it too"
+    echo ":: early and leaves the output picker empty."
 }

@@ -479,6 +479,10 @@ QString ApplyClient::mapError(const QString &code, const QString &detail) {
         return detail.isEmpty()
             ? tr("This wallpaper cannot be applied in its current form")
             : tr("This wallpaper cannot be applied in its current form: %1").arg(detail);
+    if (code == QStringLiteral("display_unavailable"))
+        return tr("The wallpaper service started before the desktop session and "
+                  "cannot see your displays. Restart it with `systemctl --user "
+                  "restart kwe-daemon`, then try again.");
     if (code == QStringLiteral("shell_unreachable"))
         return detail.isEmpty()
             ? tr("The Plasma desktop could not be reached; nothing was changed.")

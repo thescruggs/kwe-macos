@@ -205,6 +205,12 @@ struct Arguments {
     /// kscreen-doctor binary used for the read-only output enumeration.
     #[arg(long, default_value = "kscreen-doctor")]
     kscreen_doctor_binary: PathBuf,
+    /// systemctl binary used to recover a display environment when the
+    /// daemon's own has none — a unit started before the desktop session
+    /// (BETA B1). None resolves `systemctl` on PATH, and the daemon starts
+    /// fine on systems without it (the recovery reports lazily).
+    #[arg(long)]
+    systemctl_binary: Option<PathBuf>,
     /// Deadline for every live Plasma probe (enumeration, switch, restore).
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u64).range(500..=30000))]
     apply_probe_timeout_ms: u64,
@@ -370,6 +376,7 @@ fn main() -> Result<()> {
             qdbus_binary: arguments.qdbus_binary,
             switch_command: arguments.plasma_switch_command,
             kscreen_binary: arguments.kscreen_doctor_binary,
+            systemctl_binary: arguments.systemctl_binary,
             probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
             promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
         },

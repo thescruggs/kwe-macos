@@ -335,9 +335,15 @@ format, and safe-mode restore contract are documented in
 
 Error responses (all fail closed; detail is bounded): `invalid_params`,
 `apply_unknown_wallpaper`, `apply_incompatible`, `output_missing`,
-`apply_busy` (no detail), `shell_unreachable`, `apply_failed` (already
-rolled back), `restore_failed`, and `apply_unavailable` when the daemon
-has no apply lane.
+`apply_busy` (no detail), `shell_unreachable`, `display_unavailable`,
+`apply_failed` (already rolled back), `restore_failed`, and
+`apply_unavailable` when the daemon has no apply lane.
+
+`display_unavailable` is the narrow case where the enumeration never ran
+because no display server was in reach — a daemon started before its desktop
+session, which cannot enumerate outputs and reports so with an actionable
+detail rather than an empty list. The daemon first tries to recover a display
+environment from the systemd user manager; this code means that failed too.
 
 The switch/restore/probe scripts are executed with
 `qdbus <service> /PlasmaShell evaluateScript <script>` — no shell, argv

@@ -35,6 +35,17 @@ user systemd unit. After installing, enable the daemon user service:
 systemctl --user enable --now kwe-daemon.service
 ```
 
+The unit is part of the graphical session, so it starts once the desktop is
+up and stops with it. **Upgrading from a release before this change:** the old
+enablement symlink points at `default.target` and keeps starting the daemon
+before the session exists, which leaves the output picker empty until the
+service is restarted. Re-enable it once:
+
+```sh
+systemctl --user disable kwe-daemon.service
+systemctl --user enable --now kwe-daemon.service
+```
+
 The manager also starts the service on demand when it is not running, and
 surfaces a manual `systemctl --user start kwe-daemon` hint if activation
 fails.

@@ -45,8 +45,13 @@ steam_root="$smoke_root/steam"
 # (BETA_M4a review fix 5).
 scene_json="$steam_root/steamapps/workshop/content/431960/1/scene.json"
 daemon_pid=""
+stripped_pid=""
 
 cleanup() {
+    if [[ -n "$stripped_pid" ]]; then
+        kill "$stripped_pid" 2>/dev/null || true
+        wait "$stripped_pid" 2>/dev/null || true
+    fi
     if [[ -n "$daemon_pid" ]]; then
         kill "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
@@ -91,6 +96,48 @@ start_daemon() {
     done
     echo "daemon socket did not appear" >&2
     return 1
+}
+
+# Starts a daemon with ONLY the environment a systemd user unit provides —
+# no WAYLAND_DISPLAY, no DISPLAY — which is what the boot path hands it
+# (BETA B1, docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md). Everything else about
+# the run is identical; extra arguments are appended.
+start_stripped_daemon() {
+    local socket_path="$1" state_path="$2" log_path="$3"
+    shift 3
+    mkdir -p "$state_path" "$smoke_root/stripped-runtime"
+    env -i \
+        HOME="$HOME" \
+        PATH="$PATH" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}" \
+        STEAM_ROOT="$steam_root" \
+        "$target_dir/debug/kwe-daemon" \
+        --socket "$socket_path" \
+        --renderer "$target_dir/debug/kwe-test-renderer" \
+        --renderer-runtime-dir "$smoke_root/stripped-runtime" \
+        --state-dir "$state_path" \
+        "$@" >"$log_path" 2>&1 &
+    stripped_pid=$!
+    for _attempt in {1..100}; do
+        [[ -S "$socket_path" ]] && return
+        kill -0 "$stripped_pid" 2>/dev/null || {
+            echo "stripped-environment daemon exited during startup" >&2
+            sed -n '1,120p' "$log_path" >&2
+            return 1
+        }
+        sleep 0.02
+    done
+    echo "stripped-environment daemon socket did not appear" >&2
+    return 1
+}
+
+stop_stripped_daemon() {
+    if [[ -n "$stripped_pid" ]]; then
+        kill "$stripped_pid" 2>/dev/null || true
+        wait "$stripped_pid" 2>/dev/null || true
+        stripped_pid=""
+    fi
 }
 
 command -v jq >/dev/null
@@ -172,5 +219,56 @@ restore="$(call_daemon wallpaper.restore '{"output":"Synthetic-1"}' || true)"
 [[ "$(jq -r '.ok' <<<"$restore")" == "false" ]]
 [[ "$(jq -r '.result.error' <<<"$restore")" == "output_missing" ]]
 echo "apply smoke: restore on a nonexistent output -> output_missing passed"
+
+# --- BETA B1: the boot path ------------------------------------------------
+# Before the fix, a daemon with no display in its environment ran
+# kscreen-doctor (a QGuiApplication), which aborted on SIGABRT, and
+# wallpaper.outputs answered shell_unreachable with an empty picker behind
+# it. This is the case that reproduces that without a reboot.
+stripped_socket="$smoke_root/stripped.sock"
+start_stripped_daemon "$stripped_socket" "$smoke_root/stripped-state" \
+    "$smoke_root/stripped-daemon.log"
+stripped_outputs="$("$target_dir/debug/kwe" daemon-call --socket "$stripped_socket" \
+    --method wallpaper.outputs --params '{}' || true)"
+if [[ "$(jq -r '.ok' <<<"$stripped_outputs")" != "true" ]]; then
+    echo "FAILED: enumeration from a unit-like environment did not succeed" >&2
+    echo "        (BETA B1 regression: the daemon could not recover a display)" >&2
+    jq -c '.result' <<<"$stripped_outputs" >&2
+    exit 1
+fi
+if [[ "$(jq -r '.result.outputs | length' <<<"$stripped_outputs")" == "0" ]]; then
+    echo "FAILED: enumeration from a unit-like environment returned no outputs" >&2
+    exit 1
+fi
+jq -r '.result.outputs[] | "output " + .name' <<<"$stripped_outputs"
+echo "apply smoke: enumeration with no display in the environment passed (BETA B1)"
+stop_stripped_daemon
+
+# Negative control: when the recovery genuinely finds no display, the daemon
+# must say display_unavailable with something the user can act on — never an
+# empty output list presented as success.
+no_display_stub="$smoke_root/systemctl-no-display.sh"
+cat >"$no_display_stub" <<'EOF'
+#!/bin/sh
+# Stands in for `systemctl --user show-environment` on a session that has
+# not started yet: a valid answer with no display in it.
+echo "LANG=en_US.UTF-8"
+echo "XDG_RUNTIME_DIR=/run/user/1000"
+EOF
+chmod +x "$no_display_stub"
+start_stripped_daemon "$smoke_root/nodisplay.sock" "$smoke_root/nodisplay-state" \
+    "$smoke_root/nodisplay-daemon.log" --systemctl-binary "$no_display_stub"
+no_display="$("$target_dir/debug/kwe" daemon-call --socket "$smoke_root/nodisplay.sock" \
+    --method wallpaper.outputs --params '{}' || true)"
+[[ "$(jq -r '.ok' <<<"$no_display")" == "false" ]]
+if [[ "$(jq -r '.result.error' <<<"$no_display")" != "display_unavailable" ]]; then
+    echo "FAILED: expected display_unavailable, got:" >&2
+    jq -c '.result' <<<"$no_display" >&2
+    exit 1
+fi
+detail="$(jq -r '.result.detail' <<<"$no_display")"
+[[ "$detail" == *"restart kwe-daemon"* ]]
+echo "apply smoke: no recoverable display -> display_unavailable passed (BETA B1)"
+stop_stripped_daemon
 
 echo "all apply smoke cases passed"

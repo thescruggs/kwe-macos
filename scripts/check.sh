@@ -5,6 +5,24 @@ set -euo pipefail
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
+# The half of BETA B1 that no runtime test covers: the unit must stay part of
+# the graphical session, or the daemon goes back to starting before any
+# display exists (docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md).
+unit_file="packaging/systemd/kwe-daemon.service"
+for directive in "PartOf=graphical-session.target" \
+                 "After=graphical-session.target" \
+                 "WantedBy=graphical-session.target"; do
+    if ! grep -qx -- "$directive" "$unit_file"; then
+        echo "FAILED: $unit_file is missing '$directive'" >&2
+        echo "        (BETA B1: the daemon must start with the graphical session)" >&2
+        exit 1
+    fi
+done
+if grep -qx -- "WantedBy=default.target" "$unit_file"; then
+    echo "FAILED: $unit_file installs into default.target again (BETA B1)" >&2
+    exit 1
+fi
+
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets

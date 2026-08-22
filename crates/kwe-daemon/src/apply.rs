@@ -440,13 +440,16 @@ pub fn probe_script(connector_names: &[String]) -> Result<String, String> {
 
 /// Why a shell probe failed. `Unreachable` means the shell or its tooling
 /// could not be reached at all; `Rejected` means it ran and refused; both
-/// carry bounded detail.
+/// carry bounded detail. `DisplayUnavailable` is the narrower case where the
+/// probe never ran because there is no display server to talk to — the user
+/// can fix that one, so it stays distinct from `Unreachable`.
 #[derive(Debug, Clone)]
 pub enum ProbeError {
     Unreachable(String),
     Rejected(String),
     TimedOut(String),
     Parse(String),
+    DisplayUnavailable(String),
 }
 
 impl std::fmt::Display for ProbeError {
@@ -456,6 +459,7 @@ impl std::fmt::Display for ProbeError {
             ProbeError::Rejected(detail) => write!(formatter, "{detail}"),
             ProbeError::TimedOut(detail) => write!(formatter, "{detail}"),
             ProbeError::Parse(detail) => write!(formatter, "{detail}"),
+            ProbeError::DisplayUnavailable(detail) => write!(formatter, "{detail}"),
         }
     }
 }
@@ -612,6 +616,14 @@ enum ShellEvaluator {
 pub struct QdbusShellProbe {
     evaluator: ShellEvaluator,
     kscreen_binary: PathBuf,
+    systemctl_binary: Option<PathBuf>,
+    ambient: AmbientDisplay,
+    /// A display environment recovered from the systemd user manager, kept
+    /// so the recovery shell-out runs once rather than per enumeration.
+    /// Only SUCCESSFUL recoveries are cached: a daemon that started before
+    /// its session must keep asking, and a stale entry is dropped the
+    /// moment the enumeration child fails with it (`system_outputs`).
+    display_env: Mutex<Option<Vec<(String, String)>>>,
     timeout: Duration,
 }
 
@@ -621,6 +633,7 @@ impl QdbusShellProbe {
         qdbus_binary: Option<PathBuf>,
         switch_command: Option<PathBuf>,
         kscreen_binary: PathBuf,
+        systemctl_binary: Option<PathBuf>,
         timeout: Duration,
     ) -> Self {
         Self {
@@ -632,9 +645,182 @@ impl QdbusShellProbe {
                 },
             },
             kscreen_binary,
+            systemctl_binary,
+            ambient: AmbientDisplay::FromProcessEnv,
+            display_env: Mutex::new(None),
             timeout,
         }
     }
+
+    /// Test-only: pin the ambient answer to "no display". The process
+    /// environment of a running test binary cannot be mutated safely, and
+    /// the recovery path is exactly what these tests are about.
+    #[cfg(test)]
+    fn without_ambient_display(mut self) -> Self {
+        self.ambient = AmbientDisplay::Absent;
+        self
+    }
+
+    /// The display variables the enumeration child needs on top of the
+    /// daemon's own environment.
+    ///
+    /// `kscreen-doctor` is a `QGuiApplication`: handed an environment with
+    /// no `WAYLAND_DISPLAY` (or `DISPLAY`) it cannot load a Qt platform
+    /// plugin and dies on SIGABRT. That is exactly the environment systemd
+    /// hands a daemon started at boot, because Plasma imports the session
+    /// environment into the user manager only at login — after the unit is
+    /// already running. See `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md`.
+    ///
+    /// So: inherit unchanged when the daemon already has a display, and
+    /// otherwise recover one from the systemd user manager — the same
+    /// environment a restart of the unit would have inherited. Resolution
+    /// is lazy and per call, exactly like `resolve_qdbus`: the daemon may
+    /// legitimately start before any session exists, and enumeration only
+    /// ever runs once somebody is logged in and asking.
+    ///
+    /// `evaluate_script` deliberately does NOT use this. `qdbus` is a
+    /// `QCoreApplication` and reaches plasmashell over the session bus with
+    /// no display at all; only the KScreen enumeration needs one.
+    ///
+    /// Never substitute `QT_QPA_PLATFORM=offscreen` for a real display:
+    /// measured 2026-08-22, `kscreen-doctor` then HANGS until it is killed
+    /// instead of failing fast, turning a clear error into a probe timeout.
+    fn display_env(&self) -> Result<Vec<(String, String)>, ProbeError> {
+        if self.ambient.present() {
+            return Ok(Vec::new());
+        }
+        if let Ok(cached) = self.display_env.lock()
+            && let Some(entries) = cached.as_ref()
+        {
+            return Ok(entries.clone());
+        }
+        let entries = self.recover_display_env()?;
+        if let Ok(mut cached) = self.display_env.lock() {
+            *cached = Some(entries.clone());
+        }
+        Ok(entries)
+    }
+
+    /// Drops a cached recovery so the next enumeration resolves again.
+    /// Called when the child failed while running with recovered values —
+    /// the session may have restarted under a different display.
+    fn forget_display_env(&self) {
+        if let Ok(mut cached) = self.display_env.lock() {
+            *cached = None;
+        }
+    }
+
+    /// Reads `systemctl --user show-environment` through the same bounded
+    /// child machinery as every other probe and keeps the display keys.
+    fn recover_display_env(&self) -> Result<Vec<(String, String)>, ProbeError> {
+        let binary = resolve_systemctl(&self.systemctl_binary)?;
+        let mut command = Command::new(binary);
+        command.arg("--user").arg("show-environment");
+        let outcome = run_bounded(&mut command, self.timeout).map_err(|error| {
+            ProbeError::DisplayUnavailable(format!(
+                "{DISPLAY_UNAVAILABLE_HINT} (systemctl show-environment: {error})"
+            ))
+        })?;
+        if !outcome.status.success() {
+            return Err(ProbeError::DisplayUnavailable(format!(
+                "{DISPLAY_UNAVAILABLE_HINT} (systemctl show-environment exited {})",
+                outcome.status
+            )));
+        }
+        let entries = parse_display_env(&String::from_utf8_lossy(&outcome.stdout));
+        if entries.is_empty() {
+            return Err(ProbeError::DisplayUnavailable(
+                DISPLAY_UNAVAILABLE_HINT.to_string(),
+            ));
+        }
+        Ok(entries)
+    }
+}
+
+/// How `display_env` learns whether the daemon's own environment already
+/// names a display. Production reads the process environment; tests pin the
+/// answer, because mutating the environment of a running test binary is a
+/// data race, not a fixture.
+#[derive(Debug, Clone, Copy)]
+enum AmbientDisplay {
+    FromProcessEnv,
+    #[cfg(test)]
+    Absent,
+}
+
+impl AmbientDisplay {
+    fn present(self) -> bool {
+        match self {
+            AmbientDisplay::FromProcessEnv => DISPLAY_ENV_KEYS
+                .iter()
+                .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty())),
+            #[cfg(test)]
+            AmbientDisplay::Absent => false,
+        }
+    }
+}
+
+/// The variables that let a Qt GUI program find its display, most specific
+/// first. Both are forwarded when both are known: `kscreen-doctor` picks
+/// the platform plugin itself, and guessing for it is what hangs.
+const DISPLAY_ENV_KEYS: [&str; 2] = ["WAYLAND_DISPLAY", "DISPLAY"];
+
+/// Longest display value accepted from the manager environment. A Wayland
+/// display is a socket name or a path to one; anything longer is not a
+/// display, it is someone else's data.
+const MAX_DISPLAY_VALUE_BYTES: usize = 128;
+
+/// Said to the user, not just logged: this failure has a fix they can run.
+const DISPLAY_UNAVAILABLE_HINT: &str = "the wallpaper service cannot reach the display server \
+(it started before the desktop session did); run `systemctl --user restart kwe-daemon`";
+
+/// Resolves the systemctl binary: an explicit path wins, else `systemctl`
+/// from PATH. Resolved per call for the same reason as `resolve_qdbus`.
+fn resolve_systemctl(systemctl_binary: &Option<PathBuf>) -> Result<PathBuf, ProbeError> {
+    if let Some(path) = systemctl_binary {
+        return Ok(path.clone());
+    }
+    find_in_path(std::env::var_os("PATH").as_deref(), &["systemctl"]).ok_or_else(|| {
+        ProbeError::DisplayUnavailable(format!(
+            "{DISPLAY_UNAVAILABLE_HINT} (systemctl is not on PATH)"
+        ))
+    })
+}
+
+/// Picks the display keys out of `systemctl show-environment` output:
+/// `KEY=VALUE` per line, unknown keys ignored. systemd shell-quotes values
+/// that need it, so one layer of surrounding double quotes is stripped;
+/// anything that is not a plain printable token is dropped rather than
+/// handed to a child process — the daemon builds its children's inputs, it
+/// does not forward whatever it was told.
+fn parse_display_env(text: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !DISPLAY_ENV_KEYS.contains(&key) {
+            continue;
+        }
+        let value = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(value);
+        if valid_display_value(value) {
+            entries.push((key.to_string(), value.to_string()));
+        }
+    }
+    entries
+}
+
+/// A display value is a bounded, non-empty run of printable ASCII with no
+/// whitespace and no quoting characters.
+fn valid_display_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_DISPLAY_VALUE_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\'' | b'`' | b'$' | b'\\')
+        })
 }
 
 /// Resolves the qdbus binary: an explicit path wins, else `qdbus` then
@@ -683,17 +869,36 @@ impl ShellProbe for QdbusShellProbe {
     }
 
     fn system_outputs(&self) -> Result<Vec<SystemOutput>, ProbeError> {
+        let recovered = self.display_env()?;
         let mut command = Command::new(&self.kscreen_binary);
         command.arg("-o");
-        let outcome = run_bounded(&mut command, self.timeout)
-            .map_err(|error| classify_probe_failure(&format!("kscreen-doctor: {error}")))?;
+        for (key, value) in &recovered {
+            command.env(key, value);
+        }
+        // A child that failed while running on RECOVERED values may have
+        // been handed a display that no longer exists (the session
+        // restarted under a new one). Drop the cache on any failure so the
+        // next enumeration resolves again instead of repeating a stale
+        // answer; an inherited environment is the daemon's own and is not
+        // ours to forget.
+        let forget_on_failure = |probe_error| {
+            if !recovered.is_empty() {
+                self.forget_display_env();
+            }
+            probe_error
+        };
+        let outcome = run_bounded(&mut command, self.timeout).map_err(|error| {
+            forget_on_failure(classify_probe_failure(&format!("kscreen-doctor: {error}")))
+        })?;
         if !outcome.status.success() {
             let detail = String::from_utf8_lossy(&outcome.stderr).trim().to_string();
-            return Err(ProbeError::Rejected(if detail.is_empty() {
-                format!("kscreen-doctor exited {}", outcome.status)
-            } else {
-                detail
-            }));
+            return Err(forget_on_failure(ProbeError::Rejected(
+                if detail.is_empty() {
+                    format!("kscreen-doctor exited {}", outcome.status)
+                } else {
+                    detail
+                },
+            )));
         }
         let text = String::from_utf8_lossy(&outcome.stdout);
         Ok(parse_kscreen_doctor(&text))
@@ -1016,6 +1221,10 @@ pub struct ApplyConfig {
     /// the real qdbus path by leaving it unset.
     pub switch_command: Option<PathBuf>,
     pub kscreen_binary: PathBuf,
+    /// Explicit systemctl binary; None resolves `systemctl` on PATH. Used
+    /// only to recover a display environment for the enumeration child
+    /// (`QdbusShellProbe::display_env`).
+    pub systemctl_binary: Option<PathBuf>,
     /// Deadline for every probe (enumeration, switch, restore).
     pub probe_timeout: Duration,
     /// Deadline for the renderer to reach a live phase after start.
@@ -1043,10 +1252,24 @@ pub enum ApplyError {
     Yielded(String),
     /// The Plasma shell or its tooling could not be reached.
     ShellUnreachable(String),
+    /// The output enumeration never ran: there is no display server in
+    /// reach. Distinct from `ShellUnreachable` because the user has a fix
+    /// (BETA B1, `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md`).
+    DisplayUnavailable(String),
     /// A step of the apply transaction failed (already rolled back).
     Transaction(String),
     /// The restore script could not be executed.
     RestoreFailed(String),
+}
+
+/// Enumeration failures are `shell_unreachable` as they always were, with
+/// one exception carried through intact: "there is no display server" is a
+/// state the user can fix, so it keeps its own code all the way to the UI.
+fn enumeration_error(error: ProbeError) -> ApplyError {
+    match error {
+        ProbeError::DisplayUnavailable(detail) => ApplyError::DisplayUnavailable(detail),
+        other => ApplyError::ShellUnreachable(other.to_string()),
+    }
 }
 
 impl ApplyError {
@@ -1059,6 +1282,7 @@ impl ApplyError {
             ApplyError::Busy => "apply_busy",
             ApplyError::Yielded(_) => "apply_yielded",
             ApplyError::ShellUnreachable(_) => "shell_unreachable",
+            ApplyError::DisplayUnavailable(_) => "display_unavailable",
             ApplyError::Transaction(_) => "apply_failed",
             ApplyError::RestoreFailed(_) => "restore_failed",
         }
@@ -1072,6 +1296,7 @@ impl ApplyError {
             | ApplyError::OutputMissing(detail)
             | ApplyError::Yielded(detail)
             | ApplyError::ShellUnreachable(detail)
+            | ApplyError::DisplayUnavailable(detail)
             | ApplyError::Transaction(detail)
             | ApplyError::RestoreFailed(detail) => Some(detail),
             ApplyError::Busy => None,
@@ -1171,6 +1396,7 @@ impl ApplyService {
             config.qdbus_binary,
             config.switch_command,
             config.kscreen_binary,
+            config.systemctl_binary,
             config.probe_timeout,
         ));
         Ok(Self {
@@ -1239,10 +1465,7 @@ impl ApplyHandle {
     /// Fresh probe of the live outputs; the apply transaction and restore
     /// always re-probe so desktop indices cannot go stale mid-decision.
     pub(crate) fn enumerate_fresh(&self) -> Result<Vec<OutputInfo>, ApplyError> {
-        let system = self
-            .probe
-            .system_outputs()
-            .map_err(|error| ApplyError::ShellUnreachable(error.to_string()))?;
+        let system = self.probe.system_outputs().map_err(enumeration_error)?;
         let names: Vec<String> = system.iter().map(|output| output.name.clone()).collect();
         let script = probe_script(&names).map_err(|error| {
             ApplyError::ShellUnreachable(format!("cannot build the enumeration script: {error}"))
@@ -1250,9 +1473,8 @@ impl ApplyHandle {
         let reply = self
             .probe
             .evaluate_script(&script)
-            .map_err(|error| ApplyError::ShellUnreachable(error.to_string()))?;
-        let reply: ProbeReply = parse_probe_reply(&reply)
-            .map_err(|error| ApplyError::ShellUnreachable(error.to_string()))?;
+            .map_err(enumeration_error)?;
+        let reply: ProbeReply = parse_probe_reply(&reply).map_err(enumeration_error)?;
         Ok(assemble_outputs(system, reply.desktops, reply.connectors))
     }
 
@@ -2622,6 +2844,313 @@ mod tests {
         );
     }
 
+    /// Writes an executable stub and returns its path, ready to exec.
+    ///
+    /// Tests in this binary run on many threads, and a thread that forks
+    /// while another is writing an executable leaves the child holding the
+    /// write descriptor until it execs — so exec'ing the new stub can fail
+    /// with ETXTBSY through no fault of the code under test. Wait that
+    /// window out here, with a no-argument warm-up call the stubs are
+    /// written to ignore, rather than teaching production code to retry.
+    fn write_stub(root: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _attempt in 0..200 {
+            let status = Command::new(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match status {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                _ => return path,
+            }
+        }
+        panic!("stub {name} stayed busy");
+    }
+
+    /// A probe whose systemctl is `stub` and which believes it has no
+    /// display of its own — the boot-started daemon of BETA B1.
+    fn recovery_probe(stub: PathBuf) -> QdbusShellProbe {
+        QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            None,
+            PathBuf::from("kscreen-doctor"),
+            Some(stub),
+            Duration::from_secs(5),
+        )
+        .without_ambient_display()
+    }
+
+    #[test]
+    fn display_env_parse_keeps_display_keys_and_drops_everything_else() {
+        // Real `systemctl --user show-environment` shape, plus the values
+        // an attacker-controlled or merely broken manager could carry.
+        let text = concat!(
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\n",
+            "LANG=en_US.UTF-8\n",
+            "WAYLAND_DISPLAY=wayland-0\n",
+            "DISPLAY=:0\n",
+            "XDG_SESSION_TYPE=wayland\n",
+        );
+        assert_eq!(
+            parse_display_env(text),
+            vec![
+                ("WAYLAND_DISPLAY".to_string(), "wayland-0".to_string()),
+                ("DISPLAY".to_string(), ":0".to_string()),
+            ]
+        );
+        // systemd shell-quotes values that need it; one layer comes off.
+        assert_eq!(
+            parse_display_env("WAYLAND_DISPLAY=\"wayland-1\"\n"),
+            vec![("WAYLAND_DISPLAY".to_string(), "wayland-1".to_string())]
+        );
+        // An absolute socket path is a legitimate Wayland display.
+        assert_eq!(
+            parse_display_env("WAYLAND_DISPLAY=/run/user/1000/wayland-0\n"),
+            vec![(
+                "WAYLAND_DISPLAY".to_string(),
+                "/run/user/1000/wayland-0".to_string()
+            )]
+        );
+        // Rejected: empty, whitespace, quoting characters, control bytes,
+        // and anything over the length bound. None of these reach a child.
+        for hostile in [
+            "WAYLAND_DISPLAY=\n",
+            "WAYLAND_DISPLAY=wayland 0\n",
+            "WAYLAND_DISPLAY=way\"land\n",
+            "WAYLAND_DISPLAY=way'land\n",
+            "WAYLAND_DISPLAY=way`land`\n",
+            "WAYLAND_DISPLAY=$(id)\n",
+            "WAYLAND_DISPLAY=way\\land\n",
+        ] {
+            assert!(
+                parse_display_env(hostile).is_empty(),
+                "accepted hostile value: {hostile:?}"
+            );
+        }
+        let long = format!(
+            "WAYLAND_DISPLAY={}\n",
+            "w".repeat(MAX_DISPLAY_VALUE_BYTES + 1)
+        );
+        assert!(parse_display_env(&long).is_empty());
+        let at_bound = format!("WAYLAND_DISPLAY={}\n", "w".repeat(MAX_DISPLAY_VALUE_BYTES));
+        assert_eq!(parse_display_env(&at_bound).len(), 1);
+        // Lines that are not KEY=VALUE, and keys we do not want, are noise.
+        assert!(parse_display_env("no equals sign here\nPATH=/usr/bin\n").is_empty());
+    }
+
+    #[test]
+    fn display_env_inherits_when_the_daemon_already_has_one() {
+        // Ambient display present: the recovery must not run at all, which
+        // a stub that would fail loudly proves.
+        let root = temporary_directory("display-inherit");
+        std::fs::create_dir_all(&root).unwrap();
+        let stub = write_stub(&root, "systemctl.sh", "#!/bin/sh\nexit 9\n");
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            None,
+            PathBuf::from("kscreen-doctor"),
+            Some(stub),
+            Duration::from_secs(5),
+        );
+        // This test binary runs inside a session, so the ambient answer is
+        // real; skip rather than assert a lie when it is not.
+        if AmbientDisplay::FromProcessEnv.present() {
+            assert!(probe.display_env().unwrap().is_empty());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn display_env_recovers_from_the_manager_and_caches_only_success() {
+        let root = temporary_directory("display-recover");
+        std::fs::create_dir_all(&root).unwrap();
+        let calls = root.join("calls");
+        let stub = write_stub(
+            &root,
+            "systemctl.sh",
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --user ] && echo x >> {}\necho 'WAYLAND_DISPLAY=wayland-7'\n",
+                calls.display()
+            ),
+        );
+        let probe = recovery_probe(stub);
+        let recovered = probe.display_env().unwrap();
+        assert_eq!(
+            recovered,
+            vec![("WAYLAND_DISPLAY".to_string(), "wayland-7".to_string())]
+        );
+        // Second call is served from the cache: the stub ran once.
+        assert_eq!(probe.display_env().unwrap(), recovered);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        // Forgetting sends the next call back to the manager.
+        probe.forget_display_env();
+        assert_eq!(probe.display_env().unwrap(), recovered);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn display_env_failure_is_actionable_and_never_cached() {
+        let root = temporary_directory("display-fail");
+        std::fs::create_dir_all(&root).unwrap();
+        let calls = root.join("calls");
+        // The manager answers, but with no display in it — a session that
+        // has genuinely not started yet.
+        let empty = write_stub(
+            &root,
+            "empty.sh",
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --user ] && echo x >> {}\necho 'LANG=en_US.UTF-8'\n",
+                calls.display()
+            ),
+        );
+        let probe = recovery_probe(empty);
+        for _ in 0..2 {
+            let error = probe.display_env().unwrap_err();
+            assert!(
+                matches!(error, ProbeError::DisplayUnavailable(ref detail)
+                    if detail.contains("systemctl --user restart kwe-daemon")),
+                "{error}"
+            );
+        }
+        // Called twice: a failure must never be remembered, or a daemon
+        // that started before its session would stay broken for good.
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+
+        // A manager that answers with a failure fails the same way. /bin/false
+        // rather than a written stub: no file to race an exec against.
+        let error = recovery_probe(PathBuf::from("/bin/false"))
+            .display_env()
+            .unwrap_err();
+        assert!(
+            matches!(error, ProbeError::DisplayUnavailable(ref detail)
+                if detail.contains("exited") && detail.contains("restart kwe-daemon")),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovered_display_reaches_the_enumeration_child() {
+        // The point of the whole fix: kscreen-doctor must actually be run
+        // with the recovered WAYLAND_DISPLAY in its environment.
+        let root = temporary_directory("display-child");
+        std::fs::create_dir_all(&root).unwrap();
+        let seen = root.join("seen");
+        let systemctl = write_stub(
+            &root,
+            "systemctl.sh",
+            "#!/bin/sh\necho 'WAYLAND_DISPLAY=wayland-9'\n",
+        );
+        let kscreen = write_stub(
+            &root,
+            "kscreen.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$WAYLAND_DISPLAY\" > {}\n\
+                 echo 'Output: 1 DP-1 uuid'\necho '\tenabled'\necho '\tconnected'\n",
+                seen.display()
+            ),
+        );
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            None,
+            kscreen,
+            Some(systemctl),
+            Duration::from_secs(5),
+        )
+        .without_ambient_display();
+        let outputs = probe.system_outputs().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].name, "DP-1");
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "wayland-9");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failing_enumeration_forgets_a_recovered_display() {
+        // A recovered display can go stale (the session restarted under a
+        // new one); a failed child must send the next call back to the
+        // manager rather than replaying the stale value forever.
+        let root = temporary_directory("display-stale");
+        std::fs::create_dir_all(&root).unwrap();
+        let calls = root.join("calls");
+        let systemctl = write_stub(
+            &root,
+            "systemctl.sh",
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --user ] && echo x >> {}\necho 'WAYLAND_DISPLAY=wayland-0'\n",
+                calls.display()
+            ),
+        );
+        let kscreen = write_stub(&root, "kscreen.sh", "#!/bin/sh\necho 'boom' >&2\nexit 1\n");
+        let probe = QdbusShellProbe::new(
+            "org.kde.plasmashell".into(),
+            None,
+            None,
+            kscreen,
+            Some(systemctl),
+            Duration::from_secs(5),
+        )
+        .without_ambient_display();
+        for _ in 0..2 {
+            assert!(matches!(
+                probe.system_outputs().unwrap_err(),
+                ProbeError::Rejected(_)
+            ));
+        }
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_systemctl_prefers_the_explicit_path() {
+        let explicit = PathBuf::from("/somewhere/systemctl");
+        assert_eq!(
+            resolve_systemctl(&Some(explicit.clone())).unwrap(),
+            explicit
+        );
+        // Without an explicit path it resolves from PATH, the same way
+        // resolve_qdbus does; a PATH with no systemctl in it finds none,
+        // and that miss is what becomes the actionable DisplayUnavailable.
+        let root = temporary_directory("systemctl-path");
+        std::fs::create_dir_all(&root).unwrap();
+        let empty = std::env::join_paths([&root]).unwrap();
+        assert!(find_in_path(Some(empty.as_os_str()), &["systemctl"]).is_none());
+        std::fs::write(root.join("systemctl"), b"x").unwrap();
+        assert_eq!(
+            find_in_path(Some(empty.as_os_str()), &["systemctl"]).unwrap(),
+            root.join("systemctl")
+        );
+        assert!(DISPLAY_UNAVAILABLE_HINT.contains("systemctl --user restart kwe-daemon"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enumeration_error_keeps_display_unavailable_distinct() {
+        // Only this one survives as its own code; everything else stays
+        // shell_unreachable exactly as before.
+        let mapped = enumeration_error(ProbeError::DisplayUnavailable("no display".into()));
+        assert_eq!(mapped.code(), "display_unavailable");
+        assert_eq!(mapped.detail(), Some("no display"));
+        for other in [
+            ProbeError::Unreachable("gone".into()),
+            ProbeError::Rejected("nope".into()),
+            ProbeError::TimedOut("slow".into()),
+            ProbeError::Parse("garbage".into()),
+        ] {
+            assert_eq!(enumeration_error(other).code(), "shell_unreachable");
+        }
+    }
+
     #[test]
     fn find_in_path_resolves_qdbus_then_qdbus6() {
         let root = temporary_directory("path");
@@ -2673,17 +3202,17 @@ mod tests {
         // boundary: the command is spawned with the evaluateScript script
         // as its sole argument and its stdout is the probe reply, through
         // the same bounded-run machinery as qdbus.
-        use std::os::unix::fs::PermissionsExt;
         let root = temporary_directory("external-evaluator");
         std::fs::create_dir_all(&root).unwrap();
-        let stub = root.join("plasma-stub.sh");
-        std::fs::write(&stub, "#!/bin/sh\nprintf '%s' \"$1\"\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // write_stub, not a bare write: exec'ing a just-written file races
+        // other threads' forks and fails with ETXTBSY (observed here).
+        let stub = write_stub(&root, "plasma-stub.sh", "#!/bin/sh\nprintf '%s' \"$1\"\n");
         let probe = QdbusShellProbe::new(
             "org.kde.plasmashell".into(),
             None,
             Some(stub),
             PathBuf::from("kscreen-doctor"),
+            None,
             Duration::from_secs(5),
         );
         // Enumeration and switch scripts both pass through the same
@@ -2693,14 +3222,17 @@ mod tests {
         let switch = "var d = desktops()[1]; d.wallpaperPlugin = \"org.kde.kwe.wallpaper\";";
         assert_eq!(probe.evaluate_script(switch).unwrap(), switch);
         // A failing stub maps onto ProbeError::Rejected with its stderr.
-        let failing = root.join("failing-stub.sh");
-        std::fs::write(&failing, "#!/bin/sh\necho 'nope' >&2\nexit 3\n").unwrap();
-        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let failing = write_stub(
+            &root,
+            "failing-stub.sh",
+            "#!/bin/sh\necho 'nope' >&2\nexit 3\n",
+        );
         let probe = QdbusShellProbe::new(
             "org.kde.plasmashell".into(),
             None,
             Some(failing),
             PathBuf::from("kscreen-doctor"),
+            None,
             Duration::from_secs(5),
         );
         let error = probe.evaluate_script("print(1);").unwrap_err();
