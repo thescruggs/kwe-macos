@@ -8,6 +8,7 @@
 
 ## Change log
 
+- 2026-08-22 — **Three user reports triaged into the plan** (this session, no code changes): (1) **B1 outputs empty after reboot** — a *new* daemon-side defect, not a regression of `a747064`. `kwe-daemon.service` is `WantedBy=default.target` with no graphical-session ordering, so at boot the daemon starts before Plasma imports the session environment and has no `WAYLAND_DISPLAY`; the `kscreen-doctor -o` shell-out in `apply.rs:685` inherits that environment, cannot load a Qt platform plugin, and SIGABRTs → `wallpaper.outputs` answers `shell_unreachable` and the picker is empty. Confirmed live both ways (boot-started PID has no display env and fails; `systemctl --user restart kwe-daemon` after login enumerates `DP-1` fine — that restart is the workaround). Every apply test to date ran a terminal-started daemon inside the session, which is why no gate saw it. `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md`. (2) **B2 scene apply renders a blank desktop** — applying Workshop scene 1725674512 ("Aurora Borealis", scene.pkg) promoted cleanly and drew *nothing*: both `last-good-{a,b}.ppm` are 960x540 of a single colour `b2b2b2` = the scene's own 0.7 clearcolor, 518400/518400 pixels identical. Cause: model-referencing layers are skipped at parse (`scene.rs:551`, pinned by `model_json_references_skipped_as_m3h`) because scene3d is M3h — a scene built only from model layers registers zero drawables. Two defects follow: model skips are counted and logged **nowhere** (unlike text/video/particle skips), and a zero-drawable composite is accepted as a good frame and promoted. The honesty fix outlives M3h. `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md`. (3) **F1 scaling modes** (stretch/fill/aspect) — accepted; `FrameItem::imageDestination()` hardcodes `Qt::KeepAspectRatio`, and the surrounding work (pointer-coordinate mapping, an additive `scaling` field in `assignments-v1.json`, display-session transport, manager selector, and the 960x540-vs-output-geometry question) is the real scope. `docs/backlog/WALLPAPER_SCALING_MODES.md`.
 - 2026-08-21 — **BETA_M3g recovered/completed** on `beta-m3g-video-layer-recovery`: shared minimal libmpv FFI now drives up to two software VideoLayer decoders in the external scene worker; persistent Vulkan texture refresh, native-size fallback, local/package confinement, 160 MiB extraction cap, protocol whitelist, bounded demux buffers, latest-wins media transport, and one-layer degradation are covered by synthetic scene smoke and unit tests. Recovery fixes added fatal FenceTimeout propagation at every texture/vertex upload caller, one-shot decoder disable after ordinary refresh failure, explicit decoder-before-file teardown, and scene-specific 32768 NPROC/6000 ms startup budgets. No UI change; scene2d/SceneScript remain partial/deferred. Final review evidence is recorded below.
 - 2026-08-22 — **BETA_M3g final adversarial review APPROVE and trunk merge** (`3b368d2`+`0087c06`): validated-descriptor file snapshots, stable directory-fd staging operations, extra-byte cap probe, RAII/supervisor cleanup, and bounded standalone teardown/pixel waits are covered. On exact merged HEAD, `./scripts/check.sh` passed (workspace format/clippy/tests, scene 172, daemon 128, CMake build/tests, diagnostics); `smoke-video.sh` and `smoke-supervisor.sh` passed. The traced full `scripts/smoke-scene.sh` passed all M3g daemon/package/corrupt/media-state/cleanup and standalone llvmpipe lanes with the Plasma PID unchanged. Graphify's code map was refreshed (3,826 nodes / 9,682 edges). No UI/live-Plasma changes; M3h scene3d remains next.
 - 2026-08-22 — **Alpha package rebuilt from post-M3g trunk** (`ca3807e`): retained application version `0.1.0-alpha.1` and bumped the Arch package release to `0.1.0.alpha.1-2`, reserving the coordinated `0.1.0-beta.1` application-version change for M5. A clean `makepkg -Ccf` build passed the release workspace tests and produced the new `-2` archive; its package and scene-renderer hashes differ from the stale `-1` archive. The first sandboxed check hit `EPERM` creating a synthetic Wayland socket, then passed unchanged outside that restriction. No install, dependency, compatibility, UI, or live-Plasma change.
@@ -58,6 +59,28 @@
 | BETA_M3 (scene, a–k) | M3a–M3g done; M4 complete — M3h (scene3d P1) is next |
 | BETA_M4 (live apply) | M4a–M4d done |
 | BETA_M5 (release) | pending |
+| Open user-reported queue | B1 + B2 bugs diagnosed, F1 accepted — see below |
+
+## Open work queue (user-reported, ahead of M3h)
+
+Fix order agreed 2026-08-22: one at a time, each as its own worktree +
+branch + adversarial review pass, same as a milestone slice.
+
+| # | Item | Kind | Status | Doc |
+|---|---|---|---|---|
+| B1 | No display outputs enumerated after a reboot | bug (high) | diagnosed, root cause confirmed | `docs/bugs/OUTPUTS_EMPTY_AFTER_REBOOT.md` |
+| B2 | Applying a scene shows a blank/white background | bug (high) | diagnosed from the left-behind state | `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md` |
+| F1 | Wallpaper scaling modes (stretch / fill / aspect) | feature | accepted, unscheduled | `docs/backlog/WALLPAPER_SCALING_MODES.md` |
+
+**B1 first** — it blocks every boot, and it blocks testing the other two on a
+freshly booted machine. **B2 second** — the honesty half (count and report
+model-layer skips, refuse or visibly degrade a zero-drawable scene) is
+independent of M3h and should land before it, so M3h ships against a build
+that can already say what it does not support. **F1 third**, and it wants the
+render-resolution decision settled with it.
+
+BETA_M3h (scene3d P1) resumes after B1 and B2; F1 can be sequenced either side
+of it.
 
 ## Context
 
