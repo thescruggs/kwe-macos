@@ -4,11 +4,119 @@
   reboot, after a reboot there is no display outputs enumerated")
 - **Severity:** High user-facing — Apply is unreachable again on every fresh
   boot, which is the only state a normal user ever starts from.
-- **Status:** DIAGNOSED, root cause confirmed live. Not yet fixed.
+- **Status:** FIXED on branch `beta-b1-display-env` (`3d29272` fix + `1d332a9`
+  review fixes), ff-merged into the trunk `fix/qt611-gallery-delegates`.
+  Verified against the real session — see "Fix" below. The reboot-path
+  confirmation is the maintainer's, on their own schedule.
 - **Relation to `APPLY_NO_OUTPUTS.md`:** this is a *different* defect that the
   earlier fix could not have caught. `a747064` fixed the manager side (QML
   type registration + the enumeration trigger); this one is on the daemon
   side and only appears when the daemon is started by systemd at boot.
+
+## Fix (2026-08-22)
+
+Two independent fixes for the same failure — the first makes existing installs
+and hand-started daemons work with no user action, the second makes the boot
+path correct by construction.
+
+1. **Lazy display-environment recovery
+   (`crates/kwe-daemon/src/apply.rs`).** When the daemon's own environment
+   names no display, the enumeration probe recovers one from
+   `systemctl --user show-environment` — the same environment a restart of the
+   unit would have inherited — and passes it to the `kscreen-doctor` child.
+   Resolution is lazy and per call, mirroring the documented `resolve_qdbus`
+   contract: the daemon may legitimately start before any session exists, and
+   enumeration only ever runs once somebody is logged in and asking. Only
+   *successful* recoveries are cached, and a child that fails while using one
+   drops it, so a session that restarted under a different display self-heals.
+   Recovered values are validated (bounded length, printable ASCII, no
+   whitespace or quoting characters) before they reach a child. The recovery
+   child is bounded to `min(probe timeout, 1500 ms)`: it sits on a path that
+   already spends the probe deadline twice, answering a manager request with
+   its own 10 s deadline.
+
+   `evaluate_script` deliberately does not use any of this — `qdbus` is a
+   `QCoreApplication` and reaches plasmashell over the session bus with no
+   display at all. Only the KScreen enumeration needs one.
+
+   Two measurements are recorded in the code so they are not re-litigated:
+   `WAYLAND_DISPLAY` alone is sufficient, and `QT_QPA_PLATFORM=offscreen` must
+   never be substituted for a real display — `kscreen-doctor` then **hangs**
+   until killed instead of aborting, turning a fast clear failure into a probe
+   timeout.
+
+   New `--systemctl-binary` flag (default `systemctl` on PATH), matching the
+   existing `--qdbus-binary` / `--kscreen-doctor-binary` so tests and smokes
+   can stub the recovery.
+
+2. **Unit ordering (`packaging/systemd/kwe-daemon.service`).**
+   `PartOf=graphical-session.target`, `After=graphical-session.target`, and
+   `WantedBy=graphical-session.target` in place of `default.target` — the
+   pattern `systemd.special(7)` prescribes for session-scoped services, and
+   what every Plasma unit on this machine uses. The daemon now starts with a
+   display in reach and stops with the session it belongs to. `Restart=always`
+   stays, with its rationale corrected: session teardown is `PartOf=`'s job
+   now, and Restart is only about crashes.
+
+   **Existing installs must re-enable the unit once** — the old symlink lives
+   in the user's own `~/.config/systemd/user/default.target.wants/` and keeps
+   starting the daemon too early:
+
+   ```sh
+   systemctl --user disable kwe-daemon.service
+   systemctl --user enable --now kwe-daemon.service
+   ```
+
+   Said in both places that speak to users: the README and the pacman
+   `post_upgrade` hook.
+
+3. **An honest error (`apply.rs`, `apps/kwe-manager/src/applyclient.cpp`).**
+   When no display can be recovered at all, `wallpaper.outputs` now answers
+   with a new `display_unavailable` code carrying the restart the user can
+   run, instead of the generic `shell_unreachable` behind an empty picker.
+   The manager maps it to that message; unknown codes already degrade to
+   `code: detail`, so the addition is safe in both directions. Recorded in
+   `docs/SUPERVISOR_API_V1.md`.
+
+## Gates (2026-08-22)
+
+- **Nine unit tests** over the resolver: `show-environment` parsing (real
+  shape, systemd's quoting, absolute socket paths), rejection of empty,
+  whitespace-bearing, quote-bearing, control and over-length values, the
+  inherit short-circuit, successful-only caching, cache invalidation after a
+  failed child, the recovered value actually reaching the child's environment,
+  the bounded recovery budget, and `display_unavailable` surviving the mapping
+  to the wire while every other probe error stays `shell_unreachable`.
+- **A stripped-environment case in `scripts/smoke-apply.sh`** (the read-only
+  live lane): the daemon is started under `env -i` with only what the unit
+  provides — `HOME`, `PATH`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` —
+  and must enumerate the real connector. **This case reproduces B1 without a
+  reboot**, confirmed by running it against the pre-fix binary: it answers
+  `shell_unreachable` / `kscreen-doctor exited signal: 6 (SIGABRT)`. A
+  negative control in the same lane stubs the recovery to a session with no
+  display and asserts `display_unavailable` with an actionable detail.
+- **A unit-file assertion in `scripts/check.sh`**, since the ordering half has
+  no runtime test: the unit must keep all three graphical-session directives
+  and must not reinstall into `default.target`. Verified both ways — green on
+  the fixed unit, and it names the missing directive on a reverted one.
+- `./scripts/check.sh` exit 0 (fmt/clippy/137 daemon tests/workspace build/
+  CMake/qml-typecheck/diagnose), `ctest` 8/8, `KWE_LIVE_APPLY=1
+  smoke-apply.sh` green including both new cases.
+
+Also fixed in passing: exec'ing a just-written stub races other test threads'
+forks and fails with `ETXTBSY`. This surfaced in the *pre-existing*
+`external_evaluator_runs_the_script_as_its_single_argument` test once the new
+tests added spawn traffic; stub creation now waits that window out, and the
+old test uses the same helper.
+
+## Still open
+
+The reboot itself. Everything above is verified on the running session and by
+a case that reproduces the boot environment, but the real boot path is proven
+only by booting. After the next reboot, `wallpaper.outputs` should return the
+connector with no manual restart, and
+`systemctl --user show -p ActiveEnterTimestamp kwe-daemon.service` should land
+after `graphical-session.target`.
 
 ## Symptom
 
@@ -67,7 +175,7 @@ environment. The boot-ordering path — systemd starting the unit before the
 session env import — has never been exercised. `smoke-playlist-restart.sh`
 substitutes a fake `kscreen-doctor`, so it cannot see this either.
 
-## Fix directions (to be decided at fix time)
+## Fix directions considered (kept for the record)
 
 1. **Unit ordering (primary).** Make `kwe-daemon.service` part of the
    graphical session: `After=graphical-session.target`,
