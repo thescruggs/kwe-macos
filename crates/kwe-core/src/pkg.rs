@@ -749,6 +749,19 @@ pub fn image_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, Strin
     resolve_pkg_entry(reference, entries, "image")
 }
 
+/// Resolve a scene layer's `video` reference against the package entry
+/// table (M3g). Same rules as `image_entry` — the reference is a path into
+/// the package, not a host path — with a `video` diagnostic word so a
+/// failed lookup names the right field. No extension check: libmpv probes
+/// the container, and Wallpaper Engine packages carry video layers under
+/// several extensions.
+pub fn video_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, String> {
+    if reference.is_empty() {
+        return Err("scene layer video reference must not be empty".into());
+    }
+    resolve_pkg_entry(reference, entries, "video")
+}
+
 /// Extract the `general.script` string from scene.json bytes, if any.
 /// Preflight uses this to find the script entry without enforcing the
 /// renderer's full JSON rules (the renderer rejects malformed descriptors
@@ -1501,5 +1514,60 @@ mod tests {
         }];
         let idx = image_entry("weird.tex", &entries).unwrap();
         assert_eq!(entries[idx].path, "tex/weird.tex");
+    }
+
+    // ---- video_entry (M3g) ----
+
+    #[test]
+    fn video_entry_resolves_like_an_image_with_its_own_diagnostic_word() {
+        // Same resolution rules as image_entry (literal path, tail-after-
+        // slash, case-insensitive) with a `video` diagnostic word, so a
+        // failed lookup names the field the scene actually wrote.
+        let entries = vec![
+            PkgEntry {
+                path: "movies/clip.mp4".into(),
+                offset: 0,
+                size: 4,
+                compressed: false,
+            },
+            PkgEntry {
+                path: "movies/other.webm".into(),
+                offset: 4,
+                size: 4,
+                compressed: false,
+            },
+        ];
+        let idx = video_entry("movies/clip.mp4", &entries).unwrap();
+        assert_eq!(entries[idx].path, "movies/clip.mp4");
+        let idx = video_entry("CLIP.MP4", &entries).unwrap();
+        assert_eq!(entries[idx].path, "movies/clip.mp4");
+
+        let error = video_entry("movies/missing.mp4", &entries).unwrap_err();
+        assert!(error.contains("video"), "{error}");
+        assert!(error.contains("is not an entry of the package"), "{error}");
+        let error = video_entry("", &entries).unwrap_err();
+        assert!(error.contains("video"), "{error}");
+        assert!(error.contains("must not be empty"), "{error}");
+        for hostile in ["../clip.mp4", "/etc/clip.mp4", "a\\b.mp4", "nul\0.mp4"] {
+            let error = video_entry(hostile, &entries).unwrap_err();
+            assert!(
+                error.contains("must stay inside the package"),
+                "{hostile:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_entry_applies_no_extension_policy() {
+        // libmpv probes the container, and WE packages carry video layers
+        // under several extensions — so the resolver imposes none.
+        let entries = vec![PkgEntry {
+            path: "movies/clip.bin".into(),
+            offset: 0,
+            size: 4,
+            compressed: false,
+        }];
+        let idx = video_entry("clip.bin", &entries).unwrap();
+        assert_eq!(entries[idx].path, "movies/clip.bin");
     }
 }

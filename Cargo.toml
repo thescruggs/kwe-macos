@@ -8,6 +8,7 @@ members = [
     "crates/kwe-daemon",
     "crates/kwe-frame-protocol",
     "crates/kwe-input-protocol",
+    "crates/kwe-mpv",
     "crates/kwe-scene-renderer",
     "crates/kwe-test-renderer",
     "crates/kwe-video-renderer",

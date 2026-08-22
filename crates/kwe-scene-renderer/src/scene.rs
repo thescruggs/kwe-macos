@@ -125,6 +125,11 @@ pub struct SceneConfig {
     /// one-time diagnostic; the particle pool is separate from the layer
     /// cap).
     pub particle_system_skips: usize,
+    /// Video layers past video::MAX_VIDEO_LAYERS (M3g). The layers still
+    /// register — a script can move and read them — but their source is
+    /// cleared at parse so no decoder ever opens; counted for the worker's
+    /// one-time diagnostic.
+    pub video_layer_skips: usize,
     /// Particle objects whose `particle` value is a string — an external
     /// particle definition file (a researched WE feature). The M3f parse
     /// registers such systems with all defaults (the file-level definition
@@ -199,6 +204,57 @@ pub struct LayerSpec {
     /// text path: a per-layer glyph atlas + a quad whose vertex data the
     /// worker rebuilds on change (text.rs).
     pub text: Option<TextSpec>,
+    /// Video-layer content (M3g), `Some` exactly when the object was a
+    /// video layer (has `video`, no `image`). The layer then draws through
+    /// the video path: a libmpv software-render decoder writes RGBA frames
+    /// into the layer's texture slot every frame (video.rs). `texture`
+    /// stays `None` for video layers — their pixels never come from the
+    /// image decoder.
+    pub video: Option<VideoSpec>,
+}
+
+/// One `objects` entry interpreted as a video layer (M3g). The
+/// classification key is `video`, checked after `image` and before
+/// `particle`.
+///
+/// **Corpus honesty (the load-bearing caveat for this whole slice):** the
+/// 60-package corpus contains **zero video layers and zero video files** —
+/// no `objects` entry carries a `video`/`movie` key, and no package entry
+/// has a video extension (verified by a full re-scan of every scene.json
+/// and every package entry table at M3g). Unlike M3c's image layers, no
+/// field below can be corroborated against real content. The schema is
+/// therefore derived from the researched WE object model — video layers
+/// reuse the shared `objects` props exactly like image and text layers do
+/// — plus the playback keys the renderer needs, and it is exercised by
+/// synthetic fixtures only. Every field is property-wrapped like the M3c
+/// fields; playback scalars CLAMP to the documented ranges (the M3f
+/// convention) rather than rejecting the scene, because a video that
+/// cannot play must never cost the user the rest of the wallpaper.
+#[derive(Debug, Clone)]
+pub struct VideoSpec {
+    /// Raw `video` reference exactly as written: a path relative to the
+    /// content root (file scenes) or a package entry path (pkg scenes).
+    /// `None` when the field is present but not a string — the layer is
+    /// still registered so the script can reach it, but no decoder opens
+    /// and it draws nothing (the M3c missing-image policy).
+    pub source: Option<String>,
+    /// Whether playback restarts at EOF. WE video wallpapers loop by
+    /// default and there is no corpus key to contradict it, so the default
+    /// is `true`; `false` leaves the last decoded frame on screen (libmpv
+    /// `keep-open`), which is the only non-looping behavior that keeps the
+    /// layer visible.
+    pub loop_playback: bool,
+    /// Playback speed multiplier, clamped to
+    /// `video::MIN_PLAYBACK_RATE..=video::MAX_PLAYBACK_RATE`, default 1.0.
+    /// A design field, not a documented WE key (recorded as a deviation):
+    /// the deterministic smoke oracles need a way to pin playback speed.
+    pub rate: f32,
+    /// The resolved on-disk path, filled by main.rs after parse (`None`
+    /// until then, and for a layer whose source did not resolve). libmpv
+    /// opens a path, not a byte slice, so a package-embedded video is
+    /// extracted into the worker's private HOME first — unlike an image,
+    /// which is decoded straight out of the package in memory.
+    pub path: Option<PathBuf>,
 }
 
 /// One `objects` entry interpreted as a particle system (M3f). The
@@ -415,6 +471,7 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
         particles,
         text_layer_skips: counts.text_layer_skips,
         particle_system_skips: counts.particle_system_skips,
+        video_layer_skips: counts.video_layer_skips,
         particle_file_refs: counts.particle_file_refs,
         text_on_image_objects: counts.text_on_image_objects,
         text_size_ignored: counts.text_size_ignored,
@@ -434,6 +491,10 @@ pub struct ObjectCounts {
     /// particle definition file references (registered with defaults; the
     /// file-level merge is planned).
     pub particle_file_refs: usize,
+    /// Video objects past `video::MAX_VIDEO_LAYERS` (M3g). They still
+    /// register as layers — the script can read and write their props —
+    /// but no decoder opens for them, so they draw nothing.
+    pub video_layer_skips: usize,
 }
 
 /// The `objects` array, interpreted as image (M3c), particle (M3f), and
@@ -471,6 +532,7 @@ fn parse_objects(
     let mut layers = Vec::new();
     let mut particles = Vec::new();
     let mut text_layers = 0usize;
+    let mut video_layers = 0usize;
     let mut counts = ObjectCounts::default();
     for (index, entry) in array.iter().enumerate() {
         let object = entry.as_object().ok_or_else(|| {
@@ -495,6 +557,34 @@ fn parse_objects(
                 continue;
             }
             let layer = parse_image_layer(object, index)?;
+            layers.push(layer);
+        } else if object.contains_key("video") {
+            // A video layer (M3g). Placed after `image` and before
+            // `particle`: video is not in the researched WE classification
+            // order (image, sound, particle, text) because the corpus has
+            // no video objects to place it with, so the position is a
+            // documented design decision — adjacent to `image` because a
+            // video layer IS an image layer whose texture is a movie, and
+            // ahead of `particle`/`text` so an object carrying both keys
+            // resolves to the kind that owns the texture slot.
+            //
+            // Layers past the concurrency cap still register (the script
+            // reaches them through Scene.getLayer) but never open a
+            // decoder — counted, never a rejection, exactly like the
+            // particle-system cap.
+            let over_cap = video_layers >= crate::video::MAX_VIDEO_LAYERS;
+            if over_cap {
+                counts.video_layer_skips += 1;
+            } else {
+                video_layers += 1;
+            }
+            let mut layer = parse_video_layer(object, index)?;
+            if over_cap {
+                layer.video = layer.video.map(|spec| VideoSpec {
+                    source: None, // over the cap: registered, never decoded
+                    ..spec
+                });
+            }
             layers.push(layer);
         } else if object.contains_key("particle") {
             // A particle system (M3f), classified after image and before
@@ -796,6 +886,7 @@ fn parse_image_layer(
         tint,
         texture: None,
         text: None,
+        video: None,
     })
 }
 
@@ -903,6 +994,103 @@ fn parse_text_layer(
             vertical_align,
             color,
             has_size,
+        }),
+        video: None,
+    })
+}
+
+/// One video layer entry (M3g). Shared props come from parse_common_props,
+/// so a video layer honors origin/angles/scale/alpha/visible/blend/
+/// brightness exactly like an image layer. The video-only keys are
+/// `video` (the source reference, plain or property-wrapped), `loop`
+/// (default true), and `rate` (clamped playback speed).
+///
+/// Like an image layer, `size` [0, 0] (absent or zero) means "the decoded
+/// video's own dimensions", substituted once the decoder reports them.
+/// Unlike an image layer, an unreadable source is ALWAYS survivable: the
+/// layer registers, the decoder never opens, and the scene renders
+/// without it.
+fn parse_video_layer(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<LayerSpec, SceneError> {
+    let common = parse_common_props(object, index, "video")?;
+
+    let source = match property_value(object.get("video").expect("caller checked")) {
+        Value::String(reference) => Some(reference.clone()),
+        _ => None,
+    };
+
+    let size = match object.get("size") {
+        None => [0.0, 0.0],
+        Some(value) => {
+            let vector = parse_vector(property_value(value), &field(index, "size"), &[2], true)?;
+            [vector[0], vector[1]]
+        }
+    };
+
+    // Same precedence as image layers: the brief's `tint` wins over WE's
+    // `color`, components clamp 0..=1.
+    let tint = match object.get("tint").or_else(|| object.get("color")) {
+        None => [1.0, 1.0, 1.0, 1.0],
+        Some(value) => {
+            let vector =
+                parse_vector(property_value(value), &field(index, "tint"), &[3, 4], false)?;
+            let mut tint = [1.0, 1.0, 1.0, 1.0];
+            for (slot, component) in tint.iter_mut().zip(vector.iter()) {
+                *slot = crate::layers::clamp_layer_tint(f64::from(*component));
+            }
+            tint
+        }
+    };
+
+    // Playback keys clamp instead of rejecting (the M3f convention): a
+    // hostile or sloppy `rate` costs the user a speed, never the scene. A
+    // non-boolean `loop` falls back to the default rather than rejecting,
+    // for the same reason.
+    let loop_playback = match object.get("loop").map(property_value) {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(value)) => *value,
+        // The editor serializes some scalars as strings; accept the two
+        // spellings it could produce and default anything else.
+        Some(Value::String(value)) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no"
+        ),
+        Some(Value::Number(number)) => number.as_f64().is_none_or(|value| value != 0.0),
+        Some(_) => true,
+    };
+    let rate = match object.get("rate").map(property_value) {
+        None | Some(Value::Null) => 1.0,
+        Some(value) => {
+            let raw = value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+                .unwrap_or(1.0);
+            crate::video::clamp_playback_rate(raw)
+        }
+    };
+
+    Ok(LayerSpec {
+        name: common.name,
+        scene_order: index,
+        image: None,
+        origin: common.origin,
+        angles: common.angles,
+        scale: common.scale,
+        size,
+        alpha: common.alpha,
+        visible: common.visible,
+        blend_mode: common.blend_mode,
+        brightness: common.brightness,
+        tint,
+        texture: None,
+        text: None,
+        video: Some(VideoSpec {
+            source,
+            loop_playback,
+            rate,
+            path: None,
         }),
     })
 }
@@ -2899,5 +3087,198 @@ mod tests {
             Some("textures/dot.png")
         );
         assert!(config.particles[0].texture.is_none());
+    }
+
+    // ---- M3g: video layers ----
+
+    /// Parse one `objects` array and return only its layers.
+    fn parse_layers(json: &str) -> Vec<LayerSpec> {
+        let value: Value = serde_json::from_str(json).unwrap();
+        let root = value.as_object().unwrap();
+        parse_objects(root).unwrap().0
+    }
+
+    #[test]
+    fn video_layer_classifies_after_image_and_before_particle() {
+        // The classification order is a documented design decision (the
+        // corpus has no video objects to corroborate one): an object
+        // carrying both `image` and `video` is an image layer, and one
+        // carrying both `video` and `particle`/`text` is a video layer —
+        // the kind that owns the texture slot wins.
+        let layers = parse_layers(
+            r#"{"objects": [
+                {"name": "img", "image": "a.png", "video": "v.mp4"},
+                {"name": "vid", "video": "v.mp4", "particle": {}, "text": "hi"}
+            ]}"#,
+        );
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].image.as_deref(), Some("a.png"));
+        assert!(layers[0].video.is_none(), "`image` wins over `video`");
+        assert!(layers[1].image.is_none());
+        assert!(layers[1].text.is_none(), "`video` wins over `text`");
+        assert_eq!(
+            layers[1].video.as_ref().unwrap().source.as_deref(),
+            Some("v.mp4")
+        );
+    }
+
+    #[test]
+    fn video_layer_defaults_and_property_wrapping() {
+        // Defaults: loop on, rate 1.0, size [0, 0] ("the video's own
+        // dimensions"), path unresolved. The source accepts the editor's
+        // property-wrapped form exactly like an image reference does, and
+        // a non-string `video` registers the layer with no source — never
+        // a rejection.
+        let layers = parse_layers(
+            r#"{"objects": [
+                {"name": "plain", "video": "clip.mp4"},
+                {"name": "wrapped", "video": {"value": "wrapped.mp4"}},
+                {"name": "nonstring", "video": 7}
+            ]}"#,
+        );
+        let plain = layers[0].video.as_ref().unwrap();
+        assert_eq!(plain.source.as_deref(), Some("clip.mp4"));
+        assert!(plain.loop_playback, "WE video wallpapers loop by default");
+        assert_eq!(plain.rate, 1.0);
+        assert!(plain.path.is_none(), "the parse never resolves a path");
+        assert_eq!(layers[0].size, [0.0, 0.0]);
+        assert_eq!(layers[0].alpha, 1.0);
+        assert!(layers[0].visible);
+        assert_eq!(
+            layers[1].video.as_ref().unwrap().source.as_deref(),
+            Some("wrapped.mp4")
+        );
+        assert!(
+            layers[2].video.as_ref().unwrap().source.is_none(),
+            "a non-string video registers the layer without a source"
+        );
+    }
+
+    #[test]
+    fn video_loop_accepts_the_editor_spellings() {
+        // `loop` clamps to a default rather than rejecting (the M3f
+        // convention): booleans are exact, the editor's string and number
+        // spellings of false are honored, and anything else stays true.
+        let layers = parse_layers(
+            r#"{"objects": [
+                {"name": "a", "video": "v.mp4", "loop": false},
+                {"name": "b", "video": "v.mp4", "loop": true},
+                {"name": "c", "video": "v.mp4", "loop": "false"},
+                {"name": "d", "video": "v.mp4", "loop": " NO "},
+                {"name": "e", "video": "v.mp4", "loop": "0"},
+                {"name": "f", "video": "v.mp4", "loop": 0},
+                {"name": "g", "video": "v.mp4", "loop": 1},
+                {"name": "h", "video": "v.mp4", "loop": null},
+                {"name": "i", "video": "v.mp4", "loop": "yes"},
+                {"name": "j", "video": "v.mp4", "loop": {"value": false}}
+            ]}"#,
+        );
+        let looping: Vec<bool> = layers
+            .iter()
+            .map(|layer| layer.video.as_ref().unwrap().loop_playback)
+            .collect();
+        assert_eq!(
+            looping,
+            vec![
+                false, true, false, false, false, false, true, true, true, false
+            ]
+        );
+    }
+
+    #[test]
+    fn video_rate_clamps_never_rejects() {
+        // A hostile or sloppy `rate` costs the user a speed, never the
+        // scene: every value lands inside the documented range.
+        let layers = parse_layers(
+            r#"{"objects": [
+                {"name": "a", "video": "v.mp4", "rate": 2},
+                {"name": "b", "video": "v.mp4", "rate": 1000},
+                {"name": "c", "video": "v.mp4", "rate": -5},
+                {"name": "d", "video": "v.mp4", "rate": 0},
+                {"name": "e", "video": "v.mp4", "rate": "1.5"},
+                {"name": "f", "video": "v.mp4", "rate": "garbage"},
+                {"name": "g", "video": "v.mp4", "rate": {"value": 0.25}}
+            ]}"#,
+        );
+        let rates: Vec<f32> = layers
+            .iter()
+            .map(|layer| layer.video.as_ref().unwrap().rate)
+            .collect();
+        assert_eq!(
+            rates,
+            vec![
+                2.0,
+                crate::video::MAX_PLAYBACK_RATE,
+                crate::video::MIN_PLAYBACK_RATE,
+                crate::video::MIN_PLAYBACK_RATE,
+                1.5,
+                1.0,
+                crate::video::MIN_PLAYBACK_RATE.max(0.25),
+            ]
+        );
+    }
+
+    #[test]
+    fn video_concurrency_cap_clears_sources_without_rejecting() {
+        // Past video::MAX_VIDEO_LAYERS the layer still registers — a
+        // script can move it and read its props through Scene.getLayer —
+        // but its source is cleared at parse so no decoder ever opens.
+        // Counted for the worker's one-time diagnostic, exactly like the
+        // particle-system cap.
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..crate::video::MAX_VIDEO_LAYERS + 3 {
+            objects.push_str(&format!(r#"{{"name": "v{i}", "video": "v.mp4"}},"#));
+        }
+        objects.push_str(r#"{"name": "img", "image": "a.png"}"#);
+        objects.push_str("]}");
+        let value: Value = serde_json::from_str(&objects).unwrap();
+        let root = value.as_object().unwrap();
+        let (layers, _, counts) = parse_objects(root).unwrap();
+        assert_eq!(
+            layers.len(),
+            crate::video::MAX_VIDEO_LAYERS + 4,
+            "over-cap layers register, never skipped from the scene"
+        );
+        assert_eq!(counts.video_layer_skips, 3);
+        let with_source = layers
+            .iter()
+            .filter(|layer| {
+                layer
+                    .video
+                    .as_ref()
+                    .is_some_and(|spec| spec.source.is_some())
+            })
+            .count();
+        assert_eq!(with_source, crate::video::MAX_VIDEO_LAYERS);
+        // The image layer is untouched by the video cap.
+        assert_eq!(layers.last().unwrap().image.as_deref(), Some("a.png"));
+    }
+
+    #[test]
+    fn video_layer_carries_the_full_config_through_parse() {
+        // End to end through the shared JSON core so the skip counter
+        // and the shared props reach the worker; `color` still feeds
+        // `tint` and the draw order is the objects index.
+        let config = parse_scene_json(
+            br#"{"objects": [
+                {"name": "back", "image": "a.png"},
+                {"name": "clip", "video": "movies/clip.mp4", "loop": false,
+                 "rate": 0.5, "origin": [1, 2, 3], "size": [640, 480],
+                 "color": [1, 0, 0], "alpha": 0.5, "visible": false}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.video_layer_skips, 0);
+        let layer = &config.layers[1];
+        assert_eq!(layer.scene_order, 1);
+        assert_eq!(layer.origin, [1.0, 2.0]);
+        assert_eq!(layer.size, [640.0, 480.0], "an explicit size is kept");
+        assert_eq!(layer.tint, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(layer.alpha, 0.5);
+        assert!(!layer.visible);
+        let spec = layer.video.as_ref().unwrap();
+        assert_eq!(spec.source.as_deref(), Some("movies/clip.mp4"));
+        assert!(!spec.loop_playback);
+        assert_eq!(spec.rate, 0.5);
     }
 }

@@ -16,6 +16,7 @@ clap.workspace = true
 kwe-core = { path = "../kwe-core" }
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
+kwe-mpv = { path = "../kwe-mpv" }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 libc.workspace = true
 rquickjs.workspace = true

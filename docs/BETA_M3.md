@@ -516,6 +516,43 @@ the daemon lane, llvmpipe software rasterizer for the standalone lane).
 | regressions | video + supervisor suites | `smoke-video.sh` exit 0 (deviation 2 ≤ 4) |
 | plasmashell pid guard | no plasmashell touched | pid unchanged across the suite |
 
+### M3g — VideoLayer textures via libmpv (recovered implementation)
+
+This slice keeps video decoding in the supervised `kwe-scene-renderer`
+process. A `video` object is registered in scene order and gets at most two
+software libmpv cores; additional layers remain registered but draw nothing.
+The decoder uses `rgb0` into one reusable RGBA buffer, then Vulkan refreshes a
+persistent image through one grow-only host-visible staging buffer. Matching
+dimensions never allocate or replace descriptors per frame. A missing,
+unreadable, unsupported-extension, corrupt, oversized, or failed source
+degrades only that layer; the last good texture remains visible after a
+refresh failure.
+
+The source boundary is intentionally local-only: file references are
+canonicalized beneath the scene root and package entries are extracted into a
+0700 pid-qualified directory. The 160 MiB source cap matches the scene
+worker's RLIMIT_FSIZE. mpv is configured with `hwdec=no`, `audio=no`,
+`cache=no`, bounded lavf demux buffers, `access-references=no`,
+`autoload-files=no`, `load-scripts=no`, and FFmpeg's
+`protocol_whitelist=file`; no network grant is consulted or needed. Package
+files are removed only after worker teardown. Media state is latest-wins and
+fans out play/pause/stop (stop also seeks to zero) to open layers; per-layer
+SceneScript controls remain deferred.
+
+| Case | Expected containment | Result |
+|---|---|---|
+| playback oracle | synthetic two-colour 64×64 mp4 changes at the frame center | `scripts/smoke-scene.sh` M3g-a: both colors observed; compositor frame refreshes |
+| native-size | omit `size` | M3g-b: decoder dimensions fill the layer and the surrounding clear remains unchanged |
+| decoder cap | three valid layers | M3g-c: exactly two cores open; one layer is skipped with a bounded diagnostic |
+| bad source | missing local source beside a healthy image | M3g-d: only the bad layer skips and the scene remains live |
+| package/path policy | package extraction is bounded and cleaned after decoder drop; traversal, symlink, remote protocol, and non-container extension are rejected | unit and package resolver coverage; no media code runs in plasmashell |
+| compositor failure | ordinary refresh failure disables that decoder once; fence timeout is process-fatal before fence/resource reuse | classifier unit plus worker rejection path |
+| regressions | video/supervisor suites and plasmashell guard | `smoke-video.sh`, `smoke-supervisor.sh`, and scene smoke are required; environments without ffmpeg must report the M3g lane as skipped, not pass silently |
+
+No UI changed in M3g. `content.scene2d` remains partial/backend-dependent:
+the scene capability manifest and manager presentation are deferred, and this
+slice does not claim full `content.scene2d` or `runtime.scenescript` parity.
+
 ## Renderer exit codes
 
 | Code | Meaning | Supervisor mapping |

@@ -23,7 +23,7 @@
 // are rate-limited, input reads are nonblocking with a byte cap, and the
 // render framebuffer is fixed by the frame spec.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::exit;
@@ -74,129 +74,18 @@ const MAX_INPUT_READS_PER_POLL: usize = 16;
 // libmpv render API (bound directly; see docs/BETA_M1.md)
 // ---------------------------------------------------------------------------
 
-/// Minimal direct binding to the libmpv render API as shipped with 0.41.
-/// The `mpv` crate cannot host it: `MpvHandlerBuilder::build()` runs
-/// `mpv_initialize` before exposing the handle, and libmpv aborts when a
-/// render context is created after initialization (empirically verified
-/// against 0.41 — see docs/BETA_M1.md). The crate is gone since M1e: the
-/// client API-version diagnostic is the FFI declaration below, so this
-/// module is the only linkage to libmpv. All render calls stay on this
-/// (main) thread, and the update callback only flips an atomic.
-mod mpv_ffi {
-    use super::{c_char, c_int, c_ulong, c_void};
+/// The libmpv render API binding lives in `kwe-mpv` since BETA_M3g: the
+/// scene renderer's VideoLayer path drives the same software render API,
+/// and two inline copies of one `unsafe extern` ABI would drift silently.
+/// The declarations there are verbatim the ones this worker carried since
+/// M1; the crate's module docs keep the rationale (the `mpv` crate cannot
+/// host it — it initializes before exposing the handle, and libmpv aborts
+/// when a render context is created after initialization). All render
+/// calls stay on this (main) thread, and the update callback only flips an
+/// atomic.
+use kwe_mpv as mpv_ffi;
 
-    pub const MPV_FORMAT_STRING: c_int = 1;
-    pub const MPV_FORMAT_FLAG: c_int = 3;
-    pub const MPV_FORMAT_DOUBLE: c_int = 5;
-
-    pub const MPV_EVENT_SHUTDOWN: c_int = 1;
-    pub const MPV_EVENT_END_FILE: c_int = 7;
-    pub const MPV_EVENT_FILE_LOADED: c_int = 8;
-    pub const MPV_END_FILE_REASON_EOF: c_int = 0;
-
-    pub const MPV_RENDER_PARAM_INVALID: c_int = 0;
-    pub const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
-    pub const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
-    pub const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
-    pub const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
-    pub const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
-    pub const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
-
-    pub const MPV_RENDER_UPDATE_FRAME: u64 = 1;
-
-    /// `struct mpv_event` (client.h): event_id, error, reply_userdata, data.
-    #[repr(C)]
-    pub struct mpv_event {
-        pub event_id: c_int,
-        pub error: c_int,
-        pub reply_userdata: u64,
-        pub data: *mut c_void,
-    }
-
-    /// `struct mpv_event_end_file` (client.h): reason, error, then per-format
-    /// fields we never read (any trailing layout is fine).
-    #[repr(C)]
-    pub struct mpv_event_end_file {
-        pub reason: c_int,
-        pub error: c_int,
-    }
-
-    /// `struct mpv_render_param` (render.h): type, then data.
-    #[repr(C)]
-    pub struct mpv_render_param {
-        pub type_: c_int,
-        pub data: *mut c_void,
-    }
-
-    pub type MpvHandle = c_void;
-    pub type MpvRenderContext = c_void;
-
-    // Links the binary against the system libmpv. The removed `mpv` crate
-    // emitted this directive through its bindgen tree; with the crate gone
-    // the explicit declaration is the only linkage (THIRD_PARTY.yml, libmpv
-    // entry). The worker hard-requires libmpv.so — a distro without the SW
-    // render API fails closed with exit 73 rather than misbehaving.
-    #[link(name = "mpv")]
-    unsafe extern "C" {
-        /// `unsigned long mpv_client_api_version(void)` (client.h): the
-        /// packed `MPV_MAKE_VERSION(major, minor)` this libmpv was built
-        /// with. Replaces the `mpv` crate's diagnostic entry point.
-        pub fn mpv_client_api_version() -> c_ulong;
-        pub fn mpv_create() -> *mut MpvHandle;
-        pub fn mpv_initialize(handle: *mut MpvHandle) -> c_int;
-        pub fn mpv_terminate_destroy(handle: *mut MpvHandle);
-        pub fn mpv_set_option(
-            handle: *mut MpvHandle,
-            name: *const c_char,
-            format: c_int,
-            data: *const c_void,
-        ) -> c_int;
-        pub fn mpv_set_property(
-            handle: *mut MpvHandle,
-            name: *const c_char,
-            format: c_int,
-            data: *const c_void,
-        ) -> c_int;
-        pub fn mpv_get_property(
-            handle: *mut MpvHandle,
-            name: *const c_char,
-            format: c_int,
-            data: *mut c_void,
-        ) -> c_int;
-        pub fn mpv_command(handle: *mut MpvHandle, args: *const *const c_char) -> c_int;
-        pub fn mpv_wait_event(handle: *mut MpvHandle, timeout: f64) -> *mut mpv_event;
-        pub fn mpv_error_string(code: c_int) -> *const c_char;
-        pub fn mpv_render_context_create(
-            res: *mut *mut MpvRenderContext,
-            handle: *mut MpvHandle,
-            params: *mut mpv_render_param,
-        ) -> c_int;
-        pub fn mpv_render_context_set_update_callback(
-            context: *mut MpvRenderContext,
-            callback: Option<extern "C" fn(*mut c_void)>,
-            callback_ctx: *mut c_void,
-        );
-        pub fn mpv_render_context_update(context: *mut MpvRenderContext) -> u64;
-        pub fn mpv_render_context_render(
-            context: *mut MpvRenderContext,
-            params: *mut mpv_render_param,
-        ) -> c_int;
-        pub fn mpv_render_context_free(context: *mut MpvRenderContext);
-    }
-}
-
-/// Earliest libmpv client API version with the software render API
-/// (`MPV_RENDER_API_TYPE_SW`), added in libmpv 0.33.0 (client API 2.1).
-/// Older libmpv is rejected at runtime by this worker anyway (exit 73 on
-/// the backend reject path); the probe reports the same bound honestly.
-const SW_RENDER_MIN_API_VERSION: c_ulong = (2_u64 << 16 | 1) as c_ulong;
-
-/// Split the packed libmpv client API version (`MPV_MAKE_VERSION(major,
-/// minor)`) into `(major, minor)`, byte-for-byte the decoding the removed
-/// `mpv` crate used for the same diagnostic (docs/BETA_M1.md).
-fn decode_api_version(version: c_ulong) -> (u16, u16) {
-    ((version >> 16) as u16, (version & 0xFFFF) as u16)
-}
+use kwe_mpv::{SW_RENDER_MIN_API_VERSION, decode_api_version};
 
 /// One-line JSON backend report for `kwe diagnose`'s video lane. No device
 /// is created and no mpv handle is opened: only the version query runs, so
@@ -809,11 +698,10 @@ fn check_mpv(code: c_int, action: &str) -> Result<()> {
     if code >= 0 {
         return Ok(());
     }
-    // SAFETY: libmpv returns a static string for the lifetime of the call.
-    let message = unsafe { CStr::from_ptr(mpv_ffi::mpv_error_string(code)) }
-        .to_string_lossy()
-        .into_owned();
-    Err(anyhow::anyhow!("{action} failed: {message}"))
+    Err(anyhow::anyhow!(
+        "{action} failed: {}",
+        mpv_ffi::error_string(code)
+    ))
 }
 
 /// Bounded wait for MPV_EVENT_FILE_LOADED so the `duration` property is

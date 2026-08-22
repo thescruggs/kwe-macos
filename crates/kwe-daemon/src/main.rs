@@ -88,6 +88,11 @@ struct Arguments {
     /// Video renderers get more time than the test pattern needs.
     #[arg(long, default_value_t = 6000, value_parser = clap::value_parser!(u64).range(100..=30000))]
     renderer_video_startup_timeout_ms: u64,
+    /// Scene startup includes one bounded libmpv load wait per VideoLayer;
+    /// allow two sequential decoders to initialize without weakening the
+    /// normal test-renderer deadline.
+    #[arg(long, default_value_t = 6000, value_parser = clap::value_parser!(u64).range(100..=30000))]
+    renderer_scene_startup_timeout_ms: u64,
     /// Chromium needs the most: cold start plus first screenshot.
     #[arg(long, default_value_t = 10000, value_parser = clap::value_parser!(u64).range(100..=30000))]
     renderer_web_startup_timeout_ms: u64,
@@ -148,6 +153,10 @@ struct Arguments {
     /// ~1265-thread session).
     #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
     renderer_web_processes: u64,
+    /// UID-scoped process ceiling for the scene renderer, which owns up to
+    /// two libmpv cores in VideoLayers.
+    #[arg(long, default_value_t = 32768, value_parser = clap::value_parser!(u64).range(64..=32768))]
+    renderer_scene_processes: u64,
     /// Session-scoped liveness probe interval for web renderers: the
     /// worker probes the page's renderer main thread every interval and
     /// exits 73 after consecutive failures (a page that wedges after first
@@ -293,7 +302,10 @@ fn main() -> Result<()> {
             arguments.renderer_video_startup_timeout_ms,
         ),
         (RendererKind::Web, arguments.renderer_web_startup_timeout_ms),
-        (RendererKind::Scene, arguments.renderer_startup_timeout_ms),
+        (
+            RendererKind::Scene,
+            arguments.renderer_scene_startup_timeout_ms,
+        ),
     ]);
     let global_limits = RendererResourceLimits {
         address_space_mib: arguments.renderer_address_space_mib,
@@ -312,8 +324,12 @@ fn main() -> Result<()> {
         processes: arguments.renderer_web_processes,
         ..global_limits
     };
+    let scene_limits = RendererResourceLimits {
+        processes: arguments.renderer_scene_processes,
+        ..global_limits
+    };
     let resource_limits_by_kind =
-        resource_limits_for_kinds(global_limits, video_limits, web_limits);
+        resource_limits_for_kinds(global_limits, video_limits, web_limits, scene_limits);
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_paths,
         runtime_dir: renderer_runtime_dir,
@@ -1211,12 +1227,13 @@ fn resource_limits_for_kinds(
     global: RendererResourceLimits,
     video: RendererResourceLimits,
     web: RendererResourceLimits,
+    scene: RendererResourceLimits,
 ) -> BTreeMap<RendererKind, RendererResourceLimits> {
     BTreeMap::from([
         (RendererKind::Test, global),
         (RendererKind::Video, video),
         (RendererKind::Web, web),
-        (RendererKind::Scene, global),
+        (RendererKind::Scene, scene),
     ])
 }
 
@@ -1346,6 +1363,8 @@ mod tests {
         assert_eq!(arguments.renderer_processes, 1024);
         assert_eq!(arguments.renderer_video_processes, 32768);
         assert_eq!(arguments.renderer_web_processes, 32768);
+        assert_eq!(arguments.renderer_scene_processes, 32768);
+        assert_eq!(arguments.renderer_scene_startup_timeout_ms, 6000);
         // The web address-space budget sits above the measured CDP floor: a
         // chromium 151 process reserves ~53 GiB of virtual space for the V8
         // sandbox before main (16 GiB SIGTRAPs at startup), and the DevTools
@@ -1360,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn per_kind_process_ceiling_applies_only_to_video_and_web() {
+    fn per_kind_process_ceiling_applies_to_video_web_and_scene() {
         let global = sample_limits(1024);
         let video = sample_limits(32768);
         let web = RendererResourceLimits {
@@ -1369,17 +1388,11 @@ mod tests {
             processes: 32768,
             ..global
         };
-        let map = resource_limits_for_kinds(global, video, web);
+        let scene = sample_limits(32768);
+        let map = resource_limits_for_kinds(global, video, web, scene);
         assert_eq!(map[&RendererKind::Video].processes, 32768);
         assert_eq!(map[&RendererKind::Web].processes, 32768);
-        for kind in [RendererKind::Test, RendererKind::Scene] {
-            assert_eq!(
-                map[&kind].processes,
-                1024,
-                "kind {} must keep the global process ceiling",
-                kind.as_str()
-            );
-        }
+        assert_eq!(map[&RendererKind::Test].processes, 1024);
         // The web budget is untouched by the video knob.
         assert_eq!(map[&RendererKind::Web].address_space_mib, 131_072);
         assert_eq!(map[&RendererKind::Web].open_files, 1024);
@@ -1391,11 +1404,15 @@ mod tests {
             processes: 8192,
             ..web
         };
-        let map = resource_limits_for_kinds(global, overridden, web_overridden);
+        let scene_overridden = RendererResourceLimits {
+            processes: 16384,
+            ..scene
+        };
+        let map = resource_limits_for_kinds(global, overridden, web_overridden, scene_overridden);
         assert_eq!(map[&RendererKind::Video].processes, 4096);
         assert_eq!(map[&RendererKind::Web].processes, 8192);
         assert_eq!(map[&RendererKind::Test].processes, 1024);
-        assert_eq!(map[&RendererKind::Scene].processes, 1024);
+        assert_eq!(map[&RendererKind::Scene].processes, 16384);
     }
 
     fn cache_for_tests() -> Arc<std::sync::Mutex<WorkshopCache>> {

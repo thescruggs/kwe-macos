@@ -63,7 +63,7 @@ entries:
     license_observed: LGPL-2.1-or-later (with GPL-2.0+ option)
     use: dependency
     approved_for_code_use: true
-    notes: Dynamically linked into the separate-process kwe-video-renderer worker only; never in plasmashell; release license review tracked per PROVENANCE.md. FFI linkage is explicit in kwe-video-renderer since M1e: the render API and the `mpv_client_api_version` diagnostic are declared in one local `extern "C"` block with `#[link(name = "mpv")]`, and the `mpv` crate (rust-mpv 0.2.3) has been removed (its builder initializes the mpv core before exposing the handle, which libmpv 0.41 forbids with a render context; docs/BETA_M1.md).
+    notes: Dynamically linked only by the separate-process kwe-video-renderer and kwe-scene-renderer workers; never in plasmashell; release license review tracked per PROVENANCE.md. FFI linkage is explicit in the shared crates/kwe-mpv surface (the render API and `mpv_client_api_version` diagnostic are declared in one local `extern "C"` block with `#[link(name = "mpv")]`). Scene VideoLayers use software rendering (`hwdec=no`, `audio=no`, cache/demux buffers bounded), local-file-only FFmpeg protocol filtering, disabled references/autoload/scripts, ≤2 cores, and a 160 MiB source cap. The `mpv` crate (rust-mpv 0.2.3) remains removed (its builder initializes the mpv core before exposing the handle, which libmpv 0.41 forbids with a render context; docs/BETA_M1.md).
 
   - id: qt-kirigami
     project: Qt 6 and KDE Kirigami

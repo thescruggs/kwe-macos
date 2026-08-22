@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Supervised SceneScript smoke suite (BETA_M3a..M3f).
+# Supervised SceneScript smoke suite (BETA_M3a..M3g).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. The
 # scene.json + script.js fixtures (and the solid-PNG images) are generated
@@ -16,11 +16,14 @@
 # machine-dependent). The M3f particle cases (a)-(e) pin the deterministic
 # simulation (motion trail, gravity differential, the spawn cap with its
 # bounded diagnostic, the instance.count factor from script, and the
-# blend-mode differential) through region/gravity/max oracles. The
+# blend-mode differential) through region/gravity/max oracles. The M3g
+# video cases (a)-(d) poll a runtime-generated two-color clip for playback
+# advance, native-size substitution, the concurrency cap, and an
+# unresolved source; they are skipped, never failed, without ffmpeg. The
 # standalone llvmpipe lanes repeat the scripted-color oracle AND the M3c
-# composite/blend layer oracles AND the M3f particle oracles, so a
-# driver-dependent readback orientation (mirrored frames) or a broken quad
-# is caught on the CI-friendly lane.
+# composite/blend layer oracles AND the M3f particle oracles AND the M3g
+# video oracles, so a driver-dependent readback orientation (mirrored
+# frames) or a broken quad is caught on the CI-friendly lane.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,6 +70,7 @@ start_daemon() {
         --renderer-runtime-dir "$runtime_dir" \
         --state-dir "$state_dir" \
         --renderer-startup-timeout-ms 500 \
+        --renderer-scene-startup-timeout-ms 6000 \
         --renderer-frame-timeout-ms 1000 \
         --renderer-stop-grace-ms 80 \
         --renderer-restart-delay-ms 20 \
@@ -1225,6 +1229,102 @@ json.dump(
 PY
 echo "scene smoke: M3f fixtures generated"
 
+# M3g fixtures: video layers (BETA_M3g). The corpus carries NO video
+# layers at all — not one of the 60 packages has a `video` object key —
+# so every M3g fixture is synthetic and generated at runtime, never
+# committed (the M3c/M3f convention). The clip is 64x64, 2 s at 30 fps:
+# one second of flat #3366CC, then one second of flat #CC6633. Flat
+# frames are the deterministic oracle (the smoke-video.sh convention) —
+# a flat color survives yuv420p chroma subsampling and the YUV round
+# trip without edge error, measured back as (49,100,201) and
+# (202,100,49), ~3 off nominal — so the probes run at tolerance 20 while
+# the two colors stay 153 apart in both R and B. Cases: (a) playback
+# advances (color A then color B on one fullscreen layer), (b) the
+# native-size substitution when `size` is absent, (c) the concurrency
+# cap diagnostic, (d) an unresolved source skipping only its own layer.
+# The whole block is guarded on ffmpeg: without it the M3g cases are
+# skipped, never failed.
+m3g_ready=0
+m3g_clip="$smoke_root/m3g-clip.mp4"
+m3g_a_scene="$smoke_root/m3g-a.json"
+m3g_b_scene="$smoke_root/m3g-b.json"
+m3g_c_scene="$smoke_root/m3g-c.json"
+m3g_d_scene="$smoke_root/m3g-d.json"
+if command -v ffmpeg >/dev/null; then
+    ffmpeg -loglevel error -y \
+        -f lavfi -i "color=c=0x3366CC:s=64x64:r=30:d=1" \
+        -f lavfi -i "color=c=0xCC6633:s=64x64:r=30:d=1" \
+        -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" \
+        -pix_fmt yuv420p "$m3g_clip"
+    python3 - "$m3g_a_scene" "$m3g_b_scene" "$m3g_c_scene" "$m3g_d_scene" <<'PY'
+import json
+import sys
+
+
+def scene(objects, clear=(0.0, 0.0, 0.0, 1.0)):
+    return {
+        "general": {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30},
+        "objects": objects,
+    }
+
+
+def video(name, source="m3g-clip.mp4", **props):
+    # The `video` key carries the source reference and classifies the
+    # object; `loop` and `rate` sit BESIDE it on the object, like the
+    # shared props (origin, size, alpha) the M3c/M3d path reads.
+    spec = {"name": name, "video": source, "origin": [0.0, 0.0], "loop": True}
+    spec.update(props)
+    return spec
+
+
+# (a): one fullscreen looping layer. The declared size stretches the
+# 64x64 clip over the whole 160x90 frame, so the center band samples the
+# video wherever playback has reached.
+json.dump(scene([video("clip", size=[160.0, 90.0])]), open(sys.argv[1], "w"))
+
+# (b): the same layer with `size` ABSENT — open_video_layers substitutes
+# the decoder's own 64x64 (the semantics an image layer gets from its
+# decoded texture), so the layer covers frame [48,112] x [13,77] and
+# everything outside keeps the clear. The clear is opaque green, a color
+# the clip never contains, so an "outside" sample is unambiguous.
+json.dump(
+    scene([video("clip")], clear=(0.0, 1.0, 0.0, 1.0)),
+    open(sys.argv[2], "w"),
+)
+
+# (c): MAX_VIDEO_LAYERS + 1 = 3 video layers. The parse clears the third
+# layer's source and counts one skip rather than rejecting the scene; the
+# first two still open, so the frame keeps showing the clip.
+json.dump(
+    scene([video("clip%d" % index, size=[160.0, 90.0]) for index in range(3)]),
+    open(sys.argv[3], "w"),
+)
+
+# (d): an unresolved source (no such file under the content root) skips
+# ONLY its own layer — video-source-unavailable — while the layer beside
+# it still draws. The 30x30 red square is the M3f 8x8 red png generated
+# above, scaled by the layer size.
+json.dump(
+    scene(
+        [
+            video("broken", source="m3g-missing.mp4", size=[160.0, 90.0]),
+            {
+                "name": "overlay",
+                "image": "m3f-red.png",
+                "origin": [0.0, 0.0],
+                "size": [30.0, 30.0],
+            },
+        ]
+    ),
+    open(sys.argv[4], "w"),
+)
+PY
+    m3g_ready=1
+    echo "scene smoke: M3g fixtures generated"
+else
+    echo "scene smoke: skipping the M3g video cases (ffmpeg not installed)"
+fi
+
 # Frame pixel oracle for the shared frame file: like scene_oracle, but for
 # one arbitrary pixel against an expected BGRA value with a tolerance
 # (driver float rounding). Reads whole, stable even generation.
@@ -2185,6 +2285,123 @@ done
 }
 echo "scene smoke passed (M3f f): draw order — particle system under the image listed after it (center red, disc white at x 50)"
 
+# M3g poll primitive: wait for at least `want` pixels in the box to match
+# the color, printing the last count seen (so a failure reports how close
+# it got). Args: frame x0 y0 w h "B,G,R,A" tol want attempts.
+m3g_wait_color() {
+    local frame="$1" x0="$2" y0="$3" w="$4" h="$5" color="$6" tol="$7" want="$8" attempts="$9"
+    local probe count=0
+    for _attempt in $(seq 1 "$attempts"); do
+        if probe="$(scene_region_probe "$frame" "$x0" "$y0" "$w" "$h" "$color" "$tol" 2>/dev/null)"; then
+            count="${probe#foreground=}"
+            if (( count >= want )); then
+                echo "$count"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
+    echo "$count"
+    return 1
+}
+
+if [[ "$m3g_ready" == "1" ]]; then
+
+# M3g cases (BETA_M3g): video layers decoded by libmpv and uploaded into
+# the same layer texture every frame. Same lane conventions as M3f: the
+# daemon lanes sample the live shared frame file, the standalone llvmpipe
+# lanes below repeat the oracles against the worker's own frame file.
+# Every assertion is a POLL, not a single sample — a video layer's frame
+# is whatever playback has reached, so the oracle waits for a state to
+# appear rather than pinning one instant.
+
+# Case M3g-a: playback advances. One fullscreen looping layer over the
+# 2 s clip: the 8x8 center box must read flat #3366CC (BGRA 204,102,51)
+# at some poll and flat #CC6633 (BGRA 51,102,204) at a later one. A
+# decoder that opened but never advanced — the failure this case exists
+# for, since a static first frame still renders and still logs
+# video_open — passes the first probe and hangs on the second. 200
+# attempts x 0.25 s = 50 s, 25 clip loops.
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_a_scene" \
+    '{wallpaper_id:"scene-m3g-a",content_hash:"hash-m3g-a",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_a_status="$(wait_phase live)"
+m3g_a_frame="$(jq -r '.result.frame_file' <<<"$m3g_a_status")"
+m3g_a_first="$(m3g_wait_color "$m3g_a_frame" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-a failure: the first clip color never reached the frame center (best=$m3g_a_first of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_a_second="$(m3g_wait_color "$m3g_a_frame" 76 41 8 8 "51,102,204,255" 20 60 200)" || {
+    echo "M3g-a failure: the second clip color never arrived — playback is not advancing (best=$m3g_a_second of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_a_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_a_tail" == *"event=renderer.scene.video_open layer=clip size=64x64"* ]]
+echo "scene smoke passed (M3g a): playback advances — both clip colors reached the frame center ($m3g_a_first then $m3g_a_second of 64 px)"
+
+# Case M3g-b: the native-size substitution. The scene declares no `size`,
+# so open_video_layers fills it from the decoder (64x64) before the
+# script engine is built: the layer covers frame [48,112] x [13,77]. The
+# center reads the clip; the box at x 120 — outside the layer, inside a
+# fullscreen stretch — must stay the opaque green clear. A substitution
+# that fell back to the frame size, or to [0,0] and a degenerate quad,
+# fails one of the two.
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_b_scene" \
+    '{wallpaper_id:"scene-m3g-b",content_hash:"hash-m3g-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_b_status="$(wait_phase live)"
+m3g_b_frame="$(jq -r '.result.frame_file' <<<"$m3g_b_status")"
+m3g_b_center="$(m3g_wait_color "$m3g_b_frame" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-b failure: the clip never reached the frame center (best=$m3g_b_center of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_b_outside="$(scene_region_probe "$m3g_b_frame" 120 41 8 8 "0,255,0,255" 20)"
+[[ "${m3g_b_outside#foreground=}" == "64" ]]
+m3g_b_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_b_tail" == *"event=renderer.scene.video_open layer=clip size=64x64"* ]]
+echo "scene smoke passed (M3g b): native-size substitution — clip at the center, clear still green at x 120"
+
+# Case M3g-c: the concurrency cap. Three video layers, cap 2: the parse
+# clears the third source and counts one skip; the scene still loads and
+# the two opened layers still draw. The diagnostic is emitted once at
+# load, so it is already in the tail by the time the frame is live.
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_c_scene" \
+    '{wallpaper_id:"scene-m3g-c",content_hash:"hash-m3g-c",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_c_status="$(wait_phase live)"
+m3g_c_frame="$(jq -r '.result.frame_file' <<<"$m3g_c_status")"
+m3g_c_center="$(m3g_wait_color "$m3g_c_frame" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-c failure: the capped scene never drew the clip (best=$m3g_c_center of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_c_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_c_tail" == *"event=renderer.scene.video_layer_skip count=1 (cap is 2)"* ]]
+# The parse clears the third source, so the loader diagnoses that layer by
+# name too: the cap is visible per layer, not just as a count.
+[[ "$m3g_c_tail" == *"layer_skip layer=clip2 detail=video-source-unavailable"* ]]
+echo "scene smoke passed (M3g c): concurrency cap — 3 video layers, 1 skipped, the scene still renders"
+
+# Case M3g-d: an unresolved source degrades ONE layer. The video layer is
+# listed first and its source does not exist; the 30x30 red square beside
+# it must still draw at the center, and the skip must name the layer and
+# carry the RESOLVER's own detail (the video-source-unavailable slug is
+# the cleared-source case, which (c) covers).
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_d_scene" \
+    '{wallpaper_id:"scene-m3g-d",content_hash:"hash-m3g-d",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_d_status="$(wait_phase live)"
+m3g_d_frame="$(jq -r '.result.frame_file' <<<"$m3g_d_status")"
+m3g_d_red="$(m3g_wait_color "$m3g_d_frame" 76 41 8 8 "0,0,255,255" 20 60 120)" || {
+    echo "M3g-d failure: the healthy image layer never drew beside the broken video (best=$m3g_d_red of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_d_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_d_tail" == *'layer_skip layer=broken detail=video "m3g-missing.mp4" is missing or unreadable'* ]]
+echo "scene smoke passed (M3g d): unresolved source — only the video layer skipped, the image still drew"
+
+fi
+
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
 stopped_status="$(wait_phase stopped)"
@@ -2558,5 +2775,69 @@ if [[ "$m3f_f_lane_white_seen" != "1" ]]; then
 fi
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3f f draw-order oracle (image over particle system)"
+
+
+# The M3g oracles on the llvmpipe lane: the same four cases, run directly
+# against the worker's own frame file and its own stderr log. Video
+# decoding is libmpv on the CPU (hwdec=no), so nothing here depends on
+# the device — but the UPLOAD path does: refresh_layer writes the decoded
+# frame into the live image every tick, and a driver that needed an
+# explicit flush would show a frozen first frame, which case (a) catches.
+if [[ "$m3g_ready" == "1" ]]; then
+
+# (a): playback advances — both clip colors reach the center.
+lane_start "$smoke_root/standalone-m3g-a.bin" "$m3g_a_scene" "$smoke_root/standalone-m3g-a.log"
+m3g_a_lane_first="$(m3g_wait_color "$smoke_root/standalone-m3g-a.bin" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-a failure: standalone lane never showed the first clip color (best=$m3g_a_lane_first of 64)" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3g-a.log" >&2
+    exit 1
+}
+m3g_a_lane_second="$(m3g_wait_color "$smoke_root/standalone-m3g-a.bin" 76 41 8 8 "51,102,204,255" 20 60 200)" || {
+    echo "M3g-a failure: standalone lane playback is not advancing (best=$m3g_a_lane_second of 64)" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3g-a.log" >&2
+    exit 1
+}
+grep -q "event=renderer.scene.video_open layer=clip size=64x64" "$smoke_root/standalone-m3g-a.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3g a playback oracle ($m3g_a_lane_first then $m3g_a_lane_second of 64 px)"
+
+# (b): the native-size substitution — clip at the center, clear outside.
+lane_start "$smoke_root/standalone-m3g-b.bin" "$m3g_b_scene" "$smoke_root/standalone-m3g-b.log"
+m3g_b_lane_center="$(m3g_wait_color "$smoke_root/standalone-m3g-b.bin" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-b failure: standalone lane never showed the clip at the center (best=$m3g_b_lane_center of 64)" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3g-b.log" >&2
+    exit 1
+}
+m3g_b_lane_outside="$(scene_region_probe "$smoke_root/standalone-m3g-b.bin" 120 41 8 8 "0,255,0,255" 20)"
+[[ "${m3g_b_lane_outside#foreground=}" == "64" ]]
+grep -q "event=renderer.scene.video_open layer=clip size=64x64" "$smoke_root/standalone-m3g-b.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3g b native-size oracle"
+
+# (c): the concurrency cap — one skip counted, the scene still renders.
+lane_start "$smoke_root/standalone-m3g-c.bin" "$m3g_c_scene" "$smoke_root/standalone-m3g-c.log"
+m3g_c_lane_center="$(m3g_wait_color "$smoke_root/standalone-m3g-c.bin" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-c failure: standalone lane capped scene never drew the clip (best=$m3g_c_lane_center of 64)" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3g-c.log" >&2
+    exit 1
+}
+grep -q "event=renderer.scene.video_layer_skip count=1 (cap is 2)" "$smoke_root/standalone-m3g-c.log"
+grep -q "layer_skip layer=clip2 detail=video-source-unavailable" "$smoke_root/standalone-m3g-c.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3g c concurrency-cap oracle"
+
+# (d): the unresolved source — only that layer skipped, with the
+# resolver's detail.
+lane_start "$smoke_root/standalone-m3g-d.bin" "$m3g_d_scene" "$smoke_root/standalone-m3g-d.log"
+m3g_d_lane_red="$(m3g_wait_color "$smoke_root/standalone-m3g-d.bin" 76 41 8 8 "0,0,255,255" 20 60 120)" || {
+    echo "M3g-d failure: standalone lane image layer never drew (best=$m3g_d_lane_red of 64)" >&2
+    sed -n '1,120p' "$smoke_root/standalone-m3g-d.log" >&2
+    exit 1
+}
+grep -qF 'layer_skip layer=broken detail=video "m3g-missing.mp4" is missing or unreadable' "$smoke_root/standalone-m3g-d.log"
+lane_stop
+echo "scene smoke passed: standalone llvmpipe lane — M3g d unresolved-source oracle"
+
+fi
 
 echo "all scene smoke cases passed"

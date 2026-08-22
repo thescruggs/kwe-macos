@@ -1056,15 +1056,15 @@ impl TextRenderer {
 
     /// Re-sync every dirty text layer: resolve font, relayout, rasterize
     /// missing glyphs, upload atlas texture (via the image path) and quad
-    /// vertices. Returns the set of layer indices whose textures failed to
-    /// upload (draws for them are suppressed this frame, like image
-    /// layers). Never returns an error: a hostile text can only degrade
-    /// rendering.
+    /// vertices. Returns the set of layer indices whose ordinary uploads
+    /// failed (draws for them are suppressed this frame, like image
+    /// layers). A fence timeout is propagated because its submit may still
+    /// be pending and the worker must terminate before Vulkan reuse/free.
     pub fn sync_and_upload(
         &mut self,
         vulkan: &mut LayerRenderer,
         layers: &[std::rc::Rc<std::cell::RefCell<LayerState>>],
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>, crate::vulkan::RenderError> {
         let mut failed: Vec<usize> = Vec::new();
         if self.layers.len() < layers.len() {
             self.layers.resize_with(layers.len(), || None);
@@ -1191,32 +1191,36 @@ impl TextRenderer {
                         runtime.budget_counted = true;
                         self.atlas_bytes_used = self.atlas_bytes_used.saturating_add(atlas_bytes);
                     }
-                    if vulkan
-                        .upload_layer(i, &runtime.atlas.pixels, ATLAS_SIZE, ATLAS_SIZE)
-                        .is_err()
-                    {
-                        if runtime.budget_counted {
-                            runtime.budget_counted = false;
-                            self.atlas_bytes_used =
-                                self.atlas_bytes_used.saturating_sub(atlas_bytes);
+                    match vulkan.upload_layer(i, &runtime.atlas.pixels, ATLAS_SIZE, ATLAS_SIZE) {
+                        Ok(()) => {}
+                        Err(error) if crate::vulkan::is_fence_timeout(&error) => {
+                            return Err(error);
                         }
-                        ok = false;
+                        Err(_) => {
+                            if runtime.budget_counted {
+                                runtime.budget_counted = false;
+                                self.atlas_bytes_used =
+                                    self.atlas_bytes_used.saturating_sub(atlas_bytes);
+                            }
+                            ok = false;
+                        }
                     }
                 }
             }
-            if ok
-                && !runtime.vertex_bytes.is_empty()
-                && vulkan
-                    .upload_text_vertices(i, &runtime.vertex_bytes)
-                    .is_err()
-            {
-                ok = false;
+            if ok && !runtime.vertex_bytes.is_empty() {
+                match vulkan.upload_text_vertices(i, &runtime.vertex_bytes) {
+                    Ok(()) => {}
+                    Err(error) if crate::vulkan::is_fence_timeout(&error) => {
+                        return Err(error);
+                    }
+                    Err(_) => ok = false,
+                }
             }
             if !ok {
                 failed.push(i);
             }
         }
-        failed
+        Ok(failed)
     }
 }
 

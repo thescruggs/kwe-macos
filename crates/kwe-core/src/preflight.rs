@@ -169,6 +169,26 @@ pub fn preflight_video(path: &Path) -> VideoPreflight {
     report
 }
 
+/// Whether a scene VideoLayer reference names one of the same local
+/// containers accepted by the supervised video worker. This is only an
+/// early policy gate; libmpv still probes the bytes and the decoder's
+/// protocol whitelist is the security boundary.
+#[must_use]
+pub fn video_extension_allowed(reference: &str) -> bool {
+    if reference.contains("://") || reference.contains('\0') {
+        return false;
+    }
+    matches!(
+        Path::new(reference)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "mp4" | "webm" | "mkv" | "mov" | "avi" | "wmv" | "flv" | "m4v" | "ogv"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +337,15 @@ mod tests {
             report.reasons
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scene_video_extension_policy_is_local_container_only() {
+        assert!(video_extension_allowed("clip.MP4"));
+        assert!(video_extension_allowed("nested/movie.webm"));
+        assert!(!video_extension_allowed("playlist.m3u8"));
+        assert!(!video_extension_allowed("https://example.test/movie.mp4"));
+        assert!(!video_extension_allowed("movie.bin"));
     }
 
     #[test]

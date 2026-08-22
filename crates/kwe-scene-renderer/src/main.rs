@@ -40,6 +40,7 @@ mod particles;
 mod scene;
 mod text;
 mod textures;
+mod video;
 mod vulkan;
 
 use std::cell::RefCell;
@@ -66,7 +67,7 @@ use particles::{MAX_PARTICLE_SYSTEMS, ParticleSystemState, particle_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
 use text::{MAX_TEXT_LAYERS, TextRenderer};
 use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
-use vulkan::{LayerRenderer, RenderError};
+use vulkan::{LayerRenderer, RenderError, is_fence_timeout};
 
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
@@ -212,6 +213,7 @@ struct InputChannel {
     /// Latest audio spectrum (consumed by M3k effects; stored + counted now).
     audio: Option<AudioFrame>,
     audio_frames: u64,
+    media: Option<video::MediaCommand>,
 }
 
 impl InputChannel {
@@ -225,6 +227,7 @@ impl InputChannel {
             pointer: None,
             audio: None,
             audio_frames: 0,
+            media: None,
         })
     }
 
@@ -288,9 +291,10 @@ impl InputChannel {
                     self.ack(ack.as_deref());
                 }
             }
-            // Acked and otherwise a no-op in M3a: scenes have no media
-            // transport of their own.
             Some("media_state") if decode_media_state(line).is_ok() => {
+                if let Ok(state) = decode_media_state(line) {
+                    self.media = media_command_for(&state.playback);
+                }
                 self.ack(ack.as_deref());
             }
             _ => {} // unknown types and malformed messages are ignored
@@ -305,6 +309,19 @@ impl InputChannel {
             .stdout
             .write_all(ack)
             .and_then(|()| self.stdout.flush());
+    }
+
+    fn take_media(&mut self) -> Option<video::MediaCommand> {
+        self.media.take()
+    }
+}
+
+fn media_command_for(playback: &str) -> Option<video::MediaCommand> {
+    match playback {
+        "playing" => Some(video::MediaCommand::Play),
+        "paused" => Some(video::MediaCommand::Pause),
+        "stopped" => Some(video::MediaCommand::Stop),
+        _ => None,
     }
 }
 
@@ -384,6 +401,11 @@ struct SceneWorker {
     /// successful upload, see vulkan.rs). particle_draws skips false
     /// entries.
     particle_texture_ok: Vec<bool>,
+    /// M3g: the open video decoders, each paired with the layer index it
+    /// feeds. At most video::MAX_VIDEO_LAYERS entries — a scene without
+    /// video carries none, and the frame loop's sync_videos is then a
+    /// no-op over an empty slice.
+    videos: Vec<(usize, video::VideoDecoder)>,
     published: u64,
     consecutive_render_failures: u64,
 }
@@ -445,8 +467,11 @@ impl SceneWorker {
         // M3f: particle systems are seeded with one pacing interval of
         // simulation, so the first published frame already shows particles
         // (the burst a script queued in init() spawns on this first step).
-        self.sync_text();
+        if let Err(error) = self.sync_text() {
+            reject_render(&error, "fence timeout during text upload");
+        }
         self.sync_particles(interval.as_secs_f64());
+        self.sync_videos();
         // M3f draw order: the layer and particle lists are merged by the
         // scene.json objects-array order, so a particle system and an
         // image interleave exactly as the file says (an image listed after
@@ -463,6 +488,17 @@ impl SceneWorker {
         let mut last_pixels: Option<Vec<u8>> = Some(initial);
         loop {
             self.input.poll();
+            if let Some(command) = self.input.take_media() {
+                for (index, decoder) in &mut self.videos {
+                    if let Err(error) = decoder.apply_media(command) {
+                        decoder.disable();
+                        eprintln!(
+                            "event=renderer.scene.layer_skip layer={} detail=video-media-failed: {error}",
+                            self.layers[*index].borrow().name
+                        );
+                    }
+                }
+            }
             self.check_faults()?;
             if TERMINATED.load(Ordering::Acquire) {
                 self.writer.set_state(ProducerState::Stopping);
@@ -497,8 +533,11 @@ impl SceneWorker {
                     // systems are simulated with the same dt the script's
                     // update() ran under, and their per-frame vertex
                     // buffers are rebuilt whenever a fixed step ran.
-                    self.sync_text();
+                    if let Err(error) = self.sync_text() {
+                        reject_render(&error, "fence timeout during text upload");
+                    }
                     self.sync_particles(dt);
+                    self.sync_videos();
                     let draws = merged_draws(
                         frame_draws(&self.layers, &self.texture_ok),
                         particle_draws(&self.particles, &self.particle_texture_ok),
@@ -575,8 +614,10 @@ impl SceneWorker {
     /// drawable this frame, exactly like an image layer; a hostile text can
     /// only degrade rendering, never the scene. All diagnostics are bounded
     /// one-time eprintlns (text.rs).
-    fn sync_text(&mut self) {
-        let failed = self.text.sync_and_upload(&mut self.renderer, &self.layers);
+    fn sync_text(&mut self) -> std::result::Result<(), RenderError> {
+        let failed = self
+            .text
+            .sync_and_upload(&mut self.renderer, &self.layers)?;
         for index in failed {
             self.texture_ok[index] = false;
             eprintln!(
@@ -584,6 +625,7 @@ impl SceneWorker {
                 self.layers[index].borrow().name
             );
         }
+        Ok(())
     }
 
     /// M3f: step every particle system with the frame's dt (the same dt
@@ -611,10 +653,49 @@ impl SceneWorker {
                 continue; // all aged out: nothing to upload, no draw
             }
             if let Err(error) = self.renderer.upload_particle_vertices(index, &scratch) {
+                if is_fence_timeout(&error) {
+                    reject_render(&error, "fence timeout during particle vertex upload");
+                }
                 self.particle_texture_ok[index] = false;
                 eprintln!(
                     "event=renderer.scene.particle_skip system={} detail=vertex-upload-failed: {error}",
                     system.name
+                );
+            }
+        }
+    }
+
+    /// M3g: pull one frame from each open decoder and refresh its layer
+    /// texture in place. `poll_frame` returns None when libmpv has nothing
+    /// new this tick (the common case at a pacing rate above the video's
+    /// frame rate) or when the decoder has failed — either way the layer
+    /// keeps its current texture, so a stalled or dead video freezes on its
+    /// last frame instead of disappearing.
+    ///
+    /// `refresh_layer` reuses the image and descriptor set as long as the
+    /// dimensions match, which they always do here (the decoder's size is
+    /// fixed at open). A failed refresh disables only future decoder polls;
+    /// the already-uploaded last good texture remains drawable.
+    fn sync_videos(&mut self) {
+        // Disjoint field borrows: poll_frame borrows the decoder for the
+        // life of the returned slice, so the renderer and the texture table
+        // have to be reborrowed outside the loop.
+        let renderer = &mut self.renderer;
+        let layers = &self.layers;
+        for (index, decoder) in self.videos.iter_mut() {
+            let index = *index;
+            let (width, height) = (decoder.width(), decoder.height());
+            let Some(frame) = decoder.poll_frame() else {
+                continue;
+            };
+            if let Err(error) = renderer.refresh_layer(index, frame, width, height) {
+                if is_fence_timeout(&error) {
+                    reject_render(&error, "fence timeout during video refresh");
+                }
+                decoder.disable();
+                eprintln!(
+                    "event=renderer.scene.layer_skip layer={} detail=video-refresh-failed: {error}",
+                    layers[index].borrow().name
                 );
             }
         }
@@ -670,7 +751,11 @@ fn main() -> Result<()> {
         .context("--content is required (--probe excepted)")?;
 
     // 1. Scene: parse and reject (exit 73) anything the engine cannot render.
-    let config = load_scene(&content);
+    let mut config = load_scene(&content);
+    // 1b. M3g: open the video decoders before the script engine, so a layer
+    //     that declared size [0, 0] carries the video's own dimensions by
+    //     the time init() reads it (the same rule image layers follow).
+    let mut videos = open_video_layers(&mut config.layers);
     if let Some((w, h)) = config.resolution
         && (w, h) != (arguments.width, arguments.height)
     {
@@ -735,7 +820,8 @@ fn main() -> Result<()> {
     //    completion per upload). A failed upload skips the layer with a
     //    bounded one-time diagnostic — the renderer stays healthy.
     let layers = engine.layers();
-    let texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
+    let mut texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
+    upload_video_first_frames(&mut renderer, &config.layers, &mut videos, &mut texture_ok);
 
     // 5b. M3f: particle-system textures (slot MAX_LAYERS + system_index).
     let particles = engine.particles();
@@ -784,6 +870,13 @@ fn main() -> Result<()> {
             config.particle_system_skips
         );
     }
+    if config.video_layer_skips > 0 {
+        eprintln!(
+            "event=renderer.scene.video_layer_skip count={} (cap is {})",
+            config.video_layer_skips,
+            video::MAX_VIDEO_LAYERS
+        );
+    }
     if config.particle_file_refs > 0 {
         eprintln!(
             "event=renderer.scene.particle_file_ref count={} (external particle files are planned; defaults used)",
@@ -803,13 +896,20 @@ fn main() -> Result<()> {
         texture_ok,
         particles,
         particle_texture_ok,
+        videos,
         published: 0,
         consecutive_render_failures: 0,
     };
     let run_result = worker.run();
+    // Release libmpv render contexts before removing package-backed files;
+    // the decoder's teardown is ordered render-context -> mpv handle.
+    drop(worker);
     // M3b review follow-up: the worker removes its own extracted script
     // directory on the graceful exit path (it owns its HOME).
     cleanup_script_dir(config.script_path.as_deref());
+    // M3g: the extracted video directory is the worker's too (pkg lane only;
+    // a file scene never creates one, and the cleanup is a no-op then).
+    cleanup_video_dir();
     run_result
 }
 
@@ -865,6 +965,11 @@ fn load_scene(content: &Path) -> SceneConfig {
         load_particle_textures(&mut config.particles, &mut used_bytes, |reference| {
             resolve_layer_image(&root, reference)
         });
+        // M3g: video layers resolve to a path inside the same root; the
+        // file is never read here (libmpv opens it).
+        load_layer_videos(&mut config.layers, |reference| {
+            resolve_layer_video(&root, reference)
+        });
         return config;
     }
 
@@ -912,6 +1017,24 @@ fn load_scene(content: &Path) -> SceneConfig {
         reader
             .read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
             .map_err(|error| format!("cannot read entry: {error}"))
+    });
+    // M3g: a packaged video is extracted into the worker's private HOME,
+    // because libmpv opens a path rather than a byte slice. Bounded by
+    // MAX_VIDEO_SOURCE_BYTES and by the concurrency cap the parse enforced.
+    let mut video_slot = 0usize;
+    load_layer_videos(&mut config.layers, |reference| {
+        if !kwe_core::video_extension_allowed(reference) {
+            return Err(format!(
+                "video \"{reference}\" has an unsupported container extension"
+            ));
+        }
+        let index = kwe_core::video_entry(reference, reader.entries())?;
+        let bytes = reader
+            .read_entry_bounded(index, video::MAX_VIDEO_SOURCE_BYTES)
+            .map_err(|error| format!("cannot read entry: {error}"))?;
+        let slot = video_slot;
+        video_slot += 1;
+        extract_video(slot, &bytes).map_err(|error| format!("cannot extract video entry: {error}"))
     });
     eprintln!(
         "event=renderer.scene.pkg entries={} script_entry={}",
@@ -1098,6 +1221,9 @@ fn upload_layer_textures(
         match renderer.upload_layer(index, &texture.rgba, texture.width, texture.height) {
             Ok(()) => {}
             Err(error) => {
+                if is_fence_timeout(&error) {
+                    reject_render(&error, "fence timeout during layer texture upload");
+                }
                 texture_ok[index] = false;
                 eprintln!(
                     "event=renderer.scene.layer_skip layer={} detail=upload-failed: {error}",
@@ -1135,6 +1261,9 @@ fn upload_particle_textures(
         ) {
             Ok(()) => texture_ok[index] = true,
             Err(error) => {
+                if is_fence_timeout(&error) {
+                    reject_render(&error, "fence timeout during particle texture upload");
+                }
                 eprintln!(
                     "event=renderer.scene.particle_skip system={} detail=upload-failed: {error}",
                     particle.name
@@ -1143,6 +1272,275 @@ fn upload_particle_textures(
         }
     }
     texture_ok
+}
+
+/// M3g: fill `layers[*].video.path` for every video layer — resolve the
+/// reference the same way an image resolves (the caller's closure is
+/// lane-specific: a path inside the content root for file scenes, an
+/// extracted copy of the package entry for pkg scenes). libmpv opens a
+/// path, not a byte slice, which is the one asymmetry with images: a
+/// package-embedded video is written into the worker's private HOME first.
+///
+/// A layer whose source is absent (non-string `video`, or over the
+/// concurrency cap — parse already cleared those), unresolved, or too
+/// large is skipped with a bounded one-time diagnostic and stays
+/// registered but textureless; a video problem never rejects the scene.
+fn load_layer_videos(
+    layers: &mut [scene::LayerSpec],
+    mut resolve: impl FnMut(&str) -> Result<PathBuf, String>,
+) {
+    for layer in layers {
+        let name = layer.name.clone();
+        let Some(spec) = layer.video.as_mut() else {
+            continue; // not a video layer
+        };
+        let Some(reference) = spec.source.clone() else {
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={name} detail=video-source-unavailable"
+            );
+            continue;
+        };
+        match resolve(&reference) {
+            Ok(path) => spec.path = Some(path),
+            Err(detail) => {
+                eprintln!("event=renderer.scene.layer_skip layer={name} detail={detail}");
+            }
+        }
+    }
+}
+
+/// Resolve one layer's video reference against the content root (file
+/// scenes). The same containment rules as `resolve_layer_image` —
+/// relative, no `..`/absolute components, canonicalized inside the root so
+/// a symlink cannot smuggle the source out, a regular file — but the file
+/// is never read: libmpv opens the path itself, so the size cap is checked
+/// from the metadata instead of from a bounded read.
+fn resolve_layer_video(root: &Path, reference: &str) -> Result<PathBuf, String> {
+    if reference.is_empty() {
+        return Err("video reference must not be empty".into());
+    }
+    if !kwe_core::video_extension_allowed(reference) {
+        return Err(format!(
+            "video \"{reference}\" has an unsupported container extension"
+        ));
+    }
+    let joined = Path::new(reference);
+    if joined.is_absolute() {
+        return Err(format!(
+            "video \"{reference}\" must be relative to the scene directory"
+        ));
+    }
+    for component in joined.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(format!(
+                "video \"{reference}\" must stay inside the scene directory"
+            ));
+        }
+    }
+    let canonical = root
+        .join(joined)
+        .canonicalize()
+        .map_err(|error| format!("video \"{reference}\" is missing or unreadable: {error}"))?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "video \"{reference}\" resolves outside the scene directory"
+        ));
+    }
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("video \"{reference}\" is unreadable: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("video \"{reference}\" is not a regular file"));
+    }
+    if metadata.len() > video::MAX_VIDEO_SOURCE_BYTES {
+        return Err(format!(
+            "video \"{reference}\" is {} bytes, over the {} byte cap",
+            metadata.len(),
+            video::MAX_VIDEO_SOURCE_BYTES
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Write one package video entry into a private 0700 directory under the
+/// worker's HOME, mirroring `extract_script`. Videos are extracted rather
+/// than decoded in memory because libmpv opens a path; the directory is
+/// removed on the graceful exit path (`cleanup_video_dir`), and a stale
+/// one left by a hard kill is reused after its files are replaced.
+fn extract_video(slot: usize, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    extract_video_into(&home, slot, bytes)
+}
+
+/// The extraction core, testable against a caller-chosen HOME. Unlike
+/// `extract_script_into` the directory is reused across calls (a scene may
+/// carry MAX_VIDEO_LAYERS videos), so staleness is handled per file: the
+/// old entry is unlinked before the exclusive create. `remove_file` unlinks
+/// a symlink itself rather than following it, so a planted link cannot
+/// redirect the write.
+fn extract_video_into(home: &Path, slot: usize, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = home.join(format!("kwe-scene-video-{}", std::process::id()));
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stale video directory is not a plain directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let path = dir.join(format!("video-{slot}.bin"));
+    let _ = fs::remove_file(&path);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    Ok(path)
+}
+
+/// Remove the extracted video directory on the worker's graceful exit path
+/// (the worker owns its HOME). Unconditional: the directory only exists
+/// when a packaged scene carried a video, and a missing one is not an
+/// error. A kill -9 leaves it behind; the next start with a recycled pid
+/// replaces the files inside it.
+fn cleanup_video_dir() {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    cleanup_video_dir_in(&home);
+}
+
+/// The cleanup core, testable against a caller-chosen HOME (the same split
+/// `extract_video_into` uses). Name-guarded and symlink-guarded: only a
+/// plain directory named `kwe-scene-video-<our pid>` is removed, so a
+/// planted symlink of that name is left where it is rather than followed.
+fn cleanup_video_dir_in(home: &Path) {
+    let dir = home.join(format!("kwe-scene-video-{}", std::process::id()));
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        _ => return, // nothing we created
+    }
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => eprintln!(
+            "event=renderer.scene.video_dir_cleanup path={}",
+            dir.display()
+        ),
+        Err(error) => eprintln!("event=renderer.scene.video_dir_cleanup error={error}"),
+    }
+}
+
+/// M3g: open a decoder for every video layer whose source resolved, and
+/// give the layer the video's own dimensions when the scene declared
+/// `size` [0, 0] (the same WE semantics image layers get from their
+/// decoded texture). This runs before the script engine is built, so
+/// `init()` always sees the real size.
+///
+/// At most `video::MAX_VIDEO_LAYERS` decoders open: the parse already
+/// cleared the source of every layer past the cap, and the defensive break
+/// here means a future parse change cannot silently uncap concurrency. A
+/// decoder that fails to open skips its layer with a bounded diagnostic —
+/// a broken video degrades one layer, never the scene.
+fn open_video_layers(layers: &mut [scene::LayerSpec]) -> Vec<(usize, video::VideoDecoder)> {
+    let mut decoders = Vec::new();
+    for (index, layer) in layers.iter_mut().enumerate() {
+        let Some(spec) = layer.video.as_ref() else {
+            continue;
+        };
+        let Some(path) = spec.path.clone() else {
+            continue; // no source, or it did not resolve (already diagnosed)
+        };
+        if decoders.len() >= video::MAX_VIDEO_LAYERS {
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={} detail=video-concurrency-cap",
+                layer.name
+            );
+            continue;
+        }
+        let (loop_playback, rate) = (spec.loop_playback, spec.rate);
+        match video::VideoDecoder::open(&path, loop_playback, rate) {
+            Ok(decoder) => {
+                if layer.size == [0.0, 0.0] {
+                    layer.size = [decoder.width() as f32, decoder.height() as f32];
+                }
+                eprintln!(
+                    "event=renderer.scene.video_open layer={} size={}x{} loop={loop_playback} rate={rate}",
+                    layer.name,
+                    decoder.width(),
+                    decoder.height()
+                );
+                decoders.push((index, decoder));
+            }
+            Err(detail) => {
+                eprintln!(
+                    "event=renderer.scene.layer_skip layer={} detail=video-open-failed: {detail}",
+                    layer.name
+                );
+            }
+        }
+    }
+    decoders
+}
+
+/// M3g: upload each decoder's current frame once before the first render,
+/// so the layer owns an image and a descriptor set that `refresh_layer`
+/// can then update in place at frame rate. Video layers with no decoder
+/// are marked not drawable: `frame_draws` would otherwise emit a draw the
+/// compositor silently discards for want of a descriptor set.
+fn upload_video_first_frames(
+    renderer: &mut LayerRenderer,
+    config_layers: &[scene::LayerSpec],
+    videos: &mut [(usize, video::VideoDecoder)],
+    texture_ok: &mut [bool],
+) {
+    for (index, layer) in config_layers.iter().enumerate() {
+        if layer.video.is_some() && !videos.iter().any(|(slot, _)| *slot == index) {
+            texture_ok[index] = false;
+        }
+    }
+    for (index, decoder) in videos.iter_mut() {
+        // Best effort: a decoder that has not produced a frame yet uploads
+        // its zero-filled buffer, which is transparent black under the
+        // layer's blend — the next sync_videos replaces it in place.
+        let _ = decoder.poll_frame();
+        // A decoder that already failed will never produce a frame, so it
+        // gets no image and no descriptor set: allocating a texture slot
+        // for it would waste the bounded pool on a layer that draws
+        // nothing. The decoder emitted its own one-time video_error.
+        if decoder.failed() {
+            texture_ok[*index] = false;
+            eprintln!(
+                "event=renderer.scene.layer_skip layer={} detail=video-failed-before-first-frame",
+                config_layers[*index].name
+            );
+            continue;
+        }
+        let (width, height) = (decoder.width(), decoder.height());
+        match renderer.upload_layer(*index, decoder.frame(), width, height) {
+            Ok(()) => texture_ok[*index] = true,
+            Err(error) => {
+                if is_fence_timeout(&error) {
+                    reject_render(&error, "fence timeout during video texture upload");
+                }
+                texture_ok[*index] = false;
+                decoder.disable();
+                eprintln!(
+                    "event=renderer.scene.layer_skip layer={} detail=video-upload-failed: {error}",
+                    config_layers[*index].name
+                );
+            }
+        }
+    }
 }
 
 /// Write a script entry into a private 0700 directory under the worker's
@@ -1241,6 +1639,24 @@ fn reject_scene(error: &SceneError) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn media_state_maps_to_latest_wins_commands() {
+        assert_eq!(
+            media_command_for("playing"),
+            Some(video::MediaCommand::Play)
+        );
+        assert_eq!(
+            media_command_for("paused"),
+            Some(video::MediaCommand::Pause)
+        );
+        assert_eq!(
+            media_command_for("stopped"),
+            Some(video::MediaCommand::Stop)
+        );
+        assert_eq!(media_command_for("metadata"), None);
+    }
 
     #[test]
     fn publish_decision_pure() {
@@ -1375,6 +1791,7 @@ mod tests {
             tint: [1.0, 1.0, 1.0, 1.0],
             texture: None,
             text: None,
+            video: None,
         }
     }
 
@@ -1488,6 +1905,236 @@ mod tests {
         assert!(
             layers[1].texture.is_none(),
             "undecodable bytes skip the layer"
+        );
+    }
+
+    // ---- M3g: video layer resolution, extraction, and lifecycle ----
+
+    /// A video layer with every shared prop at its default. `source` is
+    /// the raw reference exactly as a scene would write it; `path` is
+    /// filled by the loaders, never by the parse.
+    fn video_layer(name: &str, source: Option<&str>) -> scene::LayerSpec {
+        let mut spec = layer(name, None);
+        spec.video = Some(scene::VideoSpec {
+            source: source.map(Into::into),
+            loop_playback: true,
+            rate: 1.0,
+            path: None,
+        });
+        spec
+    }
+
+    #[test]
+    fn resolve_layer_video_confines_to_the_content_root() {
+        // Same containment contract as resolve_layer_image, with one
+        // deliberate difference: the file is never read (libmpv opens the
+        // path), so the size cap is checked from the metadata.
+        let root = std::env::temp_dir().join(format!("kwe-video-root-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("kwe-video-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(root.join("videos")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("videos").join("clip.mp4"), b"not really a video").unwrap();
+        fs::write(outside.join("secret.mp4"), b"secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("secret.mp4"),
+            root.join("videos").join("link.mp4"),
+        )
+        .unwrap();
+
+        // Relative and inside the root: resolves to the canonical path and
+        // does NOT read the file (the bytes above are not a video).
+        let path = resolve_layer_video(&root, "videos/clip.mp4").expect("inside root");
+        assert!(path.starts_with(root.canonicalize().unwrap()));
+        assert_eq!(fs::read(&path).unwrap(), b"not really a video");
+        // Absolute, parent-directory, symlink-escape, missing, directory,
+        // and empty references are all refused.
+        assert!(resolve_layer_video(&root, "/etc/passwd").is_err());
+        assert!(resolve_layer_video(&root, "../outside/secret.mp4").is_err());
+        assert!(resolve_layer_video(&root, "videos/link.mp4").is_err());
+        assert!(resolve_layer_video(&root, "videos/missing.mp4").is_err());
+        assert!(resolve_layer_video(&root, "videos").is_err());
+        assert!(resolve_layer_video(&root, "").is_err());
+
+        // Over the source cap: a sparse file costs no space but reports a
+        // length past MAX_VIDEO_SOURCE_BYTES, and metadata alone refuses it.
+        let huge = root.join("videos").join("huge.mp4");
+        fs::File::create(&huge)
+            .unwrap()
+            .set_len(video::MAX_VIDEO_SOURCE_BYTES + 1)
+            .unwrap();
+        assert!(resolve_layer_video(&root, "videos/huge.mp4").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn load_layer_videos_fills_paths_and_skips_unresolved() {
+        // Through a real closure, the file lane's shape: a resolvable
+        // source fills `path`; an unresolvable one and a cleared source
+        // (the over-cap case) leave it None — the layer stays registered
+        // either way, and a non-video layer is untouched.
+        let root = std::env::temp_dir().join(format!("kwe-video-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("clip.mp4"), b"bytes").unwrap();
+        let mut layers = vec![
+            video_layer("a", Some("clip.mp4")),
+            video_layer("b", Some("missing.mp4")),
+            video_layer("c", None),
+            layer("d", Some("red.png")),
+        ];
+        load_layer_videos(&mut layers, |reference| {
+            resolve_layer_video(&root, reference)
+        });
+        assert!(
+            layers[0].video.as_ref().unwrap().path.is_some(),
+            "resolvable source fills the path"
+        );
+        assert!(
+            layers[1].video.as_ref().unwrap().path.is_none(),
+            "missing source skips the layer, never the scene"
+        );
+        assert!(
+            layers[2].video.as_ref().unwrap().path.is_none(),
+            "a cleared source opens no decoder"
+        );
+        assert!(layers[3].video.is_none(), "non-video layers are untouched");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_video_into_reuses_one_dir_across_slots() {
+        // Unlike the script dir (replaced wholesale), the video dir is
+        // reused: a scene may carry MAX_VIDEO_LAYERS videos, so staleness
+        // is handled per file. Both slots must survive the second call.
+        let home = std::env::temp_dir().join(format!("kwe-video-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let first = extract_video_into(&home, 0, b"one").unwrap();
+        let second = extract_video_into(&home, 1, b"two").unwrap();
+        assert_ne!(first, second, "each slot gets its own file");
+        assert_eq!(fs::read(&first).unwrap(), b"one");
+        assert_eq!(fs::read(&second).unwrap(), b"two");
+        assert_eq!(
+            first.parent(),
+            second.parent(),
+            "one directory holds every slot"
+        );
+        let dir = first.parent().unwrap().to_path_buf();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A stale file from a recycled pid is replaced, not appended to
+        // and not a create_new failure.
+        let again = extract_video_into(&home, 0, b"fresh").unwrap();
+        assert_eq!(again, first);
+        assert_eq!(fs::read(&first).unwrap(), b"fresh");
+        assert_eq!(
+            fs::read(&second).unwrap(),
+            b"two",
+            "the other slot survives"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn extract_video_into_unlinks_a_planted_symlink_file() {
+        // remove_file unlinks the link itself rather than following it, so
+        // a link planted at the slot path cannot redirect the write into
+        // the target.
+        let home = std::env::temp_dir().join(format!("kwe-video-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let dir = home.join(format!("kwe-scene-video-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = home.join("target.bin");
+        fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("video-0.bin")).unwrap();
+        let path = extract_video_into(&home, 0, b"payload").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"original",
+            "the symlink target must be untouched"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn extract_video_into_refuses_a_stale_non_directory() {
+        // A stale entry of that name which is not a plain directory (a
+        // file, or a symlink to one) is an error, never something we
+        // remove and replace.
+        let home = std::env::temp_dir().join(format!("kwe-video-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let dir = home.join(format!("kwe-scene-video-{}", std::process::id()));
+        fs::write(&dir, b"not a directory").unwrap();
+        assert!(extract_video_into(&home, 0, b"x").is_err());
+        assert_eq!(fs::read(&dir).unwrap(), b"not a directory");
+
+        let linked = std::env::temp_dir().join(format!("kwe-video-stale-t-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&linked);
+        fs::create_dir_all(&linked).unwrap();
+        fs::remove_file(&dir).unwrap();
+        std::os::unix::fs::symlink(&linked, &dir).unwrap();
+        assert!(extract_video_into(&home, 0, b"x").is_err());
+        assert!(
+            fs::read_dir(&linked).unwrap().next().is_none(),
+            "the symlink target must stay empty"
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&linked);
+    }
+
+    #[test]
+    fn cleanup_video_dir_removes_only_its_own_dir() {
+        // The graceful exit path removes what extract_video_into created,
+        // and nothing else: a symlink of the same name is left alone.
+        let home = std::env::temp_dir().join(format!("kwe-video-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let path = extract_video_into(&home, 0, b"payload").unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        cleanup_video_dir_in(&home);
+        assert!(!dir.exists(), "the extracted dir must be gone");
+        // A missing dir is not an error (the common case: no video layer).
+        cleanup_video_dir_in(&home);
+
+        let linked = std::env::temp_dir().join(format!("kwe-video-clean-t-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&linked);
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(linked.join("keep.bin"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&linked, &dir).unwrap();
+        cleanup_video_dir_in(&home);
+        assert!(
+            linked.join("keep.bin").exists(),
+            "a planted symlink must not be followed"
+        );
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&linked);
+    }
+
+    #[test]
+    fn open_video_layers_skips_layers_without_a_resolved_path() {
+        // No path means no decoder — the parse's over-cap clearing and the
+        // loader's skip both land here, and neither costs the scene.
+        let mut layers = vec![
+            video_layer("a", Some("clip.mp4")),
+            video_layer("b", None),
+            layer("c", None),
+        ];
+        assert!(
+            open_video_layers(&mut layers).is_empty(),
+            "an unresolved source opens nothing"
         );
     }
 }

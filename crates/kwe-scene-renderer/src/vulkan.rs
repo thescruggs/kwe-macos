@@ -85,6 +85,15 @@ pub enum RenderError {
     FenceTimeout,
 }
 
+/// A fence timeout means the last queue submit may still own the command
+/// buffer and all resources referenced by it. Callers must terminate the
+/// worker immediately; resetting the fence or freeing those resources would
+/// race the device.
+#[must_use]
+pub fn is_fence_timeout(error: &RenderError) -> bool {
+    matches!(error, RenderError::FenceTimeout)
+}
+
 impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -171,6 +180,25 @@ struct LayerTexture {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// The image's extent. M3g's `refresh_layer` reuses the image, view,
+    /// and descriptor set when a new frame has these exact dimensions —
+    /// without them the video path could not tell an in-place update from
+    /// a reallocation.
+    width: u32,
+    height: u32,
+}
+
+/// A persistent host-visible staging buffer (M3g). `upload_layer` creates
+/// and destroys its staging per call, which is right for a handful of
+/// startup uploads and wrong for a video layer re-uploading at 30 fps:
+/// that would create, map, unmap, and destroy a multi-megabyte buffer
+/// every frame. `refresh_layer` keeps one buffer per renderer, grown in
+/// place to the largest frame seen, mapped once for its lifetime.
+struct StagingBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    bytes: usize,
 }
 
 /// One text layer's quad vertex buffer (M3e): host-visible, grown in
@@ -238,6 +266,11 @@ pub struct LayerRenderer {
     /// Uploaded textures per layer index; None = skipped at load or failed
     /// upload.
     textures: Vec<Option<LayerTexture>>,
+    /// M3g: the shared staging buffer for in-place texture refreshes (the
+    /// video path). Created on the first `refresh_layer` and grown to the
+    /// largest frame seen; None until then, so a scene without video never
+    /// allocates it.
+    video_staging: Option<StagingBuffer>,
     /// Number of currently live layer textures (image + atlas). Re-uploads
     /// replace in place, so this only grows with distinct layer indices —
     /// the drop-accounting assertion backing the device test for the M3e
@@ -752,6 +785,7 @@ impl LayerRenderer {
             descriptor_pool,
             descriptor_sets: Vec::new(),
             textures: Vec::new(),
+            video_staging: None,
             live_uploads: 0,
             text_vertex_buffers: Vec::new(),
             command_pool,
@@ -1018,6 +1052,16 @@ impl LayerRenderer {
             Ok(())
         })();
         if let Err(error) = outcome {
+            if is_fence_timeout(&error) {
+                // The queue submit may still be reading the staging buffer
+                // and destination image. Do not unmap, destroy, or free any
+                // of these raw handles. The caller must exit immediately
+                // through reject_render; leaking the handles to process
+                // teardown is safe, while freeing them here races Vulkan.
+                // Vulkan handles are Copy scalars, so returning here leaves
+                // the raw allocations owned by the process until exit.
+                return Err(error);
+            }
             // Every error here happens before or after the submit's fence
             // completed (the submit either succeeded and the fence was
             // waited, or it never ran); FenceTimeout — the one error with a
@@ -1077,9 +1121,242 @@ impl LayerRenderer {
             image: image.expect("upload succeeded"),
             memory: image_memory.expect("upload succeeded"),
             view: view.expect("upload succeeded"),
+            width,
+            height,
         });
         self.descriptor_sets[index] = set;
         self.live_uploads += 1;
+        Ok(())
+    }
+
+    /// Refresh one already-uploaded layer texture in place (M3g). A video
+    /// layer re-uploads every decoded frame; `upload_layer` would create a
+    /// new image, view, and descriptor set each time and free the old ones,
+    /// which churns the bounded descriptor pool and the device allocator at
+    /// frame rate. When the slot already holds a texture of exactly these
+    /// dimensions this writes the new pixels into that image and leaves the
+    /// view and descriptor set untouched; otherwise (first frame, or a
+    /// resolution change) it falls back to `upload_layer`, which is the
+    /// only path that may allocate.
+    ///
+    /// Sharing `self.fence` and `self.upload_buffer` with `render()` is safe
+    /// for the same reason `sync_text`'s per-frame `upload_layer` is:
+    /// `render()` waits its fence to completion before returning, so no
+    /// submit is ever in flight when this runs on the worker thread.
+    pub fn refresh_layer(
+        &mut self,
+        index: usize,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), RenderError> {
+        let in_place = self
+            .textures
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|texture| texture.width == width && texture.height == height)
+            && self
+                .descriptor_sets
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some();
+        if !in_place {
+            return self.upload_layer(index, rgba, width, height);
+        }
+        let expected = width as usize * height as usize * 4;
+        if rgba.len() != expected {
+            return Err(RenderError::Vulkan(format!(
+                "refresh byte count {} does not match {width}x{height} RGBA8",
+                rgba.len()
+            )));
+        }
+
+        self.ensure_video_staging(rgba.len())?;
+        let staging = self
+            .video_staging
+            .as_ref()
+            .expect("ensure_video_staging returned Ok");
+        let (buffer, memory, mapped) = (staging.buffer, staging.memory, staging.mapped);
+        let image = self.textures[index]
+            .as_ref()
+            .expect("in_place checked the slot")
+            .image;
+        unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), mapped, rgba.len()) };
+        // The staging stays mapped for its lifetime, so an explicit flush is
+        // the only thing that makes the write visible to the device on a
+        // host-visible-but-not-coherent memory type (allocate_host_visible
+        // prefers coherent but falls back). WHOLE_SIZE at offset 0 always
+        // satisfies the nonCoherentAtomSize alignment rule.
+        let range = vk::MappedMemoryRange::default()
+            .memory(memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            self.device
+                .flush_mapped_memory_ranges(std::slice::from_ref(&range))
+        }?;
+
+        unsafe { self.device.reset_fences(&[self.fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.upload_buffer, &begin_info)
+        }?;
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        // SHADER_READ_ONLY_OPTIMAL -> TRANSFER_DST_OPTIMAL. Unlike the
+        // upload path this cannot start from UNDEFINED: the image holds the
+        // previous frame and every prior submit left it in the shader-read
+        // layout. srcAccess SHADER_READ orders the last frame's sampler
+        // reads before the overwrite.
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.upload_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+        }
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.upload_buffer,
+                buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+        }
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.upload_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+        }
+        unsafe { self.device.end_command_buffer(self.upload_buffer) }?;
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.upload_buffer));
+        unsafe { self.device.queue_submit(self.queue, &[submit], self.fence) }?;
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RenderError::FenceTimeout),
+        }
+    }
+
+    /// Create or grow the shared video staging buffer to hold at least
+    /// `bytes`. Grow-only: a scene whose two decoders differ in resolution
+    /// settles at the larger frame and never reallocates again. The buffer
+    /// is mapped once here and stays mapped until `Drop`, so the per-frame
+    /// path is a memcpy plus a flush.
+    fn ensure_video_staging(&mut self, bytes: usize) -> Result<(), RenderError> {
+        if self
+            .video_staging
+            .as_ref()
+            .is_some_and(|staging| staging.bytes >= bytes)
+        {
+            return Ok(());
+        }
+        if let Some(old) = self.video_staging.take() {
+            unsafe {
+                self.device.unmap_memory(old.memory);
+                self.device.destroy_buffer(old.buffer, None);
+                self.device.free_memory(old.memory, None);
+            }
+        }
+        let size = bytes.max(64) as vk::DeviceSize;
+        let info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.device.create_buffer(&info, None) }?;
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        // Every failure past this point destroys what it created: leaving a
+        // half-built staging behind would leak a frame-sized allocation on
+        // each retry, and the video path retries every frame.
+        let memory =
+            match allocate_host_visible(&self.instance, &self.device, self.physical, &requirements)
+            {
+                Ok(memory) => memory,
+                Err(error) => {
+                    unsafe { self.device.destroy_buffer(buffer, None) };
+                    return Err(error);
+                }
+            };
+        if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+            }
+            return Err(error.into());
+        }
+        let mapped = match unsafe {
+            self.device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+        } {
+            Ok(pointer) => pointer.cast::<u8>(),
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
+        self.video_staging = Some(StagingBuffer {
+            buffer,
+            memory,
+            mapped,
+            bytes: size as usize,
+        });
         Ok(())
     }
 
@@ -1574,6 +1851,11 @@ impl Drop for LayerRenderer {
             self.device.destroy_image_view(self.image_view, None);
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.image_memory, None);
+            if let Some(staging) = self.video_staging.take() {
+                self.device.unmap_memory(staging.memory);
+                self.device.destroy_buffer(staging.buffer, None);
+                self.device.free_memory(staging.memory, None);
+            }
             for texture in self.textures.iter().flatten() {
                 self.device.destroy_image_view(texture.view, None);
                 self.device.destroy_image(texture.image, None);
@@ -2049,6 +2331,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fence_timeout_is_the_only_process_fatal_upload_error() {
+        assert!(is_fence_timeout(&RenderError::FenceTimeout));
+        assert!(!is_fence_timeout(&RenderError::Vulkan(
+            "out of memory".into()
+        )));
+    }
+
+    #[test]
     fn bgra_premultiplied_exact_bytes() {
         // B8G8R8A8 readback is already in protocol order: identity with
         // premultiplication (opaque alpha keeps the bytes).
@@ -2233,6 +2523,85 @@ mod tests {
         renderer
             .upload_layer(7, &rgba, 1, 1)
             .expect("fresh index allocates");
+        assert_eq!(renderer.live_uploads, 2);
+    }
+
+    /// M3g: the per-frame video path. `refresh_layer` must update the same
+    /// image, view, and descriptor set in place — a video at 30 fps runs
+    /// this once per frame, and creating a set per frame would exhaust the
+    /// bounded pool in nine seconds. A dimension change is the one case
+    /// that falls back to a full `upload_layer`.
+    #[test]
+    fn refresh_layer_updates_in_place_and_reallocates_only_on_resize() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!("refresh_layer_updates_in_place: skipped (set KWE_TEST_DEVICE to run)");
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 8, 8).expect("create renderer");
+        // A 2×2 red frame establishes the slot the normal way.
+        let red = [255u8, 0, 0, 255].repeat(4);
+        renderer.upload_layer(0, &red, 2, 2).expect("first frame");
+        assert_eq!(renderer.live_uploads, 1);
+
+        // Byte-count validation happens before any GPU work.
+        assert!(
+            renderer.refresh_layer(0, &red[..8], 2, 2).is_err(),
+            "a short frame must be refused, not copied"
+        );
+
+        // 320 same-size refreshes: more than the 256-set pool, so a set
+        // allocated per refresh would exhaust it mid-loop.
+        let blue = [0u8, 0, 255, 255].repeat(4);
+        for _ in 0..MAX_LAYERS + 64 {
+            renderer
+                .refresh_layer(0, &blue, 2, 2)
+                .expect("refresh must not exhaust the descriptor pool");
+        }
+        assert_eq!(
+            renderer.live_uploads, 1,
+            "in-place refreshes never allocate a new slot"
+        );
+
+        // The refreshed content is what actually draws: a fullscreen quad
+        // of the blue frame reads back blue, not the red first frame.
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[8.0, 0.0], [0.0, 8.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 0.0], &draws)
+            .expect("render the refreshed frame");
+        // The B8G8R8A8 readback is B,G,R,A in memory order, so the blue
+        // texel reads back [255, 0, 0, 255] — the red first frame would
+        // read back [0, 0, 255, 255].
+        assert_eq!(
+            &pixels[0..4],
+            &[255, 0, 0, 255],
+            "the refresh, not the first upload, is on screen"
+        );
+
+        // A dimension change cannot update in place: it falls back to the
+        // full upload path, which replaces the slot rather than leaking it.
+        let green = [0u8, 255, 0, 255].repeat(16);
+        renderer
+            .refresh_layer(0, &green, 4, 4)
+            .expect("resize falls back to upload_layer");
+        assert_eq!(
+            renderer.live_uploads, 1,
+            "the resize replaced the slot in place"
+        );
+        // Refreshing a slot that was never uploaded also falls back, and
+        // the fallback is what allocates.
+        renderer
+            .refresh_layer(3, &green, 4, 4)
+            .expect("empty slot falls back to upload_layer");
         assert_eq!(renderer.live_uploads, 2);
     }
 

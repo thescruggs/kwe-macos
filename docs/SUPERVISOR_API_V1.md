@@ -391,8 +391,9 @@ descriptor, and UID-scoped process ceilings and disables core dumps. Any
 failure to install the policy fails the launch.
 
 Per-kind policies replace the alpha's single set: startup timeouts default to
-6 s for video and 10 s for web (Chromium's cold start), everything else keeps
-the global 3 s; resource limits default to the global budget
+6 s for video, 6 s for scene (two sequential libmpv VideoLayer opens), and 10
+s for web (Chromium's cold start); everything else keeps the global 3 s;
+resource limits default to the global budget
 (address-space 4096 MiB, file 160 MiB, 256 descriptors, 1024 processes) except
 web and video. *(M2b:)* web overrides all three — a 131072 MiB virtual
 address space, 1024 descriptors, and a 32768-process ceiling — because
@@ -411,11 +412,16 @@ kernel's `RLIMIT_NPROC` check counts every thread of the uid
 the worker, and a normal desktop session commonly runs more than 1024 threads
 — libmpv's thread creation then fails with EAGAIN and `mpv_create` hangs in
 its failure path, and bwrap's fork fails with EAGAIN the same way (measured).
-Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
+The scene kind also overrides the process ceiling with
+`--renderer-scene-processes` (default 32768) because it may own two libmpv
+cores; its file-size ceiling remains 160 MiB, matching bounded package-video
+extraction. Per-renderer protection comes from `RLIMIT_AS` plus the supervisor timeouts
 (startup/frame/handoff), not from `NPROC`. The daemon flags
 `--renderer-video-startup-timeout-ms`, `--renderer-web-startup-timeout-ms`,
 `--renderer-web-address-space-mib`, `--renderer-web-open-files`,
-`--renderer-video-processes`, and `--renderer-web-processes` tune these;
+`--renderer-video-processes`, `--renderer-web-processes`, and
+`--renderer-scene-processes` tune these; `--renderer-scene-startup-timeout-ms`
+tunes the scene load budget;
 frame timeouts and the canary stay global. *(M2b:)* web renderers also take
 `--renderer-web-heartbeat-ms` (default 5000) and
 `--renderer-web-heartbeat-max-failures` (default 3): the worker probes the

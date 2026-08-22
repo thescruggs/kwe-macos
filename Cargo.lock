@@ -403,6 +403,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kwe-mpv"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "kwe-scene-renderer"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -414,6 +418,7 @@ dependencies = [
  "kwe-core",
  "kwe-frame-protocol",
  "kwe-input-protocol",
+ "kwe-mpv",
  "libc",
  "rquickjs",
  "serde_json",
@@ -439,6 +444,7 @@ dependencies = [
  "clap",
  "kwe-frame-protocol",
  "kwe-input-protocol",
+ "kwe-mpv",
  "libc",
  "serde_json",
 ]

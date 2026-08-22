@@ -8,6 +8,8 @@
 
 ## Change log
 
+- 2026-08-21 — **BETA_M3g recovered/completed** on `beta-m3g-video-layer-recovery`: shared minimal libmpv FFI now drives up to two software VideoLayer decoders in the external scene worker; persistent Vulkan texture refresh, native-size fallback, local/package confinement, 160 MiB extraction cap, protocol whitelist, bounded demux buffers, latest-wins media transport, and one-layer degradation are covered by synthetic scene smoke and unit tests. Recovery fixes added fatal FenceTimeout propagation at every texture/vertex upload caller, one-shot decoder disable after ordinary refresh failure, explicit decoder-before-file teardown, and scene-specific 32768 NPROC/6000 ms startup budgets. No UI change; scene2d/SceneScript remain partial/deferred. Remaining gate evidence is recorded in the handoff and must be rerun by the orchestrator after review.
+
 - 2026-08-18 — Plan authored (user decisions locked: full SceneScript engine; Chromium+CDP web; live apply authorized). Moved from `docs/BETA_PLAN.md` to `AI-Skills/BETA_PLAN.md` as the living plan. No slices started.
 - 2026-08-18 — AI-Skills setup committed (`db8563d`). **BETA_M1a started** on branch `beta-m1a-renderer-contract` (worktree `/home/qcv123/gitProjects/kwe-m1a`), implemented by a sub-agent under orchestration; review agent pass follows. Scope note for M1a: `preflight_video` stays deferred to M1c — video content validation in M1a is path-level only (exists, regular, non-symlink), documented as temporary.
 - 2026-08-18 — **BETA_M1a done** (commits `cd2d61e` feat + `62bdbdc` review fixes, merged ff into `fix/qt611-gallery-delegates`). Independent adversarial review found 12 findings (5 must-fix): exit-stderr was unreachable in the failure path → folded into failure detail; shared `HOME=/tmp` would break web→web handoff → per-worker `HOME=<runtime>/home-<launch_serial>` (0700); preflight ran twice per start (once blocking the supervisor loop) → single `into_validated()` in the RPC layer; two doc/implementation mismatches fixed. Design decision confirmed by review: `media_state`/`audio_bands` wire `sequence` carries the daemon display generation (staleness rejected daemon-side; retry after re-reading `renderer.status`). Extra decisions recorded: quarantine identity is now `wallpaper_id:content_hash:kind` with legacy `id:hash` fallback+migration; per-tick stderr drain budget raised to 64 KiB; `renderer.status` kind falls back active→requested→test. **Note for M3 renderer work:** renderers must NOT validate monotonicity on audio/media `sequence` (it is a generation, not an input sequence).
@@ -49,7 +51,7 @@
 |---|---|
 | BETA_M1 (contract + video) | done (M1a–M1e; see change log) |
 | BETA_M2 (web) | done (M2a–M2e; see change log) |
-| BETA_M3 (scene, a–k) | M3a–M3f done; M4 complete so the pause is over — M3g (VideoLayer via libmpv) is next |
+| BETA_M3 (scene, a–k) | M3a–M3g done; M4 complete — M3h (scene3d P1) is next |
 | BETA_M4 (live apply) | M4a–M4d done |
 | BETA_M5 (release) | pending |
 
@@ -110,7 +112,7 @@ Format research contract first (docs/BETA_M3.md + docs/SCENE_FORMAT_V1.md): scen
 - **M3d** blend modes + color effects (WE set) via pipeline blending; oracle per mode.
 - **M3e** TextLayer via stb_truetype, bounded glyph atlas.
 - **M3f** ParticleSystem CPU-sim, bounded count (~4096).
-- **M3g** VideoLayer textures via libmpv (≤2 concurrent).
+- **M3g done 2026-08-21** VideoLayer textures via libmpv (≤2 concurrent), synthetic frame/native-size/cap/bad-source evidence, bounded local/package policy, media transport, and compositor refresh safety.
 - **M3h** scene3d P1: .obj/.mtl parser, camera/lights, naga shader subset with fail-closed default.
 - **M3i** AudioAnalyser (16/32/64 bands from daemon 64-band frames) + mouse/buttons/keyboard; `runtime.audio-scene-16-32-64` evidence.
 - **M3j** Properties: IProperty objects, `property_set` wire message (additive, protocol doc update), per-wallpaper persistence; manager property UI deferred to M4 (flagged in docs).

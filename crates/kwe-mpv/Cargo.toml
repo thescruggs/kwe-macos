@@ -1,0 +1,9 @@
+[package]
+name = "kwe-mpv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Minimal shared FFI declarations for the system libmpv client and software render APIs"
+
+[dependencies]

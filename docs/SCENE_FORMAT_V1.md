@@ -744,7 +744,8 @@ image compositing in M3a.
 | color effects (`brightness`, `tint`) | **implemented (M3d)** | the effects apply to the sampled texel before blending; clamps absorb any out-of-range write |
 | text layers | **implemented (M3e)** | see the Text layers table below |
 | particles | **implemented (M3f)** | see the Particles table below |
-| 3D models, user properties | *planned* (M3g–M3k) | the parse tolerates extra keys but renders none of them |
+| `VideoLayer` objects | **implemented (M3g, partial)** | an object with a `video` reference and no `image` is decoded by a supervised libmpv software core; at most two cores are open, native decoded size fills an absent `size`, `loop` and bounded `rate` are accepted, and bad/capped sources skip only that layer. Local file/package containment, protocol whitelist, 160 MiB source cap, `audio=no`, and no scripts/network are intentional semantics. SceneScript per-layer video controls remain planned. |
+| 3D models, user properties | *planned* (M3h–M3k) | the parse tolerates extra keys but renders none of them |
 
 ### Text layers (M3e)
 
@@ -776,7 +777,8 @@ image compositing in M3a.
 
 | `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
 | image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
-| audio/pointer/media input in script | *planned* | the worker receives and acks the wire inputs (M1a plumbing, unchanged) but exposes none of them to the script in M3a |
+| audio/pointer input in script | *planned* | the worker receives and acks the wire inputs but exposes none of them to the script until M3i |
+| media input | **implemented (M3g transport only)** | latest-wins `playing`/`paused`/`stopped` fans out to open VideoLayers (stop pauses and seeks to zero); metadata is acknowledged but not exposed to SceneScript |
 
 ## Output
 

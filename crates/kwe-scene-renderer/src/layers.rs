@@ -771,6 +771,7 @@ mod tests {
             tint: [0.5, 0.25, 1.0, 0.75],
             texture: None,
             text: Some(spec),
+            video: None,
         });
         assert_eq!(layer.size, [1.0, 1.0]);
         let text = layer.text.as_ref().unwrap();

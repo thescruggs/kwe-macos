@@ -26,14 +26,16 @@ pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
 pub use pkg::{
     MAX_SCENE_JSON_BYTES, MAX_SCRIPT_BYTES, PkgEntry, PkgError, PkgErrorKind, PkgReader,
-    image_entry, preflight_pkg, scene_json_entry, script_entry,
+    image_entry, preflight_pkg, scene_json_entry, script_entry, video_entry,
 };
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
 pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};
 pub use policy::{
     PlaybackAction, PlaybackPolicy, PolicyDecision, PolicyRule, PolicySnapshot, PolicyTrigger,
 };
-pub use preflight::{ScenePreflight, VideoPreflight, preflight_scene, preflight_video};
+pub use preflight::{
+    ScenePreflight, VideoPreflight, preflight_scene, preflight_video, video_extension_allowed,
+};
 pub use scan::{
     Catalog, CatalogItem, CatalogStats, Compatibility, Diagnostic, DiagnosticLevel, ProjectKind,
     ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,
