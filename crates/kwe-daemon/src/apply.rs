@@ -1270,6 +1270,12 @@ pub enum ApplyError {
     DisplayUnavailable(String),
     /// A step of the apply transaction failed (already rolled back).
     Transaction(String),
+    /// The supervisor refused to start this content because its persisted
+    /// failure record is quarantined (three strikes under this build). The
+    /// detail is the record's last failure detail; a client that wants to
+    /// try anyway re-applies with `retry: true`, which clears exactly this
+    /// identity's record first (B4).
+    Quarantined(String),
     /// The restore script could not be executed.
     RestoreFailed(String),
 }
@@ -1296,6 +1302,7 @@ impl ApplyError {
             ApplyError::ShellUnreachable(_) => "shell_unreachable",
             ApplyError::DisplayUnavailable(_) => "display_unavailable",
             ApplyError::Transaction(_) => "apply_failed",
+            ApplyError::Quarantined(_) => "apply_quarantined",
             ApplyError::RestoreFailed(_) => "restore_failed",
         }
     }
@@ -1310,6 +1317,7 @@ impl ApplyError {
             | ApplyError::ShellUnreachable(detail)
             | ApplyError::DisplayUnavailable(detail)
             | ApplyError::Transaction(detail)
+            | ApplyError::Quarantined(detail)
             | ApplyError::RestoreFailed(detail) => Some(detail),
             ApplyError::Busy => None,
         }
@@ -1336,6 +1344,12 @@ pub struct ApplyWallpaperParams {
     pub height: u32,
     #[serde(default = "default_apply_fps")]
     pub fps: u32,
+    /// Clear this identity's quarantine record before starting (B4): the
+    /// user saw `apply_quarantined` with the reason and chose to try
+    /// anyway. Routes through the supervisor's `Retry` command — the same
+    /// thing `renderer.retry` does — and nothing else changes.
+    #[serde(default)]
+    pub retry: bool,
 }
 
 pub const fn default_apply_width() -> u32 {
@@ -1565,7 +1579,14 @@ impl ApplyHandle {
         let old_assignment = self.stored_assignment(&output.name)?;
 
         // 4+. Start the renderer; EVERY failure from here on rolls back.
-        let result = self.complete_apply(&spec, &content, &output.name, desktop_index, previous);
+        let result = self.complete_apply(
+            &spec,
+            &content,
+            &output.name,
+            desktop_index,
+            previous,
+            params.retry,
+        );
         if let Err(error) = result {
             self.rollback_after_failure(&spec, &output.name, old_assignment);
             return Err(error);
@@ -1662,15 +1683,34 @@ impl ApplyHandle {
         output_name: &str,
         desktop_index: usize,
         previous: PreviousWallpaper,
+        retry: bool,
     ) -> Result<Value, ApplyError> {
-        // 4. Start the renderer and wait (bounded) for OUR promotion.
-        let started = self
-            .supervisor
-            .start(spec.clone())
-            .map_err(|error| ApplyError::Transaction(format!("renderer.start failed: {error}")))?;
+        // 4. Start the renderer and wait (bounded) for OUR promotion. A
+        // `retry` apply clears this identity's failure record first (the
+        // user saw the quarantine reason and chose to try again).
+        let started = if retry {
+            self.supervisor.retry(spec.clone())
+        } else {
+            self.supervisor.start(spec.clone())
+        }
+        .map_err(|error| ApplyError::Transaction(format!("renderer.start failed: {error}")))?;
         if started.phase == WorkerPhase::Quarantined || started.phase == WorkerPhase::RolledBack {
+            // The supervisor answered synchronously with a terminal phase:
+            // either the record is quarantined (B4: say why, and under
+            // which code, so the client can offer "try anyway") or the
+            // spawn itself failed and struck.
+            let detail = started
+                .last_failure_detail
+                .clone()
+                .unwrap_or_else(|| phase_name(&started.phase).to_string());
+            if started.quarantined {
+                return Err(ApplyError::Quarantined(format!(
+                    "disabled after {} failures under this build; last failure: {detail}",
+                    started.failures
+                )));
+            }
             return Err(ApplyError::Transaction(format!(
-                "renderer rejected the start ({})",
+                "renderer rejected the start ({}: {detail})",
                 phase_name(&started.phase)
             )));
         }
@@ -2038,8 +2078,14 @@ impl PlaylistApplyLane for ApplyHandle {
         // exactly like wallpaper.apply (same ownership guard, same store
         // revert).
         let old_assignment = self.stored_assignment(&resolved_output)?;
-        let result =
-            self.complete_apply(&spec, &content, &resolved_output, desktop_index, previous);
+        let result = self.complete_apply(
+            &spec,
+            &content,
+            &resolved_output,
+            desktop_index,
+            previous,
+            false,
+        );
         if let Err(error) = result {
             self.rollback_after_failure(&spec, &resolved_output, old_assignment);
             return Err(error);
@@ -2146,7 +2192,7 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
 /// item (the catalog content is authoritative): the item's runnable entry
 /// for video/scene (or its scene.json when no entry is declared), and the
 /// content root for web (the renderer serves the whole root).
-fn catalog_content_path(item: &CatalogItem, kind: RendererKind) -> PathBuf {
+pub(crate) fn catalog_content_path(item: &CatalogItem, kind: RendererKind) -> PathBuf {
     if kind == RendererKind::Web {
         return item.content_root.clone();
     }
@@ -2175,7 +2221,7 @@ fn content_spec_for(kind: RendererKind, path: &std::path::Path) -> ContentSpec {
 /// Stable content identity for the supervisor's quarantine key: the
 /// catalog item's project-metadata hash when present (it is stable across
 /// rescans), else the SHA-256 of the canonical content path.
-fn content_hash_for(item: &CatalogItem, content: &std::path::Path) -> String {
+pub(crate) fn content_hash_for(item: &CatalogItem, content: &std::path::Path) -> String {
     if let Some(hash) = &item.metadata_hash {
         return hash.clone();
     }

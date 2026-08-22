@@ -111,6 +111,10 @@ private:
         QString kind;
         QString content;
         std::function<void(bool ok, const QJsonObject &result, const QString &error)> callback;
+        /// B4: apply with `retry: true` — the daemon clears this wallpaper's
+        /// quarantine record before starting. Set only by retry() after an
+        /// `apply_quarantined` failure, never by a first apply.
+        bool retry = false;
     };
 
     void send(Pending pending);
@@ -124,6 +128,9 @@ private:
     /// Records the failed operation so the UI's Try Again replays exactly
     /// it, and nothing else.
     void recordFailure(const Pending &pending);
+    /// The apply request builder shared by applyWallpaper() and retry().
+    void sendApply(const QString &output, const QString &wallpaperId, const QString &kind,
+                   const QUrl &content, bool retry);
     int requestTimeoutMilliseconds(Method method) const;
     void drainQueue();
     void retryLater();
@@ -166,5 +173,9 @@ private:
     QString m_lastFailedWallpaperId;
     QString m_lastFailedKind;
     QString m_lastFailedContent;
+    /// The last apply failed with `apply_quarantined`: Try Again must ask
+    /// the daemon to clear the record (retry: true) or it would fail again
+    /// with the same answer.
+    bool m_lastFailedQuarantined = false;
     QVariantMap m_assignments;
 };

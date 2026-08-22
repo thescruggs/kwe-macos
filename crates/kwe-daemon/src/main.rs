@@ -2377,12 +2377,18 @@ with open(args.output, "wb") as frame:
     /// A supervisor fast enough for the promotion wait (150 ms canary) with
     /// the python3 fake renderer wired as the scene kind.
     fn fast_scene_supervisor(root: &Path) -> SupervisorService {
+        SupervisorService::start(fast_scene_supervisor_config(root)).unwrap()
+    }
+
+    /// The config behind `fast_scene_supervisor`, exposed so a test can
+    /// compute the build identity its state file must carry (B4).
+    fn fast_scene_supervisor_config(root: &Path) -> SupervisorConfig {
         let script = root.join("fake-scene-renderer.py");
         std::fs::write(&script, FAKE_SCENE_RENDERER).unwrap();
         std::fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let dir = root.join("supervisor");
         let limits = sample_limits(1024);
-        SupervisorService::start(SupervisorConfig {
+        SupervisorConfig {
             renderer_paths: BTreeMap::from([(RendererKind::Scene, script)]),
             runtime_dir: dir.join("runtime"),
             state_dir: dir.join("state"),
@@ -2406,8 +2412,82 @@ with open(args.output, "wb") as frame:
                 (RendererKind::Web, limits),
                 (RendererKind::Scene, limits),
             ]),
-        })
-        .unwrap()
+        }
+    }
+
+    #[test]
+    fn apply_quarantined_names_the_reason_and_retry_clears_it() {
+        // B4: a quarantined identity answers `apply_quarantined` with the
+        // record's last detail (not a bare phase name), touches no shell
+        // script, and `retry: true` clears exactly that record and applies.
+        let root = temp_dir("apply-quarantined");
+        let catalog = scene_catalog();
+        let config = fast_scene_supervisor_config(&root);
+        let build_id = supervisor::build_identity(&config.clone().validate().unwrap());
+        let (identity, scene) = {
+            let guard = catalog.read().unwrap();
+            let item = guard
+                .items
+                .iter()
+                .find(|item| item.workshop_id == "1")
+                .unwrap();
+            let content = apply::catalog_content_path(item, RendererKind::Scene);
+            let hash = apply::content_hash_for(item, &content);
+            (format!("1:{hash}:scene"), fixture_scene_path(&guard))
+        };
+        let state_dir = root.join("supervisor").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("supervisor-v1.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "build_id": build_id,
+                "records": { identity.clone(): {
+                    "wallpaper_id": "1", "content_hash": identity.split(':').nth(1).unwrap(),
+                    "failures": 3, "quarantined": true, "last_failure": "process_exit",
+                    "last_detail": "exit_code_73 stderr=[Zygote could not fork]",
+                    "updated_unix_seconds": 1 }},
+                "last_good": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let supervisor_service = SupervisorService::start(config).unwrap();
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let request = |retry: &str| {
+            format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","width":320,"height":180,"fps":30{retry}}}}}"#,
+                scene.display()
+            )
+        };
+        let (ok, result) = process_with_apply(&request(""), &handle, &catalog);
+        assert!(!ok, "quarantined apply must fail: {result}");
+        assert_eq!(result["error"], "apply_quarantined");
+        let detail = result["detail"].as_str().unwrap();
+        assert!(detail.contains("disabled after 3 failures"), "{detail}");
+        assert!(detail.contains("Zygote could not fork"), "{detail}");
+        assert!(
+            probe
+                .scripts()
+                .iter()
+                .all(|script| script.contains("screenForConnector")),
+            "no switch script may run for a refused start"
+        );
+        // The transaction rolled back (renderer stopped if ours) and the
+        // record is still there: a plain re-apply would answer the same.
+        let (ok, result) = process_with_apply(&request(""), &handle, &catalog);
+        assert!(!ok);
+        assert_eq!(result["error"], "apply_quarantined");
+        // Try again: clears the record, applies, promotes.
+        let (ok, result) = process_with_apply(&request(r#","retry":true"#), &handle, &catalog);
+        assert!(ok, "retry apply failed: {result}");
+        assert_eq!(result["applied"]["wallpaper_id"], "1");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+        assert!(!status.quarantined);
+        assert_eq!(status.failures, 0);
     }
 
     /// One stub system output on "DP-1".
@@ -3420,6 +3500,7 @@ with open(args.output, "wb") as frame:
                 width: 320,
                 height: 180,
                 fps: 30,
+                retry: false,
             })
             .unwrap();
         wait_for_settled(&supervisor, &probe, "2", 1);
@@ -3475,6 +3556,7 @@ with open(args.output, "wb") as frame:
             width: 320,
             height: 180,
             fps: 30,
+            retry: false,
         });
         assert!(
             user_apply.is_ok(),

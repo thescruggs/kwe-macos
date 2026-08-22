@@ -1587,6 +1587,12 @@ mod tests {
     /// fabricate worker state through the real supervisor's own API (or
     /// the pure verdict tests).
     fn start_supervisor(state_dir: PathBuf) -> (SupervisorService, SupervisorHandle) {
+        let service = SupervisorService::start(supervisor_config(state_dir)).unwrap();
+        let handle = service.handle();
+        (service, handle)
+    }
+
+    fn supervisor_config(state_dir: PathBuf) -> crate::supervisor::SupervisorConfig {
         let limits = crate::supervisor::RendererResourceLimits {
             address_space_mib: 4096,
             file_size_mib: 160,
@@ -1594,7 +1600,7 @@ mod tests {
             processes: 1024,
             core_dump_bytes: 0,
         };
-        let service = SupervisorService::start(crate::supervisor::SupervisorConfig {
+        crate::supervisor::SupervisorConfig {
             renderer_paths: BTreeMap::from([(
                 crate::supervisor::RendererKind::Test,
                 std::env::current_exe().unwrap(),
@@ -1621,10 +1627,7 @@ mod tests {
                 (crate::supervisor::RendererKind::Web, limits),
                 (crate::supervisor::RendererKind::Scene, limits),
             ]),
-        })
-        .unwrap();
-        let handle = service.handle();
-        (service, handle)
+        }
     }
 
     /// A fresh, empty supervisor service.
@@ -1642,8 +1645,14 @@ mod tests {
     ) -> (SupervisorService, SupervisorHandle) {
         let state_dir = supervisor_dir().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
+        // B4: records are scoped to the build that earned them; a fixture
+        // without the running build's id would be dropped at load.
+        let build_id = crate::supervisor::build_identity(
+            &supervisor_config(state_dir.clone()).validate().unwrap(),
+        );
         let fixture = json!({
             "schema_version": 1,
+            "build_id": build_id,
             "forced_kill_count": 0,
             "records": {
                 format!("{wallpaper_id}:{content_hash}"): {
@@ -1953,6 +1962,7 @@ mod tests {
             forced_kill_count: 0,
             last_failure: None,
             last_failure_detail: None,
+            quarantined: false,
             requested_wallpaper_id: requested.map(str::to_string),
             requested_content_hash: None,
             candidate_pid: None,

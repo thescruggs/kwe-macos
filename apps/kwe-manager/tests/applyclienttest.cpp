@@ -293,6 +293,15 @@ private slots:
                              "this build: 5 model layer(s) need scene3d, which this build does "
                              "not render yet"),
               QStringLiteral("needs features this version cannot render yet"));
+        // B4: a quarantined record names the reason and what Try Again does;
+        // a stale service names the restart.
+        check(QStringLiteral("wallpaper.apply"), QStringLiteral("apply_quarantined"),
+              QStringLiteral("disabled after 3 failures under this build; last failure: "
+                             "exit_code_73 stderr=[backend_reject]"),
+              QStringLiteral("disabled after repeated failures (disabled after 3 failures"));
+        check(QStringLiteral("wallpaper.apply"), QStringLiteral("service_stale"),
+              QStringLiteral("binary replaced"),
+              QStringLiteral("systemctl --user restart kwe-daemon"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("output_missing"),
               QStringLiteral("DP-2"), QStringLiteral("Output not found: DP-2"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("restore_failed"),
@@ -449,6 +458,30 @@ private slots:
         QCOMPARE(m_daemon.receivedMethods.size(), 3); // apply, apply, assignments
         QCOMPARE(m_daemon.receivedParams.at(1).value(QStringLiteral("content")).toString(),
                  QStringLiteral("/x.mp4"));
+    }
+
+    void retryAfterQuarantineSendsTheClearFlagOnce() {
+        // B4: the first apply never carries `retry`; after apply_quarantined
+        // the replay does; a later fresh apply does not inherit it.
+        m_daemon.failByMethod.insert(QStringLiteral("wallpaper.apply"),
+                                     {QStringLiteral("apply_quarantined"),
+                                      QStringLiteral("disabled after 3 failures")});
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("web"),
+                              QUrl::fromLocalFile(QStringLiteral("/w")));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        QVERIFY(client.errorMessage().contains(QStringLiteral("disabled after repeated failures")));
+        QVERIFY(!m_daemon.receivedParams.first().contains(QStringLiteral("retry")));
+        m_daemon.failByMethod.clear();
+        client.retry();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
+        QCOMPARE(m_daemon.receivedParams.at(1).value(QStringLiteral("retry")).toBool(), true);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("2"), QStringLiteral("web"),
+                              QUrl::fromLocalFile(QStringLiteral("/w2")));
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() >= 4, 5000);
+        const auto fresh = m_daemon.receivedParams.at(3);
+        QCOMPARE(fresh.value(QStringLiteral("wallpaper_id")).toString(), QStringLiteral("2"));
+        QVERIFY(!fresh.contains(QStringLiteral("retry")));
     }
 
     void retryRerunsAFailedRestore() {

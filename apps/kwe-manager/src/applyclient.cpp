@@ -65,6 +65,11 @@ void ApplyClient::listOutputs() {
 
 void ApplyClient::applyWallpaper(const QString &output, const QString &wallpaperId,
                                  const QString &kind, const QUrl &content) {
+    sendApply(output, wallpaperId, kind, content, false);
+}
+
+void ApplyClient::sendApply(const QString &output, const QString &wallpaperId,
+                            const QString &kind, const QUrl &content, bool retry) {
     if (!validIdentity(output) || !validIdentity(wallpaperId)) {
         setErrorMessage(tr("The output or wallpaper id is invalid for applying."));
         setState(Failed);
@@ -85,7 +90,8 @@ void ApplyClient::applyWallpaper(const QString &output, const QString &wallpaper
                  [this](bool ok, const QJsonObject &, const QString &) {
                      if (ok)
                          refreshAssignments();
-                 }});
+                 },
+                 retry});
 }
 
 void ApplyClient::restoreWallpaper(const QString &output) {
@@ -118,8 +124,11 @@ void ApplyClient::resetStatus() {
 
 void ApplyClient::retry() {
     if (m_lastFailedMethod == Apply) {
-        applyWallpaper(m_lastFailedOutput, m_lastFailedWallpaperId, m_lastFailedKind,
-                       QUrl::fromLocalFile(m_lastFailedContent));
+        // A quarantined wallpaper is re-applied with the clear flag (B4):
+        // the user read the reason and chose to try anyway; without the
+        // flag the daemon would answer apply_quarantined again.
+        sendApply(m_lastFailedOutput, m_lastFailedWallpaperId, m_lastFailedKind,
+                  QUrl::fromLocalFile(m_lastFailedContent), m_lastFailedQuarantined);
     } else if (m_lastFailedMethod == Restore) {
         restoreWallpaper(m_lastFailedOutput);
     } else if (m_lastFailedMethod == ListOutputs) {
@@ -192,6 +201,8 @@ void ApplyClient::writeRequest() {
         params.insert(QStringLiteral("kind"), m_current.kind);
         if (!m_current.content.isEmpty())
             params.insert(QStringLiteral("content"), m_current.content);
+        if (m_current.retry)
+            params.insert(QStringLiteral("retry"), true);
         break;
     case Restore:
         params.insert(QStringLiteral("output"), m_current.output);
@@ -273,6 +284,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_lastFailedWallpaperId = wallpaperId;
             m_lastFailedKind = kind;
             m_lastFailedContent = content;
+            m_lastFailedQuarantined = errorCode == QStringLiteral("apply_quarantined");
             clearResult();
             // The UI's Try Again only makes sense for operations with a
             // recorded target to replay (apply/restore). An enumeration
@@ -508,6 +520,22 @@ QString ApplyClient::mapError(const QString &code, const QString &detail) {
         return detail.isEmpty()
             ? tr("Applying failed; the previous wallpaper was restored.")
             : tr("Applying failed: %1").arg(detail);
+    // B4: the wallpaper's failure record is quarantined. Name the reason and
+    // tell the user what Try Again does differently (it clears the record).
+    if (code == QStringLiteral("apply_quarantined"))
+        return detail.isEmpty()
+            ? tr("This wallpaper was disabled after repeated failures. Try Again "
+                 "re-enables it and applies it once more.")
+            : tr("This wallpaper was disabled after repeated failures (%1). Try Again "
+                 "re-enables it and applies it once more.")
+                  .arg(detail);
+    // B4: the daemon noticed its own binary was replaced (package upgrade)
+    // and refuses to drive applies with the old code. Same shape as
+    // display_unavailable: a condition with an exact user fix.
+    if (code == QStringLiteral("service_stale"))
+        return tr("The wallpaper service was upgraded but is still running the old "
+                  "version. Restart it with `systemctl --user restart kwe-daemon`, "
+                  "then try again.");
     if (code == QStringLiteral("restore_failed"))
         return detail.isEmpty() ? tr("Restoring the previous wallpaper failed.")
                                 : tr("Restoring the previous wallpaper failed: %1").arg(detail);

@@ -56,6 +56,9 @@ fn log_audio_grant_drop() {
 }
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MAX_RECORDS: usize = 256;
+/// Renderer contract exit codes that mean "refused", not "crashed" (B4).
+const EXIT_BACKEND_REJECT: i32 = 73;
+const EXIT_NO_DRAWABLE_CONTENT: i32 = 74;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_SUPERVISED_MAPPING_BYTES: u64 = 128 * 1024 * 1024;
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -432,6 +435,10 @@ pub struct WorkerStatus {
     pub forced_kill_count: u64,
     pub last_failure: Option<FailureKind>,
     pub last_failure_detail: Option<String>,
+    /// True when the requested identity's persisted record is quarantined
+    /// (three strikes); the apply lane reports this as `apply_quarantined`
+    /// with the record's last detail instead of a bare phase name (B4).
+    pub quarantined: bool,
     pub requested_wallpaper_id: Option<String>,
     pub requested_content_hash: Option<String>,
     pub candidate_pid: Option<u32>,
@@ -473,6 +480,16 @@ pub enum FailureKind {
     ProcessExit,
     LaunchFailed,
     ResourceLimit,
+    /// The worker declined to render before its first publish — exit 73
+    /// (`backend_reject`: the browser/backend could not boot in this
+    /// environment) or 74 (`no_drawable_content`: the scene needs features
+    /// this build lacks). A refusal is "cannot run this here/now", not a
+    /// crash: it never restarts, never strikes toward quarantine, and its
+    /// detail is kept for the apply error (BETA B4,
+    /// docs/bugs/APPLY_REJECTED_QUARANTINED.md). The same exit codes from
+    /// an ACTIVE worker (web heartbeat exit 73 after first paint) are
+    /// runtime failures and strike as `ProcessExit`.
+    Refused,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -505,6 +522,14 @@ struct PersistedState {
     #[serde(default)]
     records: BTreeMap<String, FailureRecord>,
     last_good: Option<LastGoodRecord>,
+    /// Identity of the daemon + renderer binaries that earned `records`
+    /// (B4). A failure record describes how THIS build behaved; a new
+    /// build (package upgrade) may have fixed the cause, so records from
+    /// another build are dropped at load instead of banning content
+    /// forever. Additive: an old file without it is treated as "unknown
+    /// build" and its records are dropped once.
+    #[serde(default)]
+    build_id: Option<String>,
 }
 
 struct StateStore {
@@ -520,6 +545,32 @@ impl StateStore {
             directory,
         };
         let state = store.load()?;
+        Ok((store, state))
+    }
+
+    /// `open`, then reconcile the failure records with the running build:
+    /// records earned by a different daemon/renderer build are dropped
+    /// (logged once with the count) and the file is rewritten under the
+    /// current `build_id`. Everything else in the state (last-good frame,
+    /// forced-kill count) is kept.
+    fn open_for_build(directory: PathBuf, build_id: &str) -> Result<(Self, PersistedState)> {
+        let (store, mut state) = Self::open(directory)?;
+        if state.build_id.as_deref() != Some(build_id) {
+            let dropped = state.records.len();
+            let previous = state
+                .build_id
+                .take()
+                .unwrap_or_else(|| "unknown".to_string());
+            state.records.clear();
+            state.build_id = Some(build_id.to_string());
+            if dropped > 0 {
+                eprintln!(
+                    "event=renderer.quarantine_reset reason=build_changed dropped={dropped} previous_build={} build={build_id}",
+                    truncate_detail(&previous)
+                );
+            }
+            store.save(&state)?;
+        }
         Ok((store, state))
     }
 
@@ -743,7 +794,8 @@ pub struct SupervisorService {
 impl SupervisorService {
     pub fn start(config: SupervisorConfig) -> Result<Self> {
         let config = config.validate()?;
-        let (store, state) = StateStore::open(config.state_dir.clone())?;
+        let build_id = build_identity(&config);
+        let (store, state) = StateStore::open_for_build(config.state_dir.clone(), &build_id)?;
         let grant_store = GrantStore::open(&config.state_dir)?;
         let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let thread = thread::Builder::new()
@@ -964,13 +1016,18 @@ impl SupervisorRuntime {
             self.persisted.records.remove(&identity);
             self.persisted.records.remove(&legacy);
             self.store.save(&self.persisted)?;
-        } else if self
+        } else if let Some(record) = self
             .persisted
             .records
             .get(&identity)
             .or_else(|| self.persisted.records.get(&legacy))
-            .is_some_and(|record| record.quarantined)
+            .filter(|record| record.quarantined)
+            .cloned()
         {
+            // Surface WHY it is quarantined: the record's last failure and
+            // detail ride along in status() so the apply error can name the
+            // cause instead of the bare phase (B4).
+            self.last_failure = Some((record.last_failure, record.last_detail));
             self.requested = Some(spec);
             self.phase = if self.active.is_some() {
                 WorkerPhase::RolledBack
@@ -1475,6 +1532,14 @@ impl SupervisorRuntime {
         let Some(worker) = self.active.take() else {
             return;
         };
+        // A worker that already published and then exits 73/74 (web
+        // heartbeat exit after first paint, say) failed at runtime: that is
+        // a strike like any other exit, not a refusal.
+        let kind = if kind == FailureKind::Refused {
+            FailureKind::ProcessExit
+        } else {
+            kind
+        };
         let spec = worker.spec.clone();
         self.stop_worker(worker, false);
         if let Some(retired) = self.retired.take() {
@@ -1518,6 +1583,28 @@ impl SupervisorRuntime {
     }
 
     fn handle_candidate_failure(&mut self, kind: FailureKind, detail: String, spec: StartSpec) {
+        if kind == FailureKind::Refused {
+            // Refusal: the worker told us this content cannot run in this
+            // environment/build. Retrying would only repeat the answer, and
+            // three repeats used to ban the content (B4). Stop here, keep
+            // the detail for status()/apply, strike nothing, persist
+            // nothing; an active wallpaper stays on screen (RolledBack).
+            self.last_failure = Some((kind, truncate_detail(&detail)));
+            self.pending = None;
+            self.requested = Some(spec.clone());
+            self.phase = if self.active.is_some() {
+                WorkerPhase::RolledBack
+            } else {
+                WorkerPhase::Stopped
+            };
+            eprintln!(
+                "event=renderer.refused wallpaper_id={} content_hash={} detail={}",
+                spec.wallpaper_id,
+                spec.content_hash,
+                truncate_detail(&detail)
+            );
+            return;
+        }
         let quarantined = self.record_failure(kind, &detail, &spec);
         if quarantined {
             self.phase = if self.active.is_some() {
@@ -1718,6 +1805,7 @@ impl SupervisorRuntime {
             forced_kill_count: self.persisted.forced_kill_count,
             last_failure: self.last_failure.as_ref().map(|(kind, _)| *kind),
             last_failure_detail: self.last_failure.as_ref().map(|(_, detail)| detail.clone()),
+            quarantined: record.is_some_and(|record| record.quarantined),
             requested_wallpaper_id: requested.map(|spec| spec.wallpaper_id.clone()),
             requested_content_hash: requested.map(|spec| spec.content_hash.clone()),
             candidate_pid: candidate.map(|worker| worker.child.id()),
@@ -1794,7 +1882,14 @@ fn inspect_worker(
             // Fold the drained ring tail into the detail so crash diagnostics
             // survive the worker drop and reach status()/quarantine records.
             let detail = append_stderr_tail(&detail, worker);
-            return Some(WorkerObservation::Failure(FailureKind::ProcessExit, detail));
+            // 73 (backend_reject) and 74 (no_drawable_content) are the
+            // renderer contract's refusal codes; the candidate/active
+            // handlers decide whether they strike (B4).
+            let kind = match status.code() {
+                Some(EXIT_BACKEND_REJECT | EXIT_NO_DRAWABLE_CONTENT) => FailureKind::Refused,
+                _ => FailureKind::ProcessExit,
+            };
+            return Some(WorkerObservation::Failure(kind, detail));
         }
         Ok(None) => {}
         Err(error) => {
@@ -2163,6 +2258,41 @@ fn set_nonblocking(descriptor: libc::c_int) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Identity of the build whose failures the persisted records describe:
+/// the daemon's own version and executable (size + mtime) plus every
+/// configured renderer binary's size + mtime, in kind order. Package
+/// upgrades rewrite these files (new mtime, usually new size); the cargo
+/// version alone is not enough because alpha package releases bump
+/// `pkgrel` without it. Missing binaries are recorded as such so a later
+/// install changes the identity too. Pure metadata — no hashing of
+/// multi-megabyte binaries on every start.
+pub(crate) fn build_identity(config: &SupervisorConfig) -> String {
+    fn stamp(path: &Path) -> String {
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |duration| duration.as_secs());
+                format!("{}:{}", metadata.len(), mtime)
+            }
+            Err(_) => "missing".to_string(),
+        }
+    }
+    let mut parts = vec![format!(
+        "daemon={}:{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe()
+            .map(|exe| stamp(&exe))
+            .unwrap_or_else(|_| "unknown".to_string())
+    )];
+    for (kind, path) in &config.renderer_paths {
+        parts.push(format!("{}={}", kind.as_str(), stamp(path)));
+    }
+    parts.join(";")
 }
 
 fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
@@ -3208,5 +3338,247 @@ mod tests {
         assert_eq!(read, expected.len() as isize);
         assert_eq!(&received[..read as usize], &expected[..]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// B4: a script renderer for refusal/strike tests; `body` is the shell
+    /// body after the shebang.
+    fn script_renderer(root: &Path, name: &str, body: &str) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let script = root.join(name);
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn script_runtime(root: &Path, script: PathBuf) -> SupervisorRuntime {
+        let mut config = validated_config(root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, script)]);
+        let config = config.validate().unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        )
+    }
+
+    fn test_spec() -> StartSpec {
+        StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+        }
+    }
+
+    /// Tick until the candidate is gone (it exited) or `limit` elapses.
+    fn tick_until_candidate_settles(runtime: &mut SupervisorRuntime, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while runtime.candidate.is_some() && Instant::now() < deadline {
+            runtime.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn refusal_exit_codes_do_not_strike_restart_or_persist() {
+        for (code, name) in [(73, "backend-reject"), (74, "no-drawable")] {
+            let root = temporary_directory(&format!("refused-{name}"));
+            let script = script_renderer(
+                &root,
+                "refuse.sh",
+                &format!("echo event=renderer.refusal.{name} >&2\nexit {code}"),
+            );
+            let mut runtime = script_runtime(&root, script);
+            let status = runtime.start_selected(test_spec(), false).unwrap();
+            assert_eq!(status.phase, WorkerPhase::Starting);
+            tick_until_candidate_settles(&mut runtime, Duration::from_secs(5));
+            assert!(
+                runtime.candidate.is_none(),
+                "exit {code} worker must be reaped"
+            );
+            let status = runtime.status();
+            assert_eq!(
+                status.phase,
+                WorkerPhase::Stopped,
+                "exit {code}: no restart, no quarantine"
+            );
+            assert_eq!(status.last_failure, Some(FailureKind::Refused));
+            let detail = status.last_failure_detail.unwrap();
+            assert!(detail.starts_with(&format!("exit_code_{code}")), "{detail}");
+            assert!(
+                detail.contains(&format!("renderer.refusal.{name}")),
+                "{detail}"
+            );
+            assert!(
+                runtime.pending.is_none(),
+                "a refusal never schedules a restart"
+            );
+            assert!(
+                runtime.persisted.records.is_empty(),
+                "a refusal is not a strike"
+            );
+            assert!(!status.quarantined);
+            assert_eq!(status.failures, 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_exit_still_strikes_and_restarts() {
+        let root = temporary_directory("strike-exit-3");
+        let script = script_renderer(&root, "crash.sh", "exit 3");
+        let mut runtime = script_runtime(&root, script);
+        runtime.start_selected(test_spec(), false).unwrap();
+        tick_until_candidate_settles(&mut runtime, Duration::from_secs(5));
+        let status = runtime.status();
+        assert_eq!(status.phase, WorkerPhase::Restarting);
+        assert_eq!(status.last_failure, Some(FailureKind::ProcessExit));
+        assert_eq!(status.failures, 1);
+        assert!(runtime.pending.is_some());
+    }
+
+    #[test]
+    fn refusal_from_an_active_worker_is_a_runtime_strike() {
+        // A worker that already published and then exits 73 (web heartbeat
+        // after first paint) failed at runtime: it strikes like any exit.
+        let root = temporary_directory("active-refused");
+        let script = script_renderer(&root, "sleep.sh", "sleep 30");
+        let mut runtime = script_runtime(&root, script);
+        let worker = runtime.spawn_worker(test_spec()).unwrap();
+        runtime.active = Some(worker);
+        runtime.requested = Some(test_spec());
+        runtime.phase = WorkerPhase::Live;
+        runtime.handle_active_failure(FailureKind::Refused, "exit_code_73".into());
+        let record = runtime
+            .persisted
+            .records
+            .get(&test_spec().identity())
+            .expect("an active-worker exit 73 must be recorded");
+        assert_eq!(record.failures, 1);
+        assert_eq!(record.last_failure, FailureKind::ProcessExit);
+        assert_eq!(
+            runtime.status().last_failure,
+            Some(FailureKind::ProcessExit)
+        );
+        assert_eq!(runtime.phase, WorkerPhase::Restarting);
+    }
+
+    #[test]
+    fn quarantined_start_reports_the_record_and_its_reason() {
+        let root = temporary_directory("quarantined-status");
+        let script = script_renderer(&root, "never-run.sh", "exit 0");
+        let mut runtime = script_runtime(&root, script);
+        let spec = test_spec();
+        runtime.persisted.records.insert(
+            spec.identity(),
+            FailureRecord {
+                wallpaper_id: spec.wallpaper_id.clone(),
+                content_hash: spec.content_hash.clone(),
+                failures: 3,
+                quarantined: true,
+                last_failure: FailureKind::ProcessExit,
+                last_detail: "exit_code_73 stderr=[zygote could not fork]".into(),
+                updated_unix_seconds: 1,
+            },
+        );
+        let status = runtime.start_selected(spec.clone(), false).unwrap();
+        assert_eq!(status.phase, WorkerPhase::Quarantined);
+        assert!(
+            status.quarantined,
+            "status must say the identity is quarantined"
+        );
+        assert_eq!(status.failures, 3);
+        assert_eq!(status.last_failure, Some(FailureKind::ProcessExit));
+        assert_eq!(
+            status.last_failure_detail.as_deref(),
+            Some("exit_code_73 stderr=[zygote could not fork]")
+        );
+        assert!(
+            runtime.candidate.is_none(),
+            "a quarantined start spawns nothing"
+        );
+        // Retry clears exactly this identity and spawns.
+        let status = runtime.start_selected(spec, true).unwrap();
+        assert_eq!(status.phase, WorkerPhase::Starting);
+        assert!(!status.quarantined);
+        assert!(runtime.persisted.records.is_empty());
+        runtime.stop_candidate(false);
+    }
+
+    #[test]
+    fn records_from_another_build_are_dropped_at_load() {
+        let root = temporary_directory("build-id");
+        let dir = root.join("state");
+        let (store, mut state) = StateStore::open(dir.clone()).unwrap();
+        state.records.insert(
+            "a:b:test".into(),
+            FailureRecord {
+                wallpaper_id: "a".into(),
+                content_hash: "b".into(),
+                failures: 3,
+                quarantined: true,
+                last_failure: FailureKind::ProcessExit,
+                last_detail: "old build".into(),
+                updated_unix_seconds: 1,
+            },
+        );
+        state.forced_kill_count = 7;
+        state.build_id = Some("build-1".into());
+        store.save(&state).unwrap();
+
+        // Same build: everything survives.
+        let (_, same) = StateStore::open_for_build(dir.clone(), "build-1").unwrap();
+        assert_eq!(same.records.len(), 1);
+        assert_eq!(same.build_id.as_deref(), Some("build-1"));
+        // New build: records go, the rest stays, the file now names the
+        // new build so the next load keeps what this build earns.
+        let (_, fresh) = StateStore::open_for_build(dir.clone(), "build-2").unwrap();
+        assert!(fresh.records.is_empty());
+        assert_eq!(fresh.forced_kill_count, 7);
+        assert_eq!(fresh.build_id.as_deref(), Some("build-2"));
+        let (_, again) = StateStore::open(dir.clone()).unwrap();
+        assert_eq!(again.build_id.as_deref(), Some("build-2"));
+        // A pre-B4 file (no build_id) is an unknown build: dropped once.
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "records": {"x:y:test": {
+                "wallpaper_id": "x", "content_hash": "y", "failures": 3,
+                "quarantined": true, "last_failure": "process_exit",
+                "last_detail": "legacy", "updated_unix_seconds": 1}},
+            "last_good": null,
+        });
+        atomic_write(
+            &dir.join("supervisor-v1.json"),
+            &serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let (_, migrated) = StateStore::open_for_build(dir, "build-2").unwrap();
+        assert!(migrated.records.is_empty());
+        assert_eq!(migrated.build_id.as_deref(), Some("build-2"));
+    }
+
+    #[test]
+    fn build_identity_follows_the_renderer_binaries() {
+        let root = temporary_directory("build-identity");
+        let script = script_renderer(&root, "renderer.sh", "exit 0");
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
+        let config = config.validate().unwrap();
+        let first = build_identity(&config);
+        assert!(first.starts_with(&format!("daemon={}:", env!("CARGO_PKG_VERSION"))));
+        assert!(first.contains("test="));
+        assert_eq!(build_identity(&config), first, "stable across calls");
+        // A replaced renderer (different size) changes the identity.
+        fs::write(&script, "#!/bin/sh\necho upgraded\nexit 0\n").unwrap();
+        assert_ne!(build_identity(&config), first);
+        // A missing renderer is part of the identity too.
+        fs::remove_file(&script).unwrap();
+        assert!(build_identity(&config).contains("test=missing"));
     }
 }
