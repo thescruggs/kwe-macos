@@ -66,7 +66,10 @@ bounded to 1–240.
 `renderer.start` refuses to launch an unchanged quarantined identity.
 `renderer.retry` explicitly clears that identity's failure record and starts a
 new bounded attempt. A changed content hash naturally receives a new failure
-budget.
+budget. Failure records are scoped to the build that earned them (BETA B4,
+`build_id` in `supervisor-v1.json`); a daemon whose own or renderer
+binaries changed drops them at load, logging
+`event=renderer.quarantine_reset reason=build_changed dropped=N`.
 
 Synthetic `test_fault` parameters are rejected unless the daemon was launched
 with `--allow-test-faults`. They are development-only and support
@@ -94,6 +97,7 @@ The result contains:
   "forced_kill_count": 0,
   "last_failure": null,
   "last_failure_detail": null,
+  "quarantined": false,
   "resource_limits": {
     "address_space_mib": 4096,
     "file_size_mib": 160,
@@ -119,8 +123,13 @@ a lifetime counter, reset on daemon restart, not per worker.)*
 
 Phases are `idle`, `starting`, `canary`, `live`, `restarting`, `awaiting_ack`,
 `rolled_back`, `stopped`, and `quarantined`. Stable failure classes are
-`startup_timeout`, `frame_timeout`, `invalid_frame`, `process_exit`, and
-`launch_failed`, and `resource_limit`.
+`startup_timeout`, `frame_timeout`, `invalid_frame`, `process_exit`,
+`launch_failed`, `resource_limit`, and `refused` (BETA B4: a candidate's
+exit 73/74 before first publish — reported, never restarted, never
+counted). `quarantined` (B4) is true when the requested identity's
+persisted record is quarantined; a quarantined `renderer.start` leaves the
+record's `last_failure`/`last_failure_detail` in the status so the caller
+can say why.
 
 The PID/frame/sequence fields always describe the active display source.
 Candidate state is separate in `requested_*`, `candidate_pid`,
@@ -321,11 +330,16 @@ format, and safe-mode restore contract are documented in
   (desktop mapping) and is cached 5 s per call — never indefinitely, and
   the apply transaction always probes fresh.
 - `wallpaper.apply` — params `{"output", "wallpaper_id", "kind", "content",
-  "width"?, "height"?, "fps"?}` (`width` 960 / `height` 540 / `fps` 30
-  defaults). `kind`/`content` follow the `renderer.start` rules; the `test`
-  kind is not assignable. Completes on renderer *promotion* (phase `live`
-  or `awaiting_ack`), not on display acknowledgement. Success returns the
-  persisted assignment with `applied_at_unix_seconds`.
+  "width"?, "height"?, "fps"?, "retry"?}` (`width` 960 / `height` 540 /
+  `fps` 30 defaults; `retry` false). `kind`/`content` follow the
+  `renderer.start` rules; the `test` kind is not assignable. Completes on
+  renderer *promotion* (phase `live` or `awaiting_ack`), not on display
+  acknowledgement. Success returns the persisted assignment with
+  `applied_at_unix_seconds`. `retry: true` (BETA B4) clears this
+  wallpaper/content/kind identity's failure record before starting —
+  exactly what `renderer.retry` does — for a client that saw
+  `apply_quarantined` and wants to try anyway; it never clears anything
+  else.
 - `wallpaper.restore` — params `{"output"}`. Reverts the saved previous
   plugin/config-group/image, or restores the stock `org.kde.image` plugin
   with the first present stock image when no assignment exists; returns
@@ -336,8 +350,29 @@ format, and safe-mode restore contract are documented in
 Error responses (all fail closed; detail is bounded): `invalid_params`,
 `apply_unknown_wallpaper`, `apply_incompatible`, `output_missing`,
 `apply_busy` (no detail), `shell_unreachable`, `display_unavailable`,
-`apply_failed` (already rolled back), `restore_failed`, and
-`apply_unavailable` when the daemon has no apply lane.
+`apply_failed` (already rolled back), `apply_quarantined`, `service_stale`,
+`restore_failed`, and `apply_unavailable` when the daemon has no apply lane.
+
+`apply_quarantined` (BETA B4): the supervisor's persisted record for this
+identity is quarantined — `max_failures` strikes under the running build.
+Detail: `disabled after N failures under this build; last failure:
+<record detail>`. Nothing was started and no shell script ran. Failure
+records are scoped to the build that earned them (`build_id` in
+`supervisor-v1.json`: daemon version + executable stamp + every renderer
+binary's size/mtime); a daemon built differently drops them at load
+(`event=renderer.quarantine_reset`), so an upgrade never inherits a ban.
+Renderer *refusals* — a candidate exiting 73 (`backend_reject`) or 74
+(`no_drawable_content`) before its first publish — are not strikes at all:
+the supervisor reports `last_failure: "refused"` with the worker's detail,
+schedules no restart, and persists nothing (phase `stopped`, or
+`rolled_back` when a previous renderer is live); the apply lane reports
+them as `apply_failed` with that detail.
+
+`service_stale` (BETA B4): the daemon's own executable was replaced on disk
+after it started (package upgrade without a restart). `wallpaper.apply` is
+refused with the restart command in the detail; `health` carries
+`service_stale: true`. Nothing else is gated (the playlist lane keeps
+running its own applies).
 
 `display_unavailable` is the narrow case where the enumeration never ran
 because no display server was in reach — a daemon started before its desktop

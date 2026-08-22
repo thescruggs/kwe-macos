@@ -310,6 +310,18 @@ Empirically (all measured on this machine, Chromium 151.0.7922.137):
   **32768-process ceiling** and 1024 open files, like the M1e video fix.
 - Resident protection comes from the supervisor timeouts plus the
   containing unit's systemd `MemoryMax`, not from `RLIMIT_AS`.
+- **The unit's `TasksMax` is a launch-class bound too (BETA B4,
+  2026-08-22, chromium 151.0.7922.173).** The cgroup pids limit counts
+  every thread of the daemon, the audio worker, bwrap and every chromium
+  process; at `TasksMax=96` the browser's zygote cannot fork the renderer
+  (`Zygote could not fork`, `pthread_create: Resource temporarily
+  unavailable (11)` in the stderr tail) and the worker exits 73 at
+  bootstrap. Measured with `systemd-run -p TasksMax=N kwe-web-renderer
+  --probe`: 96 fails, 128+ passes, one probe alone peaks at ≥53 tasks
+  sampled at 200 ms. The unit ships `TasksMax=512` and `kwe diagnose` runs
+  the web probe under the unit's own `TasksMax` so the lane fails exactly
+  when a supervised launch would. A probe from the shell is NOT evidence
+  that the unit can launch the browser.
 
 The status `resource_limits` for a web worker reports
 `{address_space_mib: 131072, open_files: 1024, processes: 32768}`.

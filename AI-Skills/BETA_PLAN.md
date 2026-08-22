@@ -8,6 +8,7 @@
 
 ## Change log
 
+- 2026-08-22 — **B4 fixed** on `beta-b4-apply-quarantine` (B4a `4256c1d`, B4b `20ac809`, B4c `1800636`; docs in `docs/bugs/APPLY_REJECTED_QUARANTINED.md` §Fix). Unit `TasksMax` 96→512 (measured), `kwe diagnose` runs the web probe under the unit's TasksMax, daemon `selfcheck` refuses `wallpaper.apply` with `service_stale` once its binary was replaced on disk (no auto-restart: assignments are not re-applied on start — **B5 filed**), `post_upgrade` prints the restart, `pkgrel` 6. Supervisor: candidate exit 73/74 = `refused` (no strike/restart/record), records scoped by `build_id` (dropped on build change, pre-B4 files dropped once), `WorkerStatus.quarantined`, quarantined start keeps the record detail; apply: `apply_quarantined` with the reason, `retry: true` clears one identity; manager: the two messages + Try Again sends `retry` once. Web renderer drains stderr during bootstrap and reports a filtered tail (under TasksMax=96: `Zygote could not fork … pthread_create: Resource temporarily unavailable`). Gates: workspace tests (148 daemon), clippy `-D warnings`, ctest 8/8, `./scripts/check.sh` exit 0. Live verification needs the `-6` package installed + unit restarted (maintainer).
 - 2026-08-22 — **B4 filed and diagnosed** (user report: "Applying failed: renderer rejected the start (quarantined)"; no code changes). Three confirmed causes, `docs/bugs/APPLY_REJECTED_QUARANTINED.md`: (1) the unit's `TasksMax=96` kills chromium 151.0.7922.173 (upgraded today 11:33) at bootstrap — measured with `kwe-web-renderer --probe` in transient units: 96 fails, 128+ passes; every web apply exits 73 three times and is quarantined; (2) the running daemon was still the `-4` binary while the renderers were `-5` (nothing restarts the unit on upgrade), so the B2 preflight refusal was absent and the `-5` scene worker's own exit-74 re-check fired three times → quarantine; (3) refusals (73/74) count as crash strikes, records carry no build identity and never expire, `complete_apply` drops `last_failure_detail`, and nothing calls `renderer.retry` — the user sees a bare phase name with no way out. Bonus: the web bootstrap-failure stderr tail is always empty (ring not drained during bootstrap). Fix planned as B4a–B4c in the open queue; **B4 goes ahead of F1** because the maintainer's current goal is "all wallpapers apply".
 - 2026-08-22 — **B3 filed** (user report while preparing to test `-5`, no code changes): the wallpaper selection grid visibly shifts back and forth every few seconds. Triaged from the code, not yet measured: `CatalogClient` auto-refreshes the whole catalog every 5 s unconditionally (`catalogclient.cpp:10`, `:31-37`), and every reply lands through `CatalogModel`'s only update path — a full `beginResetModel`/`endResetModel` (`catalogmodel.cpp:119-128`) — which invalidates every delegate and index and makes the view re-settle. Candidate fixes, smallest first: skip the reset when the payload is unchanged; diff by stable identity and emit targeted signals instead of resetting; revisit the cadence. Confirm the 5 s cadence matches the observed interval before changing anything — if it does not, the suspect is wrong. Queued after F1, but manager-only and can be pulled forward. `docs/bugs/GALLERY_AUTO_REFRESH_SHIFT.md`.
 - 2026-08-22 — **Alpha package release 5 built** (`36bceee`): `pkgrel` 4→5 carrying B2, application version unchanged at `0.1.0-alpha.1` (the coordinated `0.1.0-beta.1` change stays with M5); `.SRCINFO` regenerated via `KWE_FORCE_AUR_SOURCE=1 makepkg --printsrcinfo`. Clean `makepkg -Ccf` green with the release-profile workspace tests. Archive `kde-wallpaper-engine-0.1.0.alpha.1-5-x86_64.pkg.tar.zst`, SHA-256 `ec674b44589a7aee125771fd4a10b76f0eec59ce3e921c3e4d4d6a33fe374a50`. Verified **from the archive**: the packaged `kwe preflight` refuses the reported scene 1725674512 with the named reason, refuses 46 of the 60 local scene packages and passes 14, and the packaged `kwe-scene-renderer` exits 74 on a model-only scene without publishing a frame. Not installed; the maintainer runs `sudo pacman -U` (no re-enable needed this time — the B1 unit change is already in `-4`). Known cosmetic carry-over, not new: makepkg warns that `kwe-scene-renderer` references `$srcdir`.
@@ -65,7 +66,7 @@
 | BETA_M3 (scene, a–k) | M3a–M3g done; M4 complete — M3h (scene3d P1) after F1, and B2 made it the gate on 46 of 60 local scenes |
 | BETA_M4 (live apply) | M4a–M4d done |
 | BETA_M5 (release) | pending |
-| Open user-reported queue | B1 and B2 fixed; **B4 next** (web lane dead + quarantine dead end), then F1, then B3 — see below |
+| Open user-reported queue | B1, B2, B4 fixed; F1 next, then B3, B5 — see below |
 
 ## Open work queue (user-reported, ahead of M3h)
 
@@ -78,13 +79,14 @@ branch + adversarial review pass, same as a milestone slice.
 | B2 | Applying a scene shows a blank/white background | bug (high) | **fixed and merged** (`77c6d3e`+`e6fff36`) | `docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md` |
 | F1 | Wallpaper scaling modes (stretch / fill / aspect) | feature | accepted, unscheduled | `docs/backlog/WALLPAPER_SCALING_MODES.md` |
 | B3 | Gallery shifts wallpapers back and forth every few seconds | bug (medium) | triaged 2026-08-22, suspect identified, not reproduced under instrumentation | `docs/bugs/GALLERY_AUTO_REFRESH_SHIFT.md` |
-| B4 | Apply fails "renderer rejected the start (quarantined)" — web lane dead under chromium 151.173, stale daemon after upgrade, quarantine unrecoverable | bug (high) | **diagnosed 2026-08-22, fix planned (B4a–B4c below), next up** | `docs/bugs/APPLY_REJECTED_QUARANTINED.md` |
+| B4 | Apply fails "renderer rejected the start (quarantined)" — web lane dead under chromium 151.173, stale daemon after upgrade, quarantine unrecoverable | bug (high) | **fixed 2026-08-22** (`4256c1d`+`20ac809`+`1800636` on `beta-b4-apply-quarantine`); live verification after the `-6` install pending | `docs/bugs/APPLY_REJECTED_QUARANTINED.md` |
+| B5 | Applied wallpaper is not restored when the daemon (re)starts — upgrade restart, crash, reboot all leave the desktop on the plugin's status panel until the user re-applies; precondition for restarting automatically on upgrade | bug (medium) | filed 2026-08-22 from B4, not started | (bug doc with B4, §"Not done here") |
 
 **B1 first** — it blocks every boot, and it blocks testing the other two on a
 freshly booted machine. **Done 2026-08-22.** **B2 second — done 2026-08-22**:
 the policy chosen was *refuse, not degrade to blank* (one drawable object is
 enough to apply; zero is a refusal), and it landed with the classification
-defect it uncovered. **B4 is next** (2026-08-22, maintainer: keep getting every wallpaper to apply before features) — see the B4 plan below. **F1 after B4**, and it wants the render-resolution
+defect it uncovered. **B4 done 2026-08-22** (maintainer: keep getting every wallpaper to apply before features) — the B4 plan below is as executed. **F1 is next**, and it wants the render-resolution
 decision settled with it. **B3 after F1** — a manager-only UI defect with a
 suspect already named (the unconditional 5 s catalog auto-refresh drives a
 full `beginResetModel`, so the grid rebuilds its delegates and re-settles
@@ -92,22 +94,19 @@ its scroll position on a cadence). It touches nothing the renderer lanes
 depend on, so it can be pulled forward if it annoys the maintainer during
 testing.
 
-### B4 plan (one worktree per slice, adversarial review each, smallest first)
+### B4 plan (executed 2026-08-22 as three commits on one branch; deviations noted inline)
 
 - **B4a — unblock the web lane and the stale-daemon upgrade (packaging + unit).**
   - `packaging/systemd/kwe-daemon.service`: `TasksMax=96` → `512`, with the
     measurement in the comment (one chromium probe ≥53 tasks sampled; 96
     fails, 128 passes; daemon + audio worker + outgoing renderer share it).
     `MemoryMax=3G` is the real memory bound and stays.
-  - Upgrade restart: the daemon notices its own executable was replaced
-    (`/proc/self/exe` unlinked, or an inode/mtime check on a slow tick) and
-    exits cleanly; `Restart=always` brings the new binary up. Decision to
-    settle in the slice: exit only when no apply is in flight, and confirm
-    assignments re-apply on start (otherwise the desktop goes blank for the
-    restart window — acceptable only if the wallpaper comes back by itself).
-    If re-apply on start does not exist, `post_upgrade` prints the restart
-    command and the manager shows a "service is older than the installed
-    version, restart it" banner (same pattern as `display_unavailable`).
+  - Upgrade restart — **decided: no auto-exit.** Assignments are NOT
+    re-applied on daemon start (B5), so a silent restart would blank the
+    desktop. Instead the daemon detects the replaced binary (dev+inode) and
+    refuses `wallpaper.apply` with `service_stale` + the restart command;
+    `health` carries the flag; `post_upgrade` prints the command. Auto
+    restart becomes safe once B5 lands.
   - `kwe diagnose` web lane runs the probe under the unit's `TasksMax`
     (read `/sys/fs/cgroup/…/pids.max` of the daemon's cgroup, or run it
     through `systemd-run -p TasksMax=<unit value>`), so the diagnostic

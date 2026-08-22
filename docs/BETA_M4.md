@@ -284,6 +284,8 @@ bounded one):
 | `apply_incompatible` | "This wallpaper cannot be applied in its current form: \<detail\>" |
 | `shell_unreachable` | "The Plasma desktop could not be reached: \<detail\>; nothing was changed." |
 | `apply_failed` | "Applying failed: \<detail\>" |
+| `apply_quarantined` (B4) | "This wallpaper was disabled after repeated failures (\<detail\>). Try Again re-enables it and applies it once more." — Try Again re-applies with `retry: true` |
+| `service_stale` (B4) | "The wallpaper service was upgraded but is still running the old version. Restart it with `systemctl --user restart kwe-daemon`, then try again." |
 | `restore_failed` | "Restoring the previous wallpaper failed: \<detail\>" |
 | `invalid_params` / `apply_unavailable` | rejected-request / no-apply-lane wording |
 

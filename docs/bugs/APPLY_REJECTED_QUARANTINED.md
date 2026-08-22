@@ -6,8 +6,9 @@
   message names no cause, and nothing in the UI can clear it. On this
   machine it hits every web wallpaper and the one scene that was tried
   under the stale daemon.
-- **Status:** DIAGNOSED 2026-08-22, three causes confirmed by measurement
-  (below), fix planned as B4 in `AI-Skills/BETA_PLAN.md`. Not fixed.
+- **Status:** FIXED 2026-08-22 on `beta-b4-apply-quarantine` (B4a
+  `4256c1d`, B4b `20ac809`, B4c `1800636`; see "Fix" at the end). Three
+  causes confirmed by measurement (below), all three addressed.
 
 ## Symptom
 
@@ -115,7 +116,82 @@ compatibility question, not part of this bug.
    Alternatively `kwe daemon-call --method renderer.retry` with the start
    spec, which clears only that identity.
 
-## Fix (planned — B4)
+## Fix (2026-08-22)
 
-See `AI-Skills/BETA_PLAN.md` "Open work queue" B4 for the slices and
-acceptance tests.
+Branch `beta-b4-apply-quarantine`, three commits, one per planned slice.
+
+**B4a — `4256c1d`, the environment.**
+
+- `packaging/systemd/kwe-daemon.service`: `TasksMax` 96 → 512, comment
+  carries the measurement. `MemoryMax=3G` stays the memory bound.
+- `kwe-daemon`: new `selfcheck` module records the running executable's
+  device+inode at start. While the file on disk is a different inode
+  (package upgraded, unit not restarted) `wallpaper.apply` answers
+  `service_stale` with the exact restart command and `health` reports
+  `service_stale: true`. No automatic restart: the applied wallpaper is not
+  re-applied on daemon start today (filed as B5), so a silent restart would
+  blank the desktop.
+- `kwe diagnose`: the web probe runs inside a transient unit carrying the
+  daemon unit's `TasksMax` (`systemd-run --property=TasksMax=N …`), so the
+  lane fails exactly when the daemon's launch would; verified on this
+  machine — under the still-running `-5` unit (`TasksMax=96`) the lane
+  prints `kwe-web-renderer --probe failed (… exit 73); if the shell probe
+  passes but this fails, the unit's TasksMax is too low`.
+- `post_upgrade` prints the restart command; `pkgrel` 6.
+
+**B4b — `20ac809`, the policy.**
+
+- Refusals are not strikes: a candidate exiting 73/74 before its first
+  publish is `FailureKind::Refused` — no restart, no record, the detail
+  kept for status/apply (`event=renderer.refused`). The same codes from an
+  active worker (web heartbeat exit after first paint) still strike as
+  `process_exit`.
+- Records are per build: `supervisor-v1.json` carries `build_id` (daemon
+  version + executable stamp + every renderer binary's size/mtime);
+  records earned under another build — or a pre-B4 file with none — are
+  dropped at load (`event=renderer.quarantine_reset`). The three records
+  on this machine clear themselves at the first start of the new daemon.
+- The apply error says why: `apply_quarantined` — `disabled after N
+  failures under this build; last failure: <record detail>`; the
+  synchronous rejection detail is never a bare phase name any more.
+- A way out: `wallpaper.apply {… "retry": true}` routes through the
+  supervisor's `Retry` (clears exactly that identity, like
+  `renderer.retry`). The manager maps `apply_quarantined` to "This
+  wallpaper was disabled after repeated failures (…). Try Again re-enables
+  it and applies it once more." and its Try Again sends `retry: true` once.
+  `service_stale` maps to the restart instruction.
+
+**B4c — `1800636`, the diagnostics.** The web renderer drains chromium's
+stderr during `find_page_target` and every bootstrap-class failure folds in
+`diagnostic_tail()`: the last non-routine lines (dbus/crashpad noise
+dropped, pid/time prefix stripped, clipped), so the daemon's 256-char
+record detail leads with the cause. Under `TasksMax=96` the probe now
+reports `Zygote could not fork: process_type renderer … | pthread_create:
+Resource temporarily unavailable (11) | NOTREACHED hit. Did not receive
+ping from zygote child`, where it used to say nothing.
+
+**Tests.** Supervisor: refusal vs strike per exit code, active-refused
+strikes, quarantined status carries the record detail and `retry` clears
+one identity, build-id drop/keep/legacy migration, build identity follows
+the renderer binaries. RPC: `apply_quarantined` names the reason, no
+switch script runs, `retry: true` applies and promotes. Manager
+(`kwe-apply-client-test`): the two new messages, Try Again sends `retry`
+once and a fresh apply does not inherit it. `selfcheck`: same inode vs
+rename-over vs removal, ` (deleted)` suffix. Gates: `cargo test
+--workspace` green, `cargo clippy --all-targets -D warnings` clean,
+`ctest` 8/8, `scripts/check.sh` exit 0.
+
+**Not done here (recorded).** B5: re-apply the stored assignment when the
+daemon starts, so a restart (upgrade, crash, reboot) brings the wallpaper
+back by itself — the precondition for restarting automatically on upgrade.
+The WebGL observation above is a separate compatibility question. No
+smoke-script lane was added for the TasksMax case: it needs the daemon run
+inside a constrained transient unit, which `smoke-web.sh` does not model;
+the unit tests above and `kwe diagnose` under the unit cover it.
+
+**To verify on this machine.** `pacman -U` the `-6` package, then
+`systemctl --user daemon-reload && systemctl --user restart kwe-daemon`
+(the journal must show `event=renderer.quarantine_reset … dropped=3`), then
+apply 2646399969 or 1747779570 (web) and 1652229298 (scene: expect the B2
+refusal message, not a quarantine). `kwe diagnose` must print the web lane
+under `TasksMax=512` with a report.
