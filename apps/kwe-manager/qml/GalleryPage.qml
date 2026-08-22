@@ -4,6 +4,16 @@ import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import QtQuick.Window
 import org.kde.kirigami as Kirigami
+// The module's own C++ clients (CatalogClient, ApplyClient, …). The engine
+// resolves them implicitly for a file of this module, but qmllint does not —
+// these files sit one directory below the module root — and the type gate in
+// scripts/qml-typecheck.sh is what keeps the QML_ELEMENT registration from
+// silently disappearing again, so the dependency is stated explicitly.
+import org.kde.kwe
+// The C++ clients (CatalogClient, ApplyClient, …) are registered into this
+// module, but these files live one directory below the module root, so the
+// implicit directory import does not cover them: without this explicit
+// import every type-based enum read is a ReferenceError at runtime.
 
 // One gallery destination: the Installed view shows every indexed item, the
 // Workshop view shows only subscribed items (installed, downloading, or

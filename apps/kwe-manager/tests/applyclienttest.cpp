@@ -34,6 +34,23 @@ public:
         holdResponses = false;
         holdByMethod.clear();
         restoreMode = QStringLiteral("stock");
+        outputs = defaultOutputs();
+    }
+    static QJsonArray defaultOutputs() {
+        return QJsonArray{
+            QJsonObject{{QStringLiteral("name"), QStringLiteral("DP-1")},
+                        {QStringLiteral("screen"), 0},
+                        {QStringLiteral("desktop_id"), 111},
+                        {QStringLiteral("desktop_index"), 1},
+                        {QStringLiteral("enabled"), true},
+                        {QStringLiteral("connected"), true}},
+            QJsonObject{{QStringLiteral("name"), QStringLiteral("HDMI-A-1")},
+                        {QStringLiteral("screen"), 1},
+                        {QStringLiteral("desktop_id"), 112},
+                        {QStringLiteral("desktop_index"), 0},
+                        {QStringLiteral("enabled"), true},
+                        {QStringLiteral("connected"), true}},
+        };
     }
     /// Records requests but never answers them, so a client stays busy with
     /// its queue filling.
@@ -45,20 +62,7 @@ public:
     QHash<QString, Fail> failByMethod;
     QList<QString> receivedMethods;
     QList<QJsonObject> receivedParams;
-    QJsonArray outputs = QJsonArray{
-        QJsonObject{{QStringLiteral("name"), QStringLiteral("DP-1")},
-                    {QStringLiteral("screen"), 0},
-                    {QStringLiteral("desktop_id"), 111},
-                    {QStringLiteral("desktop_index"), 1},
-                    {QStringLiteral("enabled"), true},
-                    {QStringLiteral("connected"), true}},
-        QJsonObject{{QStringLiteral("name"), QStringLiteral("HDMI-A-1")},
-                    {QStringLiteral("screen"), 1},
-                    {QStringLiteral("desktop_id"), 112},
-                    {QStringLiteral("desktop_index"), 0},
-                    {QStringLiteral("enabled"), true},
-                    {QStringLiteral("connected"), true}},
-    };
+    QJsonArray outputs = defaultOutputs();
     /// The wallpaper.restore success mode.
     QString restoreMode = QStringLiteral("stock");
     /// The wallpaper.assignments store payload.
@@ -467,6 +471,57 @@ private slots:
         client.listOutputs();
         QTRY_VERIFY_WITH_TIMEOUT(client.outputs().size() > 0, 5000);
         QCOMPARE(client.state(), ApplyClient::Idle);
+    }
+
+    void emptyEnumerationIsAnAnswerNotSilence() {
+        // A daemon that truthfully reports zero outputs used to leave the
+        // picker mutely empty: applyOutputs() returned early on the unchanged
+        // list, so nothing signalled and the UI could not tell "asked and got
+        // none" apart from "never asked".
+        m_daemon.outputs = QJsonArray{};
+        ApplyClient client(m_socketPath);
+        QVERIFY(!client.outputsListed());
+        client.listOutputs();
+        QTRY_VERIFY_WITH_TIMEOUT(client.outputsListed(), 5000);
+        QVERIFY(client.outputs().isEmpty());
+        QCOMPARE(client.state(), ApplyClient::Idle);
+        QVERIFY(!client.errorMessage().isEmpty());
+        QCOMPARE(m_daemon.receivedMethods.size(), 1);
+    }
+
+    void resetStatusKeepsTheErrorOfAnOperationStillPending() {
+        // Clearing unconditionally erased the message of a failure that was
+        // still queued for retry, leaving Failed with empty text.
+        m_daemon.holdByMethod.insert(QStringLiteral("wallpaper.apply"));
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")));
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() == 1, 5000);
+        m_daemon.dropClients();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        const auto failure = client.errorMessage();
+        QVERIFY(!failure.isEmpty());
+        QVERIFY(client.busy());
+        client.resetStatus();
+        QCOMPARE(client.errorMessage(), failure);
+        QCOMPARE(client.state(), ApplyClient::Failed);
+    }
+
+    void unansweredRequestFailsAtItsDeadline() {
+        // A daemon that accepts the connection and never answers used to leave
+        // the client busy forever: picker disabled, no error, no retry.
+        m_daemon.holdResponses = true;
+        ApplyClient client(m_socketPath);
+        client.listOutputs();
+        QTRY_VERIFY_WITH_TIMEOUT(m_daemon.receivedMethods.size() == 1, 5000);
+        QCOMPARE(client.state(), ApplyClient::ListingOutputs);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 15000);
+        QVERIFY(!client.errorMessage().isEmpty());
+        QVERIFY(!client.busy());
+        QVERIFY(!client.outputsListed());
+        // A deadline miss is never replayed on its own: the daemon may still be
+        // running the transaction it never answered.
+        QCOMPARE(m_daemon.receivedMethods.size(), 1);
     }
 
     void invalidInputIsRejectedWithoutTraffic() {

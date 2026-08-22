@@ -26,9 +26,15 @@ class ApplyClient final : public QObject {
     Q_OBJECT
     // Instances are constructed in C++ and exposed as a context property; QML
     // still needs the registered type to reach the State enum values.
+    QML_ELEMENT
     QML_UNCREATABLE("ApplyClient is created by the manager")
     Q_PROPERTY(State state READ state NOTIFY stateChanged)
     Q_PROPERTY(QStringList outputs READ outputs NOTIFY outputsChanged)
+    /// True once the daemon has answered an enumeration, whatever it
+    /// contained. Without it an empty picker cannot be told apart from a
+    /// picker that was never filled, and the UI has nothing truthful to
+    /// say about either.
+    Q_PROPERTY(bool outputsListed READ outputsListed NOTIFY outputsChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString appliedWallpaperId READ appliedWallpaperId NOTIFY resultChanged)
@@ -49,6 +55,7 @@ public:
     explicit ApplyClient(QString socketPath, QObject *parent = nullptr);
     State state() const { return m_state; }
     QStringList outputs() const { return m_outputs; }
+    bool outputsListed() const { return m_outputsListed; }
     QString errorMessage() const { return m_errorMessage; }
     /// True while any apply-lane operation is queued or in flight; the UI
     /// disables the picker and both actions while it holds.
@@ -110,7 +117,14 @@ private:
     void begin(Pending pending);
     void writeRequest();
     void consumeResponse();
-    void failCurrent(const QString &error);
+    /// Fails the in-flight operation. `requeue` false abandons it instead of
+    /// replaying it automatically — used for a deadline miss, where the
+    /// daemon may still be running the transaction it never answered.
+    void failCurrent(const QString &error, bool requeue = true);
+    /// Records the failed operation so the UI's Try Again replays exactly
+    /// it, and nothing else.
+    void recordFailure(const Pending &pending);
+    int requestTimeoutMilliseconds(Method method) const;
     void drainQueue();
     void retryLater();
     void setState(State state);
@@ -134,9 +148,14 @@ private:
     QList<Pending> m_queue;
     Pending m_current;
     QTimer m_retryTimer;
+    // Bounds every request: a daemon that accepts the connection and never
+    // answers used to leave this client busy forever, with the picker
+    // disabled and no error anywhere.
+    QTimer m_requestTimer;
     int m_retryDelayMilliseconds = 5000;
     int m_requestSerial = 0;
     QStringList m_outputs;
+    bool m_outputsListed = false;
     QString m_appliedWallpaperId;
     QString m_appliedOutput;
     QString m_restoredOutput;

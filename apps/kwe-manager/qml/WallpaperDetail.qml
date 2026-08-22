@@ -3,6 +3,12 @@ import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+// The module's own C++ clients (CatalogClient, ApplyClient, …). The engine
+// resolves them implicitly for a file of this module, but qmllint does not —
+// these files sit one directory below the module root — and the type gate in
+// scripts/qml-typecheck.sh is what keeps the QML_ELEMENT registration from
+// silently disappearing again, so the dependency is stated explicitly.
+import org.kde.kwe
 
 // Details pane shared by the Installed and Workshop views; shows the item
 // selected through WallpaperSelection.
@@ -46,14 +52,40 @@ Kirigami.ScrollablePage {
         return WallpaperSelection.selectedEntry;
     }
 
+    // Outputs are loaded on demand: the daemon caches its enumeration for 5 s,
+    // so re-listing on every appearance is cheap and picks up hotplugs. The
+    // enumeration must never depend on a visibility *edge* alone: an Item is
+    // visible by default, so a pane whose binding is already true when it is
+    // created never emits visibleChanged, and the picker stayed empty forever.
+    function ensureOutputs() {
+        if (!detailPage.visible)
+            return;
+        // The lane is strictly serialized; onBusyChanged re-runs this when it
+        // frees up, so a skipped listing is never simply dropped.
+        if (applyClient.busy)
+            return;
+        applyClient.listOutputs();
+    }
+
+    Component.onCompleted: detailPage.ensureOutputs()
+
     onVisibleChanged: {
         if (visible) {
             refreshPermissions();
-            // Outputs are loaded on demand: the daemon caches its
-            // enumeration for 5 s, so re-listing on every appearance is
-            // cheap and picks up hotplugs.
-            if (!applyClient.busy)
-                applyClient.listOutputs();
+            detailPage.ensureOutputs();
+        }
+    }
+
+    Connections {
+        target: applyClient
+        // Re-arm a listing that was skipped because the lane was busy. Guarded
+        // on outputsListed so a daemon that truthfully reports zero outputs is
+        // asked once, not in a loop, and on Failed so an error stays on screen
+        // for the user's Try Again instead of being retried behind their back.
+        function onBusyChanged() {
+            if (!applyClient.busy && !applyClient.outputsListed
+                    && applyClient.state !== ApplyClient.Failed)
+                detailPage.ensureOutputs();
         }
     }
 
@@ -212,16 +244,22 @@ Kirigami.ScrollablePage {
             // new one. Clearing also hides the Try Again affordance.
             onCurrentIndexChanged: applyClient.resetStatus()
             Controls.ToolTip.visible: hovered
-            Controls.ToolTip.text: applyClient.outputs.length === 0
-                ? qsTr("No display outputs are available yet")
-                : Accessible.description
+            Controls.ToolTip.text: applyClient.outputs.length > 0
+                ? Accessible.description
+                : applyClient.outputsListed
+                    ? qsTr("The wallpaper service reports no display outputs")
+                    : qsTr("The display outputs have not been enumerated yet")
         }
         Controls.Label {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length === 0
             text: applyClient.state === ApplyClient.ListingOutputs
                 ? qsTr("Enumerating display outputs…")
-                : qsTr("No display outputs are available.")
+                : applyClient.outputsListed
+                    ? qsTr("The wallpaper service reports no display outputs. Check that a display is connected and enabled.")
+                    : applyClient.errorMessage !== ""
+                        ? applyClient.errorMessage
+                        : qsTr("The display outputs have not been enumerated yet.")
             opacity: 0.75
             wrapMode: Text.Wrap
         }

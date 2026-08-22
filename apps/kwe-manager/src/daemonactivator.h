@@ -30,6 +30,7 @@ class DaemonActivator final : public QObject {
     Q_OBJECT
     // Constructed in C++ and exposed as a context property; QML still needs
     // the registered type to reach the State enum values.
+    QML_ELEMENT
     QML_UNCREATABLE("DaemonActivator is created by the manager")
     Q_PROPERTY(State state READ state NOTIFY stateChanged)
     Q_PROPERTY(QString message READ message NOTIFY stateChanged)

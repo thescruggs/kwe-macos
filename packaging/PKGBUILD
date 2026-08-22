@@ -43,6 +43,13 @@ depends=(
     'kirigami'
     'vulkan-icd-loader'
     'vulkan-driver'
+    # The apply lane shells out to both of these for its read-only output
+    # enumeration (crates/kwe-daemon/src/apply.rs): kscreen-doctor is
+    # authoritative for which outputs exist, and qdbus6 (qt6-tools) carries
+    # the Plasma shell probe and the wallpaper switch. Without them every
+    # apply fails with shell_unreachable.
+    'kscreen'
+    'qt6-tools'
 )
 makedepends=(
     'rust'

@@ -14,6 +14,11 @@ constexpr qsizetype MaxQueuedOperations = 64;
 constexpr int MaxIdentityBytes = 128;
 constexpr int MaxContentBytes = 4096;
 constexpr int MaxOutputs = 64;
+// Per-request deadlines. The daemon bounds its own probes (5 s) and the
+// promotion wait (15 s), so these sit above the daemon's worst case and
+// only fire when it has stopped answering altogether.
+constexpr int RequestTimeoutMilliseconds = 10000;
+constexpr int ApplyRequestTimeoutMilliseconds = 30000;
 }
 
 ApplyClient::ApplyClient(QString socketPath, QObject *parent)
@@ -31,6 +36,17 @@ ApplyClient::ApplyClient(QString socketPath, QObject *parent)
                          "kwe-daemon.service");
                 failCurrent(message + hint);
             });
+    m_requestTimer.setSingleShot(true);
+    connect(&m_requestTimer, &QTimer::timeout, this, [this] {
+        if (m_current.method == None)
+            return;
+        // Never replayed automatically: the daemon may still be running the
+        // transaction it never answered, and a silent re-apply would race it.
+        // Try Again re-runs it deliberately.
+        failCurrent(tr("The wallpaper service did not answer within %1 seconds.")
+                        .arg(requestTimeoutMilliseconds(m_current.method) / 1000),
+                    false);
+    });
     m_retryTimer.setSingleShot(true);
     connect(&m_retryTimer, &QTimer::timeout, this, [this] {
         // Never clobber an in-flight operation: its own failure path re-arms
@@ -91,9 +107,13 @@ void ApplyClient::refreshAssignments() {
 
 void ApplyClient::resetStatus() {
     clearResult();
-    setErrorMessage({});
-    if (m_current.method == None && m_queue.isEmpty())
+    // Only a settled lane is safe to clear. Clearing unconditionally erased
+    // the message of a failure that was still queued or in flight, leaving
+    // Failed with empty text and nothing for the user to act on.
+    if (m_current.method == None && m_queue.isEmpty()) {
+        setErrorMessage({});
         setState(Idle);
+    }
 }
 
 void ApplyClient::retry() {
@@ -159,6 +179,7 @@ void ApplyClient::begin(Pending pending) {
     emit busyChanged();
     m_socket.abort();
     m_buffer.clear();
+    m_requestTimer.start(requestTimeoutMilliseconds(m_current.method));
     m_socket.connectToServer(m_socketPath, QIODevice::ReadWrite);
 }
 
@@ -231,6 +252,7 @@ void ApplyClient::consumeResponse() {
 
 void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &errorCode,
                          const QString &detail) {
+    m_requestTimer.stop();
     const auto method = m_current.method;
     const auto output = m_current.output;
     const auto wallpaperId = m_current.wallpaperId;
@@ -259,6 +281,10 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_failedMethod = method == Apply ? QStringLiteral("apply")
                                              : method == Restore ? QStringLiteral("restore")
                                                                  : QString();
+            // clearResult() above emitted with failedMethod still empty; without
+            // this the Try Again affordance never re-evaluates its binding.
+            if (!m_failedMethod.isEmpty())
+                emit resultChanged();
             setErrorMessage(mapError(errorCode, detail));
             setState(Failed);
         }
@@ -267,6 +293,12 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
         switch (method) {
         case ListOutputs:
             applyOutputs(result);
+            // A successful enumeration that names nothing is a real answer, not
+            // a no-op: say so instead of leaving the picker mutely empty.
+            if (m_outputs.isEmpty()) {
+                setErrorMessage(tr("The wallpaper service reports no display outputs. "
+                                   "Check that a display is connected and enabled."));
+            }
             setState(Idle);
             break;
         case Apply:
@@ -293,8 +325,9 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
     drainQueue();
 }
 
-void ApplyClient::failCurrent(const QString &error) {
+void ApplyClient::failCurrent(const QString &error, bool requeue) {
     m_socket.abort();
+    m_requestTimer.stop();
     if (m_current.method == None) {
         // A retry-timer connection attempt failed before writing; fall
         // through and let the timer fire again.
@@ -302,7 +335,7 @@ void ApplyClient::failCurrent(const QString &error) {
         retryLater();
         return;
     }
-    if (m_queue.size() >= MaxQueuedOperations) {
+    if (requeue && m_queue.size() >= MaxQueuedOperations) {
         // Re-queue the failed operation at the front, but respect the
         // capacity bound: the least urgent queued operation is dropped —
         // never silently. Its callback runs with the queue-full error.
@@ -314,21 +347,54 @@ void ApplyClient::failCurrent(const QString &error) {
         }
     }
     const bool backgroundMirror = m_current.method == Assignments;
-    m_queue.push_front(std::move(m_current));
+    const auto abandoned = m_current;
+    if (requeue) {
+        m_queue.push_front(std::move(m_current));
+    } else if (abandoned.callback) {
+        abandoned.callback(false, {}, error);
+    }
     m_current = {};
     emit busyChanged();
     if (backgroundMirror) {
         // The assignment mirror must not clobber the user-facing state or a
         // just-confirmed result on a socket failure either — the same
         // isolation as the daemon-answered failure path in finish(). It
-        // re-queues at the front and retries in the background.
-        retryLater();
+        // re-queues at the front and retries in the background; an abandoned
+        // one has nothing to retry, so the queue simply drains.
+        if (requeue)
+            retryLater();
+        else
+            drainQueue();
         return;
     }
     clearResult();
+    if (!requeue)
+        recordFailure(abandoned);
     setErrorMessage(error);
     setState(Failed);
-    retryLater();
+    if (requeue)
+        retryLater();
+    else
+        drainQueue();
+}
+
+void ApplyClient::recordFailure(const Pending &pending) {
+    m_lastFailedMethod = pending.method;
+    m_lastFailedOutput = pending.output;
+    m_lastFailedWallpaperId = pending.wallpaperId;
+    m_lastFailedKind = pending.kind;
+    m_lastFailedContent = pending.content;
+    m_failedMethod = pending.method == Apply
+        ? QStringLiteral("apply")
+        : pending.method == Restore ? QStringLiteral("restore") : QString();
+    if (!m_failedMethod.isEmpty())
+        emit resultChanged();
+}
+
+int ApplyClient::requestTimeoutMilliseconds(Method method) const {
+    // An apply waits on the daemon's bounded promotion wait; everything else
+    // is a probe or a state read.
+    return method == Apply ? ApplyRequestTimeoutMilliseconds : RequestTimeoutMilliseconds;
 }
 
 void ApplyClient::drainQueue() {
@@ -381,8 +447,13 @@ void ApplyClient::applyOutputs(const QJsonObject &result) {
                 break;
         }
     }
-    if (names == m_outputs)
+    const bool firstAnswer = !m_outputsListed;
+    m_outputsListed = true;
+    if (names == m_outputs) {
+        if (firstAnswer)
+            emit outputsChanged();
         return;
+    }
     m_outputs = names;
     emit outputsChanged();
 }

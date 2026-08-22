@@ -11,13 +11,10 @@ cargo test --workspace --all-targets
 cargo build --workspace
 cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/cmake --parallel
-if command -v qmllint >/dev/null 2>&1; then
-    qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-manager \
-        apps/kwe-manager/qml/Main.qml apps/kwe-manager/qml/GalleryPage.qml \
-        apps/kwe-manager/qml/WallpaperCard.qml apps/kwe-manager/qml/WallpaperDetail.qml \
-        apps/kwe-manager/qml/WallpaperSelection.qml
-    qmllint -I /usr/lib/qt6/qml -I build/cmake/apps/kwe-frame-preview apps/kwe-frame-preview/qml/Preview.qml
-fi
+# Resolves the Qt 6 qmllint itself (a bare `qmllint` is Qt 5's on this distro
+# and passes everything), asserts the QML module really registers its C++
+# types, and fails on any unresolved type.
+scripts/qml-typecheck.sh
 target/debug/kwe diagnose
 target/debug/kwe-vulkan --json
 

@@ -18,6 +18,8 @@ pkgbase = kde-wallpaper-engine
 	depends = kirigami
 	depends = vulkan-icd-loader
 	depends = vulkan-driver
+	depends = kscreen
+	depends = qt6-tools
 	source = kde-wallpaper-engine::git+https://github.com/kde-wallpaper-engine/kde-wallpaper-engine.git#commit=4477783
 	sha256sums = SKIP
 
