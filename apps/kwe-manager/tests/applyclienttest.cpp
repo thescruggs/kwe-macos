@@ -285,6 +285,14 @@ private slots:
               QStringLiteral("does not support applying"));
         check(QStringLiteral("wallpaper.apply"), QStringLiteral("invalid_params"),
               QStringLiteral("kind: unexpected"), QStringLiteral("rejected the request"));
+        // B2: a scene refused because nothing in it can be drawn reads as a
+        // feature gap, not as a rejected request, and says the desktop was
+        // left alone.
+        check(QStringLiteral("wallpaper.apply"), QStringLiteral("invalid_params"),
+              QStringLiteral("scene preflight rejected /w/scene.pkg: scene draws nothing in "
+                             "this build: 5 model layer(s) need scene3d, which this build does "
+                             "not render yet"),
+              QStringLiteral("needs features this version cannot render yet"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("output_missing"),
               QStringLiteral("DP-2"), QStringLiteral("Output not found: DP-2"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("restore_failed"),

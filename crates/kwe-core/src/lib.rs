@@ -16,6 +16,7 @@ mod playlist_runtime;
 mod policy;
 mod preflight;
 mod scan;
+mod sceneobjects;
 mod webpreflight;
 mod websandbox;
 
@@ -39,6 +40,10 @@ pub use preflight::{
 pub use scan::{
     Catalog, CatalogItem, CatalogStats, Compatibility, Diagnostic, DiagnosticLevel, ProjectKind,
     ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,
+};
+pub use sceneobjects::{
+    SceneObjectKind, SceneObjectSummary, classify_scene_object, property_value,
+    summarize_scene_objects,
 };
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{

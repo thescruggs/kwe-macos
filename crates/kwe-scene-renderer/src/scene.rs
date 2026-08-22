@@ -18,6 +18,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use kwe_core::{SceneObjectKind, classify_scene_object};
 use serde_json::Value;
 
 use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
@@ -116,6 +117,14 @@ pub struct SceneConfig {
     /// scene.json order. The loader resolves and decodes each system's
     /// material and fills `texture`.
     pub particles: Vec<ParticleSpec>,
+    /// Objects that can draw in this build (see ObjectCounts). The worker
+    /// refuses a scene that declares objects and can draw none of them.
+    pub drawable_objects: usize,
+    /// Model-backed image objects skipped at parse (scene3d is BETA_M3h);
+    /// counted for the worker's one-time diagnostic. A scene made only of
+    /// these draws nothing at all — see the no-drawable-content guard in
+    /// the worker and docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md.
+    pub model_layer_skips: usize,
     /// Text objects skipped because the scene declares more than
     /// text::MAX_TEXT_LAYERS of them. Never a rejection — the extra layers
     /// just do not register; counted for the worker's one-time diagnostic.
@@ -469,6 +478,8 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
         fps,
         layers,
         particles,
+        drawable_objects: counts.drawable_objects,
+        model_layer_skips: counts.model_layer_skips,
         text_layer_skips: counts.text_layer_skips,
         particle_system_skips: counts.particle_system_skips,
         video_layer_skips: counts.video_layer_skips,
@@ -482,6 +493,17 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
 /// M3f): never rejections, only one-time worker diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObjectCounts {
+    /// Objects that can put pixels on the screen in this build, by the
+    /// shared classification (`kwe_core::SceneObjectKind::can_draw`): a
+    /// decodable image reference, a video layer, a text layer, or a
+    /// particle system with an inline material. Zero means the scene
+    /// composites to bare clear colour no matter what its script does.
+    pub drawable_objects: usize,
+    /// Objects whose `image` is a `.json` model reference (scene3d,
+    /// BETA_M3h). Skipped before any validation; counted here so the
+    /// worker can say so out loud instead of compositing bare clear
+    /// colour in silence (B2).
+    pub model_layer_skips: usize,
     pub text_layer_skips: usize,
     pub text_on_image_objects: usize,
     pub text_size_ignored: usize,
@@ -541,80 +563,103 @@ fn parse_objects(
                 format!("scene.json \"objects[{index}]\" must be an object"),
             )
         })?;
-        if object.contains_key("image") {
-            if object.contains_key("text") {
-                counts.text_on_image_objects += 1;
-            }
+        // The kind decision is `kwe_core::classify_scene_object` — the
+        // same rule preflight uses to answer "can this scene draw
+        // anything?", so a scene the daemon accepted and a scene this
+        // parser builds layers for can never disagree (B2). The caps and
+        // the per-kind parsing stay here.
+        let kind = classify_scene_object(object);
+        if kind.can_draw() {
+            counts.drawable_objects += 1;
+        }
+        match kind {
             // A model instance: WE stores every visual (2D included) as a
             // model; model layers are M3h. The scene renders without it.
-            // The check runs on the raw (property-unwrapped) reference
-            // BEFORE parse_image_layer, so a malformed model layer skips
-            // like any model layer instead of rejecting the whole scene.
-            if property_value(object.get("image").expect("caller checked"))
-                .as_str()
-                .is_some_and(|image| image.to_ascii_lowercase().ends_with(".json"))
-            {
+            // The classification runs on the raw (property-unwrapped)
+            // reference BEFORE parse_image_layer, so a malformed model
+            // layer skips like any model layer instead of rejecting the
+            // whole scene. Counted so the worker can report the skip.
+            SceneObjectKind::Model => {
+                counts.model_layer_skips += 1;
                 continue;
             }
-            let layer = parse_image_layer(object, index)?;
-            layers.push(layer);
-        } else if object.contains_key("video") {
-            // A video layer (M3g). Placed after `image` and before
-            // `particle`: video is not in the researched WE classification
-            // order (image, sound, particle, text) because the corpus has
-            // no video objects to place it with, so the position is a
-            // documented design decision — adjacent to `image` because a
-            // video layer IS an image layer whose texture is a movie, and
-            // ahead of `particle`/`text` so an object carrying both keys
-            // resolves to the kind that owns the texture slot.
-            //
-            // Layers past the concurrency cap still register (the script
-            // reaches them through Scene.getLayer) but never open a
-            // decoder — counted, never a rejection, exactly like the
-            // particle-system cap.
-            let over_cap = video_layers >= crate::video::MAX_VIDEO_LAYERS;
-            if over_cap {
-                counts.video_layer_skips += 1;
-            } else {
-                video_layers += 1;
+            // An image layer (M3c). TEXV (.tex) references and non-string
+            // references register the same way: the layer exists for the
+            // script, and the load step skips the texture with its own
+            // diagnostic.
+            SceneObjectKind::Image
+            | SceneObjectKind::TexvImage
+            | SceneObjectKind::TexturelessImage => {
+                if object.contains_key("text") {
+                    counts.text_on_image_objects += 1;
+                }
+                let layer = parse_image_layer(object, index)?;
+                layers.push(layer);
             }
-            let mut layer = parse_video_layer(object, index)?;
-            if over_cap {
-                layer.video = layer.video.map(|spec| VideoSpec {
-                    source: None, // over the cap: registered, never decoded
-                    ..spec
-                });
+            SceneObjectKind::Video => {
+                // A video layer (M3g). Placed after `image` and before
+                // `particle`: video is not in the researched WE classification
+                // order (image, sound, particle, text) because the corpus has
+                // no video objects to place it with, so the position is a
+                // documented design decision — adjacent to `image` because a
+                // video layer IS an image layer whose texture is a movie, and
+                // ahead of `particle`/`text` so an object carrying both keys
+                // resolves to the kind that owns the texture slot.
+                //
+                // Layers past the concurrency cap still register (the script
+                // reaches them through Scene.getLayer) but never open a
+                // decoder — counted, never a rejection, exactly like the
+                // particle-system cap.
+                let over_cap = video_layers >= crate::video::MAX_VIDEO_LAYERS;
+                if over_cap {
+                    counts.video_layer_skips += 1;
+                } else {
+                    video_layers += 1;
+                }
+                let mut layer = parse_video_layer(object, index)?;
+                if over_cap {
+                    layer.video = layer.video.map(|spec| VideoSpec {
+                        source: None, // over the cap: registered, never decoded
+                        ..spec
+                    });
+                }
+                layers.push(layer);
             }
-            layers.push(layer);
-        } else if object.contains_key("particle") {
-            // A particle system (M3f), classified after image and before
-            // text per the researched WE order. A string `particle` value
-            // is a reference to an external particle definition file (a WE
-            // feature): counted for the worker's one-time diagnostic; the
-            // system registers with all defaults (the file-level
-            // definition merge is planned). Systems past the cap are
-            // skipped (counted, never a rejection).
-            if particles.len() >= particles::MAX_PARTICLE_SYSTEMS {
-                counts.particle_system_skips += 1;
-                continue;
+            // A particle system (M3f). An object whose `image` is present
+            // but NOT a string reaches this arm through the shared
+            // classifier: the editor writes `"image": null` on every
+            // particle object, and before B2 those took the image branch
+            // and registered as textureless image layers, so the particle
+            // systems silently vanished (65 of 65 in the local corpus).
+            SceneObjectKind::Particle | SceneObjectKind::ParticleFile => {
+                // A string `particle` value is a reference to an external
+                // particle definition file (a WE feature): counted for the
+                // worker's one-time diagnostic; the system registers with all
+                // defaults (the file-level definition merge is planned).
+                // Systems past the cap are skipped (counted, never a
+                // rejection).
+                if particles.len() >= particles::MAX_PARTICLE_SYSTEMS {
+                    counts.particle_system_skips += 1;
+                    continue;
+                }
+                if property_value(object.get("particle").expect("caller checked")).is_string() {
+                    counts.particle_file_refs += 1;
+                }
+                particles.push(parse_particle_system(object, index)?);
             }
-            if property_value(object.get("particle").expect("caller checked")).is_string() {
-                counts.particle_file_refs += 1;
+            SceneObjectKind::Text => {
+                if text_layers >= crate::text::MAX_TEXT_LAYERS {
+                    counts.text_layer_skips += 1;
+                    continue;
+                }
+                text_layers += 1;
+                let layer = parse_text_layer(object, index)?;
+                if layer.text.as_ref().is_some_and(|spec| spec.has_size) {
+                    counts.text_size_ignored += 1;
+                }
+                layers.push(layer);
             }
-            particles.push(parse_particle_system(object, index)?);
-        } else if object.contains_key("text") {
-            if text_layers >= crate::text::MAX_TEXT_LAYERS {
-                counts.text_layer_skips += 1;
-                continue;
-            }
-            text_layers += 1;
-            let layer = parse_text_layer(object, index)?;
-            if layer.text.as_ref().is_some_and(|spec| spec.has_size) {
-                counts.text_size_ignored += 1;
-            }
-            layers.push(layer);
-        } else {
-            continue; // audio, ... — M3d+
+            SceneObjectKind::Other => continue, // audio, ... — M3d+
         }
     }
     if layers.len() > MAX_LAYERS {
@@ -1391,10 +1436,7 @@ fn field(index: usize, name: &str) -> String {
 /// Unwrap a property-wrapped value (`{"user": ..., "value": ...}`) to its
 /// `value`; anything else passes through unchanged.
 fn property_value(value: &Value) -> &Value {
-    match value.as_object().and_then(|object| object.get("value")) {
-        Some(inner) => inner,
-        None => value,
-    }
+    kwe_core::property_value(value)
 }
 
 /// Parse a WE vector field: the space-separated string form the editor
@@ -2317,6 +2359,60 @@ mod tests {
         let layers = parse_objects_of(&objects).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].name, "real");
+    }
+
+    /// B2: model skips are counted so the worker can report them. A scene
+    /// made only of model layers registers nothing and is exactly the case
+    /// that used to composite to bare clear colour in silence.
+    #[test]
+    fn model_layer_skips_are_counted() {
+        let value: Value = serde_json::from_str(
+            r#"{"objects": [
+                {"name": "a", "image": "models/a.json"},
+                {"name": "b", "image": "models/b.JSON"},
+                {"name": "real", "image": "tex.png"}
+            ]}"#,
+        )
+        .unwrap();
+        let (layers, particles, counts) = parse_objects(value.as_object().unwrap()).unwrap();
+        assert_eq!(counts.model_layer_skips, 2);
+        assert_eq!(layers.len(), 1);
+        assert!(particles.is_empty());
+    }
+
+    /// B2 (the classification half): the editor writes `"image": null` on
+    /// particle objects — all 65 of the local corpus's null-image objects
+    /// are particle systems. They used to take the image branch and
+    /// register as textureless image layers, which silently deleted the
+    /// scene's only drawable content.
+    #[test]
+    fn null_image_particle_objects_register_as_particle_systems() {
+        let value: Value = serde_json::from_str(
+            r#"{"objects": [
+                {"name": "sparkle", "image": null,
+                 "particle": "particles/presets/magic_sparkle.json"},
+                {"name": "dust", "image": null, "particle": {"material": "m.png"}}
+            ]}"#,
+        )
+        .unwrap();
+        let (layers, particles, counts) = parse_objects(value.as_object().unwrap()).unwrap();
+        assert!(layers.is_empty(), "no textureless image layers register");
+        assert_eq!(particles.len(), 2);
+        assert_eq!(particles[0].name, "sparkle");
+        assert_eq!(particles[1].material.as_deref(), Some("m.png"));
+        assert_eq!(counts.particle_file_refs, 1);
+    }
+
+    /// An object with a non-string image and no other visual key keeps the
+    /// pre-B2 behavior: it registers as a textureless image layer, so a
+    /// script can still reach it by name.
+    #[test]
+    fn null_image_without_another_kind_still_registers_a_layer() {
+        let layers =
+            parse_objects_of(r#"{"objects": [{"name": "ghost", "image": null}]}"#).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "ghost");
+        assert_eq!(layers[0].image, None);
     }
 
     #[test]

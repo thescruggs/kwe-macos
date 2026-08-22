@@ -74,6 +74,15 @@ use vulkan::{LayerRenderer, RenderError, is_fence_timeout};
 
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
+/// B2: the scene declares objects and NONE of them can put a pixel on the
+/// screen in this build — every layer is a model (scene3d, M3h), a texture
+/// that would not decode, or a particle system with no material. Compositing
+/// it would publish the bare clear colour as a healthy frame and the desktop
+/// would go flat with nothing anywhere saying why, so the worker refuses
+/// before the first publish and the apply transaction rolls back. Preflight
+/// refuses the same scenes statically; this is the backstop for the ones
+/// whose content only fails once it is decoded.
+const EXIT_NO_DRAWABLE_CONTENT: i32 = 74;
 /// Synthetic fault exit codes, identical to the video worker's contract.
 /// Exit 71 is the resource-limit declaration: the daemon maps ANY worker
 /// exit 71 to `resource_limit` (memory denied), fault flag or not.
@@ -779,6 +788,41 @@ fn main() -> Result<()> {
             "event=renderer.scene.fps scene={scene_fps} requested={}",
             arguments.fps
         );
+    }
+
+    if config.model_layer_skips > 0 {
+        eprintln!(
+            "event=renderer.scene.model_layer_skip count={} (scene3d model layers are BETA_M3h)",
+            config.model_layer_skips
+        );
+    }
+
+    // 1c. B2 no-drawable-content guard: the same static rule preflight runs
+    // (`kwe_core::classify_scene_object`), applied to the scene this worker
+    // actually parsed. A scene that declares objects and can draw NONE of
+    // them composites to bare clear colour forever — no script can change
+    // that, because a script only moves and recolours what the scene
+    // declared — so the worker refuses before its first publish and the
+    // apply transaction rolls back instead of promoting a flat frame.
+    //
+    // The rule is deliberately STATIC, not "did any texture upload
+    // succeed": a layer whose content fails to decode or whose video
+    // source will not open is a degraded layer, and degrading a layer
+    // never rejects a scene (the M3c/M3g skip-never-reject contract).
+    //
+    // A scene that declares NO objects at all is exempt: an empty scene is
+    // the author's choice (and its script may animate the clear colour),
+    // not a feature this build is missing.
+    let declared_objects = config.layers.len() + config.particles.len() + config.model_layer_skips;
+    if declared_objects > 0 && config.drawable_objects == 0 {
+        eprintln!(
+            "event=renderer.scene.no_drawable_content objects={declared_objects} model_layers={} particle_systems={} layers={} detail=scene renders nothing in this build",
+            config.model_layer_skips,
+            config.particles.len(),
+            config.layers.len()
+        );
+        eprintln!("event=renderer.scene.unsupported exit_code={EXIT_NO_DRAWABLE_CONTENT}");
+        exit(EXIT_NO_DRAWABLE_CONTENT);
     }
 
     // 2. Frame mapping.

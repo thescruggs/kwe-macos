@@ -467,6 +467,20 @@ void ApplyClient::applyAssignments(const QJsonObject &result) {
 }
 
 QString ApplyClient::mapError(const QString &code, const QString &detail) {
+    // B2: the daemon refuses a scene whose every layer needs a feature this
+    // build does not have yet. The raw detail is a preflight sentence with a
+    // file path in it; the user needs the "why", not the path, and they need
+    // to know their current wallpaper is untouched.
+    if (detail.contains(QStringLiteral("draws nothing in this build"))) {
+        const auto because = detail.section(QStringLiteral("draws nothing in this build:"), 1)
+                                 .trimmed();
+        return because.isEmpty()
+            ? tr("This wallpaper needs features this version cannot render yet, so it "
+                 "was not applied. Your current wallpaper is unchanged.")
+            : tr("This wallpaper needs features this version cannot render yet, so it "
+                 "was not applied (%1). Your current wallpaper is unchanged.")
+                  .arg(because);
+    }
     if (code == QStringLiteral("output_missing"))
         return detail.isEmpty() ? tr("Output not found")
                                 : tr("Output not found: %1").arg(detail);

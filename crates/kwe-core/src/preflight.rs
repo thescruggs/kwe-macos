@@ -18,6 +18,34 @@ pub struct ScenePreflight {
     pub reasons: Vec<String>,
 }
 
+/// B2: the honesty gate. A scene whose every object is a feature this
+/// build cannot render composites to bare `general.clearcolor` — a flat
+/// rectangle the user reads as a crash, applied through a transaction that
+/// reported success. Refusing here (invalid_params, before the renderer
+/// starts) keeps the wallpaper that is already on screen and hands the
+/// manager a reason to show instead of a blank desktop.
+///
+/// Only a scene that declares objects and can draw NONE of them is
+/// refused: a scene with one drawable layer is applied (degraded, and the
+/// renderer's own diagnostics name what it skipped), and a scene with no
+/// objects at all is the author's empty scene, not a missing feature.
+/// See `crate::sceneobjects` for the classification and
+/// docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md for the evidence.
+pub(crate) fn no_drawable_content_reasons(root: &serde_json::Value) -> Vec<String> {
+    let summary = crate::summarize_scene_objects(root);
+    if summary.drawable() > 0 {
+        return Vec::new();
+    }
+    let unsupported = summary.unsupported_reasons();
+    if unsupported.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "scene draws nothing in this build: {}",
+        unsupported.join("; ")
+    )]
+}
+
 pub fn preflight_scene(path: &Path) -> ScenePreflight {
     let mut report = ScenePreflight {
         path: path.to_path_buf(),
@@ -78,7 +106,9 @@ pub fn preflight_scene(path: &Path) -> ScenePreflight {
         }
         match fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(value) if value.is_object() => {}
+                Ok(value) if value.is_object() => {
+                    report.reasons.extend(no_drawable_content_reasons(&value));
+                }
                 Ok(_) => report
                     .reasons
                     .push("scene JSON root must be an object".into()),
@@ -210,6 +240,47 @@ mod tests {
             .write_all(b"not json")
             .unwrap();
         assert!(!preflight_scene(&invalid).safe);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// B2: a file-lane scene.json made only of features this build cannot
+    /// render is refused with a reason naming each one, instead of applying
+    /// and compositing bare clear colour.
+    #[test]
+    fn refuses_scene_json_with_no_drawable_content() {
+        let root = std::env::temp_dir().join(format!("kwe-preflight-b2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let blank = root.join("scene.json");
+        fs::write(
+            &blank,
+            br#"{"objects": [{"name": "a", "image": "models/a.json"}]}"#,
+        )
+        .unwrap();
+        let report = preflight_scene(&blank);
+        assert!(!report.safe);
+        assert!(
+            report.reasons.join("; ").contains("scene3d"),
+            "{:?}",
+            report.reasons
+        );
+
+        // One drawable object is enough: degraded applies are allowed.
+        let mixed = root.join("mixed.json");
+        fs::write(
+            &mixed,
+            br#"{"objects": [{"name": "a", "image": "models/a.json"},
+                             {"name": "b", "image": "textures/b.png"}]}"#,
+        )
+        .unwrap();
+        assert!(preflight_scene(&mixed).safe);
+
+        // An objectless scene is empty by authorship, not by a missing
+        // feature (the existing accepts_object_scene_json case), so it
+        // stays safe.
+        let empty = root.join("empty.json");
+        fs::write(&empty, br#"{"objects": []}"#).unwrap();
+        assert!(preflight_scene(&empty).safe);
         let _ = fs::remove_dir_all(root);
     }
 

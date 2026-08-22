@@ -1449,6 +1449,37 @@ scene_pixel_wait() {
     return 1
 }
 
+# wait_first_frame: block until the worker has PUBLISHED a frame, not
+# merely created the mapping. The frame file gets its KWEFRM1 magic when
+# the mapping is created, which is before font loading and the first
+# render, so a lane that starts sampling on the magic alone can read
+# generation 0 — an all-zero slot — and fail an oracle that would have
+# passed a moment later. (Observed on the llvmpipe M3e lane, where the
+# 900+ font scan sits inside that window.) Lanes with their own polling
+# oracles do not need this; a one-shot region oracle does.
+wait_first_frame() {
+    local frame_file="$1" log="$2"
+    for _attempt in {1..400}; do
+        local generation
+        generation="$(python3 -c "
+import struct, sys
+try:
+    with open('$frame_file', 'rb') as f:
+        data = f.read(64)
+    print(struct.unpack_from('<Q', data, 48)[0] if len(data) >= 64 else 0)
+except OSError:
+    print(0)
+")"
+        if (( generation > 0 )); then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "no frame published: $frame_file" >&2
+    sed -n '1,160p' "$log" >&2
+    return 1
+}
+
 # M3e region oracles: structural assertions over a rectangle of the shared
 # frame file — never byte-pins, because the exact glyph pixels depend on
 # which font the resolver lands on (machine-dependent). Each embeds the
@@ -2529,6 +2560,72 @@ echo "scene smoke passed (M3g f): corrupt package video degraded one layer and s
 
 fi
 
+# ---------------------------------------------------------------------------
+# B2 cases: a scene that draws nothing must never be applied as a healthy
+# wallpaper (docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md). The gate is the
+# shared classification, applied twice: statically at preflight here
+# (invalid_params, no worker spawns), and inside the worker itself for a
+# scene that never went through preflight (the standalone B2-d lane below).
+# One drawable object is enough to apply — degraded is not blank.
+b2_models_scene="$smoke_root/b2-models.json"
+b2_partial_scene="$smoke_root/b2-partial.json"
+python3 - "$b2_models_scene" "$b2_partial_scene" <<'B2PY'
+import json
+import sys
+
+
+def scene(objects):
+    return {
+        "general": {"clearcolor": [0.7, 0.7, 0.7, 1.0], "resolution": [160, 90], "fps": 30},
+        "objects": objects,
+    }
+
+
+# (a) every object is a feature this build cannot render: two model layers
+# (scene3d, M3h) and a particle system whose definition is an external file
+# — the exact shape of the reported Workshop scene.
+json.dump(
+    scene([
+        {"name": "bg", "image": "models/bg.json"},
+        {"name": "fg", "image": "models/fg.json"},
+        {"name": "sparkle", "image": None, "particle": "particles/presets/magic_sparkle.json"},
+    ]),
+    open(sys.argv[1], "w"),
+)
+# (b) the same scene plus one drawable image layer: degraded, not blank, so
+# it must still apply.
+json.dump(
+    scene([
+        {"name": "bg", "image": "models/bg.json"},
+        {"name": "real", "image": "m3c-red.png", "origin": [0.0, 0.0], "size": [160.0, 90.0]},
+    ]),
+    open(sys.argv[2], "w"),
+)
+B2PY
+
+# Case B2-a: model-only scene -> preflight invalid_params, no worker spawns.
+b2_reject="$(call_daemon renderer.start "$(jq -cn --arg content "$b2_models_scene" \
+    '{wallpaper_id:"scene-b2-models",content_hash:"hash-b2-models",width:160,height:90,fps:30,kind:"scene",content:$content}')" || true)"
+[[ "$(jq -r '.ok' <<<"$b2_reject")" == "false" ]]
+[[ "$(jq -r '.result.error' <<<"$b2_reject")" == "invalid_params" ]]
+[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"scene preflight rejected"* ]]
+[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"draws nothing in this build"* ]]
+[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"scene3d"* ]]
+[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"external particle files"* ]]
+echo "scene smoke passed (B2 a): model-only scene -> preflight invalid_params, never applied"
+
+# Case B2-b: one drawable layer is enough — a degraded scene still applies
+# (fullscreen red at the frame center), and the worker reports the model
+# layer it could not render.
+call_daemon renderer.start "$(jq -cn --arg content "$b2_partial_scene" \
+    '{wallpaper_id:"scene-b2-partial",content_hash:"hash-b2-partial",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+b2_partial_status="$(wait_phase live)"
+b2_partial_frame="$(jq -r '.result.frame_file' <<<"$b2_partial_status")"
+scene_pixel_oracle "$b2_partial_frame" 80 45 "0,0,255,255" 1
+b2_partial_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$b2_partial_status")"
+[[ "$b2_partial_tail" == *"event=renderer.scene.model_layer_skip count=1"* ]]
+echo "scene smoke passed (B2 b): one drawable layer -> applied, model skip reported"
+
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
 stopped_status="$(wait_phase stopped)"
@@ -2802,6 +2899,7 @@ if [[ -n "$m3e_any_font" ]]; then
         sleep 0.05
     done
     head -c 8 "$standalone_m3e_a" | grep -q KWEFRM1
+    wait_first_frame "$standalone_m3e_a" "$smoke_root/standalone-m3e-a.log"
     if grep -q "event=renderer.scene.text_font_none" "$smoke_root/standalone-m3e-a.log"; then
         echo "scene smoke SKIP (M3e a): no usable system fonts — text lane needs real fonts"
         stop_standalone "$standalone_m3e_a_pid" "$smoke_root/standalone-m3e-a.log" "standalone M3e renderer" || true
@@ -3005,5 +3103,26 @@ lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3g d unresolved-source oracle"
 
 fi
+
+# B2 backstop lane: the worker's own no-drawable-content guard. The daemon
+# lane cannot reach it (preflight refuses the same scene first), so the
+# model-only scene runs standalone: it must exit 74 before publishing a
+# single frame, naming what it could not render.
+b2_standalone_log="$smoke_root/standalone-b2.log"
+b2_standalone_status=0
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-b2.bin" --width 160 --height 90 --fps 30 \
+    --content "$b2_models_scene" --device llvmpipe >"$b2_standalone_log" 2>&1 || \
+    b2_standalone_status=$?
+if [[ "$b2_standalone_status" != "74" ]]; then
+    echo "B2 backstop failure: expected exit 74, got $b2_standalone_status" >&2
+    sed -n '1,120p' "$b2_standalone_log" >&2
+    exit 1
+fi
+grep -q "event=renderer.scene.model_layer_skip count=2" "$b2_standalone_log"
+grep -q "event=renderer.scene.no_drawable_content objects=3" "$b2_standalone_log"
+grep -q "event=renderer.scene.unsupported exit_code=74" "$b2_standalone_log"
+[[ ! -f "$smoke_root/standalone-b2.bin" ]]
+echo "scene smoke passed (B2 d): standalone model-only scene -> exit 74, no frame published"
 
 echo "all scene smoke cases passed"

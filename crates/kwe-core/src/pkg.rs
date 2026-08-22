@@ -841,17 +841,26 @@ pub fn preflight_pkg(path: &Path) -> ScenePreflight {
                 "scene.json entry \"{}\" is {} bytes, over the {MAX_SCENE_JSON_BYTES} byte cap",
                 scene_entry.path, scene_entry.size
             ));
-        } else if !scene_entry.compressed
-            && let Ok(bytes) = reader.read_entry_raw(scene_idx)
-            && let Ok(reference) = script_reference_from_json(&bytes)
-            && let Ok(script_idx) = script_entry(&reference, reader.entries())
-            && reader.entries()[script_idx].size > MAX_SCRIPT_BYTES
+        } else if let Ok(bytes) = reader.read_entry_bounded(scene_idx, MAX_SCENE_JSON_BYTES)
+            && let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes)
         {
-            let script_entry = &reader.entries()[script_idx];
-            report.reasons.push(format!(
-                "script entry \"{}\" is {} bytes, over the {MAX_SCRIPT_BYTES} byte cap",
-                script_entry.path, script_entry.size
-            ));
+            // B2: the same drawable gate the file lane runs, on the
+            // package's scene.json. The entry is read (and decompressed)
+            // under the worker's own cap, so a hostile package cannot make
+            // preflight allocate more than the renderer would.
+            report
+                .reasons
+                .extend(crate::preflight::no_drawable_content_reasons(&root));
+            if let Ok(reference) = script_reference_from_json(&bytes)
+                && let Ok(script_idx) = script_entry(&reference, reader.entries())
+                && reader.entries()[script_idx].size > MAX_SCRIPT_BYTES
+            {
+                let script_entry = &reader.entries()[script_idx];
+                report.reasons.push(format!(
+                    "script entry \"{}\" is {} bytes, over the {MAX_SCRIPT_BYTES} byte cap",
+                    script_entry.path, script_entry.size
+                ));
+            }
         }
     }
     report.safe = report.reasons.is_empty();
@@ -1346,6 +1355,54 @@ mod tests {
         let report = preflight_pkg(&pkg);
         assert!(report.safe);
         assert_eq!(report.format, "scene-package");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// B2: a package whose every object is a model layer draws nothing in
+    /// this build. Preflight refuses it so the apply transaction never
+    /// runs and the wallpaper already on screen stays there. The scene.json
+    /// is LZ4-compressed here — the gate must decompress it, which the
+    /// pre-B2 script-cap check skipped.
+    #[test]
+    fn model_only_package_refused_as_undrawable() {
+        let dir = tmpdir();
+        let mut writer = PkgWriter::new();
+        writer.add_lz4(
+            "scene.json",
+            br#"{"objects": [
+                {"name": "a", "image": "models/a.json"},
+                {"name": "sparkle", "image": null, "particle": "particles/p.json"}
+            ]}"#,
+        );
+        let pkg = write_bytes(&dir, "models.pkg", &writer.build("0001"));
+        let report = preflight_pkg(&pkg);
+        assert!(!report.safe, "{:?}", report.reasons);
+        let reason = report.reasons.join("; ");
+        assert!(reason.contains("draws nothing"), "unexpected: {reason}");
+        assert!(reason.contains("scene3d"), "unexpected: {reason}");
+        assert!(
+            reason.contains("external particle files"),
+            "unexpected: {reason}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// One drawable object is enough to apply: the scene is degraded, not
+    /// blank, and the renderer's own diagnostics name what it skipped.
+    #[test]
+    fn package_with_one_drawable_object_passes() {
+        let dir = tmpdir();
+        let mut writer = PkgWriter::new();
+        writer.add(
+            "scene.json",
+            br#"{"objects": [
+                {"name": "a", "image": "models/a.json"},
+                {"name": "t", "text": "hello"}
+            ]}"#,
+        );
+        let pkg = write_bytes(&dir, "mixed.pkg", &writer.build("0001"));
+        let report = preflight_pkg(&pkg);
+        assert!(report.safe, "{:?}", report.reasons);
         let _ = fs::remove_dir_all(dir);
     }
 
