@@ -7,6 +7,11 @@ post_install() {
 
 post_upgrade() {
     post_install
+    echo ":: The running service keeps the OLD binary until it is restarted, and"
+    echo ":: a stale daemon supervising the new renderers misreports failures"
+    echo ":: (docs/bugs/APPLY_REJECTED_QUARANTINED.md). Restart it now:"
+    echo "     systemctl --user daemon-reload && systemctl --user restart kwe-daemon.service"
+    echo ":: Until then the manager refuses Apply with 'service_stale'."
     echo ":: If you enabled the service before this release, re-enable it once:"
     echo "     systemctl --user disable kwe-daemon.service"
     echo "     systemctl --user enable --now kwe-daemon.service"

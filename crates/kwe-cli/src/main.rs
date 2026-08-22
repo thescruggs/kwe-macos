@@ -172,18 +172,31 @@ fn main() -> Result<()> {
             // root and answers Browser.getVersion over the CDP pipe — a
             // missing sandbox runtime or a browser that cannot boot reports
             // as a failed probe instead of a blanket "not found".
-            match probe_web_backend() {
-                WebProbeOutcome::Report(report) => print!("web backend: {report}"),
+            // B4: the daemon's unit caps the cgroup task count (TasksMax),
+            // and chromium 151.173 needs more than the 96 the alpha shipped
+            // — a probe run from the shell passes while the same browser
+            // under the unit dies at bootstrap. When the unit is known, the
+            // probe runs inside a transient unit with the SAME TasksMax so
+            // this diagnostic fails exactly when the daemon's launch would.
+            let confinement = unit_tasks_max();
+            let lane = match confinement {
+                Some(limit) => format!("web backend (under kwe-daemon TasksMax={limit})"),
+                None => "web backend".to_string(),
+            };
+            match probe_web_backend(confinement) {
+                WebProbeOutcome::Report(report) => print!("{lane}: {report}"),
                 WebProbeOutcome::Missing => println!(
-                    "web backend: kwe-web-renderer not found beside this binary; \
+                    "{lane}: kwe-web-renderer not found beside this binary; \
                      run it with --probe manually"
                 ),
                 WebProbeOutcome::Failed { exit, reason } => println!(
-                    "web backend: kwe-web-renderer --probe failed ({reason}, exit {})",
+                    "{lane}: kwe-web-renderer --probe failed ({reason}, exit {}); if the \
+                     shell probe passes but this fails, the unit's TasksMax is too low \
+                     (docs/bugs/APPLY_REJECTED_QUARANTINED.md)",
                     exit.map_or_else(|| "unknown".to_string(), |code| code.to_string())
                 ),
                 WebProbeOutcome::Hung => println!(
-                    "web backend: kwe-web-renderer --probe did not finish within 15 s; \
+                    "{lane}: kwe-web-renderer --probe did not finish within 15 s; \
                      killed"
                 ),
             }
@@ -302,6 +315,58 @@ enum ProbeRun {
 /// its JSON report. Bounded: the probe is a single backend query, and a
 /// hung probe is killed after `deadline` instead of hanging the diagnostic.
 fn run_renderer_probe(binary: &str, deadline: Duration) -> ProbeRun {
+    run_renderer_probe_confined(binary, deadline, None)
+}
+
+/// The daemon unit's `TasksMax` as systemd reports it, when the unit is
+/// known and the value is a finite number. `infinity`, a missing unit, a
+/// missing `systemctl`, or a slow answer all yield None (the probe then
+/// runs unconfined, exactly as before B4). Bounded to 3 s.
+fn unit_tasks_max() -> Option<u64> {
+    let mut child = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "kwe-daemon.service",
+            "-p",
+            "TasksMax",
+            "--value",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    // systemd prints the raw pids.max; "infinity" (or an empty answer for an
+    // unknown unit) is not a confinement worth reproducing.
+    text.trim().parse::<u64>().ok().filter(|limit| *limit > 0)
+}
+
+/// `run_renderer_probe`, optionally inside a transient systemd user unit
+/// carrying the given `TasksMax` (B4). Falls back to the direct probe when
+/// `systemd-run` cannot be spawned, so a host without a user manager still
+/// gets the unconfined answer.
+fn run_renderer_probe_confined(
+    binary: &str,
+    deadline: Duration,
+    tasks_max: Option<u64>,
+) -> ProbeRun {
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -328,13 +393,41 @@ fn run_renderer_probe(binary: &str, deadline: Duration) -> ProbeRun {
     // renderer's spawn_browser setpgid): a hung probe may have spawned
     // bwrap -> chromium beneath it, and only a negative-pid kill reaches
     // the whole tree.
-    let mut child = match std::process::Command::new(&probe)
-        .arg("--probe")
+    let mut command = match tasks_max {
+        Some(limit) => {
+            // --wait returns the service's exit status; --pipe hands the
+            // report through; RuntimeMaxSec bounds the unit itself so a
+            // hung probe cannot outlive this diagnostic even though the
+            // process-group kill below only reaches systemd-run.
+            let mut command = std::process::Command::new("systemd-run");
+            command
+                .args(["--user", "--quiet", "--wait", "--pipe", "--collect"])
+                .arg(format!("--property=TasksMax={limit}"))
+                .arg(format!(
+                    "--property=RuntimeMaxSec={}",
+                    deadline.as_secs().max(1)
+                ))
+                .arg(&probe)
+                .arg("--probe");
+            command
+        }
+        None => {
+            let mut command = std::process::Command::new(&probe);
+            command.arg("--probe");
+            command
+        }
+    };
+    let spawned = command
         .stdout(std::process::Stdio::piped())
         .process_group(0)
-        .spawn()
-    {
+        .spawn();
+    let mut child = match spawned {
         Ok(child) => child,
+        Err(_) if tasks_max.is_some() => {
+            // No systemd-run on this host: answer unconfined rather than
+            // not at all.
+            return run_renderer_probe_confined(binary, deadline, None);
+        }
         Err(error) => {
             return ProbeRun::Failed {
                 exit: None,
@@ -427,8 +520,8 @@ enum WebProbeOutcome {
 /// bwrap and chromium present; a hung probe is killed after a 15 s deadline
 /// (cold browser boot measured at < 1 s in docs/BETA_M2.md §1.7, so the
 /// budget is generous).
-fn probe_web_backend() -> WebProbeOutcome {
-    match run_renderer_probe("kwe-web-renderer", Duration::from_secs(15)) {
+fn probe_web_backend(tasks_max: Option<u64>) -> WebProbeOutcome {
+    match run_renderer_probe_confined("kwe-web-renderer", Duration::from_secs(15), tasks_max) {
         ProbeRun::Report(report) => WebProbeOutcome::Report(report),
         ProbeRun::Missing => WebProbeOutcome::Missing,
         ProbeRun::Failed { exit, reason } => WebProbeOutcome::Failed { exit, reason },

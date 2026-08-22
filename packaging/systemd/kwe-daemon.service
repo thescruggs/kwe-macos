@@ -53,8 +53,16 @@ MemoryMax=3G
 MemorySwapMax=256M
 OOMPolicy=continue
 CPUQuota=400%
-# Chromium spawns many helper threads/tasks; 64 was too tight for the beta.
-TasksMax=96
+# Chromium spawns many helper threads/tasks; 64 was too tight for the beta,
+# and 96 killed chromium 151.0.7922.173 at bootstrap (SIGTRAP, exit 73,
+# three strikes, web wallpaper quarantined — B4,
+# docs/bugs/APPLY_REJECTED_QUARANTINED.md). Measured 2026-08-22 with
+# `systemd-run -p TasksMax=N kwe-web-renderer --probe`: 96 fails, 128+
+# passes, one probe alone peaks at >=53 tasks sampled at 200 ms. The daemon,
+# the audio worker and the OUTGOING renderer share this budget during a
+# canary handoff, so the ceiling is sized for two browsers plus headroom.
+# MemoryMax above remains the real memory bound.
+TasksMax=512
 TimeoutStopSec=5s
 
 # Do not add PrivateDevices= or MemoryDenyWriteExecute=: Vulkan renderers need

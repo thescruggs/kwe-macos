@@ -7,6 +7,7 @@ mod audio;
 mod grants;
 mod persist;
 mod playlist_session;
+mod selfcheck;
 mod supervisor;
 mod workshop_cache;
 
@@ -244,6 +245,14 @@ struct Response<'a> {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    // B4: remember which executable this is, so a package upgrade that
+    // swaps the file underneath a still-running daemon is detected and the
+    // user is told to restart instead of the version skew turning into
+    // quarantine records (docs/bugs/APPLY_REJECTED_QUARANTINED.md).
+    match selfcheck::init() {
+        Some(binary) => eprintln!("event=daemon.binary path={}", binary.path().display()),
+        None => eprintln!("event=daemon.binary_unknown detail=stale-binary check disabled"),
+    }
     let socket = arguments.socket.unwrap_or(default_socket_path()?);
     validate_socket_parent(&socket)?;
     if socket.exists() {
@@ -600,7 +609,14 @@ fn process_request(
                     .map_err(|_| anyhow!("catalog lock poisoned"))?
                     .stats
                     .total;
-                json!({"status": "ready", "catalog_items": count})
+                json!({
+                    "status": "ready",
+                    "catalog_items": count,
+                    // B4: true once the installed kwe-daemon file is no
+                    // longer the running one (package upgraded, unit not
+                    // restarted). Applies are refused while this is set.
+                    "service_stale": selfcheck::is_stale(),
+                })
             }
             "catalog" => {
                 let guard = catalog
@@ -851,6 +867,15 @@ fn process_request(
             }
             "wallpaper.outputs" => apply_call(apply, |handle| handle.outputs()),
             "wallpaper.apply" => {
+                // A daemon whose binary was replaced on disk must not keep
+                // driving applies: its preflight and failure contracts no
+                // longer match the renderers it would spawn (B4 cause 2).
+                // Refuse with the restart command; the playlist lane is
+                // not gated (it never reaches this arm) so an active
+                // playlist keeps rotating until the restart.
+                if let Some(stale) = selfcheck::stale_error() {
+                    return Ok((false, stale));
+                }
                 match serde_json::from_value::<ApplyWallpaperParams>(request.params.clone()) {
                     Ok(params) => apply_call(apply, |handle| handle.apply(params)),
                     Err(error) => {
