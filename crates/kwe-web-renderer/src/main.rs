@@ -229,6 +229,48 @@ impl StderrRing {
     fn tail(&self) -> String {
         String::from_utf8_lossy(&self.buffer).into_owned()
     }
+
+    /// The bootstrap-failure excerpt (B4c): the last few stderr lines that
+    /// are NOT chromium's routine headless noise (no session/system bus in
+    /// the sandbox, crashpad's sysfs probes), each clipped, joined on one
+    /// line. The daemon keeps only 256 chars of a worker's failure detail,
+    /// so the excerpt must lead with the lines that explain the failure —
+    /// "Zygote could not fork" / "pthread_create: Resource temporarily
+    /// unavailable" under a too-small TasksMax, for example — not with
+    /// forty dbus lines that appear on every healthy start too.
+    fn diagnostic_tail(&self) -> String {
+        const KEEP_LINES: usize = 4;
+        const LINE_CHARS: usize = 160;
+        const NOISE: [&str; 4] = [
+            "dbus/bus.cc",
+            "dbus/object_proxy.cc",
+            "crashpad/",
+            "Failed to send Reap message",
+        ];
+        let text = self.tail();
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !NOISE.iter().any(|noise| line.contains(noise)))
+            .collect();
+        if lines.is_empty() {
+            return "(browser wrote no non-routine stderr lines)".to_string();
+        }
+        let start = lines.len().saturating_sub(KEEP_LINES);
+        lines[start..]
+            .iter()
+            .map(|line| {
+                // Strip chromium's `[pid:tid:date/time:LEVEL:` prefix when
+                // present; the source location and message are the signal.
+                let stripped = line
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.find("] ").map(|end| &rest[end + 2..]))
+                    .unwrap_or(line);
+                stripped.chars().take(LINE_CHARS).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
 }
 
 fn socket_pair() -> Result<(RawFd, RawFd)> {
@@ -625,13 +667,28 @@ impl BrowserSession {
             set_nonblocking(child_stderr.as_raw_fd())?;
         }
 
-        let target_id = find_page_target(&mut client, deadline).with_context(|| {
-            format!(
-                "browser bootstrap failed; chromium stderr tail: {}",
-                stderr.tail()
-            )
-        })?;
-        let (session_id, _started_at) = attach_and_start(&mut client, &target_id, spec)?;
+        // B4c: drain the browser's stderr WHILE bootstrapping. The ring used
+        // to be first drained after the session existed, so every bootstrap
+        // failure reported "chromium stderr tail:" empty — the one line
+        // that names a browser that died at exec (B4: the unit's TasksMax
+        // cut it off) never reached the daemon.
+        let mut stderr = stderr;
+        let target_id = find_page_target(&mut client, deadline, &mut stderr, &mut child)
+            .with_context(|| {
+                stderr.drain_from(child.stderr.as_mut());
+                format!(
+                    "browser bootstrap failed; chromium stderr tail: {}",
+                    stderr.diagnostic_tail()
+                )
+            })?;
+        let (session_id, _started_at) = attach_and_start(&mut client, &target_id, spec)
+            .with_context(|| {
+                stderr.drain_from(child.stderr.as_mut());
+                format!(
+                    "browser attach/screencast failed; chromium stderr tail: {}",
+                    stderr.diagnostic_tail()
+                )
+            })?;
 
         let mut session = Self {
             client,
@@ -978,8 +1035,17 @@ fn spawn_browser(
 /// getTargets until the fixture page target appears (headless=new starts on
 /// a pre-navigation target that later becomes the fixture page; measured in
 /// M2a). Bounded by the startup deadline.
-fn find_page_target(client: &mut Client, deadline: Instant) -> Result<String> {
+fn find_page_target(
+    client: &mut Client,
+    deadline: Instant,
+    stderr: &mut StderrRing,
+    child: &mut Child,
+) -> Result<String> {
     loop {
+        // Keep the diagnostics ring current on every round: a browser that
+        // dies here leaves its last words on stderr, and the caller folds
+        // the tail into the bootstrap error (B4c).
+        stderr.drain_from(child.stderr.as_mut());
         let response = client.request_browser("Target.getTargets", &json!({}))?;
         ensure_ok(&response, "Target.getTargets")?;
         let pages: Vec<&Value> = response
@@ -1596,11 +1662,23 @@ fn probe_browser_version(content: &Path) -> Result<Value> {
     let spec = FrameSpec::new(160, 90)?;
     let (mut child, read_fd, write_fd) = spawn_browser(content, spec, false)?;
     let mut client = Client::new(read_fd, write_fd)?;
+    // Same bootstrap diagnostics as the supervised lane (B4c): the probe's
+    // failure message carries the browser's last stderr lines.
+    let mut stderr = StderrRing::new(STDERR_RING_LIMIT);
+    if let Some(child_stderr) = child.stderr.as_mut() {
+        set_nonblocking(child_stderr.as_raw_fd())?;
+    }
     let report: Result<Value> = (|| {
         // 1. Boot + CDP pipe: the browser must answer Browser.getVersion.
         let response = client
             .request_browser("Browser.getVersion", &json!({}))
-            .context("browser did not answer Browser.getVersion within the CDP request timeout")?;
+            .with_context(|| {
+                stderr.drain_from(child.stderr.as_mut());
+                format!(
+                    "browser did not answer Browser.getVersion within the CDP request timeout; chromium stderr tail: {}",
+                    stderr.diagnostic_tail()
+                )
+            })?;
         ensure_ok(&response, "Browser.getVersion")?;
         let result = response.result.unwrap_or_default();
         // Chromium 151 answers with `product` ("Chrome/151.0.7922.137");
@@ -1618,9 +1696,34 @@ fn probe_browser_version(content: &Path) -> Result<Value> {
         // 2. Capture round-trip: attach and start the screencast, then
         // receive and ack at least one frame (the probe page animates, so
         // the compositor keeps producing frames — see PROBE_PAGE).
-        let target_id = find_page_target(&mut client, Instant::now() + STARTUP_DEADLINE)?;
-        let (session_id, _started_at) = attach_and_start(&mut client, &target_id, spec)?;
-        let frames = wait_for_probe_frame(&mut client, &session_id)?;
+        let target_id = find_page_target(
+            &mut client,
+            Instant::now() + STARTUP_DEADLINE,
+            &mut stderr,
+            &mut child,
+        )
+        .with_context(|| {
+            stderr.drain_from(child.stderr.as_mut());
+            format!(
+                "browser bootstrap failed; chromium stderr tail: {}",
+                stderr.tail()
+            )
+        })?;
+        let (session_id, _started_at) = attach_and_start(&mut client, &target_id, spec)
+            .with_context(|| {
+                stderr.drain_from(child.stderr.as_mut());
+                format!(
+                    "browser attach/screencast failed; chromium stderr tail: {}",
+                    stderr.diagnostic_tail()
+                )
+            })?;
+        let frames = wait_for_probe_frame(&mut client, &session_id).with_context(|| {
+            stderr.drain_from(child.stderr.as_mut());
+            format!(
+                "capture round-trip failed; chromium stderr tail: {}",
+                stderr.diagnostic_tail()
+            )
+        })?;
 
         // 3. Heartbeat round-trip: Runtime.evaluate("1+1") must answer 2
         // (the worker's wedged-page probe, docs/BETA_M2.md §5.3).
