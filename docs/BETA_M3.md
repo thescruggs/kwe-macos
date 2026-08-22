@@ -18,7 +18,7 @@ modes and color effects; M3e adds text layers (a glyph atlas rendered
 through the M3c compositor with zero shader changes); M3f adds particle
 systems (a bounded fixed-timestep CPU simulation, one batched draw per
 system, and the `Scene.getParticleSystem` script surface). The rest of
-the scene surface (3D, user properties — M3g–M3k) and any manager
+the scene surface (3D, user properties — M3h–M3k) and any manager
 changes are deliberately out of scope.
 
 ## Goal
@@ -528,9 +528,9 @@ unreadable, unsupported-extension, corrupt, oversized, or failed source
 degrades only that layer; the last good texture remains visible after a
 refresh failure.
 
-The source boundary is intentionally local-only: file references are
-canonicalized beneath the scene root and package entries are extracted into a
-0700 pid-qualified directory. The 160 MiB source cap matches the scene
+The source boundary is intentionally local-only: file references are opened
+with no-follow and copied from a validated fd into a worker-owned snapshot;
+package entries are extracted into the same 0700 pid-qualified directory. The 160 MiB source cap matches the scene
 worker's RLIMIT_FSIZE. mpv is configured with `hwdec=no`, `audio=no`,
 `cache=no`, bounded lavf demux buffers, `access-references=no`,
 `autoload-files=no`, `load-scripts=no`, and FFmpeg's
@@ -545,6 +545,10 @@ SceneScript controls remain deferred.
 | native-size | omit `size` | M3g-b: decoder dimensions fill the layer and the surrounding clear remains unchanged |
 | decoder cap | three valid layers | M3g-c: exactly two cores open; one layer is skipped with a bounded diagnostic |
 | bad source | missing local source beside a healthy image | M3g-d: only the bad layer skips and the scene remains live |
+| package video | runtime-generated package embeds the synthetic clip | M3g-e: package extraction decodes, then runtime-directory absence proves teardown cleanup |
+| corrupt package video | valid package containing an invalid video payload | M3g-f: only the corrupt layer skips; the scene reaches live and stops cleanly |
+| media state | paused, playing, and stopped latest-wins commands | daemon ack sequence advances and keepalive continues while paused/stopped |
+| standalone teardown | direct llvmpipe worker opens the synthetic clip | both colors advance and SIGTERM exits cleanly with no staged-media residue |
 | package/path policy | package extraction is bounded and cleaned after decoder drop; traversal, symlink, remote protocol, and non-container extension are rejected | unit and package resolver coverage; no media code runs in plasmashell |
 | compositor failure | ordinary refresh failure disables that decoder once; fence timeout is process-fatal before fence/resource reuse | classifier unit plus worker rejection path |
 | regressions | video/supervisor suites and plasmashell guard | `smoke-video.sh`, `smoke-supervisor.sh`, and scene smoke are required; environments without ffmpeg must report the M3g lane as skipped, not pass silently |

@@ -120,6 +120,15 @@ start_scene() {
     call_daemon renderer.start "$params"
 }
 
+media_state() {
+    local generation="$1"
+    local playback="$2"
+    local params
+    params="$(jq -cn --argjson generation "$generation" --arg playback "$playback" \
+        '{generation:$generation,playback:$playback}')"
+    call_daemon media.state "$params" >/dev/null
+}
+
 command -v jq >/dev/null
 command -v python3 >/dev/null
 
@@ -864,6 +873,8 @@ m3e_c_script="$smoke_root/m3e-c.js"
 m3e_d_scene="$smoke_root/m3e-d.json"
 python3 - "$m3e_a_scene" "$m3e_b_scene" "$m3e_b_script" "$m3e_c_scene" "$m3e_c_script" "$m3e_d_scene" <<'PY'
 import json
+import os
+import struct
 import sys
 
 
@@ -1250,14 +1261,18 @@ m3g_a_scene="$smoke_root/m3g-a.json"
 m3g_b_scene="$smoke_root/m3g-b.json"
 m3g_c_scene="$smoke_root/m3g-c.json"
 m3g_d_scene="$smoke_root/m3g-d.json"
+m3g_pkg="$smoke_root/m3g-video.pkg"
+m3g_bad_pkg="$smoke_root/m3g-corrupt-video.pkg"
 if command -v ffmpeg >/dev/null; then
     ffmpeg -loglevel error -y \
         -f lavfi -i "color=c=0x3366CC:s=64x64:r=30:d=1" \
         -f lavfi -i "color=c=0xCC6633:s=64x64:r=30:d=1" \
         -filter_complex "[0:v][1:v]concat=n=2:v=1:a=0[v]" -map "[v]" \
         -pix_fmt yuv420p "$m3g_clip"
-    python3 - "$m3g_a_scene" "$m3g_b_scene" "$m3g_c_scene" "$m3g_d_scene" <<'PY'
+    python3 - "$m3g_a_scene" "$m3g_b_scene" "$m3g_c_scene" "$m3g_d_scene" "$m3g_pkg" "$m3g_bad_pkg" <<'PY'
 import json
+import os
+import struct
 import sys
 
 
@@ -1318,6 +1333,29 @@ json.dump(
     ),
     open(sys.argv[4], "w"),
 )
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        encoded = path.encode()
+        table += struct.pack("<I", len(encoded)) + encoded
+        table += struct.pack("<I", offset) + struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+pkg_scene = scene([video("pkg-clip", size=[160.0, 90.0])])
+pkg_json = json.dumps(pkg_scene, separators=(",", ":")).encode()
+clip = open(os.path.join(os.path.dirname(sys.argv[1]), "m3g-clip.mp4"), "rb").read()
+open(sys.argv[5], "wb").write(build_pkg([("scene.json", pkg_json), ("m3g-clip.mp4", clip)]))
+bad_scene = scene([video("corrupt", source="m3g-corrupt.mp4", size=[160.0, 90.0])])
+bad_json = json.dumps(bad_scene, separators=(",", ":")).encode()
+open(sys.argv[6], "wb").write(build_pkg([("scene.json", bad_json), ("m3g-corrupt.mp4", b"not a video")]))
 PY
     m3g_ready=1
     echo "scene smoke: M3g fixtures generated"
@@ -1390,6 +1428,25 @@ if max(abs(g - e) for g, e in zip(got, expected)) > tol:
     )
 print("ORACLE-OK pixel (%d,%d) = %s" % (x, y, ",".join(map(str, got))))
 PY
+}
+
+# A standalone worker can publish the KWEFRM1 canary before its first real
+# compositor frame. Poll the pixel oracle for a bounded interval so a valid
+# asynchronous startup is not mistaken for a zeroed frame; dump the lane log
+# when the expected pixel never arrives.
+scene_pixel_wait() {
+    local frame_file="$1" x="$2" y="$3" expected="$4" tolerance="$5" log="$6"
+    for _attempt in {1..120}; do
+        if scene_pixel_oracle "$frame_file" "$x" "$y" "$expected" "$tolerance" >/dev/null 2>&1; then
+            scene_pixel_oracle "$frame_file" "$x" "$y" "$expected" "$tolerance"
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "standalone pixel oracle timed out: frame=$frame_file pixel=($x,$y) expected=$expected tolerance=$tolerance" >&2
+    scene_pixel_oracle "$frame_file" "$x" "$y" "$expected" "$tolerance" || true
+    sed -n '1,160p' "$log" >&2
+    return 1
 }
 
 # M3e region oracles: structural assertions over a rectangle of the shared
@@ -2326,6 +2383,7 @@ call_daemon renderer.start "$(jq -cn --arg content "$m3g_a_scene" \
     '{wallpaper_id:"scene-m3g-a",content_hash:"hash-m3g-a",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3g_a_status="$(wait_phase live)"
 m3g_a_frame="$(jq -r '.result.frame_file' <<<"$m3g_a_status")"
+m3g_a_generation="$(jq -r '.result.display_generation' <<<"$m3g_a_status")"
 m3g_a_first="$(m3g_wait_color "$m3g_a_frame" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
     echo "M3g-a failure: the first clip color never reached the frame center (best=$m3g_a_first of 64)" >&2
     jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
@@ -2339,6 +2397,30 @@ m3g_a_second="$(m3g_wait_color "$m3g_a_frame" 76 41 8 8 "51,102,204,255" 20 60 2
 m3g_a_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
 [[ "$m3g_a_tail" == *"event=renderer.scene.video_open layer=clip size=64x64"* ]]
 echo "scene smoke passed (M3g a): playback advances — both clip colors reached the frame center ($m3g_a_first then $m3g_a_second of 64 px)"
+
+# Media transport is latest-wins and ack-only at the protocol boundary. The
+# scene worker fans the command out to every open decoder; while paused or
+# stopped it must keep publishing the last frame so the supervisor sees a
+# live worker. The input ack sequence proves the state reached this worker,
+# and the sequence comparisons prove keepalive continued.
+media_state "$m3g_a_generation" paused
+sleep 0.5
+m3g_paused_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.input_ack_sequence' <<<"$m3g_paused_status")" != "0" ]]
+m3g_paused_first="$(jq -r '.result.sequence' <<<"$m3g_paused_status")"
+sleep 0.75
+m3g_paused_second="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_paused_second" -gt "$m3g_paused_first" ]]
+media_state "$m3g_a_generation" playing
+media_state "$m3g_a_generation" stopped
+sleep 0.5
+m3g_stopped_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.phase' <<<"$m3g_stopped_status")" == "live" ]]
+m3g_stopped_first="$(jq -r '.result.sequence' <<<"$m3g_stopped_status")"
+sleep 0.75
+m3g_stopped_second="$(jq -r '.result.sequence' <<<"$(call_daemon renderer.status)")"
+[[ "$m3g_stopped_second" -gt "$m3g_stopped_first" ]]
+echo "scene smoke passed (M3g media): paused/playing/stopped acked and keepalive advanced"
 
 # Case M3g-b: the native-size substitution. The scene declares no `size`,
 # so open_video_layers fills it from the decoder (64x64) before the
@@ -2400,6 +2482,51 @@ m3g_d_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon rendere
 [[ "$m3g_d_tail" == *'layer_skip layer=broken detail=video "m3g-missing.mp4" is missing or unreadable'* ]]
 echo "scene smoke passed (M3g d): unresolved source — only the video layer skipped, the image still drew"
 
+# Case M3g-e: a runtime-generated package embeds the same synthetic clip.
+# The package lane must extract it into the worker HOME before libmpv opens
+# it, then remove that private directory after teardown.
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_pkg" \
+    '{wallpaper_id:"scene-m3g-pkg",content_hash:"hash-m3g-pkg",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_pkg_status="$(wait_phase live)"
+m3g_pkg_frame="$(jq -r '.result.frame_file' <<<"$m3g_pkg_status")"
+m3g_pkg_center="$(m3g_wait_color "$m3g_pkg_frame" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+    echo "M3g-e failure: packaged clip never reached the frame center (best=$m3g_pkg_center of 64)" >&2
+    jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)" >&2
+    exit 1
+}
+m3g_pkg_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+if [[ "$m3g_pkg_tail" != *"event=renderer.scene.pkg entries=2 script_entry=false"* || \
+      "$m3g_pkg_tail" != *"event=renderer.scene.video_open layer=pkg-clip size=64x64"* ]]; then
+    echo "M3g-e failure: package diagnostics missing" >&2
+    printf '%s\n' "$m3g_pkg_tail" >&2
+    exit 1
+fi
+call_daemon renderer.stop >/dev/null
+wait_phase stopped >/dev/null
+if find "$runtime_dir" -type d -name 'kwe-scene-video-*' -print -quit | grep -q .; then
+    echo "M3g-e failure: extracted package video directory survived worker teardown" >&2
+    find "$runtime_dir" -type d -name 'kwe-scene-video-*' -print >&2
+    exit 1
+fi
+echo "scene smoke passed (M3g e): package video decoded, worker-owned extraction cleaned up"
+
+# Case M3g-f: a corrupt package video is a bad layer, not a scene/process
+# failure. The valid package structure reaches live, libmpv rejects only the
+# layer, and the daemon remains able to stop it cleanly.
+call_daemon renderer.start "$(jq -cn --arg content "$m3g_bad_pkg" \
+    '{wallpaper_id:"scene-m3g-badpkg",content_hash:"hash-m3g-badpkg",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+m3g_bad_status="$(wait_phase live)"
+m3g_bad_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$m3g_bad_status")"
+if [[ "$m3g_bad_tail" != *"event=renderer.scene.pkg entries=2 script_entry=false"* || \
+      "$m3g_bad_tail" != *"event=renderer.scene.layer_skip layer=corrupt detail=video-open-failed"* ]]; then
+    echo "M3g-f failure: corrupt-package diagnostics missing" >&2
+    printf '%s\n' "$m3g_bad_tail" >&2
+    exit 1
+fi
+call_daemon renderer.stop >/dev/null
+wait_phase stopped >/dev/null
+echo "scene smoke passed (M3g f): corrupt package video degraded one layer and stayed live"
+
 fi
 
 # Final stop: the daemon stops the active worker and stays healthy.
@@ -2420,6 +2547,18 @@ echo "scene smoke passed: plasmashell pid unchanged across the whole suite"
 # the CI-friendly lane: it needs no discrete GPU. The same scripted-color
 # oracle runs against the worker's own frame file, then SIGTERM must exit 0
 # with the Stopping state and the renderer.complete diagnostic.
+stop_standalone() {
+    local pid="$1" log="$2" label="$3"
+    kill -TERM "$pid" 2>/dev/null || true
+    local status=0
+    wait "$pid" || status=$?
+    if [[ "$status" != "0" ]]; then
+        echo "$label exited with status $status" >&2
+        sed -n '1,160p' "$log" >&2
+        return "$status"
+    fi
+}
+
 lvp_icd="/usr/share/vulkan/icd.d/lvp_icd.json"
 [[ -f "$lvp_icd" ]]
 standalone="$smoke_root/standalone.bin"
@@ -2439,10 +2578,7 @@ done
 head -c 8 "$standalone" | grep -q KWEFRM1
 grep -q "event=renderer.scene.device name=.*llvmpipe" "$smoke_root/standalone.log"
 scene_oracle "$standalone" 1.5
-kill -TERM "$standalone_pid"
-wait "$standalone_pid"
-standalone_exit=$?
-[[ "$standalone_exit" == "0" ]]
+stop_standalone "$standalone_pid" "$smoke_root/standalone.log" "standalone renderer"
 # The Stopping producer state is written into the frame header before exit
 # (producer states: Starting=1, Running=2, Stopping=3, Failed=4).
 state_field="$(python3 -c "
@@ -2476,11 +2612,10 @@ for _attempt in {1..400}; do
     sleep 0.05
 done
 head -c 8 "$standalone_m3c" | grep -q KWEFRM1
-scene_pixel_oracle "$standalone_m3c" 90 55 "0,0,255,255" 1
-scene_pixel_oracle "$standalone_m3c" 140 79 "255,0,0,255" 1
-scene_pixel_oracle "$standalone_m3c" 150 85 "255,0,0,255" 1
-kill -TERM "$standalone_m3c_pid"
-wait "$standalone_m3c_pid"
+scene_pixel_wait "$standalone_m3c" 90 55 "0,0,255,255" 1 "$smoke_root/standalone-m3c.log"
+scene_pixel_wait "$standalone_m3c" 140 79 "255,0,0,255" 1 "$smoke_root/standalone-m3c.log"
+scene_pixel_wait "$standalone_m3c" 150 85 "255,0,0,255" 1 "$smoke_root/standalone-m3c.log"
+stop_standalone "$standalone_m3c_pid" "$smoke_root/standalone-m3c.log" "standalone M3c renderer"
 echo "scene smoke passed: standalone llvmpipe lane — M3c two-layer composite oracles"
 
 standalone_blend="$smoke_root/standalone-blend.bin"
@@ -2498,10 +2633,43 @@ for _attempt in {1..400}; do
     sleep 0.05
 done
 head -c 8 "$standalone_blend" | grep -q KWEFRM1
-scene_pixel_oracle "$standalone_blend" 80 45 "106,77,48,191" 1
-kill -TERM "$standalone_blend_pid"
-wait "$standalone_blend_pid"
+scene_pixel_wait "$standalone_blend" 80 45 "106,77,48,191" 1 "$smoke_root/standalone-blend.log"
+stop_standalone "$standalone_blend_pid" "$smoke_root/standalone-blend.log" "standalone M3c blend renderer"
 echo "scene smoke passed: standalone llvmpipe lane — M3c blend oracle (106,77,48,191)"
+
+if [[ "$m3g_ready" == "1" ]]; then
+    # Standalone M3g lane: the same synthetic clip is opened directly by the
+    # worker under llvmpipe. This catches teardown/status failures that the
+    # daemon's child supervision could otherwise hide.
+    standalone_m3g="$smoke_root/standalone-m3g.bin"
+    standalone_m3g_log="$smoke_root/standalone-m3g.log"
+    VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+        --output "$standalone_m3g" --width 160 --height 90 --fps 30 \
+        --content "$m3g_a_scene" --device llvmpipe >"$standalone_m3g_log" 2>&1 &
+    standalone_m3g_pid=$!
+    for _attempt in {1..1200}; do
+        [[ -f "$standalone_m3g" ]] && head -c 8 "$standalone_m3g" | grep -q KWEFRM1 && break
+        kill -0 "$standalone_m3g_pid" 2>/dev/null || {
+            echo "standalone M3g renderer exited early" >&2
+            sed -n '1,160p' "$standalone_m3g_log" >&2
+            exit 1
+        }
+        sleep 0.05
+    done
+    head -c 8 "$standalone_m3g" | grep -q KWEFRM1
+    m3g_standalone_first="$(m3g_wait_color "$standalone_m3g" 76 41 8 8 "204,102,51,255" 20 60 200)" || {
+        echo "standalone M3g failure: first clip color missing (best=$m3g_standalone_first)" >&2
+        sed -n '1,160p' "$standalone_m3g_log" >&2
+        exit 1
+    }
+    m3g_standalone_second="$(m3g_wait_color "$standalone_m3g" 76 41 8 8 "51,102,204,255" 20 60 200)" || {
+        echo "standalone M3g failure: second clip color missing (best=$m3g_standalone_second)" >&2
+        sed -n '1,160p' "$standalone_m3g_log" >&2
+        exit 1
+    }
+    stop_standalone "$standalone_m3g_pid" "$standalone_m3g_log" "standalone M3g renderer"
+    echo "scene smoke passed: standalone llvmpipe lane — M3g video playback and teardown"
+fi
 
 # The M3d blend/effect oracles on the llvmpipe lane: seven single-sample
 # lanes plus the scripted switch. Every value is pinned EXACTLY (tolerance
@@ -2519,6 +2687,7 @@ lane_start() {
         --output "$output" --width 160 --height 90 --fps 30 \
         --content "$content" --device llvmpipe >"$log" 2>&1 &
     lane_pid=$!
+    lane_log="$log"
     for _attempt in {1..1200}; do
         [[ -f "$output" ]] && head -c 8 "$output" | grep -q KWEFRM1 && break
         kill -0 "$lane_pid" 2>/dev/null || {
@@ -2532,37 +2701,36 @@ lane_start() {
 }
 
 lane_stop() {
-    kill -TERM "$lane_pid"
-    wait "$lane_pid"
+    stop_standalone "$lane_pid" "$lane_log" "standalone lane"
 }
 
 # Normal: the src-over identity over the opaque clear.
 lane_start "$smoke_root/standalone-m3d-normal.bin" "$m3d_normal_scene" "$smoke_root/standalone-m3d-normal.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-normal.bin" 80 45 "142,103,64,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-normal.bin" 80 45 "142,103,64,255" 0 "$smoke_root/standalone-m3d-normal.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d normal byte oracle"
 
 # Multiply: texel*bg/255.
 lane_start "$smoke_root/standalone-m3d-multiply.bin" "$m3d_multiply_scene" "$smoke_root/standalone-m3d-multiply.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-multiply.bin" 80 45 "14,26,26,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-multiply.bin" 80 45 "14,26,26,255" 0 "$smoke_root/standalone-m3d-multiply.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d multiply byte oracle"
 
 # Add: min(255, texel+bg).
 lane_start "$smoke_root/standalone-m3d-add.bin" "$m3d_add_scene" "$smoke_root/standalone-m3d-add.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-add.bin" 80 45 "168,167,166,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-add.bin" 80 45 "168,167,166,255" 0 "$smoke_root/standalone-m3d-add.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d add byte oracle"
 
 # Screen: 255-(255-texel)(255-bg)/255.
 lane_start "$smoke_root/standalone-m3d-screen.bin" "$m3d_screen_scene" "$smoke_root/standalone-m3d-screen.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-screen.bin" 80 45 "154,141,140,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-screen.bin" 80 45 "154,141,140,255" 0 "$smoke_root/standalone-m3d-screen.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d screen byte oracle"
 
 # Subtract: max(0, bg-texel).
 lane_start "$smoke_root/standalone-m3d-subtract.bin" "$m3d_subtract_scene" "$smoke_root/standalone-m3d-subtract.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-subtract.bin" 80 45 "0,0,38,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-subtract.bin" 80 45 "0,0,38,255" 0 "$smoke_root/standalone-m3d-subtract.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d subtract byte oracle"
 
@@ -2571,20 +2739,20 @@ echo "scene smoke passed: standalone llvmpipe lane — M3d subtract byte oracle"
 # stores 128 (0.5*255=127.5 rounds to nearest even), and the RGB follows:
 # B=(142*128+127)/255=71, G=(103*128+127)/255=52, R=(64*128+127)/255=32.
 lane_start "$smoke_root/standalone-m3d-add128.bin" "$m3d_add128_scene" "$smoke_root/standalone-m3d-add128.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-add128.bin" 80 45 "71,52,32,128" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-add128.bin" 80 45 "71,52,32,128" 0 "$smoke_root/standalone-m3d-add128.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d add-at-128 byte oracle"
 
 # Effects: brightness 2.0, tint (1,0.4,0.5) — (128,82,142) over opaque.
 lane_start "$smoke_root/standalone-m3d-effects.bin" "$m3d_effects_scene" "$smoke_root/standalone-m3d-effects.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-effects.bin" 80 45 "142,82,128,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-effects.bin" 80 45 "142,82,128,255" 0 "$smoke_root/standalone-m3d-effects.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d effects byte oracle"
 
 # Translucent multiply: the alpha-policy pin — layer alpha 0.5 over a
 # 0.5-alpha clear, delivered (11,20,20,192).
 lane_start "$smoke_root/standalone-m3d-multiply128.bin" "$m3d_multiply128_scene" "$smoke_root/standalone-m3d-multiply128.log"
-scene_pixel_oracle "$smoke_root/standalone-m3d-multiply128.bin" 80 45 "11,20,20,192" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-multiply128.bin" 80 45 "11,20,20,192" 0 "$smoke_root/standalone-m3d-multiply128.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d translucent multiply byte oracle"
 
@@ -2604,7 +2772,7 @@ for _attempt in {1..120}; do
 done
 [[ "$m3d_js_lane_add_observed" == "1" ]]
 sleep 3.5
-scene_pixel_oracle "$smoke_root/standalone-m3d-js.bin" 80 45 "14,26,26,255" 0
+scene_pixel_wait "$smoke_root/standalone-m3d-js.bin" 80 45 "14,26,26,255" 0 "$smoke_root/standalone-m3d-js.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d scripted blendMode switch (exact)"
 
@@ -2636,16 +2804,14 @@ if [[ -n "$m3e_any_font" ]]; then
     head -c 8 "$standalone_m3e_a" | grep -q KWEFRM1
     if grep -q "event=renderer.scene.text_font_none" "$smoke_root/standalone-m3e-a.log"; then
         echo "scene smoke SKIP (M3e a): no usable system fonts — text lane needs real fonts"
-        kill -TERM "$standalone_m3e_a_pid"
-        wait "$standalone_m3e_a_pid" || true
+        stop_standalone "$standalone_m3e_a_pid" "$smoke_root/standalone-m3e-a.log" "standalone M3e renderer" || true
     else
         # Mean bounds are RED-DOMINANCE, not tight per-channel: glyph
         # interiors are pure text color, but the antialiased edges lean
         # toward the blue background, so the differing-pixel mean carries
         # a blue cast (measured on this lane: R 234.0, G 0.0, B 128.9).
         scene_region_oracle "$standalone_m3e_a" 30 18 100 54 "255,0,0,255" "0,0,255,255" 20 30 300 400 150 255 0 80 0 210
-        kill -TERM "$standalone_m3e_a_pid"
-        wait "$standalone_m3e_a_pid"
+        stop_standalone "$standalone_m3e_a_pid" "$smoke_root/standalone-m3e-a.log" "standalone M3e renderer"
         echo "scene smoke passed: standalone llvmpipe lane — M3e text region oracle (fixed string, known family)"
     fi
 else

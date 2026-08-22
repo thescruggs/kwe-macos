@@ -774,6 +774,7 @@ impl Drop for SupervisorService {
 struct ActiveWorker {
     spec: StartSpec,
     child: Child,
+    home_path: PathBuf,
     frame_path: PathBuf,
     reader: Option<SharedFrameReader>,
     started: Instant,
@@ -1148,9 +1149,14 @@ impl SupervisorRuntime {
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("launch renderer {}", renderer_path.display()))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_renderer_home(&home_dir);
+                return Err(error)
+                    .with_context(|| format!("launch renderer {}", renderer_path.display()));
+            }
+        };
         let channels = (|| -> Result<(ChildStdin, ChildStdout, ChildStderr)> {
             let input = child
                 .stdin
@@ -1174,6 +1180,7 @@ impl SupervisorRuntime {
             Ok(channels) => channels,
             Err(error) => {
                 terminate_and_reap(&mut child, self.config.stop_grace);
+                cleanup_renderer_home(&home_dir);
                 return Err(error);
             }
         };
@@ -1181,6 +1188,7 @@ impl SupervisorRuntime {
         Ok(ActiveWorker {
             spec,
             child,
+            home_path: home_dir,
             frame_path,
             reader: None,
             started: now,
@@ -1629,6 +1637,7 @@ impl SupervisorRuntime {
         {
             eprintln!("event=renderer.frame_cleanup_error detail={error}");
         }
+        cleanup_renderer_home(&worker.home_path);
     }
 
     fn stop_candidate(&mut self, count_forced: bool) {
@@ -1999,6 +2008,31 @@ fn flush_pending(
 /// video/scene/test kinds.
 fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
     env_allowlist_with_runtime(kind, home, std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// Every renderer HOME is a daemon-created 0700 directory. Remove it after
+/// reaping the child so scene VideoLayer staging is cleaned even when the
+/// worker exits through process::exit before Rust destructors can run.
+fn cleanup_renderer_home(home: &Path) {
+    match fs::symlink_metadata(home) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            if let Err(error) = fs::remove_dir_all(home) {
+                eprintln!(
+                    "event=renderer.home_cleanup_error path={} detail={error}",
+                    home.display()
+                );
+            }
+        }
+        Ok(_) => eprintln!(
+            "event=renderer.home_cleanup_refused path={} detail=not-plain-directory",
+            home.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "event=renderer.home_cleanup_error path={} detail={error}",
+            home.display()
+        ),
+    }
 }
 
 fn env_allowlist_with_runtime(
@@ -2911,6 +2945,7 @@ mod tests {
                 stderr_lines: None,
             },
             child,
+            home_path: PathBuf::new(),
             frame_path: PathBuf::new(),
             reader: None,
             started: Instant::now(),
@@ -3107,6 +3142,7 @@ mod tests {
                 stderr_lines: None,
             },
             child,
+            home_path: PathBuf::new(),
             frame_path: PathBuf::new(),
             reader: None,
             started: Instant::now(),

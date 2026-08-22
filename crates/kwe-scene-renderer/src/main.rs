@@ -44,9 +44,12 @@ mod video;
 mod vulkan;
 
 use std::cell::RefCell;
+use std::ffi::CString;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::exit;
 use std::rc::Rc;
@@ -749,6 +752,11 @@ fn main() -> Result<()> {
         .content
         .clone()
         .context("--content is required (--probe excepted)")?;
+    // Establish cleanup ownership before load_scene can stage either file or
+    // package videos. Rust returns/unwinds therefore remove staged media even
+    // when bootstrap fails; process::exit paths are additionally covered by
+    // the supervisor removing the private per-launch HOME.
+    let video_cleanup = VideoCleanupGuard::new();
 
     // 1. Scene: parse and reject (exit 73) anything the engine cannot render.
     let mut config = load_scene(&content);
@@ -907,9 +915,9 @@ fn main() -> Result<()> {
     // M3b review follow-up: the worker removes its own extracted script
     // directory on the graceful exit path (it owns its HOME).
     cleanup_script_dir(config.script_path.as_deref());
-    // M3g: the extracted video directory is the worker's too (pkg lane only;
-    // a file scene never creates one, and the cleanup is a no-op then).
-    cleanup_video_dir();
+    // M3g: the extracted video directory is the worker's too. Drop the guard
+    // only after all decoders have gone away, preserving teardown ordering.
+    drop(video_cleanup);
     run_result
 }
 
@@ -965,10 +973,15 @@ fn load_scene(content: &Path) -> SceneConfig {
         load_particle_textures(&mut config.particles, &mut used_bytes, |reference| {
             resolve_layer_image(&root, reference)
         });
-        // M3g: video layers resolve to a path inside the same root; the
-        // file is never read here (libmpv opens it).
+        // M3g: stage every file-scene video into the worker-owned private
+        // directory before libmpv sees it. The source is opened with
+        // O_NOFOLLOW and copied through that already-open fd, so a later
+        // symlink/path replacement cannot redirect libmpv outside root.
+        let mut video_slot = 0usize;
         load_layer_videos(&mut config.layers, |reference| {
-            resolve_layer_video(&root, reference)
+            let slot = video_slot;
+            video_slot += 1;
+            stage_file_video(&root, reference, slot)
         });
         return config;
     }
@@ -1309,13 +1322,11 @@ fn load_layer_videos(
     }
 }
 
-/// Resolve one layer's video reference against the content root (file
-/// scenes). The same containment rules as `resolve_layer_image` —
-/// relative, no `..`/absolute components, canonicalized inside the root so
-/// a symlink cannot smuggle the source out, a regular file — but the file
-/// is never read: libmpv opens the path itself, so the size cap is checked
-/// from the metadata instead of from a bounded read.
-fn resolve_layer_video(root: &Path, reference: &str) -> Result<PathBuf, String> {
+/// Validate the lexical part of a file-scene video reference and return the
+/// candidate path. Callers that open the source must still use
+/// `open_video_source`, which performs the no-follow fd and post-open
+/// identity checks before copying any bytes.
+fn video_candidate(root: &Path, reference: &str) -> Result<PathBuf, String> {
     if reference.is_empty() {
         return Err("video reference must not be empty".into());
     }
@@ -1340,8 +1351,16 @@ fn resolve_layer_video(root: &Path, reference: &str) -> Result<PathBuf, String> 
             ));
         }
     }
-    let canonical = root
-        .join(joined)
+    Ok(root.join(joined))
+}
+
+/// Resolve one layer's video reference for diagnostics/tests. Production
+/// file scenes use `stage_file_video` instead: canonicalize-then-open would
+/// leave a TOCTOU window between validation and libmpv's later path open.
+#[cfg(test)]
+fn resolve_layer_video(root: &Path, reference: &str) -> Result<PathBuf, String> {
+    let candidate = video_candidate(root, reference)?;
+    let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("video \"{reference}\" is missing or unreadable: {error}"))?;
     if !canonical.starts_with(root) {
@@ -1365,6 +1384,63 @@ fn resolve_layer_video(root: &Path, reference: &str) -> Result<PathBuf, String> 
     Ok(canonical)
 }
 
+/// Open a file-scene video once, with no symlink following on the final
+/// component, and verify that the opened inode is still the canonical path
+/// inside the content root. The fd is then copied, so libmpv only receives a
+/// worker-owned immutable snapshot and never reopens attacker-controlled
+/// content paths.
+fn open_video_source(root: &Path, reference: &str) -> Result<fs::File, String> {
+    let candidate = video_candidate(root, reference)?;
+    let source = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&candidate)
+        .map_err(|error| format!("video \"{reference}\" is missing or unreadable: {error}"))?;
+    let opened = source
+        .metadata()
+        .map_err(|error| format!("video \"{reference}\" is unreadable: {error}"))?;
+    if !opened.is_file() {
+        return Err(format!("video \"{reference}\" is not a regular file"));
+    }
+    if opened.len() > video::MAX_VIDEO_SOURCE_BYTES {
+        return Err(format!(
+            "video \"{reference}\" is {} bytes, over the {} byte cap",
+            opened.len(),
+            video::MAX_VIDEO_SOURCE_BYTES
+        ));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("video \"{reference}\" changed during validation: {error}"))?;
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "video \"{reference}\" resolves outside the scene directory"
+        ));
+    }
+    let canonical_metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("video \"{reference}\" changed during validation: {error}"))?;
+    if !canonical_metadata.is_file()
+        || canonical_metadata.dev() != opened.dev()
+        || canonical_metadata.ino() != opened.ino()
+    {
+        return Err(format!("video \"{reference}\" changed during validation"));
+    }
+    Ok(source)
+}
+
+/// Copy one validated source into the worker-owned video directory. The
+/// extra byte read is intentional: a concurrently growing source cannot
+/// bypass the source cap merely because its initial metadata was smaller.
+fn stage_file_video(root: &Path, reference: &str, slot: usize) -> Result<PathBuf, String> {
+    let mut source = open_video_source(root, reference)?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    copy_video_file_into(&home, slot, &mut source).map_err(|error| {
+        format!("cannot stage video \"{reference}\" into the worker directory: {error}")
+    })
+}
+
 /// Write one package video entry into a private 0700 directory under the
 /// worker's HOME, mirroring `extract_script`. Videos are extracted rather
 /// than decoded in memory because libmpv opens a path; the directory is
@@ -1384,6 +1460,146 @@ fn extract_video(slot: usize, bytes: &[u8]) -> std::io::Result<PathBuf> {
 /// a symlink itself rather than following it, so a planted link cannot
 /// redirect the write.
 fn extract_video_into(home: &Path, slot: usize, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    if bytes.len() as u64 > video::MAX_VIDEO_SOURCE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "video source exceeds the bounded extraction limit",
+        ));
+    }
+    let dir = ensure_video_dir(home)?;
+    let path = dir.slot_path(slot);
+    let mut file = dir.create_slot(slot)?;
+    file.write_all(bytes)?;
+    Ok(path)
+}
+
+/// Stream a validated file descriptor into the same private slot layout as
+/// package extraction. No whole-source allocation is needed, and a source
+/// that grows while being copied is rejected and removed.
+fn copy_video_file_into(
+    home: &Path,
+    slot: usize,
+    source: &mut fs::File,
+) -> std::io::Result<PathBuf> {
+    if source.metadata()?.len() > video::MAX_VIDEO_SOURCE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "video source exceeds the bounded extraction limit",
+        ));
+    }
+    let dir = ensure_video_dir(home)?;
+    let path = dir.slot_path(slot);
+    let mut output = dir.create_slot(slot)?;
+    // Write at most the kernel file-size limit. Probe one additional source
+    // byte only after the bounded copy; it must never be written to the
+    // destination, otherwise RLIMIT_FSIZE can kill the worker at exactly the
+    // contract boundary.
+    let copied = std::io::copy(&mut source.take(video::MAX_VIDEO_SOURCE_BYTES), &mut output);
+    match copied {
+        Ok(bytes) if bytes == video::MAX_VIDEO_SOURCE_BYTES => {
+            let mut extra = [0u8; 1];
+            match source.read(&mut extra) {
+                Ok(0) => Ok(path),
+                Ok(_) => {
+                    dir.unlink_slot(slot);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "video source grew beyond the bounded extraction limit",
+                    ))
+                }
+                Err(error) => {
+                    dir.unlink_slot(slot);
+                    Err(error)
+                }
+            }
+        }
+        Ok(_) => {
+            // A short source is complete after the bounded copy. No extra
+            // byte was written, and the subsequent probe distinguishes an
+            // exact-cap source from one that grew during the read.
+            let mut extra = [0u8; 1];
+            match source.read(&mut extra) {
+                Ok(0) => Ok(path),
+                Ok(_) => {
+                    dir.unlink_slot(slot);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "video source grew beyond the bounded extraction limit",
+                    ))
+                }
+                Err(error) => {
+                    dir.unlink_slot(slot);
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            dir.unlink_slot(slot);
+            Err(error)
+        }
+    }
+}
+
+/// Open the worker-private extraction directory and perform all slot
+/// operations relative to its stable fd. This closes the intermediate
+/// directory-symlink swap window left by pathname remove/open calls.
+struct VideoDir {
+    path: PathBuf,
+    fd: RawFd,
+}
+
+impl Drop for VideoDir {
+    fn drop(&mut self) {
+        // SAFETY: fd was returned by libc::open and is owned by this value.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+impl VideoDir {
+    fn slot_path(&self, slot: usize) -> PathBuf {
+        self.path.join(format!("video-{slot}.bin"))
+    }
+
+    fn slot_name(slot: usize) -> CString {
+        CString::new(format!("video-{slot}.bin")).expect("slot name has no NUL")
+    }
+
+    fn create_slot(&self, slot: usize) -> std::io::Result<fs::File> {
+        let name = Self::slot_name(slot);
+        // SAFETY: self.fd is an open directory fd and name is NUL-terminated.
+        let unlinked = unsafe { libc::unlinkat(self.fd, name.as_ptr(), 0) };
+        if unlinked != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+        }
+        // SAFETY: openat creates the slot beneath the already-open directory;
+        // O_NOFOLLOW and O_EXCL prevent symlink redirection or replacement.
+        let fd = unsafe {
+            libc::openat(
+                self.fd,
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd is a fresh, exclusively-created file descriptor now
+        // owned by the returned File.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+
+    fn unlink_slot(&self, slot: usize) {
+        let name = Self::slot_name(slot);
+        // SAFETY: unlinkat acts only below this stable directory fd.
+        let _ = unsafe { libc::unlinkat(self.fd, name.as_ptr(), 0) };
+    }
+}
+
+fn ensure_video_dir(home: &Path) -> std::io::Result<VideoDir> {
     let dir = home.join(format!("kwe-scene-video-{}", std::process::id()));
     match fs::symlink_metadata(&dir) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
@@ -1398,27 +1614,73 @@ fn extract_video_into(home: &Path, slot: usize, bytes: &[u8]) -> std::io::Result
         }
         Err(error) => return Err(error),
     }
-    let path = dir.join(format!("video-{slot}.bin"));
-    let _ = fs::remove_file(&path);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(bytes)?;
-    Ok(path)
+    let meta = fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "video directory changed to a symlink or non-directory",
+        ));
+    }
+    let c_path = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "video directory contains NUL",
+        )
+    })?;
+    // SAFETY: c_path is a valid path; flags open exactly the plain directory
+    // just validated and never follow a final symlink.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: stat points to writable storage and fd is valid.
+    let stat_result = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if stat_result != 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: fd is owned here after open.
+        unsafe { libc::close(fd) };
+        return Err(error);
+    }
+    // SAFETY: fstat succeeded and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
+        || stat.st_dev != meta.dev()
+        || stat.st_ino != meta.ino()
+    {
+        // SAFETY: fd is owned here after open.
+        unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "video directory changed during staging",
+        ));
+    }
+    Ok(VideoDir { path: dir, fd })
 }
 
-/// Remove the extracted video directory on the worker's graceful exit path
-/// (the worker owns its HOME). Unconditional: the directory only exists
-/// when a packaged scene carried a video, and a missing one is not an
-/// error. A kill -9 leaves it behind; the next start with a recycled pid
-/// replaces the files inside it.
-fn cleanup_video_dir() {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    cleanup_video_dir_in(&home);
+struct VideoCleanupGuard {
+    home: PathBuf,
+}
+
+impl VideoCleanupGuard {
+    fn new() -> Self {
+        Self {
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        }
+    }
+}
+
+impl Drop for VideoCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_video_dir_in(&self.home);
+    }
 }
 
 /// The cleanup core, testable against a caller-chosen HOME (the same split
@@ -1972,6 +2234,58 @@ mod tests {
     }
 
     #[test]
+    fn file_video_is_staged_as_an_immutable_private_snapshot() {
+        // The decoder must never receive the content-root path. It receives
+        // a worker-owned copy made from the already-open source fd, so a
+        // later replacement cannot change what libmpv reads.
+        let root =
+            std::env::temp_dir().join(format!("kwe-video-stage-root-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("kwe-video-stage-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let source = root.join("clip.mp4");
+        fs::write(&source, b"original synthetic video").unwrap();
+        let mut opened = open_video_source(&root, "clip.mp4").unwrap();
+        let staged = copy_video_file_into(&home, 0, &mut opened).unwrap();
+        assert!(staged.starts_with(&home));
+        assert_eq!(fs::read(&staged).unwrap(), b"original synthetic video");
+
+        // Replacing the source after staging cannot affect the private
+        // decoder input. A symlink reference is refused at open time too.
+        fs::write(&source, b"replacement outside the snapshot").unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"original synthetic video");
+        let link = root.join("link.mp4");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(open_video_source(&root, "link.mp4").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn file_video_staging_enforces_the_source_cap_while_streaming() {
+        let home = std::env::temp_dir().join(format!("kwe-video-stage-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let oversized = home.join("oversized.mp4");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(video::MAX_VIDEO_SOURCE_BYTES + 1)
+            .unwrap();
+        let mut source = fs::File::open(&oversized).unwrap();
+        assert!(copy_video_file_into(&home, 0, &mut source).is_err());
+        assert!(
+            !home
+                .join(format!("kwe-scene-video-{}", std::process::id()))
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn load_layer_videos_fills_paths_and_skips_unresolved() {
         // Through a real closure, the file lane's shape: a resolvable
         // source fills `path`; an unresolvable one and a cleared source
@@ -2096,6 +2410,30 @@ mod tests {
     }
 
     #[test]
+    fn video_slot_fd_survives_directory_path_swap_without_redirecting() {
+        let home = std::env::temp_dir().join(format!("kwe-video-dirfd-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("kwe-video-dirfd-out-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let dir = ensure_video_dir(&home).unwrap();
+        let original = dir.path.clone();
+        let moved = home.join("moved-video-dir");
+        fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &original).unwrap();
+        let mut slot = dir.create_slot(0).unwrap();
+        slot.write_all(b"fd-owned").unwrap();
+        drop(slot);
+        assert_eq!(fs::read(moved.join("video-0.bin")).unwrap(), b"fd-owned");
+        assert!(!outside.join("video-0.bin").exists());
+        drop(dir);
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn cleanup_video_dir_removes_only_its_own_dir() {
         // The graceful exit path removes what extract_video_into created,
         // and nothing else: a symlink of the same name is left alone.
@@ -2121,6 +2459,22 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&linked);
+    }
+
+    #[test]
+    fn video_cleanup_guard_removes_staged_media_on_drop() {
+        let home = std::env::temp_dir().join(format!("kwe-video-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let staged = extract_video_into(&home, 0, b"payload").unwrap();
+        let dir = staged.parent().unwrap().to_path_buf();
+        {
+            let guard = VideoCleanupGuard { home: home.clone() };
+            assert!(dir.exists());
+            drop(guard);
+        }
+        assert!(!dir.exists(), "guard drop must remove staged media");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
