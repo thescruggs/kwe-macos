@@ -781,16 +781,29 @@ echo "scene smoke: M3c fixtures generated"
 #   add      min(255, texel+bg)                -> (166,167,168)
 #   screen   255-(255-texel)(255-bg)/255       -> (140,141,154)
 #   subtract max(0, bg-texel)                  -> (38,0,0)
-# plus an add-mode alpha=128 case over a transparent clear (the readback
-# premultiplies: R=(64*128+127)/255=32, G=(103*128+127)/255=52,
-# B=(142*128+127)/255=71, A=128), a translucent multiply case (layer alpha
-# 0.5 over a 0.5-alpha clear: the mode acts on the color, the ALPHA
-# composites src-over — 0.5 + (128/255)*0.5 = 191.5 -> 192, and the
-# readback premultiplies: R=(26*192+127)/255=20, G=20, B=(14*192+127)/255=11
-# — pins the review-fixed alpha policy), an effects case (brightness 2.0,
-# tint (1,0.4,0.5): R=128, G=103*2*0.4=82.4->82, B=142), a colorBlendMode=11
-# clamp case (unimplemented -> normal + bounded one-time diagnostic), and a
-# script-driven case that switches blendMode at runtime.
+# plus an add-mode alpha=128 case over a transparent clear. S7b (B1):
+# texture.frag now outputs PREMULTIPLIED color, so the shader itself scales
+# the texel by the layer alpha before Add's (ONE, ONE) factors see it:
+# src_premult = (64,103,142)*128/255 = (32,52,71) quantized, stored as-is
+# over the transparent clear (dst=0) -> attachment (32,52,71,128). The
+# readback premultiplies AGAIN, by that same stored alpha:
+# R=(32*128+127)/255=16, G=(52*128+127)/255=26, B=(71*128+127)/255=36,
+# A=128 (before B1, with a straight-color shader, this oracle was
+# (32,52,71,128) — the single readback premultiply happened to equal what
+# the shader now computes directly); a translucent multiply case (layer
+# alpha 0.5 over a 0.5-alpha clear: the mode acts on the premultiplied
+# color — src_premult = (64,103,142)*0.5 = (32,52,71) quantized — Multiply's
+# (DST_COLOR, ZERO) hard-multiplies that against the quantized clear
+# (R=102,G=64,B=26): R=32*102/255->13, G=52*64/255->13, B=71*26/255->7; the
+# ALPHA composites src-over exactly as before (alpha is written as `a`, not
+# `a*a`) — 0.5 + (128/255)*0.5 = 191.5 -> 192, and the readback premultiplies
+# once more: R=(13*192+127)/255=10, G=10, B=(7*192+127)/255=5 — pins the
+# review-fixed alpha policy under the new premultiplied convention; before
+# B1 this oracle was (11,20,20,192)), an effects case (brightness 2.0,
+# tint (1,0.4,0.5): R=128, G=103*2*0.4=82.4->82, B=142 — opaque, alpha=1,
+# so B1's premultiply is a no-op and this oracle is unchanged), a
+# colorBlendMode=11 clamp case (unimplemented -> normal + bounded one-time
+# diagnostic), and a script-driven case that switches blendMode at runtime.
 m3d_texel="$smoke_root/m3d-texel.png"
 m3d_normal_scene="$smoke_root/m3d-normal.json"
 m3d_multiply_scene="$smoke_root/m3d-multiply.json"
@@ -862,13 +875,15 @@ for mode, path in ((1, sys.argv[3]), (6, sys.argv[4]), (7, sys.argv[5]), (9, sys
     l = dict(layer, colorBlendMode=mode)
     json.dump(scene([l]), open(path, "w"))
 # The alpha=128 add case: layer alpha 0.5 over a fully transparent clear —
-# the blend stores the straight (64,103,142,128) and the readback
-# premultiplies exactly once (the M3c blend oracle pattern).
+# S7b (B1): the shader premultiplies the texel by the layer alpha itself,
+# so the attachment stores that premultiplied (32,52,71,128), and the
+# readback premultiplies it again (see the M3d fixture header comment).
 l = dict(layer, alpha=0.5, colorBlendMode=6)
 json.dump(scene([l], clear=(0.0, 0.0, 0.0, 0.0)), open(sys.argv[7], "w"))
 # The translucent multiply case: layer alpha 0.5 over a 0.5-alpha clear —
 # the alpha policy (the mode acts on the color, the alpha composites
-# src-over) pinned byte-exact; see the M3d-10 case below.
+# src-over) pinned byte-exact under the S7b/B1 premultiplied convention;
+# see the M3d-10 case below.
 l = dict(layer, alpha=0.5, colorBlendMode=1)
 json.dump(scene([l], clear=(0.4, 0.25, 0.1, 0.5)), open(sys.argv[8], "w"))
 # The effects case: brightness 2.0 with a tint (1, 0.4, 0.5) — applied to
@@ -2005,21 +2020,27 @@ scene_pixel_oracle "$m3c_a_frame" 150 85 "255,0,0,255" 1
 echo "scene smoke passed (M3c a): two layers — fullscreen red under blue 40x22 at (60,34)"
 
 # Case M3c-b: the src-over blend oracle. Opaque texel (64,103,142,255) at
-# layer alpha 191/255 over a zero clear: the shader outputs straight color
-# and the color blend factor is ONE, so the attachment stores the STRAIGHT
-# composite (64,103,142,191); the readback premultiplies exactly once:
-# R=64*191/255=48, G=103*191/255=77, B=142*191/255=106 — BGRA memory order
-# (106,77,48,191). (A color factor of SRC_ALPHA would have stored an
-# already-premultiplied composite and the readback would premultiply AGAIN,
-# the double-darkened (79,58,36,191) — that was the M3c review finding.)
-# The alpha channel blend factor is ONE (not SRC_ALPHA), so the stored
-# alpha is 191, not 143.
+# layer alpha 191/255 over a zero clear. S7b (B1): texture.frag now outputs
+# PREMULTIPLIED color, so the fragment itself scales the texel by the layer
+# alpha before the blend hardware sees it: src_premult =
+# (64,103,142)*191/255 = (48,77,106) quantized, stored as-is by the ONE
+# color factor over the transparent clear -> attachment (48,77,106,191).
+# The readback then premultiplies AGAIN, this time by the frame's own final
+# alpha (this fixture's clear is transparent, not the opaque-frame case
+# where that pass is an identity): R=48*191/255=36, G=77*191/255=58,
+# B=106*191/255=79 — BGRA memory order (79,58,36,191). (Before B1, with a
+# straight-color shader, this same oracle was (106,77,48,191); an earlier,
+# buggy premultiplied-shader + SRC_ALPHA-color-factor combination once
+# produced this same (79,58,36,191) by double-premultiplying a straight
+# source — that was the original M3c review finding this oracle was
+# written to catch.) The alpha channel blend factor is ONE (not
+# SRC_ALPHA), so the stored alpha is 191, not 143.
 call_daemon renderer.start "$(jq -cn --arg content "$m3c_b_scene" \
     '{wallpaper_id:"scene-m3c-b",content_hash:"hash-m3c-b",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3c_b_status="$(wait_phase live)"
 m3c_b_frame="$(jq -r '.result.frame_file' <<<"$m3c_b_status")"
-scene_pixel_oracle "$m3c_b_frame" 80 45 "106,77,48,191" 1
-echo "scene smoke passed (M3c b): src-over blend — alpha 191/255 over zero clear -> (106,77,48,191)"
+scene_pixel_oracle "$m3c_b_frame" 80 45 "79,58,36,191" 1
+echo "scene smoke passed (M3c b): src-over blend — alpha 191/255 over zero clear -> (79,58,36,191, premultiplied src S7b/B1)"
 
 # Case M3c-c: draw order — the same two layers with the blue mark FIRST in
 # scene.json: the fullscreen red layer draws last, so (60,34) is red now.
@@ -2140,33 +2161,40 @@ m3d_effects_frame="$(jq -r '.result.frame_file' <<<"$m3d_effects_status")"
 scene_pixel_oracle "$m3d_effects_frame" 80 45 "142,82,128,255" 1
 echo "scene smoke passed (M3d 6): brightness 2.0 + tint (1,0.4,0.5) before blending"
 
-# Case M3d-7: add mode at layer alpha 0.5 over a transparent clear — the
-# single-premultiplication pin: the attachment stores the STRAIGHT
-# composite (64,103,142,128) — alpha 0.5*255=127.5 rounds to 128 — and the
-# readback premultiplies exactly once: B=(142*128+127)/255=71,
-# G=(103*128+127)/255=52, R=(64*128+127)/255=32.
+# Case M3d-7: add mode at layer alpha 0.5 over a transparent clear. S7b
+# (B1): texture.frag now outputs PREMULTIPLIED color — alpha 0.5*255=127.5
+# rounds to 128, so the shader scales the texel by 128/255 itself before
+# Add's (ONE, ONE) factors see it: src_premult = (64,103,142)*128/255 ->
+# (32,52,71) quantized, stored as-is over the transparent clear (dst=0).
+# The readback then premultiplies AGAIN by that same stored 128:
+# B=(71*128+127)/255=36, G=(52*128+127)/255=26, R=(32*128+127)/255=16.
+# Before B1 (straight-color shader) this oracle was (71,52,32,128).
 call_daemon renderer.start "$(jq -cn --arg content "$m3d_add128_scene" \
     '{wallpaper_id:"scene-m3d-add128",content_hash:"hash-m3d-add128",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3d_add128_status="$(wait_phase live)"
 m3d_add128_frame="$(jq -r '.result.frame_file' <<<"$m3d_add128_status")"
-scene_pixel_oracle "$m3d_add128_frame" 80 45 "71,52,32,128" 1
-echo "scene smoke passed (M3d 7): add at alpha 128 — straight composite premultiplied once"
+scene_pixel_oracle "$m3d_add128_frame" 80 45 "36,26,16,128" 1
+echo "scene smoke passed (M3d 7): add at alpha 128 — premultiplied src, double premultiply at readback (S7b/B1)"
 
 # Case M3d-10: the translucent multiply alpha policy — layer alpha 0.5 over
-# a 0.5-alpha clear. The mode acts on the color (the attachment stores the
-# hard multiply B=142*26/255=14, G=103*64/255=26, R=64*102/255=26) while
-# the ALPHA channel composites src-over: 0.5 + (128/255)*0.5 = 0.75098 ->
-# 191.5 -> 192 (the dst alpha is the quantized 128, which pushes the tie to
-# 192). Readback premultiplies exactly once: B=(14*192+127)/255=11,
-# G=(26*192+127)/255=20, R=20, A=192. This pins that the layer's own
+# a 0.5-alpha clear. S7b (B1): the mode acts on the PREMULTIPLIED color —
+# src_premult = (64,103,142)*0.5 -> (32,52,71) quantized — so the hard
+# multiply (DST_COLOR, ZERO) against the quantized clear (R=102,G=64,B=26)
+# gives B=71*26/255=7, G=52*64/255=13, R=32*102/255=13, while the ALPHA
+# channel composites src-over exactly as before (alpha is written as `a`,
+# not `a*a`, so B1 does not touch this half): 0.5 + (128/255)*0.5 =
+# 0.75098 -> 191.5 -> 192 (the dst alpha is the quantized 128, which pushes
+# the tie to 192). Readback premultiplies once more: B=(7*192+127)/255=5,
+# G=(13*192+127)/255=10, R=10, A=192. Before B1 (straight-color shader)
+# this oracle was (11,20,20,192). This still pins that the layer's own
 # opacity survives (the review-fixed (ZERO, ONE) delivered the backdrop's
 # (7,13,13,128) instead, discarding the layer's 0.5 entirely).
 call_daemon renderer.start "$(jq -cn --arg content "$m3d_multiply128_scene" \
     '{wallpaper_id:"scene-m3d-multiply128",content_hash:"hash-m3d-multiply128",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 m3d_multiply128_status="$(wait_phase live)"
 m3d_multiply128_frame="$(jq -r '.result.frame_file' <<<"$m3d_multiply128_status")"
-scene_pixel_oracle "$m3d_multiply128_frame" 80 45 "11,20,20,192" 1
-echo "scene smoke passed (M3d 10): translucent multiply — alpha src-over, layer opacity survives"
+scene_pixel_oracle "$m3d_multiply128_frame" 80 45 "5,10,10,192" 1
+echo "scene smoke passed (M3d 10): translucent multiply — alpha src-over, layer opacity survives (premultiplied src, S7b/B1)"
 
 # Case M3d-8: colorBlendMode 11 is a recorded-but-undecoded value that no
 # fixed-function Vulkan factor can express, so it clamps to normal with a
@@ -3031,9 +3059,9 @@ for _attempt in {1..400}; do
     sleep 0.05
 done
 head -c 8 "$standalone_blend" | grep -q KWEFRM1
-scene_pixel_wait "$standalone_blend" 80 45 "106,77,48,191" 1 "$smoke_root/standalone-blend.log"
+scene_pixel_wait "$standalone_blend" 80 45 "79,58,36,191" 1 "$smoke_root/standalone-blend.log"
 stop_standalone "$standalone_blend_pid" "$smoke_root/standalone-blend.log" "standalone M3c blend renderer"
-echo "scene smoke passed: standalone llvmpipe lane — M3c blend oracle (106,77,48,191)"
+echo "scene smoke passed: standalone llvmpipe lane — M3c blend oracle (79,58,36,191, premultiplied src S7b/B1)"
 
 if [[ "$m3g_ready" == "1" ]]; then
     # Standalone M3g lane: the same synthetic clip is opened directly by the
@@ -3132,12 +3160,13 @@ scene_pixel_wait "$smoke_root/standalone-m3d-subtract.bin" 80 45 "0,0,38,255" 0 
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d subtract byte oracle"
 
-# Add at alpha 128: the single-premultiplication pin — the straight
-# composite (64,103,142,128) premultiplied once at readback. The alpha 0.5
-# stores 128 (0.5*255=127.5 rounds to nearest even), and the RGB follows:
-# B=(142*128+127)/255=71, G=(103*128+127)/255=52, R=(64*128+127)/255=32.
+# Add at alpha 128: S7b (B1) premultiplied-src double premultiply — the
+# alpha 0.5 stores 128 (0.5*255=127.5 rounds to nearest even), the shader
+# premultiplies the texel by it (src_premult=(32,52,71)), and the readback
+# premultiplies that again: B=(71*128+127)/255=36, G=(52*128+127)/255=26,
+# R=(32*128+127)/255=16.
 lane_start "$smoke_root/standalone-m3d-add128.bin" "$m3d_add128_scene" "$smoke_root/standalone-m3d-add128.log"
-scene_pixel_wait "$smoke_root/standalone-m3d-add128.bin" 80 45 "71,52,32,128" 0 "$smoke_root/standalone-m3d-add128.log"
+scene_pixel_wait "$smoke_root/standalone-m3d-add128.bin" 80 45 "36,26,16,128" 0 "$smoke_root/standalone-m3d-add128.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d add-at-128 byte oracle"
 
@@ -3148,9 +3177,10 @@ lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d effects byte oracle"
 
 # Translucent multiply: the alpha-policy pin — layer alpha 0.5 over a
-# 0.5-alpha clear, delivered (11,20,20,192).
+# 0.5-alpha clear, delivered (5,10,10,192) under the S7b/B1 premultiplied
+# convention (was (11,20,20,192) with the straight-color shader).
 lane_start "$smoke_root/standalone-m3d-multiply128.bin" "$m3d_multiply128_scene" "$smoke_root/standalone-m3d-multiply128.log"
-scene_pixel_wait "$smoke_root/standalone-m3d-multiply128.bin" 80 45 "11,20,20,192" 0 "$smoke_root/standalone-m3d-multiply128.log"
+scene_pixel_wait "$smoke_root/standalone-m3d-multiply128.bin" 80 45 "5,10,10,192" 0 "$smoke_root/standalone-m3d-multiply128.log"
 lane_stop
 echo "scene smoke passed: standalone llvmpipe lane — M3d translucent multiply byte oracle"
 

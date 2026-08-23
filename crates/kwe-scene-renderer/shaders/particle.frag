@@ -4,8 +4,16 @@
 // in the vertex attributes (instance factors like colorn/alpha are folded
 // into it on the CPU), then apply the M3d color effects like texture.frag —
 // brightness × tint on the sampled RGB, alpha scaled by the pushed layer
-// alpha (1.0 for particle draws). Straight color output; the pipeline's
-// blend state (the system's blend-mode variant) combines with the frame.
+// alpha (1.0 for particle draws). S7b (B1): PREMULTIPLIED output — matches
+// the S6 material-fragment convention and the pipeline's blend state
+// (`vulkan.rs::blend_attachment_for`), which is written for premultiplied
+// input: `Normal` (ONE, ONE_MINUS_SRC_ALPHA) is then true src-over, and
+// `Add` (ONE, ONE) is exactly upstream's additive blend
+// (`CPass.cpp:134-136` glBlendFuncSeparate(SRC_ALPHA, ONE) applied to
+// straight color ≡ (ONE, ONE) applied to premultiplied color). Straight
+// output under a premultiplied blend table made a fading additive particle
+// never fade (its RGB added at full strength regardless of alpha) and made
+// translucent particles too bright.
 // Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o particle.frag.spv particle.frag
 layout(set = 0, binding = 0) uniform sampler2D tex;
@@ -26,5 +34,6 @@ void main() {
     c *= vColor;                // per-particle color (colorStart..colorEnd)
     c.rgb *= pc.effects.x;      // brightness (0..=10, default 1)
     c.rgb *= pc.effects.yzw;    // tint RGB (0..=1, default 1)
-    outColor = vec4(c.rgb, c.a * pc.m1.w); // alpha = texel · color.a · layer alpha
+    float a = c.a * pc.m1.w;    // alpha = texel · color.a · layer alpha
+    outColor = vec4(c.rgb * a, a); // premultiplied output (S7b/B1)
 }
