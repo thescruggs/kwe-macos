@@ -87,6 +87,13 @@ pub struct ResolvedModel {
     /// referencing a texture that does not exist fails resolution
     /// entirely, the same honesty contract slot 0 already had.
     pub texture_slots: Vec<Option<TextureSlot>>,
+    /// S3: `model.json`'s own `"fullscreen"` boolean (default `false`) —
+    /// a `copybackground` post-process layer (e.g. the corpus's
+    /// `models/util/fullscreenlayer.json`) declares this so the renderer
+    /// knows to size the layer to the scene's world extent when it has
+    /// no static base texture to size from (its only texture slot is
+    /// typically a `_rt_` runtime target).
+    pub fullscreen: bool,
 }
 
 /// The texture-name-to-asset-path rule
@@ -148,6 +155,15 @@ pub struct TextureSlot {
     pub name: String,
     pub texture_ref: String,
     pub bytes: Vec<u8>,
+    /// S3: `true` when `name` is a `_rt_`/`_alias_` runtime render-target
+    /// reference (`crate::sceneeffect::is_runtime_target_name`) rather
+    /// than a `materials/<name>.tex` asset — `bytes` is empty in that
+    /// case; the slot is "resolved" for the B2 honesty gate, but its
+    /// actual pixel content is decided by the renderer's effect chain at
+    /// draw time (a live FBO view when an effect resolves it, or the
+    /// shared dummy texture when it does not — never a refusal, matching
+    /// this slice's degrade-not-refuse rule).
+    pub is_render_target: bool,
 }
 
 fn first_texture_name(textures: &Value) -> Option<(String, Vec<String>)> {
@@ -198,6 +214,10 @@ pub fn resolve_model(
         .and_then(Value::as_str)
         .ok_or_else(|| "model.json has no string \"material\" field".to_string())?
         .to_string();
+    let fullscreen = model_object
+        .get("fullscreen")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let material_bytes = lookup(&material_ref)
         .ok_or_else(|| format!("material reference \"{material_ref}\" could not be resolved"))?;
@@ -218,31 +238,50 @@ pub fn resolve_model(
         .get("textures")
         .and_then(first_texture_name)
         .ok_or_else(|| "material.json passes[0] has no texture slot".to_string())?;
-    let texture_ref = texture_asset_path(&texture_name);
-    let texture_bytes = lookup(&texture_ref)
-        .ok_or_else(|| format!("material texture \"{texture_ref}\" could not be resolved"))?;
-    // S1 review #2 (preflight/worker agreement): the pre-fix contract only
-    // checked that texture BYTES exist, never whether the worker could
-    // actually decode them — a resolvable-but-undecodable `.tex` (corrupt
-    // header, an unimplemented format) passed preflight and only failed
-    // once the worker parsed the identical scene, rolling the apply back
-    // after `wallpaper.apply` had already reported success. This cheap,
-    // decode-free header check (`crate::texvheader`, mirrors
-    // `kwe-scene-renderer::texv::parse_header`'s field layout without
-    // duplicating the LZ4/mip-chain/BC-decode machinery kwe-core cannot
-    // depend on) closes that gap for the common failure modes: a
-    // corrupt/truncated header, an unimplemented format, or a texture
-    // whose real dimensions alone would blow the shared texture budget.
-    if crate::texvheader::is_texv(&texture_bytes) {
-        let real_bytes = crate::texvheader::check_header(&texture_bytes).map_err(|reason| {
-            format!("material texture \"{texture_ref}\" is not decodable: {reason}")
-        })?;
-        if real_bytes > crate::texvheader::MAX_SINGLE_TEXTURE_BUDGET_BYTES {
-            return Err(format!(
-                "material texture \"{texture_ref}\" exceeds the texture budget"
-            ));
+    // S3: a `_rt_`/`_alias_` slot-0 name is never a `materials/<name>.tex`
+    // asset on disk — it is a live render target the renderer's effect
+    // chain resolves at draw time (`crate::sceneeffect::
+    // is_runtime_target_name`). Treating it as a filesystem miss is
+    // exactly the bug that kept the one remaining S1/S2-refused local
+    // scene (a full-screen effect layer whose base material samples
+    // `_rt_FullFrameBuffer`) from ever passing the B2 honesty gate: the
+    // gate only needs to know a slot-0 reference is *meaningful*, not
+    // that it decodes to bytes right now — a scene whose effect chain
+    // then fails to resolve that target still draws (degraded: the
+    // shared dummy texture fills that slot), it is never refused for it.
+    let is_render_target = crate::sceneeffect::is_runtime_target_name(&texture_name);
+    let (texture_ref, texture_bytes) = if is_render_target {
+        (texture_name.clone(), Vec::new())
+    } else {
+        let texture_ref = texture_asset_path(&texture_name);
+        let texture_bytes = lookup(&texture_ref)
+            .ok_or_else(|| format!("material texture \"{texture_ref}\" could not be resolved"))?;
+        // S1 review #2 (preflight/worker agreement): the pre-fix contract
+        // only checked that texture BYTES exist, never whether the worker
+        // could actually decode them — a resolvable-but-undecodable
+        // `.tex` (corrupt header, an unimplemented format) passed
+        // preflight and only failed once the worker parsed the identical
+        // scene, rolling the apply back after `wallpaper.apply` had
+        // already reported success. This cheap, decode-free header check
+        // (`crate::texvheader`, mirrors
+        // `kwe-scene-renderer::texv::parse_header`'s field layout without
+        // duplicating the LZ4/mip-chain/BC-decode machinery kwe-core
+        // cannot depend on) closes that gap for the common failure
+        // modes: a corrupt/truncated header, an unimplemented format, or
+        // a texture whose real dimensions alone would blow the shared
+        // texture budget.
+        if crate::texvheader::is_texv(&texture_bytes) {
+            let real_bytes = crate::texvheader::check_header(&texture_bytes).map_err(|reason| {
+                format!("material texture \"{texture_ref}\" is not decodable: {reason}")
+            })?;
+            if real_bytes > crate::texvheader::MAX_SINGLE_TEXTURE_BUDGET_BYTES {
+                return Err(format!(
+                    "material texture \"{texture_ref}\" exceeds the texture budget"
+                ));
+            }
         }
-    }
+        (texture_ref, texture_bytes)
+    };
 
     // S2: resolve every OTHER positional texture slot (1..MAX_MATERIAL_
     // TEXTURES), best-effort. Unlike slot 0 above, a slot that fails to
@@ -271,6 +310,16 @@ pub fn resolve_model(
                 name: texture_name.clone(),
                 texture_ref: texture_ref.clone(),
                 bytes: texture_bytes.clone(),
+                is_render_target,
+            }));
+            continue;
+        }
+        if crate::sceneeffect::is_runtime_target_name(name) {
+            texture_slots.push(Some(TextureSlot {
+                name: name.clone(),
+                texture_ref: name.clone(),
+                bytes: Vec::new(),
+                is_render_target: true,
             }));
             continue;
         }
@@ -286,6 +335,7 @@ pub fn resolve_model(
                 name: name.clone(),
                 texture_ref: slot_ref,
                 bytes,
+                is_render_target: false,
             })
         });
         texture_slots.push(slot);
@@ -336,6 +386,7 @@ pub fn resolve_model(
         extra_textures,
         constant_shader_values,
         texture_slots,
+        fullscreen,
     })
 }
 
@@ -449,6 +500,74 @@ mod tests {
         assert_eq!(resolved.shader.as_deref(), Some("genericimage2"));
         assert_eq!(resolved.blending.as_deref(), Some("translucent"));
         assert!(resolved.extra_textures.is_empty());
+    }
+
+    /// Regression pinned against the real Workshop scene 1652229298's
+    /// blocker: `materials/util/fullscreenlayer.json` (the shared
+    /// `copybackground` post-process base material both "Fullscreen"
+    /// objects in that scene use) declares its ONLY texture slot as the
+    /// literal string `"_rt_FullFrameBuffer"`. Before this fix, slot 0
+    /// resolution unconditionally tried `materials/_rt_FullFrameBuffer.tex`
+    /// on disk, which can never exist, failing the whole model (the S1
+    /// honesty gate) — this is what kept that scene refused after S1/S2.
+    #[test]
+    fn runtime_render_target_slot_zero_resolves_without_a_filesystem_lookup() {
+        let mut lookup = map_lookup(vec![
+            (
+                "models/util/fullscreenlayer.json",
+                br#"{"material": "materials/util/fullscreenlayer.json", "fullscreen": true}"#
+                    .to_vec(),
+            ),
+            (
+                "materials/util/fullscreenlayer.json",
+                br#"{"passes": [{"shader": "passthrough", "blending": "translucent",
+                    "textures": ["_rt_FullFrameBuffer"]}]}"#
+                    .to_vec(),
+            ),
+            // Deliberately NOT providing "materials/_rt_FullFrameBuffer.tex"
+            // — resolution must succeed without ever calling lookup() for
+            // that path (a real filesystem could never satisfy it).
+        ]);
+        let resolved =
+            resolve_model("models/util/fullscreenlayer.json", &mut lookup).expect("resolves");
+        assert_eq!(resolved.texture_name, "_rt_FullFrameBuffer");
+        assert_eq!(resolved.texture_ref, "_rt_FullFrameBuffer");
+        assert!(resolved.texture_bytes.is_empty());
+        assert!(resolved.fullscreen);
+        assert!(resolved.texture_slots[0].as_ref().unwrap().is_render_target);
+    }
+
+    #[test]
+    fn non_runtime_target_slot_zero_still_requires_the_asset_to_resolve() {
+        let mut lookup = map_lookup(vec![(
+            "models/m.json",
+            br#"{"material": "materials/m.json"}"#.to_vec(),
+        )]);
+        // material.json is never provided — this must still error, not
+        // silently pass, proving the render-target short-circuit only
+        // applies to `_rt_`/`_alias_`-prefixed names.
+        assert!(resolve_model("models/m.json", &mut lookup).is_err());
+    }
+
+    #[test]
+    fn extra_slot_runtime_target_name_also_short_circuits() {
+        let mut lookup = map_lookup(vec![
+            (
+                "models/m.json",
+                br#"{"material": "materials/m.json"}"#.to_vec(),
+            ),
+            (
+                "materials/m.json",
+                br#"{"passes": [{"shader": "s", "textures": ["base", "_rt_HalfCompoBuffer1"]}]}"#
+                    .to_vec(),
+            ),
+            ("materials/base.tex", b"bytes".to_vec()),
+        ]);
+        let resolved = resolve_model("models/m.json", &mut lookup).expect("resolves");
+        let slot1 = resolved.texture_slots[1].as_ref().expect("slot 1 resolved");
+        assert!(slot1.is_render_target);
+        assert_eq!(slot1.name, "_rt_HalfCompoBuffer1");
+        assert!(slot1.bytes.is_empty());
     }
 
     #[test]

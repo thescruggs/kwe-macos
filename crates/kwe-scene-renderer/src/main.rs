@@ -73,7 +73,9 @@ use particles::{MAX_PARTICLE_SYSTEMS, ParticleSystemState, particle_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
 use text::{MAX_TEXT_LAYERS, TextRenderer};
 use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
-use vulkan::{LayerRenderer, RenderError, is_fence_timeout};
+use vulkan::{
+    EffectTargetRequest, LayerRenderer, MaterialTextureBind, RenderError, is_fence_timeout,
+};
 
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
@@ -518,10 +520,30 @@ impl SceneWorker {
             frame_draws(&self.layers, &self.texture_ok, &self.material_ok),
             particle_draws(&self.particles, &self.particle_texture_ok),
         );
+        // S3: replay every effect action recorded at scene load (fresh
+        // content into every targeted FBO, then any `command`) BEFORE the
+        // main composite pass, so a layer's own material — whose bound
+        // texture slots may sample those FBOs — draws with this frame's
+        // effect output. A single bounds check for the overwhelming
+        // majority of scenes, which have no effects at all.
+        if let Err(error) = self.renderer.render_effect_chains() {
+            reject_render(&error, "fence timeout while replaying effect chains");
+        }
         let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
             Ok(pixels) => pixels,
             Err(error) => reject_render(&error, "initial render failure"),
         };
+        // S3: refresh `_rt_FullFrameBuffer` with THIS frame's finished
+        // composite, ready for the NEXT frame's `render_effect_chains`
+        // call — a one-frame lag, documented on
+        // `vulkan::LayerRenderer::snapshot_full_frame_buffer`. A no-op
+        // when no layer resolved an effect chain.
+        if let Err(error) = self.renderer.snapshot_full_frame_buffer() {
+            reject_render(
+                &error,
+                "fence timeout while snapshotting _rt_FullFrameBuffer",
+            );
+        }
         self.published = self.writer.publish(&initial)?;
         let mut last_pixels: Option<Vec<u8>> = Some(initial);
         loop {
@@ -580,6 +602,12 @@ impl SceneWorker {
                         frame_draws(&self.layers, &self.texture_ok, &self.material_ok),
                         particle_draws(&self.particles, &self.particle_texture_ok),
                     );
+                    // S3: same ordering as the initial frame above — a
+                    // fence timeout here is exactly as fatal as any other
+                    // per-frame Vulkan call.
+                    if let Err(error) = self.renderer.render_effect_chains() {
+                        reject_render(&error, "fence timeout while replaying effect chains");
+                    }
                     match self.renderer.render(color, &draws) {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
                             // Exact-size check: the conversion is exact by
@@ -587,6 +615,12 @@ impl SceneWorker {
                             // frame, which is skipped and counted, never
                             // published.
                             self.consecutive_render_failures = 0;
+                            if let Err(error) = self.renderer.snapshot_full_frame_buffer() {
+                                reject_render(
+                                    &error,
+                                    "fence timeout while snapshotting _rt_FullFrameBuffer",
+                                );
+                            }
                             self.published = self.writer.publish(&pixels)?;
                             last_pixels = Some(pixels);
                         }
@@ -934,6 +968,9 @@ fn main() -> Result<()> {
         &mut renderer,
         world_w,
         world_h,
+        spec.width,
+        spec.height,
+        &content,
         arguments.assets_dir.as_deref(),
     );
 
@@ -1112,12 +1149,16 @@ fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
         // kwe_core::scenemodel, looked up against the scene directory
         // first and the Wallpaper Engine assets root second (file lane
         // has no package entries to try first).
-        config.drawable_objects +=
-            load_model_textures(&mut config.layers, &mut used_bytes, |reference| {
+        config.drawable_objects += load_model_textures(
+            &mut config.layers,
+            &mut used_bytes,
+            config.resolution,
+            |reference| {
                 resolve_layer_image(&root, reference).ok().or_else(|| {
                     assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
                 })
-            });
+            },
+        );
         // M3g: stage every file-scene video into the worker-owned private
         // directory before libmpv sees it. The source is opened with
         // O_NOFOLLOW and copied through that already-open fd, so a later
@@ -1184,8 +1225,11 @@ fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
     let pkg_dir = content
         .parent()
         .and_then(|parent| parent.canonicalize().ok());
-    config.drawable_objects +=
-        load_model_textures(&mut config.layers, &mut used_bytes, |reference| {
+    config.drawable_objects += load_model_textures(
+        &mut config.layers,
+        &mut used_bytes,
+        config.resolution,
+        |reference| {
             if let Ok(index) = kwe_core::image_entry(reference, reader.entries())
                 && let Ok(bytes) = reader.read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
             {
@@ -1197,7 +1241,8 @@ fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
                 return Some(bytes);
             }
             assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
-        });
+        },
+    );
     // M3g: a packaged video is extracted into the worker's private HOME,
     // because libmpv opens a path rather than a byte slice. Bounded by
     // MAX_VIDEO_SOURCE_BYTES and by the concurrency cap the parse enforced.
@@ -1405,9 +1450,34 @@ fn load_particle_textures(
 /// (deliverable 4: unlike a direct image reference, which counts as
 /// drawable statically even before its bytes are known to decode, a model
 /// layer has no pipeline at all without a resolved texture).
+fn material_texture_slots(
+    resolved_model: &kwe_core::ResolvedModel,
+) -> Vec<Option<scene::MaterialTextureSource>> {
+    resolved_model
+        .texture_slots
+        .iter()
+        .map(|slot| {
+            slot.as_ref().map(|slot| {
+                if slot.is_render_target {
+                    scene::MaterialTextureSource::RenderTarget(slot.name.clone())
+                } else {
+                    scene::MaterialTextureSource::Bytes(slot.bytes.clone())
+                }
+            })
+        })
+        .collect()
+}
+
+/// S3: sizes and effect chains added on top of the S1/S2 model-texture
+/// resolution walk below. `scene_resolution` is the scene's own declared
+/// `general.orthogonalprojection` extent (scene units) — used ONLY to
+/// size a `fullscreen: true` model layer (the corpus's
+/// `models/util/fullscreenlayer.json` post-process base, S3) that has no
+/// static texture to size from and no explicit `size` in scene.json.
 fn load_model_textures(
     layers: &mut [scene::LayerSpec],
     used_bytes: &mut u64,
+    scene_resolution: Option<(u32, u32)>,
     mut resolve_asset: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> usize {
     let mut resolved = 0usize;
@@ -1423,20 +1493,45 @@ fn load_model_textures(
                 continue;
             }
         };
-        let Some(texture) = texv::decode_model_texture(&resolved_model.texture_bytes) else {
-            skipped += 1;
-            continue;
-        };
-        let pixels = u64::from(texture.width) * u64::from(texture.height);
-        if !texture_budget_allows(*used_bytes, texture.width, texture.height) {
-            skipped += 1;
-            continue;
+        // S3: a base texture that is a `_rt_`/`_alias_` runtime render
+        // target (the B2 honesty fix in `kwe_core::resolve_model`) has no
+        // bytes to decode — the object's real pixel content comes
+        // entirely from its effect chain (see `run_effect_chains`,
+        // vulkan.rs), and the base draw itself degrades to the shared
+        // dummy texture in that slot (never a refusal). Skip the texv
+        // decode step for this case; every other model layer keeps the
+        // exact S1/S2 decode-and-budget contract unchanged.
+        let is_render_target_base = kwe_core::is_runtime_target_name(&resolved_model.texture_name);
+        if !is_render_target_base {
+            let Some(texture) = texv::decode_model_texture(&resolved_model.texture_bytes) else {
+                skipped += 1;
+                continue;
+            };
+            let pixels = u64::from(texture.width) * u64::from(texture.height);
+            if !texture_budget_allows(*used_bytes, texture.width, texture.height) {
+                skipped += 1;
+                continue;
+            }
+            *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
+            if layer.size == [0.0, 0.0] {
+                layer.size = [texture.width as f32, texture.height as f32];
+            }
+            layer.texture = Some(texture);
+        } else if layer.size == [0.0, 0.0]
+            && resolved_model.fullscreen
+            && let Some((width, height)) = scene_resolution
+        {
+            // Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+            // src/WallpaperEngine/Render/Objects/CImage.cpp (the
+            // `fullscreen` model flag sizes the layer to the scene/output
+            // extent rather than a decoded texture) @ b016d7d1 — adapted
+            // (upstream sizes to the live output; this renderer uses the
+            // scene's own declared resolution, matching how every other
+            // "no explicit size" layer already falls back to a size
+            // derived from its content rather than the output).
+            layer.size = [width as f32, height as f32];
         }
-        *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
-        if layer.size == [0.0, 0.0] {
-            layer.size = [texture.width as f32, texture.height as f32];
-        }
-        layer.texture = Some(texture);
+        layer.fullscreen = resolved_model.fullscreen;
         // S2: keep the material data `resolve_model` already walked so
         // `compile_material_layers` (run after every layer's base texture
         // is known) can attempt a material-pipeline draw without
@@ -1457,12 +1552,18 @@ fn load_model_textures(
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
-            texture_slots: resolved_model
-                .texture_slots
-                .iter()
-                .map(|slot| slot.as_ref().map(|slot| slot.bytes.clone()))
-                .collect(),
+            texture_slots: material_texture_slots(&resolved_model),
         });
+        // S3: resolve this object's effects[] through the same lookup
+        // chain (pkg entries -> scene dir -> assets root) that just
+        // resolved model_ref/material_ref/texture_ref — effects live on
+        // the raw scene-object JSON, not model.json, so this could not
+        // happen inside `resolve_model` itself. Never fails the layer
+        // (`resolve_object_effects`'s own honesty rule).
+        if !layer.effects_raw.is_empty() {
+            layer.effects =
+                kwe_core::resolve_object_effects(&layer.effects_raw, &mut resolve_asset);
+        }
         resolved += 1;
     }
     if skipped > 0 {
@@ -1484,13 +1585,22 @@ const MAX_SHADER_SOURCE_BYTES: u64 = 256 * 1024;
 /// `shaders/<reference>` path either way `reference` did not start with
 /// `workshop/`, or the redirect did not resolve. `reference` already
 /// carries its extension (`.vert`/`.frag` for a shader, `.h` as `#include`
-/// names already do).
+/// names already do). `lookup` is the SAME pkg-entries -> scene-dir ->
+/// assets-root chain `load_model_textures`'s own asset resolution already
+/// uses (S3: a scene that bundles its OWN custom effect shaders inside
+/// its `scene.pkg` — the real corpus's godrays/tint effects both do this —
+/// could never resolve them when this only ever read the filesystem
+/// assets root; `shaders/<name>` is just one more relative path the SAME
+/// lookup chain already knows how to try).
 ///
 /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
 /// src/WallpaperEngine/Assets/AssetLocator.cpp:9-35 (`AssetLocator::shader`)
-/// @ b016d7d1 — adapted (confined_read against the assets root replaces
-/// the upstream virtual filesystem's `readString`).
-fn resolve_shader_reference(assets_root: &Path, reference: &str) -> Option<Vec<u8>> {
+/// @ b016d7d1 — adapted (the caller's lookup chain replaces the upstream
+/// virtual filesystem's `readString`).
+fn resolve_shader_reference(
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    reference: &str,
+) -> Option<Vec<u8>> {
     let path = Path::new(reference);
     if let Ok(stripped) = path.strip_prefix("workshop") {
         let mut components = stripped.components();
@@ -1498,30 +1608,28 @@ fn resolve_shader_reference(assets_root: &Path, reference: &str) -> Option<Vec<u
             let rest: PathBuf = components.collect();
             if let (Some(id), Some(rest)) = (id.as_os_str().to_str(), rest.to_str()) {
                 let redirect = format!("zcompat/scene/shaders/{id}/{rest}");
-                if let Some(bytes) =
-                    kwe_core::confined_read(assets_root, &redirect, MAX_SHADER_SOURCE_BYTES)
-                {
+                if let Some(bytes) = lookup(&redirect) {
                     return Some(bytes);
                 }
             }
         }
     }
-    kwe_core::confined_read(
-        assets_root,
-        &format!("shaders/{reference}"),
-        MAX_SHADER_SOURCE_BYTES,
-    )
+    lookup(&format!("shaders/{reference}"))
 }
 
 /// Read one shader stage's top-level source (`shaders/<shader_name>.vert`
 /// or `.frag`, through the workshop redirect above) as UTF-8. `None` on
 /// any read/decode failure — the caller treats it as one more material
 /// fallback reason.
-fn read_shader_stage(assets_root: &Path, shader_name: &str, extension: &str) -> Option<String> {
+fn read_shader_stage(
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    shader_name: &str,
+    extension: &str,
+) -> Option<String> {
     let mut path = PathBuf::from(shader_name);
     path.set_extension(extension);
     let reference = path.to_str()?;
-    let bytes = resolve_shader_reference(assets_root, reference)?;
+    let bytes = resolve_shader_reference(lookup, reference)?;
     String::from_utf8(bytes).ok()
 }
 
@@ -1639,16 +1747,470 @@ fn material_bind_error_is_fatal(error: &RenderError) -> bool {
     is_fence_timeout(error)
 }
 
+/// S3: a shader+combos+constants+texture-slots tuple in a shape both the
+/// base-material path and an effect pass can produce, so one shared
+/// preprocess/compile/bind flow serves both.
+struct PlannedMaterial {
+    shader: Option<String>,
+    blending: Option<String>,
+    combos: std::collections::BTreeMap<String, i64>,
+    constant_shader_values: Vec<(String, serde_json::Value)>,
+    texture_slots: Vec<Option<scene::MaterialTextureSource>>,
+}
+
+/// True when `slots` has NOTHING but `_rt_`/render-target texture slots
+/// — no real `.tex` bytes anywhere (an empty slice is vacuously true:
+/// "no real bytes" holds trivially when there are no slots at all).
+/// Shared, pure, unit-tested predicate behind TWO S3 safety decisions in
+/// `compile_material_layers` (see each call site's own doc comment):
+/// (1) a layer with no resolved effect chain whose material is this
+/// bare-passthrough shape never draws at all (the `models/util/
+/// fullscreenlayer.json` used WITHOUT `effects[]` case); (2) an effect
+/// chain's own final untargeted pass replaces the layer's base material
+/// ONLY when the base material is ALSO this bare-passthrough shape (the
+/// `copybackground` case) — never when it has a real photo/texture of
+/// its own to lose.
+fn texture_slots_are_bare_render_target_only(
+    slots: &[Option<scene::MaterialTextureSource>],
+) -> bool {
+    !slots
+        .iter()
+        .any(|slot| matches!(slot, Some(scene::MaterialTextureSource::Bytes(_))))
+}
+
+/// S3: one layer's resolved effect chain, walked in scene-declared order
+/// (every visible `ObjectEffect`, each effect's `passes[]` in file
+/// order): `final_material` — the LAST material pass with no `target`
+/// across the whole chain, which becomes this layer's OWN material
+/// (upstream's "no target = draws directly onto the compositor" case is
+/// exactly what a layer's own draw already does — folding it in reuses
+/// 100% of the existing per-layer pipeline/bind machinery instead of a
+/// second draw call). A chain with MORE than one untargeted pass keeps
+/// only the last one — a documented, bounded simplification (see
+/// `docs/SCENE_FORMAT_V1.md` "Effects and render targets"): every earlier
+/// untargeted pass's own visual contribution is not drawn. `intermediate`
+/// — every material pass WITH a `target`, compiled+bound to its own FBO
+/// each scene load and re-rendered every frame. `commands` — every
+/// `command: copy`/`swap` pass, `(source, target)` with the `"previous"`
+/// sentinel already substituted for the concrete FBO name it meant at
+/// that point in the chain.
+struct EffectChainPlan {
+    final_material: Option<PlannedMaterial>,
+    intermediate: Vec<(PlannedMaterial, String)>,
+    commands: Vec<(String, String)>,
+}
+
+fn combos_as_i64(
+    combos: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, i64> {
+    combos
+        .iter()
+        .filter_map(|(name, value)| Some((name.clone(), value.as_i64()?)))
+        .collect()
+}
+
+/// Convert one effect pass's resolved texture slots into
+/// `scene::MaterialTextureSource`, resolving the `"previous"` sentinel
+/// against `previous_source` (module doc comment on `plan_effect_chain`).
+fn effect_pass_texture_sources(
+    slots: &[Option<kwe_core::EffectTextureSlot>],
+    previous_source: &scene::MaterialTextureSource,
+) -> Vec<Option<scene::MaterialTextureSource>> {
+    slots
+        .iter()
+        .map(|slot| {
+            slot.as_ref().map(|slot| match slot {
+                kwe_core::EffectTextureSlot::Texture { bytes, .. } => {
+                    scene::MaterialTextureSource::Bytes(bytes.clone())
+                }
+                kwe_core::EffectTextureSlot::RenderTarget(name) => {
+                    scene::MaterialTextureSource::RenderTarget(name.clone())
+                }
+                kwe_core::EffectTextureSlot::Previous => previous_source.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `"previous"` is a chain-local, PER-SLOT concept (upstream
+/// `m_previousInput`/`m_input`, `CPass.cpp:209-244`): for the first pass
+/// in an object's whole effect chain, it means "whatever this pass's
+/// texture slot would otherwise have resolved to from the object's OWN
+/// base material" — NOT unconditionally the scene-wide
+/// `_rt_FullFrameBuffer`. Getting this wrong is a real, corpus-observed
+/// regression: an ordinary photo layer with an attached colour-grade
+/// effect (its base material samples its OWN real photo at slot 0, no
+/// `_rt_` anywhere) would have its first pass's `"previous"` wrongly
+/// resolve to the one-frame-stale, initially-transparent scene
+/// composite instead of that photo, making the whole effect (and thus
+/// the layer's final visible content, since the chain's last untargeted
+/// pass replaces the layer's own material) render black. Seeding
+/// `last_output` from the base material's OWN slot-0 content (falling
+/// back to `_rt_FullFrameBuffer` only when that slot is itself empty or
+/// already a render target — the `models/util/fullscreenlayer.json`
+/// `copybackground` case, e.g. Workshop scene 1652229298) gets both real
+/// corpus patterns right with one rule.
+fn plan_effect_chain(layer: &scene::LayerSpec) -> EffectChainPlan {
+    let mut last_output = layer
+        .material
+        .as_ref()
+        .and_then(|material| material.texture_slots.first())
+        .and_then(|slot| slot.clone())
+        .unwrap_or_else(|| {
+            scene::MaterialTextureSource::RenderTarget(kwe_core::FULL_FRAME_BUFFER.to_string())
+        });
+    let mut intermediate = Vec::new();
+    let mut commands = Vec::new();
+    let mut final_material = None;
+    for object_effect in &layer.effects {
+        if !object_effect.visible {
+            continue;
+        }
+        for pass in &object_effect.effect.passes {
+            match pass {
+                kwe_core::EffectPass::Command(command) => {
+                    // A command's source/target are always meant to be
+                    // named FBOs (an image copy, not a byte source) — if
+                    // `last_output` is not itself a named render target
+                    // at this point (the chain's very first pass and the
+                    // base material samples a real photo, not a render
+                    // target), "previous" has no FBO name to substitute;
+                    // falling through to the literal string is safe
+                    // (`copy_effect_target` no-ops on an unresolvable
+                    // name, this module's universal degrade contract).
+                    let resolve = |name: &str| {
+                        if name != kwe_core::PREVIOUS_INPUT {
+                            return name.to_string();
+                        }
+                        match &last_output {
+                            scene::MaterialTextureSource::RenderTarget(target) => target.clone(),
+                            scene::MaterialTextureSource::Bytes(_) => {
+                                kwe_core::PREVIOUS_INPUT.to_string()
+                            }
+                        }
+                    };
+                    commands.push((resolve(&command.source), resolve(&command.target)));
+                }
+                kwe_core::EffectPass::Material(material_pass) => {
+                    let texture_slots =
+                        effect_pass_texture_sources(&material_pass.texture_slots, &last_output);
+                    let planned = PlannedMaterial {
+                        shader: material_pass.shader.clone(),
+                        blending: material_pass.blending.clone(),
+                        combos: combos_as_i64(&material_pass.combos),
+                        constant_shader_values: material_pass
+                            .constant_shader_values
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect(),
+                        texture_slots,
+                    };
+                    match &material_pass.target {
+                        Some(target_name) => {
+                            last_output =
+                                scene::MaterialTextureSource::RenderTarget(target_name.clone());
+                            intermediate.push((planned, target_name.clone()));
+                        }
+                        None => final_material = Some(planned),
+                    }
+                }
+            }
+        }
+    }
+    EffectChainPlan {
+        final_material,
+        intermediate,
+        commands,
+    }
+}
+
+/// Build the `MAX_MATERIAL_TEXTURES` texture-bind list AND populate
+/// `uniforms.texture_resolution` from a positional slot list — shared by
+/// the base/final-material path and every targeted effect pass (S1/S2's
+/// original per-slot loop, generalized over `scene::MaterialTextureSource`
+/// instead of raw bytes so a `RenderTarget` slot passes straight through
+/// instead of needing bytes to decode).
+fn build_material_textures(
+    slots: &[Option<scene::MaterialTextureSource>],
+    uniforms: &mut materialshader::MaterialUniforms,
+) -> Vec<Option<MaterialTextureBind>> {
+    let mut textures: Vec<Option<MaterialTextureBind>> =
+        Vec::with_capacity(shaderpre::MAX_MATERIAL_TEXTURES);
+    for slot in slots.iter().take(shaderpre::MAX_MATERIAL_TEXTURES) {
+        match slot {
+            Some(scene::MaterialTextureSource::Bytes(bytes)) => {
+                match texv::decode_model_texture(bytes) {
+                    Some(texture) => {
+                        let index = textures.len();
+                        uniforms.texture_resolution[index] = [
+                            texture.width as f32,
+                            texture.height as f32,
+                            1.0 / (texture.width as f32).max(1.0),
+                            1.0 / (texture.height as f32).max(1.0),
+                        ];
+                        textures.push(Some(MaterialTextureBind::Bytes(
+                            texture.rgba,
+                            texture.width,
+                            texture.height,
+                        )));
+                    }
+                    None => textures.push(None),
+                }
+            }
+            Some(scene::MaterialTextureSource::RenderTarget(name)) => {
+                textures.push(Some(MaterialTextureBind::RenderTarget(name.clone())));
+            }
+            None => textures.push(None),
+        }
+    }
+    while textures.len() < shaderpre::MAX_MATERIAL_TEXTURES {
+        textures.push(None);
+    }
+    textures
+}
+
+/// Preprocess+compile one material's vertex/fragment pair (shared by the
+/// base/final-material path and every targeted effect pass). `label`
+/// (e.g. `"layer[3]"` or `"layer[3] effect[0] pass[2]"`) only reaches
+/// diagnostics via `fallback_reasons`' aggregate counts — this function
+/// itself is silent per-attempt (matching this file's one-line-per-reason
+/// convention). Returns `None` on any failure, having already
+/// incremented the matching `fallback_reasons` entry.
+#[allow(clippy::too_many_arguments)]
+fn compile_one_material(
+    lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
+    material: &PlannedMaterial,
+    fallback_reasons: &mut std::collections::BTreeMap<&'static str, usize>,
+    unsupported_uniform_names: &mut std::collections::BTreeSet<String>,
+) -> Option<(
+    Vec<u32>,
+    Vec<u32>,
+    layers::BlendMode,
+    materialshader::MaterialKey,
+)> {
+    let shader_name = material.shader.as_deref().or_else(|| {
+        *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
+        None
+    })?;
+
+    let vertex_source = read_shader_stage(lookup, shader_name, "vert").or_else(|| {
+        *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
+        None
+    })?;
+    let fragment_source = read_shader_stage(lookup, shader_name, "frag").or_else(|| {
+        *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
+        None
+    })?;
+
+    let constant_names: Vec<String> = material
+        .constant_shader_values
+        .iter()
+        .map(|(name, _)| name.clone())
+        .take(shaderpre::MAX_MATERIAL_CONSTANTS)
+        .collect();
+    let mut varying_locations = std::collections::BTreeMap::new();
+    let mut include: Box<shaderpre::IncludeLookup<'_>> =
+        Box::new(|name: &str| resolve_shader_reference(&mut *lookup, name));
+
+    let vertex_label = format!("{shader_name}.vert");
+    let vertex_pre = match shaderpre::preprocess(
+        shaderpre::Stage::Vertex,
+        &vertex_label,
+        &vertex_source,
+        &material.combos,
+        &constant_names,
+        &mut varying_locations,
+        &mut include,
+    ) {
+        Ok(output) => output,
+        Err(_) => {
+            *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+            return None;
+        }
+    };
+    if !material_vertex_format_supported(&vertex_pre.attributes) {
+        *fallback_reasons
+            .entry("unsupported_vertex_format")
+            .or_insert(0) += 1;
+        return None;
+    }
+
+    let fragment_label = format!("{shader_name}.frag");
+    let fragment_pre = match shaderpre::preprocess(
+        shaderpre::Stage::Fragment,
+        &fragment_label,
+        &fragment_source,
+        &material.combos,
+        &constant_names,
+        &mut varying_locations,
+        &mut include,
+    ) {
+        Ok(output) => output,
+        Err(_) => {
+            *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+            return None;
+        }
+    };
+
+    unsupported_uniform_names.extend(vertex_pre.unsupported_uniforms.iter().cloned());
+    unsupported_uniform_names.extend(fragment_pre.unsupported_uniforms.iter().cloned());
+
+    // S3: the S2 `render_target_reference` gate (reject any material
+    // mentioning `_rt_` at all — S2 had no FBO infrastructure to satisfy
+    // one) is gone: a `_rt_`/`Previous` texture slot now resolves to a
+    // live FBO view (or the shared dummy texture, never a failure) via
+    // `build_material_textures`/`resolve_texture_slots`, so there is
+    // nothing left for this gate to protect against.
+    let blend_mode = material_blend_mode(material.blending.as_deref());
+    let key = materialshader::MaterialKey::compute(
+        shader_name,
+        &fragment_pre.combos,
+        blend_mode.variant_index(),
+    );
+
+    let vertex_spirv = match materialshader::compile_stage(
+        &vertex_pre.source,
+        materialshader::Stage::Vertex,
+        &vertex_label,
+    ) {
+        Ok(spirv) => spirv,
+        Err(_) => {
+            *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+            return None;
+        }
+    };
+    let fragment_spirv = match materialshader::compile_stage(
+        &fragment_pre.source,
+        materialshader::Stage::Fragment,
+        &fragment_label,
+    ) {
+        Ok(spirv) => spirv,
+        Err(_) => {
+            *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+            return None;
+        }
+    };
+    Some((vertex_spirv, fragment_spirv, blend_mode, key))
+}
+
+/// S3: every `fbos[]` request across every layer's resolved, visible
+/// effects, sized to that LAYER's own pixel size / `scale` (upstream
+/// `CImage.cpp:652-654` — an effect FBO is sized relative to the OBJECT,
+/// not the scene) — `canvas_width`/`canvas_height` (pixels) and
+/// `world_width`/`world_height` (scene units, the F1 visible-extent
+/// divisor) convert `layer.size` (scene units) to pixels.
+fn effect_target_requests(
+    layers: &[scene::LayerSpec],
+    world_width: f32,
+    world_height: f32,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Vec<EffectTargetRequest> {
+    let mut requests = Vec::new();
+    let scale_x = if world_width > 0.0 {
+        canvas_width as f32 / world_width
+    } else {
+        1.0
+    };
+    let scale_y = if world_height > 0.0 {
+        canvas_height as f32 / world_height
+    } else {
+        1.0
+    };
+    for layer in layers {
+        for object_effect in &layer.effects {
+            if !object_effect.visible {
+                continue;
+            }
+            for fbo in &object_effect.effect.fbos {
+                if fbo.scale <= 0.0 || !fbo.scale.is_finite() {
+                    continue;
+                }
+                let width = ((layer.size[0] * scale_x) / fbo.scale).round().max(1.0) as u32;
+                let height = ((layer.size[1] * scale_y) / fbo.scale).round().max(1.0) as u32;
+                requests.push(EffectTargetRequest {
+                    name: fbo.name.clone(),
+                    width,
+                    height,
+                });
+            }
+        }
+    }
+    requests
+}
+
+/// S2/S3: for every model layer with resolved material data, attempt to
+/// preprocess + compile + bind its material shader (S2), and (S3) run
+/// every resolved effect chain: targeted passes get their own FBO and
+/// are re-rendered every frame (`renderer.render_effect_chains`, called
+/// from the main loop); the chain's own final untargeted pass — if any —
+/// REPLACES the layer's base material for this compile/bind step (see
+/// `EffectChainPlan`'s doc comment). On any failure the layer keeps
+/// drawing through the S1 base-texture quad above (`texture_ok` already
+/// covers it) — this step only ever ADDS a material-pipeline draw on top,
+/// never removes drawability, and an effect chain's own failure degrades
+/// to the layer's ordinary material/quad, never a refusal (deliverable 1's
+/// honesty rule, upheld at the render layer too).
+///
+/// Bounded: `materialshader::MAX_PIPELINES_PER_SCENE` distinct base
+/// pipelines; `vulkan::MAX_EFFECT_PASS_BINDINGS` distinct effect-pass
+/// pipelines; `vulkan::MAX_EFFECT_TARGETS_PER_SCENE`/`MAX_EFFECT_TARGET_
+/// BYTES` FBOs — every cap already enforced inside `vulkan.rs`'s own
+/// methods, this function just calls them and counts fallbacks.
+///
+/// Emits one bounded diagnostic per distinct fallback reason
+/// (`event=renderer.scene.shader_fallback reason=... count=N`), the S2
+/// summary line, and (S3, only when at least one layer has a resolved
+/// effect) `event=renderer.scene.effects objects=N passes=M fallback=K`.
+#[allow(clippy::too_many_arguments)]
 fn compile_material_layers(
     layers: &mut [scene::LayerSpec],
     renderer: &mut LayerRenderer,
     world_width: f32,
     world_height: f32,
+    canvas_width: u32,
+    canvas_height: u32,
+    content: &Path,
     assets_dir: Option<&Path>,
 ) -> Vec<bool> {
     let mut material_ok = vec![false; layers.len()];
-    let Some(assets_root) = assets_dir.and_then(|dir| dir.canonicalize().ok()) else {
-        return material_ok; // no assets dir (or it does not exist): shader source cannot resolve at all
+    let assets_root = assets_dir.and_then(|dir| dir.canonicalize().ok());
+    // S3: a scene can bundle its OWN custom shaders inside its `scene.pkg`
+    // (the real corpus's godrays/tint effects both do — none of their
+    // shaders live in the WE assets tree) — resolve shader source through
+    // the SAME pkg-entries -> scene-dir -> assets-root chain
+    // `load_model_textures` already uses for models/materials/textures,
+    // not the assets root alone. Still bail entirely only when NEITHER
+    // source could possibly resolve anything.
+    let pkg_reader = if content
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pkg"))
+    {
+        kwe_core::PkgReader::open(content).ok()
+    } else {
+        None
+    };
+    if assets_root.is_none() && pkg_reader.is_none() {
+        return material_ok;
+    }
+    let pkg_dir = content
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    let mut shader_lookup = move |reference: &str| -> Option<Vec<u8>> {
+        if let Some(reader) = &pkg_reader
+            && let Ok(index) = kwe_core::image_entry(reference, reader.entries())
+            && let Ok(bytes) = reader.read_entry_bounded(index, MAX_SHADER_SOURCE_BYTES)
+        {
+            return Some(bytes);
+        }
+        if let Some(dir) = &pkg_dir
+            && let Some(bytes) = kwe_core::confined_read(dir, reference, MAX_SHADER_SOURCE_BYTES)
+        {
+            return Some(bytes);
+        }
+        assets_root
+            .as_deref()
+            .and_then(|root| kwe_core::confined_read(root, reference, MAX_SHADER_SOURCE_BYTES))
     };
 
     let mut compiled = 0usize;
@@ -1662,138 +2224,142 @@ fn compile_material_layers(
     let mut unsupported_uniform_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
 
+    // S3: build every plan up front (pure, no I/O) so the FBO targets it
+    // needs can all be created in ONE `prepare_effect_targets` call before
+    // any pipeline compiles — a targeted effect pass's own pipeline
+    // creation (`compile_effect_pass`) requires its target to already
+    // exist.
+    let plans: Vec<Option<EffectChainPlan>> = layers
+        .iter()
+        .map(|layer| {
+            if layer.effects.is_empty() {
+                None
+            } else {
+                Some(plan_effect_chain(layer))
+            }
+        })
+        .collect();
+    let effect_objects = plans.iter().filter(|plan| plan.is_some()).count();
+    let requests = effect_target_requests(
+        layers,
+        world_width,
+        world_height,
+        canvas_width,
+        canvas_height,
+    );
+    let targets_created = match renderer.prepare_effect_targets(&requests) {
+        Ok(created) => created,
+        Err(error) => {
+            if is_fence_timeout(&error) {
+                reject_render(
+                    &error,
+                    "fence timeout while preparing effect render targets",
+                );
+            }
+            0
+        }
+    };
+
+    let mut effect_passes_attempted = 0usize;
+    let mut effect_fallback_reasons: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+
     for (index, layer) in layers.iter_mut().enumerate() {
-        let Some(material) = layer.material.clone() else {
+        let plan = plans[index].as_ref();
+        // S3 scope decision, safety-first: an effect chain's own final
+        // untargeted pass replaces the layer's base material ONLY when
+        // the base material has nothing real of its own to lose (its
+        // slot-0 is empty or already a `_rt_`/render-target name — the
+        // `copybackground` pattern this slice's flagship scene,
+        // 1652229298, uses). For an object whose base material samples a
+        // REAL photo/texture (the far more common real-corpus pattern —
+        // e.g. Workshop 1131061888's "trigun" image with FOUR attached
+        // effects: waterripple/waterflow/godrays/waterwaves), this
+        // renderer's single-`last_output`-chain model (concatenating
+        // every effect's passes in `effects[]` order into one linear
+        // "previous" chain) does not correctly capture upstream's real
+        // per-effect layering semantics — verified via the corpus
+        // regression sweep: letting the last effect's pass replace the
+        // base draw there discarded the real photo entirely (the object
+        // stopped drawing anything but the scene clear color), a
+        // regression the S1/S2 baseline never had. Until each effect's
+        // OWN "previous" seeding (independent of the others, or properly
+        // chained through actual upstream visibility) is implemented,
+        // this is the safe boundary: draw the effect's own output only
+        // for objects that have no real base content to protect, keep
+        // every other object's existing, already-correct S1/S2 material
+        // draw exactly as it was.
+        let base_is_passthrough = layer.material.as_ref().is_none_or(|material| {
+            texture_slots_are_bare_render_target_only(&material.texture_slots)
+        });
+        let planned = if let Some(final_material) = plan
+            .filter(|_| base_is_passthrough)
+            .and_then(|p| p.final_material.as_ref())
+        {
+            Some(PlannedMaterial {
+                shader: final_material.shader.clone(),
+                blending: final_material.blending.clone(),
+                combos: final_material.combos.clone(),
+                constant_shader_values: final_material.constant_shader_values.clone(),
+                texture_slots: final_material.texture_slots.clone(),
+            })
+        } else {
+            layer.material.as_ref().map(|material| PlannedMaterial {
+                shader: material.shader.clone(),
+                blending: material.blending.clone(),
+                combos: material.combos.clone(),
+                constant_shader_values: material.constant_shader_values.clone(),
+                texture_slots: material.texture_slots.clone(),
+            })
+        };
+        let Some(material) = planned else {
             continue; // not a model layer, or its base texture never resolved (load_model_textures)
         };
-        let Some(shader_name) = material.shader.as_deref() else {
-            *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
-            continue;
-        };
 
-        let Some(vertex_source) = read_shader_stage(&assets_root, shader_name, "vert") else {
-            *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
-            continue;
-        };
-        let Some(fragment_source) = read_shader_stage(&assets_root, shader_name, "frag") else {
-            *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
-            continue;
-        };
-
-        let constant_names: Vec<String> = material
-            .constant_shader_values
-            .iter()
-            .map(|(name, _)| name.clone())
-            .take(shaderpre::MAX_MATERIAL_CONSTANTS)
-            .collect();
-        let mut varying_locations = std::collections::BTreeMap::new();
-        let root_for_includes = assets_root.clone();
-        let mut include: Box<shaderpre::IncludeLookup<'_>> =
-            Box::new(move |name: &str| resolve_shader_reference(&root_for_includes, name));
-
-        let vertex_label = format!("{shader_name}.vert");
-        let vertex_pre = match shaderpre::preprocess(
-            shaderpre::Stage::Vertex,
-            &vertex_label,
-            &vertex_source,
-            &material.combos,
-            &constant_names,
-            &mut varying_locations,
-            &mut include,
-        ) {
-            Ok(output) => output,
-            Err(_) => {
-                *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
-                continue;
-            }
-        };
-        if !material_vertex_format_supported(&vertex_pre.attributes) {
+        // S3 safety guard: a layer with NO resolved effect chain whose
+        // material has NOTHING but `_rt_`/render-target texture slots (no
+        // real `.tex` bytes anywhere) must NOT draw. This is exactly the
+        // real corpus's `models/util/fullscreenlayer.json` used bare (no
+        // `effects[]` at all — a `copybackground` recomposite utility
+        // layer several scenes place elsewhere in their object stack):
+        // pre-S3, its unresolvable `_rt_FullFrameBuffer` slot meant
+        // `resolve_model` failed outright, `layer.material` stayed
+        // `None`, and the layer silently never drew (a true no-op,
+        // matching upstream's intent when nothing else in the frame
+        // needs it "copied back"). Now that slot resolves (the honesty
+        // fix), binding it live would draw `_rt_FullFrameBuffer` as an
+        // ordinary opaque/translucent quad — but this renderer's
+        // `_rt_FullFrameBuffer` is a ONE-FRAME-STALE snapshot
+        // (`snapshot_full_frame_buffer`'s doc comment), starting fully
+        // TRANSPARENT BLACK before the first frame. A bare passthrough
+        // drawn with an opaque source at ANY point in the object stack —
+        // worst case, last, on top of everything — paints stale/black
+        // over real same-frame content instead of the harmless no-op
+        // upstream's true same-frame causality would produce. An object
+        // WITH a resolved effect chain is fine: its `final_material`
+        // (this same `material` value) is the effect's OWN deliberate
+        // output, not a blind passthrough, and IS meant to draw.
+        if plan.is_none() && texture_slots_are_bare_render_target_only(&material.texture_slots) {
             *fallback_reasons
-                .entry("unsupported_vertex_format")
+                .entry("render_target_only_without_effects")
                 .or_insert(0) += 1;
             continue;
         }
 
-        let fragment_label = format!("{shader_name}.frag");
-        let fragment_pre = match shaderpre::preprocess(
-            shaderpre::Stage::Fragment,
-            &fragment_label,
-            &fragment_source,
-            &material.combos,
-            &constant_names,
-            &mut varying_locations,
-            &mut include,
-        ) {
-            Ok(output) => output,
-            Err(_) => {
-                *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
-                continue;
-            }
-        };
-
-        unsupported_uniform_names.extend(vertex_pre.unsupported_uniforms.iter().cloned());
-        unsupported_uniform_names.extend(fragment_pre.unsupported_uniforms.iter().cloned());
-
-        // The precise, live-preprocessed check (materialshader.rs doc
-        // comment): the static `references_render_target` flag on either
-        // stage is a fast conservative pre-filter (skips a shaderc call
-        // for a shader with no `_rt_` mention anywhere), the live check is
-        // the actual gate.
-        if (vertex_pre.references_render_target
-            && materialshader::references_live_render_target(
-                &vertex_pre.source,
-                materialshader::Stage::Vertex,
-                &vertex_label,
-            ))
-            || (fragment_pre.references_render_target
-                && materialshader::references_live_render_target(
-                    &fragment_pre.source,
-                    materialshader::Stage::Fragment,
-                    &fragment_label,
-                ))
-        {
-            *fallback_reasons
-                .entry("render_target_reference")
-                .or_insert(0) += 1;
+        let Some((vertex_spirv, fragment_spirv, blend_mode, key)) = compile_one_material(
+            &mut shader_lookup,
+            &material,
+            &mut fallback_reasons,
+            &mut unsupported_uniform_names,
+        ) else {
             continue;
-        }
-
-        let blend_mode = material_blend_mode(material.blending.as_deref());
-        let key = materialshader::MaterialKey::compute(
-            shader_name,
-            &fragment_pre.combos,
-            blend_mode.variant_index(),
-        );
+        };
         if !compiled_pipelines.contains(&key.0)
             && compiled_pipelines.len() >= materialshader::MAX_PIPELINES_PER_SCENE
         {
             *fallback_reasons.entry("pipeline_cap").or_insert(0) += 1;
             continue;
         }
-
-        let vertex_spirv = match materialshader::compile_stage(
-            &vertex_pre.source,
-            materialshader::Stage::Vertex,
-            &vertex_label,
-        ) {
-            Ok(spirv) => spirv,
-            Err(_) => {
-                *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
-                continue;
-            }
-        };
-        let fragment_spirv = match materialshader::compile_stage(
-            &fragment_pre.source,
-            materialshader::Stage::Fragment,
-            &fragment_label,
-        ) {
-            Ok(spirv) => spirv,
-            Err(_) => {
-                *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
-                continue;
-            }
-        };
-
         if renderer
             .register_material_pipeline(key.clone(), &vertex_spirv, &fragment_spirv, blend_mode)
             .is_err()
@@ -1805,34 +2371,8 @@ fn compile_material_layers(
         }
         compiled_pipelines.insert(key.0);
 
-        let mut textures: Vec<Option<(Vec<u8>, u32, u32)>> =
-            Vec::with_capacity(shaderpre::MAX_MATERIAL_TEXTURES);
         let mut uniforms = materialshader::MaterialUniforms::default();
-        for slot_bytes in material
-            .texture_slots
-            .iter()
-            .take(shaderpre::MAX_MATERIAL_TEXTURES)
-        {
-            let decoded = slot_bytes
-                .as_ref()
-                .and_then(|bytes| texv::decode_model_texture(bytes));
-            match decoded {
-                Some(texture) => {
-                    let slot = textures.len();
-                    uniforms.texture_resolution[slot] = [
-                        texture.width as f32,
-                        texture.height as f32,
-                        1.0 / (texture.width as f32).max(1.0),
-                        1.0 / (texture.height as f32).max(1.0),
-                    ];
-                    textures.push(Some((texture.rgba, texture.width, texture.height)));
-                }
-                None => textures.push(None),
-            }
-        }
-        while textures.len() < shaderpre::MAX_MATERIAL_TEXTURES {
-            textures.push(None);
-        }
+        let textures = build_material_textures(&material.texture_slots, &mut uniforms);
         for (slot, (_, value)) in material
             .constant_shader_values
             .iter()
@@ -1876,6 +2416,54 @@ fn compile_material_layers(
                 *fallback_reasons.entry("bind_failed").or_insert(0) += 1;
             }
         }
+
+        // S3: the chain's TARGETED passes — every one of them, in chain
+        // order — regardless of whether the final-untargeted pass above
+        // compiled successfully (a targeted pass's job is to feed a LATER
+        // pass, not necessarily the one this layer draws through).
+        let Some(plan) = plan else { continue };
+        for (pass_material, target_name) in &plan.intermediate {
+            effect_passes_attempted += 1;
+            let Some((vertex_spirv, fragment_spirv, blend_mode, _key)) = compile_one_material(
+                &mut shader_lookup,
+                pass_material,
+                &mut effect_fallback_reasons,
+                &mut unsupported_uniform_names,
+            ) else {
+                continue;
+            };
+            let mut uniforms = materialshader::MaterialUniforms::default();
+            let textures = build_material_textures(&pass_material.texture_slots, &mut uniforms);
+            for (slot, (_, value)) in pass_material
+                .constant_shader_values
+                .iter()
+                .enumerate()
+                .take(shaderpre::MAX_MATERIAL_CONSTANTS)
+            {
+                if let Some(components) = parse_constant_components(value) {
+                    uniforms.material_constants[slot] = components;
+                }
+            }
+            match renderer.compile_effect_pass(
+                &vertex_spirv,
+                &fragment_spirv,
+                blend_mode,
+                target_name,
+                &textures,
+                uniforms,
+            ) {
+                Ok(binding_index) => renderer.queue_effect_render(binding_index),
+                Err(error) => {
+                    if is_fence_timeout(&error) {
+                        reject_render(&error, "fence timeout while compiling an effect pass");
+                    }
+                    *effect_fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+                }
+            }
+        }
+        for (source, target) in &plan.commands {
+            renderer.queue_effect_copy(source.clone(), target.clone());
+        }
     }
 
     for (reason, count) in &fallback_reasons {
@@ -1894,6 +2482,16 @@ fn compile_material_layers(
     }
     let fallback_total: usize = fallback_reasons.values().sum();
     eprintln!("event=renderer.scene.shaders compiled={compiled} fallback={fallback_total}");
+    if effect_objects > 0 {
+        let effect_fallback_total: usize = effect_fallback_reasons.values().sum();
+        for (reason, count) in &effect_fallback_reasons {
+            eprintln!("event=renderer.scene.effect_fallback reason={reason} count={count}");
+        }
+        eprintln!(
+            "event=renderer.scene.effects objects={effect_objects} passes={effect_passes_attempted} \
+             fallback={effect_fallback_total} targets={targets_created}"
+        );
+    }
     material_ok
 }
 
@@ -2737,6 +3335,146 @@ mod tests {
         bytes
     }
 
+    /// One effect chain with a single untargeted material pass whose only
+    /// texture slot is the `"previous"` bind sentinel — the minimal shape
+    /// that exercises `plan_effect_chain`'s seeding rule.
+    fn single_previous_pass_effect() -> kwe_core::ObjectEffect {
+        kwe_core::ObjectEffect {
+            id: 1,
+            name: "test".into(),
+            visible: true,
+            effect: kwe_core::EffectSpec {
+                name: "test".into(),
+                fbos: Vec::new(),
+                passes: vec![kwe_core::EffectPass::Material(
+                    kwe_core::EffectMaterialPass {
+                        material_ref: "materials/effects/test.json".into(),
+                        shader: Some("test".into()),
+                        blending: None,
+                        combos: serde_json::Map::new(),
+                        constant_shader_values: serde_json::Map::new(),
+                        texture_slots: vec![Some(kwe_core::EffectTextureSlot::Previous)],
+                        target: None,
+                    },
+                )],
+            },
+        }
+    }
+
+    #[test]
+    fn plan_effect_chain_seeds_previous_from_the_objects_own_base_texture() {
+        let mut base = layer("photo", None);
+        base.material = Some(scene::MaterialSpec {
+            texture_slots: vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))],
+            ..Default::default()
+        });
+        base.effects = vec![single_previous_pass_effect()];
+        let plan = plan_effect_chain(&base);
+        let final_material = plan.final_material.expect("one untargeted pass");
+        assert!(matches!(
+            &final_material.texture_slots[0],
+            Some(scene::MaterialTextureSource::Bytes(bytes)) if bytes == &[1, 2, 3, 4]
+        ));
+    }
+
+    #[test]
+    fn plan_effect_chain_seeds_previous_from_full_frame_buffer_when_base_has_no_real_texture() {
+        let mut base = layer("passthrough", None);
+        base.material = Some(scene::MaterialSpec {
+            texture_slots: vec![Some(scene::MaterialTextureSource::RenderTarget(
+                "_rt_FullFrameBuffer".into(),
+            ))],
+            ..Default::default()
+        });
+        base.effects = vec![single_previous_pass_effect()];
+        let plan = plan_effect_chain(&base);
+        let final_material = plan.final_material.expect("one untargeted pass");
+        assert!(matches!(
+            &final_material.texture_slots[0],
+            Some(scene::MaterialTextureSource::RenderTarget(name)) if name == "_rt_FullFrameBuffer"
+        ));
+
+        // Same result when the base material has NO texture slots at all.
+        let mut no_slots = layer("no-slots", None);
+        no_slots.material = Some(scene::MaterialSpec::default());
+        no_slots.effects = vec![single_previous_pass_effect()];
+        let plan2 = plan_effect_chain(&no_slots);
+        let final_material2 = plan2.final_material.expect("one untargeted pass");
+        assert!(matches!(
+            &final_material2.texture_slots[0],
+            Some(scene::MaterialTextureSource::RenderTarget(name)) if name == "_rt_FullFrameBuffer"
+        ));
+    }
+
+    #[test]
+    fn bare_render_target_passthrough_is_detected_and_a_real_texture_is_not() {
+        let render_target_only = vec![
+            Some(scene::MaterialTextureSource::RenderTarget(
+                "_rt_FullFrameBuffer".into(),
+            )),
+            None,
+        ];
+        assert!(texture_slots_are_bare_render_target_only(
+            &render_target_only
+        ));
+
+        let with_real_texture = vec![
+            Some(scene::MaterialTextureSource::RenderTarget(
+                "_rt_Something".into(),
+            )),
+            Some(scene::MaterialTextureSource::Bytes(vec![9, 9, 9, 9])),
+        ];
+        assert!(!texture_slots_are_bare_render_target_only(
+            &with_real_texture
+        ));
+
+        // No slots at all is also "nothing but render targets" (vacuously
+        // true) — the caller's `plan.is_none()` guard is what actually
+        // matters for whether this material draws.
+        assert!(texture_slots_are_bare_render_target_only(&[]));
+    }
+
+    #[test]
+    fn effect_final_material_only_overrides_a_bare_passthrough_base() {
+        // A real base photo (Bytes at slot 0) keeps its OWN material even
+        // though it has a resolved effect chain — the S3 safety decision
+        // that prevents the corpus regression this slice found (Workshop
+        // 1131061888's "trigun" photo losing its real image entirely once
+        // its FOUR attached effects' single shared `last_output` chain
+        // discarded everything but the textually-last effect's pass).
+        let mut photo = layer("photo", None);
+        photo.material = Some(scene::MaterialSpec {
+            shader: Some("photo_shader".into()),
+            texture_slots: vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))],
+            ..Default::default()
+        });
+        photo.effects = vec![single_previous_pass_effect()];
+        assert!(
+            !photo
+                .material
+                .as_ref()
+                .is_none_or(|m| texture_slots_are_bare_render_target_only(&m.texture_slots))
+        );
+
+        // A bare `copybackground` passthrough (no real texture) DOES let
+        // its effect chain's final pass take over.
+        let mut passthrough = layer("passthrough", None);
+        passthrough.material = Some(scene::MaterialSpec {
+            shader: Some("passthrough_shader".into()),
+            texture_slots: vec![Some(scene::MaterialTextureSource::RenderTarget(
+                "_rt_FullFrameBuffer".into(),
+            ))],
+            ..Default::default()
+        });
+        passthrough.effects = vec![single_previous_pass_effect()];
+        assert!(
+            passthrough
+                .material
+                .as_ref()
+                .is_none_or(|m| texture_slots_are_bare_render_target_only(&m.texture_slots))
+        );
+    }
+
     /// An image layer with every field at its default, `image` optional.
     fn layer(name: &str, image: Option<&str>) -> scene::LayerSpec {
         scene::LayerSpec {
@@ -2757,6 +3495,9 @@ mod tests {
             text: None,
             video: None,
             material: None,
+            fullscreen: false,
+            effects_raw: Vec::new(),
+            effects: Vec::new(),
         }
     }
 
@@ -2900,7 +3641,7 @@ mod tests {
         let mut layers = vec![layer("m", None)];
         layers[0].model_ref = Some("models/deco.json".into());
         let mut used_bytes = 0u64;
-        let resolved = load_model_textures(&mut layers, &mut used_bytes, |reference| {
+        let resolved = load_model_textures(&mut layers, &mut used_bytes, None, |reference| {
             assets.get(reference).cloned()
         });
 
@@ -2924,7 +3665,7 @@ mod tests {
         let mut layers = vec![layer("m", None)];
         layers[0].model_ref = Some("models/missing.json".into());
         let mut used_bytes = 0u64;
-        let resolved = load_model_textures(&mut layers, &mut used_bytes, |_reference| None);
+        let resolved = load_model_textures(&mut layers, &mut used_bytes, None, |_reference| None);
         assert_eq!(resolved, 0);
         assert!(layers[0].texture.is_none());
         assert_eq!(used_bytes, 0);

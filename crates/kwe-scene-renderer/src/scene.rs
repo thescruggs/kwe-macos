@@ -235,6 +235,44 @@ pub struct LayerSpec {
     /// layer with `material.is_none()` (not a model, or resolution
     /// failed) always uses the S1 base-texture quad.
     pub material: Option<MaterialSpec>,
+    /// S3: `model.json`'s own `"fullscreen"` flag
+    /// (`models/util/fullscreenlayer.json` in the real corpus — a
+    /// `copybackground` post-process layer with no static texture of its
+    /// own). When true and `size` is `[0, 0]` (no explicit scene.json
+    /// size and no decoded base texture to size from — expected for a
+    /// layer whose only texture slot is a `_rt_` runtime target),
+    /// `load_model_textures` sizes the layer to the scene's world extent
+    /// instead of leaving it a degenerate zero-size quad.
+    pub fullscreen: bool,
+    /// S3: this object's raw `effects` JSON array entries exactly as
+    /// written, unresolved — parsing needs the same pkg/dir/assets-root
+    /// lookup `load_model_textures` already has, so resolution happens
+    /// there (`kwe_core::sceneeffect::resolve_object_effects`), not at
+    /// scene.json parse time. Empty for every layer kind except a model
+    /// layer whose object JSON carries an `effects` array.
+    pub effects_raw: Vec<serde_json::Value>,
+    /// S3: `effects_raw` resolved by `load_model_textures` (the same
+    /// lookup closure that resolves `model_ref`) — `kwe_core::sceneeffect::
+    /// resolve_object_effects`'s output. Empty when `effects_raw` was
+    /// empty, or when every declared effect failed to resolve (the
+    /// module's own honesty rule: this never blocks the layer's own base
+    /// draw, it only means the renderer has no effect chain to run for
+    /// this layer this frame).
+    pub effects: Vec<kwe_core::ObjectEffect>,
+}
+
+/// S3: one resolved effect-pass texture slot, thinned from
+/// `kwe_core::sceneeffect::EffectTextureSlot` the same way `MaterialSpec`
+/// thins `ResolvedModel` — an owned copy so `scene.rs` stays free of
+/// `kwe_core::sceneeffect`'s full surface.
+#[derive(Debug, Clone)]
+pub enum MaterialTextureSource {
+    /// A real, resolved `.tex` asset's raw (undecoded) bytes.
+    Bytes(Vec<u8>),
+    /// A `_rt_`/`_alias_` runtime target name, resolved to a live FBO (or
+    /// the shared dummy texture if nothing produces it this frame) by the
+    /// renderer at draw time — never a filesystem lookup.
+    RenderTarget(String),
 }
 
 /// S2: everything `compile_material_layers` needs from
@@ -251,12 +289,13 @@ pub struct MaterialSpec {
     /// written (string or number in the JSON — `compile_material_layers`
     /// parses to `f32`, skipping a value it cannot parse).
     pub constant_shader_values: Vec<(String, serde_json::Value)>,
-    /// Positional `g_Texture<N>` RAW (undecoded) `.tex` bytes, `None` for
-    /// an empty/unresolved slot — mirrors
-    /// `kwe_core::scenemodel::ResolvedModel::texture_slots`. Decoded by
-    /// `compile_material_layers` the same way `load_model_textures`
-    /// already decodes slot 0.
-    pub texture_slots: Vec<Option<Vec<u8>>>,
+    /// Positional `g_Texture<N>` slot source, `None` for an empty/
+    /// unresolved slot — mirrors
+    /// `kwe_core::scenemodel::ResolvedModel::texture_slots`. Raw bytes are
+    /// decoded by `compile_material_layers` the same way
+    /// `load_model_textures` already decodes slot 0; a `RenderTarget`
+    /// name is resolved by the renderer at bind/draw time (S3).
+    pub texture_slots: Vec<Option<MaterialTextureSource>>,
 }
 
 /// One `objects` entry interpreted as a video layer (M3g). The
@@ -982,6 +1021,24 @@ fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> O
         _ => return None,
     };
     let (size, tint) = parse_size_and_tint(object, index).ok()?;
+    // S3: keep the raw `effects` array for `load_model_textures` to
+    // resolve (it needs the pkg/dir/assets-root lookup this pure-JSON
+    // parse step does not have). Bounded here too, before the clone, so
+    // a scene declaring an absurd number of effect entries never costs
+    // more than one bounded `Vec::clone` at parse time —
+    // `kwe_core::sceneeffect::resolve_object_effects` applies the same
+    // cap again later, independently.
+    let effects_raw = object
+        .get("effects")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(kwe_core::MAX_EFFECTS_PER_OBJECT)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
 
     Some(LayerSpec {
         name: common.name,
@@ -1001,6 +1058,9 @@ fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> O
         text: None,
         video: None,
         material: None,
+        fullscreen: false,
+        effects_raw,
+        effects: Vec::new(),
     })
 }
 
@@ -1045,6 +1105,9 @@ fn parse_image_layer(
         text: None,
         video: None,
         material: None,
+        fullscreen: false,
+        effects_raw: Vec::new(),
+        effects: Vec::new(),
     })
 }
 
@@ -1156,6 +1219,9 @@ fn parse_text_layer(
         }),
         video: None,
         material: None,
+        fullscreen: false,
+        effects_raw: Vec::new(),
+        effects: Vec::new(),
     })
 }
 
@@ -1263,6 +1329,9 @@ fn parse_video_layer(
             path: None,
         }),
         material: None,
+        fullscreen: false,
+        effects_raw: Vec::new(),
+        effects: Vec::new(),
     })
 }
 

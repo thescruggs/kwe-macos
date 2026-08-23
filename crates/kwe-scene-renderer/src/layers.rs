@@ -796,6 +796,9 @@ mod tests {
             text: Some(spec),
             video: None,
             material: None,
+            fullscreen: false,
+            effects_raw: Vec::new(),
+            effects: Vec::new(),
         });
         assert_eq!(layer.size, [1.0, 1.0]);
         let text = layer.text.as_ref().unwrap();

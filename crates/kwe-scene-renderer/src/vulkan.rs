@@ -72,6 +72,7 @@ use crate::materialshader::{
 };
 use crate::particles::MAX_PARTICLE_SYSTEMS;
 use crate::shaderpre::MAX_MATERIAL_TEXTURES;
+use kwe_core::FULL_FRAME_BUFFER;
 use std::collections::HashMap;
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
@@ -83,6 +84,34 @@ pub const FENCE_TIMEOUT_NS: u64 = 1_000_000_000;
 /// sets. Bounded by both caps; the pool and the upload bound use this, and
 /// particle system i lives at slot MAX_LAYERS + i (see particles.rs).
 const TEXTURE_SLOT_COUNT: usize = MAX_LAYERS + MAX_PARTICLE_SYSTEMS;
+
+/// S3: cap on live effect render targets in one scene (task bound: "≤ 64
+/// targets/scene with a memory cap") — `_rt_FullFrameBuffer` plus every
+/// distinct `fbos[]` entry across every resolved effect. A request past
+/// this cap is simply not created; a name that never gets an entry
+/// degrades every slot referencing it to the shared `dummy_texture` (this
+/// module's universal "unresolved effect reference" fallback), never a
+/// failure.
+const MAX_EFFECT_TARGETS_PER_SCENE: usize = 64;
+
+/// S3: cumulative byte budget across every live effect render target
+/// (RGBA8, 4 bytes/pixel) — independent of the per-target dimension clamp
+/// applied when a target is sized, so a scene with many large targets
+/// cannot exhaust GPU memory even if each one individually looks
+/// reasonable.
+const MAX_EFFECT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// S3: cap on one FBO target's side length in pixels — generous over any
+/// real scene resolution, bounds a hostile `scale` value (e.g. a tiny
+/// fraction) from producing a target larger than the canvas itself.
+const MAX_EFFECT_TARGET_DIMENSION: u32 = 4096;
+
+/// S3: cap on distinct compiled+bound effect passes (targeted material
+/// passes) in one scene — generous over the real corpus's largest chain
+/// (godrays: 5 passes) while bounding a hostile scene's pipeline/
+/// descriptor-set allocation the same way `MAX_PIPELINES_PER_SCENE`
+/// bounds base material pipelines.
+const MAX_EFFECT_PASS_BINDINGS: usize = 256;
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -193,6 +222,31 @@ struct LayerTexture {
     height: u32,
 }
 
+/// One `g_Texture<N>` slot's binding source, as `bind_material_layer` /
+/// `compile_effect_pass` see it — `main.rs` builds this from
+/// `scene::MaterialTextureSource` (raw bytes decode to `Bytes`, S3's
+/// `RenderTarget` name passes straight through).
+pub enum MaterialTextureBind {
+    /// Already-decoded RGBA8 bytes, uploaded fresh by this call (S1/S2's
+    /// original contract, unchanged).
+    Bytes(Vec<u8>, u32, u32),
+    /// A `_rt_`/`_alias_` name: bound to `effect_targets[name]`'s current
+    /// view if that target exists, else the shared `dummy_texture` — see
+    /// the module doc comment on `effect_targets`.
+    RenderTarget(String),
+}
+
+/// S3: one requested effect render target, built by `main.rs` from a
+/// resolved `FboSpec` (name + the owning object's own pixel size /
+/// `scale`, per upstream `CImage.cpp:652-654` — see
+/// `LayerRenderer::effect_targets`'s doc comment) and handed to
+/// `prepare_effect_targets`.
+pub struct EffectTargetRequest {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// S2: one layer's bound material — everything `render`'s draw loop needs
 /// to issue the draw, plus the resources `bind_material_layer`/`Drop` must
 /// tear down. `textures` holds ONLY the slots this layer uploaded its own
@@ -224,6 +278,75 @@ struct StagingBuffer {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     bytes: usize,
+}
+
+/// S3: one live effect render target — a color-attachment-and-sampled
+/// image sized in pixels, cleared to transparent black every time a
+/// material pass renders into it (`CFBO.cpp`'s documented fix for
+/// effects otherwise drawing solid rectangles — see the module doc
+/// comment on `render_effect_chains`). Every entry uses the SAME format
+/// as the compositor's own `self.image` (`LayerRenderer::format`, chosen
+/// once at device probe time to be whatever the driver actually supports
+/// for `COLOR_ATTACHMENT | TRANSFER_SRC`) rather than a fixed
+/// `R8G8B8A8_UNORM`: `_rt_FullFrameBuffer` is refreshed every frame by a
+/// raw `vkCmdCopyImage` from `self.image` (`snapshot_full_frame_buffer`),
+/// and `vkCmdCopyImage` between images of DIFFERENT channel-order formats
+/// (e.g. `B8G8R8A8_UNORM` source into an `R8G8B8A8_UNORM` destination) is
+/// permitted by the Vulkan spec (same texel size = compatible) but
+/// reinterprets the copied bytes with the destination format's channel
+/// order — a silent red/blue channel swap. Matching `self.format`
+/// everywhere sidesteps that entirely.
+struct EffectFbo {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    framebuffer: vk::Framebuffer,
+    width: u32,
+    height: u32,
+}
+
+/// S3: one compiled, bound effect pass that renders into a named
+/// [`EffectFbo`] every frame (`render_effect_chains`). Structurally a
+/// smaller `MaterialBinding` — its own pipeline (not shared with
+/// `material_pipelines`: a targeted pass's viewport is the TARGET's own
+/// pixel size, which a canvas-sized pipeline cannot correctly draw into,
+/// since this renderer's pipelines bake a static, non-dynamic viewport)
+/// and its own descriptor set/UBO, torn down together with it. Unlike
+/// `MaterialBinding`, the UBO is written exactly once, at compile time
+/// (`compile_effect_pass`) — an effect pass has no per-frame dynamic
+/// transform (`render()` never touches `mvp`/`time_alpha_brightness` for
+/// these; `render_effect_chains` only re-runs the DRAW, sampling whatever
+/// its bound texture slots currently contain), so no mapped pointer needs
+/// to survive past that one write.
+struct EffectPassBinding {
+    pipeline: vk::Pipeline,
+    descriptor_set: vk::DescriptorSet,
+    textures: Vec<(u32, LayerTexture)>,
+    ubo_buffer: vk::Buffer,
+    ubo_memory: vk::DeviceMemory,
+    /// The FBO this pass renders into — always present in
+    /// `effect_targets` (`compile_effect_pass` only records a binding
+    /// once its target FBO already exists).
+    target: String,
+}
+
+/// S3: one step of the per-frame effect replay `render_effect_chains`
+/// executes in order.
+enum EffectFrameAction {
+    /// Render one [`EffectPassBinding`]'s fresh content into its target
+    /// FBO (index into `effect_pass_bindings`).
+    Render(usize),
+    /// `command: copy` (and, per this renderer's own documented
+    /// completion of upstream's unexecuted `swap` — see
+    /// `kwe_core::sceneeffect::EffectCommand::Swap`'s doc comment — also
+    /// `command: swap`): copy `source`'s CURRENT content into `target`.
+    /// A true pointer swap would require re-resolving every LATER pass's
+    /// already-baked descriptor-set view bindings each frame, which this
+    /// renderer's load-time-only binding design does not support; a copy
+    /// produces the same visible pixels for the frame it runs in, which
+    /// is what upstream's own unexecuted `swap` would have done too on
+    /// the one frame it mattered.
+    Copy { source: String, target: String },
 }
 
 /// One text layer's quad vertex buffer (M3e): host-visible, grown in
@@ -361,6 +484,42 @@ pub struct LayerRenderer {
     /// almost no default-combo `genericimage*` shader reads; documented
     /// as a known simplification (see `AI-Skills/BETA_PLAN.md`).
     material_frame_counter: u64,
+    /// S3: a second offscreen render pass, identical to `render_pass`
+    /// except its attachment ends in `SHADER_READ_ONLY_OPTIMAL` (a
+    /// render target meant to be SAMPLED by a later pass, not read back
+    /// to a staging buffer) and its usage adds `SAMPLED`/`TRANSFER_SRC`/
+    /// `TRANSFER_DST` (a target can be a `command: copy` source or
+    /// destination too). Created lazily (`vk::RenderPass::null()` until
+    /// the first scene with a resolved effect chain) since most scenes
+    /// have none.
+    effect_render_pass: vk::RenderPass,
+    /// Every live effect render target this scene needs, keyed by its
+    /// declared `_rt_`/`_alias_` name — `_rt_FullFrameBuffer` (scene-wide,
+    /// present whenever any layer has a resolved effect chain) plus every
+    /// `fbos[]` entry from every resolved `ObjectEffect`. Global
+    /// namespace (S3 documented scope limit: two different objects
+    /// declaring the SAME fbo name share one instance rather than getting
+    /// independent ones — not observed in the local corpus). Bounded by
+    /// `MAX_EFFECT_TARGETS_PER_SCENE` and a cumulative byte budget;
+    /// looked up by name at material-texture-slot bind time (a name with
+    /// no entry here degrades to the shared `dummy_texture`, never a
+    /// failure).
+    effect_targets: HashMap<String, EffectFbo>,
+    /// One entry per resolved effect pass that renders INTO a named FBO
+    /// (a material pass with `target: Some(..)`). A pass with no target
+    /// is never recorded here — it becomes its OWNING LAYER's own
+    /// material binding instead (`compile_material_layers`; visually,
+    /// upstream's "no target = draws directly onto the compositor" case
+    /// is exactly what the layer's own `LayerDraw` already does).
+    effect_pass_bindings: Vec<EffectPassBinding>,
+    /// The scene-wide, ordered list of per-frame effect work
+    /// `render_effect_chains` replays every frame, built once at load
+    /// (`compile_material_layers`) in each layer's own pass order: render
+    /// a targeted pass's fresh content, or execute a `command: copy`
+    /// (`swap` also executes as a copy — see `EffectFrameAction::Copy`'s
+    /// doc comment for why). Bounded by the same per-effect/per-object
+    /// caps `kwe_core::sceneeffect` already enforces at parse time.
+    effect_frame_actions: Vec<EffectFrameAction>,
     // Kept alive for the whole renderer lifetime: ash 0.38's Entry owns the
     // dlopen guard on libvulkan.so.1, and the loader's own trampoline
     // function pointers (vkDestroyDevice among them) dangle once the entry
@@ -979,6 +1138,10 @@ impl LayerRenderer {
             dummy_texture,
             material_bindings: Vec::new(),
             material_frame_counter: 0,
+            effect_render_pass: vk::RenderPass::null(),
+            effect_targets: HashMap::new(),
+            effect_pass_bindings: Vec::new(),
+            effect_frame_actions: Vec::new(),
             _entry: entry,
         })
     }
@@ -1443,29 +1606,36 @@ impl LayerRenderer {
     /// the layer's previous binding (if any) — the caller (main.rs) drops
     /// the whole material attempt on `Err`, so the layer keeps whatever it
     /// had (typically nothing yet, since binding happens once at load).
-    pub fn bind_material_layer(
+    /// Shared texture-slot resolution for `bind_material_layer` and
+    /// `compile_effect_pass` (S3): upload a `Bytes` slot fresh (S1/S2's
+    /// original contract), resolve a `RenderTarget` slot by name against
+    /// `effect_targets` (falling back to `dummy_texture` when the name
+    /// has no live entry — never a failure, matching this module's
+    /// degrade-not-refuse contract for effect references), and leave a
+    /// `None` slot on `dummy_texture` too. On an upload error for a
+    /// `Bytes` slot, everything resolved so far for THIS call is torn
+    /// down and the error propagates (mirrors `bind_material_layer`'s
+    /// pre-S3 cleanup contract exactly).
+    // Named alias would only be used at this one call site; `#[allow]` is
+    // simpler than a one-call-site `type` item purely to satisfy the lint
+    // (the same tradeoff `FoldedDeclarations` elsewhere in this crate
+    // resolves the other way because it has multiple call sites).
+    #[allow(clippy::type_complexity)]
+    fn resolve_texture_slots(
         &mut self,
-        layer_index: usize,
-        key: MaterialKey,
-        textures: &[Option<(Vec<u8>, u32, u32)>],
-        mut uniforms: MaterialUniforms,
-    ) -> Result<(), RenderError> {
-        if layer_index >= MAX_LAYERS {
-            return Err(RenderError::Vulkan(format!(
-                "layer index {layer_index} beyond the {MAX_LAYERS}-layer cap for materials"
-            )));
-        }
-        let Some(&pipeline) = self.material_pipelines.get(&key.0) else {
-            return Err(RenderError::Vulkan(
-                "bind_material_layer: pipeline not registered".to_string(),
-            ));
-        };
-
+        textures: &[Option<MaterialTextureBind>],
+    ) -> Result<
+        (
+            [vk::DescriptorImageInfo; MAX_MATERIAL_TEXTURES],
+            Vec<(u32, LayerTexture)>,
+        ),
+        RenderError,
+    > {
         let mut owned_textures: Vec<(u32, LayerTexture)> = Vec::new();
         let mut image_infos = [vk::DescriptorImageInfo::default(); MAX_MATERIAL_TEXTURES];
         for (slot, image_info) in image_infos.iter_mut().enumerate() {
             let view = match textures.get(slot).and_then(|entry| entry.as_ref()) {
-                Some((rgba, width, height)) => {
+                Some(MaterialTextureBind::Bytes(rgba, width, height)) => {
                     match upload_image_now(
                         &self.instance,
                         &self.device,
@@ -1497,6 +1667,10 @@ impl LayerRenderer {
                         }
                     }
                 }
+                Some(MaterialTextureBind::RenderTarget(name)) => self
+                    .effect_targets
+                    .get(name.as_str())
+                    .map_or(self.dummy_texture.view, |fbo| fbo.view),
                 None => self.dummy_texture.view,
             };
             *image_info = vk::DescriptorImageInfo::default()
@@ -1504,6 +1678,28 @@ impl LayerRenderer {
                 .image_view(view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         }
+        Ok((image_infos, owned_textures))
+    }
+
+    pub fn bind_material_layer(
+        &mut self,
+        layer_index: usize,
+        key: MaterialKey,
+        textures: &[Option<MaterialTextureBind>],
+        mut uniforms: MaterialUniforms,
+    ) -> Result<(), RenderError> {
+        if layer_index >= MAX_LAYERS {
+            return Err(RenderError::Vulkan(format!(
+                "layer index {layer_index} beyond the {MAX_LAYERS}-layer cap for materials"
+            )));
+        }
+        let Some(&pipeline) = self.material_pipelines.get(&key.0) else {
+            return Err(RenderError::Vulkan(
+                "bind_material_layer: pipeline not registered".to_string(),
+            ));
+        };
+
+        let (image_infos, owned_textures) = self.resolve_texture_slots(textures)?;
 
         let ubo_info = vk::BufferCreateInfo::default()
             .size(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)
@@ -1997,6 +2193,944 @@ impl LayerRenderer {
         Ok(())
     }
 
+    fn destroy_owned_textures(&self, textures: Vec<(u32, LayerTexture)>) {
+        for (_, texture) in textures {
+            unsafe {
+                self.device.destroy_image_view(texture.view, None);
+                self.device.destroy_image(texture.image, None);
+                self.device.free_memory(texture.memory, None);
+            }
+        }
+    }
+
+    /// S3: create the second offscreen render pass (`effect_render_pass`)
+    /// every effect FBO renders through — same attachment shape as the
+    /// main `render_pass` (`self.format`, `CLEAR`/`STORE`) except its
+    /// `final_layout` is `SHADER_READ_ONLY_OPTIMAL` (a target meant to be
+    /// SAMPLED by a later pass, not read back to a staging buffer).
+    /// Created once, lazily, the first time a scene needs it — most
+    /// scenes never do.
+    fn ensure_effect_render_pass(&mut self) -> Result<(), RenderError> {
+        if self.effect_render_pass != vk::RenderPass::null() {
+            return Ok(());
+        }
+        let attachment = vk::AttachmentDescription::default()
+            .format(self.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref));
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(
+                    vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::TRANSFER,
+                )
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::TRANSFER_WRITE,
+                )
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+        ];
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(&dependencies);
+        self.effect_render_pass =
+            unsafe { self.device.create_render_pass(&render_pass_info, None) }?;
+        Ok(())
+    }
+
+    /// One empty render-pass instance (clear, no draws) against a freshly
+    /// created FBO — establishes the "always cleared to transparent
+    /// black, always `SHADER_READ_ONLY_OPTIMAL`" invariant every other
+    /// effect-target operation in this module relies on, from the moment
+    /// the FBO exists (including the very first frame, before any real
+    /// pass has written it).
+    ///
+    /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    /// src/WallpaperEngine/Render/CFBO.cpp:56-63 (the explicit
+    /// clear-to-transparent-black fix: "Layer framebuffers must start
+    /// transparent... otherwise effects rendering solid rectangles") @
+    /// b016d7d1 — adapted (upstream clears once via `glClear` at FBO
+    /// creation using the current GL context; this clears via one
+    /// throwaway Vulkan render-pass instance).
+    fn clear_effect_fbo(&mut self, fbo: &EffectFbo) -> Result<(), RenderError> {
+        unsafe { self.device.reset_fences(&[self.fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+        }?;
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            },
+        };
+        let rp_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.effect_render_pass)
+            .framebuffer(fbo.framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: fbo.width,
+                    height: fbo.height,
+                },
+            })
+            .clear_values(std::slice::from_ref(&clear_value));
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.command_buffer,
+                &rp_info,
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_end_render_pass(self.command_buffer);
+            self.device.end_command_buffer(self.command_buffer)?;
+        }
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+        unsafe {
+            self.device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), self.fence)?;
+        }
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RenderError::FenceTimeout),
+        }
+    }
+
+    /// Create one [`EffectFbo`] sized `width` x `height` (clamped to
+    /// `MAX_EFFECT_TARGET_DIMENSION`) and clear it (`clear_effect_fbo`).
+    /// On any failure past image/view/framebuffer creation, everything
+    /// already created for this call is torn down before the error
+    /// propagates — the caller (`prepare_effect_targets`) treats a
+    /// non-fence error as "this one target doesn't exist," never a scene
+    /// failure.
+    fn create_effect_fbo(&mut self, width: u32, height: u32) -> Result<EffectFbo, RenderError> {
+        let width = width.clamp(1, MAX_EFFECT_TARGET_DIMENSION);
+        let height = height.clamp(1, MAX_EFFECT_TARGET_DIMENSION);
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { self.device.create_image(&image_info, None) }?;
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let memory = match allocate(
+            &self.instance,
+            &self.device,
+            self.physical,
+            &requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+            }
+            return Err(error.into());
+        }
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(self.format)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = match unsafe { self.device.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
+        let framebuffer_info = vk::FramebufferCreateInfo::default()
+            .render_pass(self.effect_render_pass)
+            .attachments(std::slice::from_ref(&view))
+            .width(width)
+            .height(height)
+            .layers(1);
+        let framebuffer = match unsafe { self.device.create_framebuffer(&framebuffer_info, None) } {
+            Ok(framebuffer) => framebuffer,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_image_view(view, None);
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
+        let fbo = EffectFbo {
+            image,
+            memory,
+            view,
+            framebuffer,
+            width,
+            height,
+        };
+        if let Err(error) = self.clear_effect_fbo(&fbo) {
+            unsafe {
+                self.device.destroy_framebuffer(fbo.framebuffer, None);
+                self.device.destroy_image_view(fbo.view, None);
+                self.device.destroy_image(fbo.image, None);
+                self.device.free_memory(fbo.memory, None);
+            }
+            return Err(error);
+        }
+        Ok(fbo)
+    }
+
+    /// Try to create one named effect target if it does not already
+    /// exist, subject to `MAX_EFFECT_TARGETS_PER_SCENE` and
+    /// `MAX_EFFECT_TARGET_BYTES`. Returns whether a target was created.
+    /// A `FenceTimeout` from the underlying clear propagates (fatal,
+    /// matching every other fence-touching call site); any other
+    /// creation failure just means this one target does not exist —
+    /// never fatal.
+    fn try_create_effect_target(
+        &mut self,
+        name: &str,
+        width: u32,
+        height: u32,
+        budget_bytes: &mut u64,
+    ) -> Result<bool, RenderError> {
+        if self.effect_targets.contains_key(name)
+            || self.effect_targets.len() >= MAX_EFFECT_TARGETS_PER_SCENE
+        {
+            return Ok(false);
+        }
+        let cost = u64::from(width.clamp(1, MAX_EFFECT_TARGET_DIMENSION))
+            * u64::from(height.clamp(1, MAX_EFFECT_TARGET_DIMENSION))
+            * 4;
+        if budget_bytes.saturating_add(cost) > MAX_EFFECT_TARGET_BYTES {
+            return Ok(false);
+        }
+        match self.create_effect_fbo(width, height) {
+            Ok(fbo) => {
+                *budget_bytes = budget_bytes.saturating_add(cost);
+                self.effect_targets.insert(name.to_string(), fbo);
+                Ok(true)
+            }
+            Err(error) => {
+                if is_fence_timeout(&error) {
+                    return Err(error);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// S3: create every effect render target a scene's resolved effect
+    /// chains need — `_rt_FullFrameBuffer` (whenever `requests` is
+    /// non-empty: at least one layer has a resolved effect chain) plus
+    /// every distinct requested name (see [`EffectTargetRequest`]).
+    /// Idempotent (a name already present, e.g. because two effects
+    /// share an `fbos[]` name, is left alone — the documented S3 scope
+    /// limit on `effect_targets`'s global namespace). Returns the number
+    /// of targets actually created (diagnostics: `main.rs`'s
+    /// `event=renderer.scene.effects` line).
+    pub fn prepare_effect_targets(
+        &mut self,
+        requests: &[EffectTargetRequest],
+    ) -> Result<usize, RenderError> {
+        if requests.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_effect_render_pass()?;
+        let mut created = 0usize;
+        let mut budget_bytes: u64 = self
+            .effect_targets
+            .values()
+            .map(|fbo| u64::from(fbo.width) * u64::from(fbo.height) * 4)
+            .sum();
+        if self.try_create_effect_target(
+            FULL_FRAME_BUFFER,
+            self.width,
+            self.height,
+            &mut budget_bytes,
+        )? {
+            created += 1;
+        }
+        for request in requests {
+            if self.try_create_effect_target(
+                &request.name,
+                request.width,
+                request.height,
+                &mut budget_bytes,
+            )? {
+                created += 1;
+            }
+        }
+        Ok(created)
+    }
+
+    /// S3: compile+bind ONE targeted effect pass — its own pipeline
+    /// (against `effect_render_pass`, viewport = the TARGET FBO's own
+    /// pixel size; deliberately NOT shared with `material_pipelines`,
+    /// whose pipelines bake the CANVAS viewport and the main
+    /// `render_pass` — this renderer's pipelines have no dynamic
+    /// viewport state) plus its own descriptor set/UBO (the same
+    /// 8-sampler+UBO shape every material pipeline uses, so
+    /// `resolve_texture_slots` and the `MaterialUniforms` layout are
+    /// shared unchanged). Bounded by `MAX_EFFECT_PASS_BINDINGS`. Returns
+    /// the new binding's index into `effect_pass_bindings` — the caller
+    /// records it in `effect_frame_actions` as `EffectFrameAction::Render`.
+    pub fn compile_effect_pass(
+        &mut self,
+        vertex_spirv: &[u32],
+        fragment_spirv: &[u32],
+        blend_mode: BlendMode,
+        target: &str,
+        textures: &[Option<MaterialTextureBind>],
+        mut uniforms: MaterialUniforms,
+    ) -> Result<usize, RenderError> {
+        if self.effect_pass_bindings.len() >= MAX_EFFECT_PASS_BINDINGS {
+            return Err(RenderError::Vulkan(
+                "compile_effect_pass: MAX_EFFECT_PASS_BINDINGS reached".to_string(),
+            ));
+        }
+        let (width, height) = match self.effect_targets.get(target) {
+            Some(fbo) => (fbo.width, fbo.height),
+            None => {
+                return Err(RenderError::Vulkan(format!(
+                    "compile_effect_pass: target \"{target}\" has no live render target"
+                )));
+            }
+        };
+        let vertex_module = shader_module(&self.device, vertex_spirv)?;
+        let fragment_module = match shader_module(&self.device, fragment_spirv) {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe { self.device.destroy_shader_module(vertex_module, None) };
+                return Err(error);
+            }
+        };
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module)
+                .name(c"main"),
+        ];
+        let binding_desc = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(20)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(12),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding_desc))
+            .vertex_attribute_descriptions(&attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(width as f32)
+            .height(height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(vk::Extent2D { width, height });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(std::slice::from_ref(&viewport))
+            .scissors(std::slice::from_ref(&scissor));
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+        let blend_attachment = blend_attachment_for(blend_mode);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&blend_attachment));
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .layout(self.material_pipeline_layout)
+            .render_pass(self.effect_render_pass)
+            .subpass(0)
+            .depth_stencil_state(&depth_stencil);
+        let result = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        unsafe {
+            self.device.destroy_shader_module(fragment_module, None);
+            self.device.destroy_shader_module(vertex_module, None);
+        }
+        let pipeline = match result {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => return Err(result.into()),
+        };
+
+        let (image_infos, owned_textures) = match self.resolve_texture_slots(textures) {
+            Ok(result) => result,
+            Err(error) => {
+                unsafe { self.device.destroy_pipeline(pipeline, None) };
+                return Err(error);
+            }
+        };
+
+        uniforms.mvp = build_orthographic_mvp([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 1.0, 1.0);
+        let ubo_info = vk::BufferCreateInfo::default()
+            .size(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let ubo_buffer = match unsafe { self.device.create_buffer(&ubo_info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.destroy_owned_textures(owned_textures);
+                unsafe { self.device.destroy_pipeline(pipeline, None) };
+                return Err(error.into());
+            }
+        };
+        let ubo_requirements = unsafe { self.device.get_buffer_memory_requirements(ubo_buffer) };
+        let ubo_memory = match allocate_host_visible(
+            &self.instance,
+            &self.device,
+            self.physical,
+            &ubo_requirements,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(ubo_buffer, None) };
+                self.destroy_owned_textures(owned_textures);
+                unsafe { self.device.destroy_pipeline(pipeline, None) };
+                return Err(error);
+            }
+        };
+        unsafe { self.device.bind_buffer_memory(ubo_buffer, ubo_memory, 0) }?;
+        let ubo_mapped = unsafe {
+            self.device.map_memory(
+                ubo_memory,
+                0,
+                MATERIAL_UNIFORMS_SIZE as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?
+        }
+        .cast::<u8>();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&uniforms).cast::<u8>(),
+                ubo_mapped,
+                MATERIAL_UNIFORMS_SIZE,
+            );
+        }
+        let ubo_flush_range = vk::MappedMemoryRange::default()
+            .memory(ubo_memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            self.device
+                .flush_mapped_memory_ranges(std::slice::from_ref(&ubo_flush_range))?;
+            // Unlike `bind_material_layer`'s UBO (updated every draw,
+            // stays mapped for the renderer's lifetime), an effect pass's
+            // UBO is written exactly once — unmap immediately rather than
+            // keep a pointer nothing ever uses again (see
+            // `EffectPassBinding`'s doc comment).
+            self.device.unmap_memory(ubo_memory);
+        }
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.material_descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.material_descriptor_set_layout));
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_buffer(ubo_buffer, None);
+                    self.device.free_memory(ubo_memory, None);
+                }
+                self.destroy_owned_textures(owned_textures);
+                unsafe { self.device.destroy_pipeline(pipeline, None) };
+                return Err(error.into());
+            }
+        };
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(MAX_MATERIAL_TEXTURES + 1);
+        for (slot, image_info) in image_infos.iter().enumerate() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(slot as u32)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(image_info)),
+            );
+        }
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(ubo_buffer)
+            .offset(0)
+            .range(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize);
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(MAX_MATERIAL_TEXTURES as u32)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info)),
+        );
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        self.effect_pass_bindings.push(EffectPassBinding {
+            pipeline,
+            descriptor_set,
+            textures: owned_textures,
+            ubo_buffer,
+            ubo_memory,
+            target: target.to_string(),
+        });
+        Ok(self.effect_pass_bindings.len() - 1)
+    }
+
+    /// S3: per-frame replay of every effect action recorded at scene load
+    /// (`compile_material_layers`/`compile_effect_pass`, main.rs) — in
+    /// order, re-render each targeted pass's fresh content or execute a
+    /// `command`. Call BEFORE `render()` each frame so any LAYER's own
+    /// material (not an effect pass — the chain's final untargeted pass,
+    /// which becomes the layer's own material; see main.rs) samples this
+    /// frame's fresh effect output, not last frame's. A single bounds
+    /// check for the overwhelming majority of scenes, which have no
+    /// effects at all.
+    pub fn render_effect_chains(&mut self) -> Result<(), RenderError> {
+        for index in 0..self.effect_frame_actions.len() {
+            match self.effect_frame_actions[index] {
+                EffectFrameAction::Render(binding_index) => {
+                    self.render_effect_pass_binding(binding_index)?;
+                }
+                EffectFrameAction::Copy {
+                    ref source,
+                    ref target,
+                } => {
+                    let source = source.clone();
+                    let target = target.clone();
+                    self.copy_effect_target(&source, &target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render_effect_pass_binding(&mut self, index: usize) -> Result<(), RenderError> {
+        let Some(binding) = self.effect_pass_bindings.get(index) else {
+            return Ok(()); // defensive: never happens by construction
+        };
+        let (pipeline, descriptor_set) = (binding.pipeline, binding.descriptor_set);
+        let Some(fbo) = self.effect_targets.get(&binding.target) else {
+            return Ok(()); // defensive: degrade, don't crash
+        };
+        let (framebuffer, width, height) = (fbo.framebuffer, fbo.width, fbo.height);
+
+        unsafe { self.device.reset_fences(&[self.fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+        }?;
+        let clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            },
+        };
+        let rp_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.effect_render_pass)
+            .framebuffer(framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            })
+            .clear_values(std::slice::from_ref(&clear_value));
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.command_buffer,
+                &rp_info,
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.material_pipeline_layout,
+                0,
+                std::slice::from_ref(&descriptor_set),
+                &[],
+            );
+            self.device.cmd_bind_vertex_buffers(
+                self.command_buffer,
+                0,
+                std::slice::from_ref(&self.material_vertex_buffer),
+                &[0],
+            );
+            self.device.cmd_draw(self.command_buffer, 6, 1, 0, 0);
+            self.device.cmd_end_render_pass(self.command_buffer);
+            self.device.end_command_buffer(self.command_buffer)?;
+        }
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+        unsafe {
+            self.device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), self.fence)?;
+        }
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RenderError::FenceTimeout),
+        }
+    }
+
+    /// `command: copy` (and `swap`, executed identically — see
+    /// `EffectFrameAction::Copy`'s doc comment for why): copy `source`'s
+    /// CURRENT content into `target`'s image. Either name missing from
+    /// `effect_targets`, or `source == target`, is a silent no-op —
+    /// degrade, not fail, matching every other unresolved-effect-
+    /// reference case in this module.
+    fn copy_effect_target(&mut self, source: &str, target: &str) -> Result<(), RenderError> {
+        if source == target {
+            return Ok(());
+        }
+        let (Some(src), Some(dst)) = (
+            self.effect_targets.get(source),
+            self.effect_targets.get(target),
+        ) else {
+            return Ok(());
+        };
+        let (src_image, dst_image) = (src.image, dst.image);
+        let copy_width = src.width.min(dst.width);
+        let copy_height = src.height.min(dst.height);
+
+        unsafe { self.device.reset_fences(&[self.fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+        }?;
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let to_transfer_src = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src_image)
+            .subresource_range(subresource);
+        let to_transfer_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer_src, to_transfer_dst],
+            );
+        }
+        let subresource_layers = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = vk::ImageCopy::default()
+            .src_subresource(subresource_layers)
+            .src_offset(vk::Offset3D::default())
+            .dst_subresource(subresource_layers)
+            .dst_offset(vk::Offset3D::default())
+            .extent(vk::Extent3D {
+                width: copy_width,
+                height: copy_height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                src_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+        }
+        let back_src = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(src_image)
+            .subresource_range(subresource);
+        let back_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[back_src, back_dst],
+            );
+            self.device.end_command_buffer(self.command_buffer)?;
+        }
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+        unsafe {
+            self.device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), self.fence)?;
+        }
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RenderError::FenceTimeout),
+        }
+    }
+
+    /// S3: refresh `_rt_FullFrameBuffer` with this frame's finished
+    /// composite (`self.image`, already `TRANSFER_SRC_OPTIMAL` — the main
+    /// render pass's own `final_layout`, no barrier needed on that side).
+    /// Call AFTER `render()` succeeds. A no-op when no scene layer
+    /// resolved an effect chain (the target was never created).
+    ///
+    /// Documented, bounded simplification versus upstream's strictly
+    /// paint-order-dependent `_rt_FullFrameBuffer` visibility (see
+    /// `effect_targets`'s doc comment): every effect chain that reads
+    /// `_rt_FullFrameBuffer`/the `"previous"` sentinel at the START of its
+    /// chain sees the PREVIOUS frame's fully composited output — a
+    /// one-frame lag, imperceptible for a steady-state animated
+    /// wallpaper — rather than a same-frame, per-object incremental
+    /// snapshot.
+    pub fn snapshot_full_frame_buffer(&mut self) -> Result<(), RenderError> {
+        let Some(fbo) = self.effect_targets.get(FULL_FRAME_BUFFER) else {
+            return Ok(());
+        };
+        let dst_image = fbo.image;
+        let copy_width = fbo.width.min(self.width);
+        let copy_height = fbo.height.min(self.height);
+
+        unsafe { self.device.reset_fences(&[self.fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            self.device
+                .begin_command_buffer(self.command_buffer, &begin_info)
+        }?;
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let to_transfer_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer_dst),
+            );
+        }
+        let subresource_layers = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = vk::ImageCopy::default()
+            .src_subresource(subresource_layers)
+            .src_offset(vk::Offset3D::default())
+            .dst_subresource(subresource_layers)
+            .dst_offset(vk::Offset3D::default())
+            .extent(vk::Extent3D {
+                width: copy_width,
+                height: copy_height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                self.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+        }
+        let back_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&back_dst),
+            );
+            self.device.end_command_buffer(self.command_buffer)?;
+        }
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+        unsafe {
+            self.device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), self.fence)?;
+        }
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.fence], true, FENCE_TIMEOUT_NS)
+        } {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RenderError::FenceTimeout),
+        }
+    }
+
+    /// S3: record one `EffectFrameAction::Render` action for a targeted
+    /// pass just compiled (`compile_effect_pass`'s returned index) plus
+    /// every pending command action queued before it — called by
+    /// `main.rs` in each layer's own chain order so the replay order in
+    /// `render_effect_chains` matches.
+    pub fn queue_effect_render(&mut self, binding_index: usize) {
+        self.effect_frame_actions
+            .push(EffectFrameAction::Render(binding_index));
+    }
+
+    /// S3: record one `command: copy`/`swap` action in chain order (see
+    /// `queue_effect_render`).
+    pub fn queue_effect_copy(&mut self, source: String, target: String) {
+        self.effect_frame_actions
+            .push(EffectFrameAction::Copy { source, target });
+    }
+
     /// Clear the attachment with `color` (straight RGBA), draw the given
     /// layers in order (scene.json order, src-over blending), read the
     /// pixels back, and return them premultiplied BGRA. In-flight 1: a
@@ -2446,6 +3580,34 @@ impl Drop for LayerRenderer {
             }
             for pipeline in self.material_pipelines.values() {
                 self.device.destroy_pipeline(*pipeline, None);
+            }
+            // S3: every targeted effect pass's own pipeline/UBO/textures
+            // (never shared with `material_pipelines` — see
+            // `compile_effect_pass`'s doc comment), then every live
+            // effect render target, then the second render pass they all
+            // share (if it was ever created).
+            for binding in &self.effect_pass_bindings {
+                // Already unmapped in `compile_effect_pass` (written once,
+                // no lifetime-long mapped pointer kept — unlike
+                // `material_bindings`, unmapped above).
+                self.device.destroy_buffer(binding.ubo_buffer, None);
+                self.device.free_memory(binding.ubo_memory, None);
+                for (_, texture) in &binding.textures {
+                    self.device.destroy_image_view(texture.view, None);
+                    self.device.destroy_image(texture.image, None);
+                    self.device.free_memory(texture.memory, None);
+                }
+                self.device.destroy_pipeline(binding.pipeline, None);
+            }
+            for fbo in self.effect_targets.values() {
+                self.device.destroy_framebuffer(fbo.framebuffer, None);
+                self.device.destroy_image_view(fbo.view, None);
+                self.device.destroy_image(fbo.image, None);
+                self.device.free_memory(fbo.memory, None);
+            }
+            if self.effect_render_pass != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.effect_render_pass, None);
             }
             self.device
                 .destroy_pipeline_layout(self.material_pipeline_layout, None);
@@ -3376,6 +4538,278 @@ mod tests {
             assert!((152..=154).contains(&pixel[1]), "G={}", pixel[1]);
             assert!((50..=52).contains(&pixel[2]), "R={}", pixel[2]);
             assert_eq!(pixel[3], 255);
+        }
+    }
+
+    /// S3 end-to-end: a synthetic effect pass renders a deterministic
+    /// solid colour into a named FBO (`prepare_effect_targets` +
+    /// `compile_effect_pass` + `render_effect_chains`), and a SECOND
+    /// material — the layer's own, bound the ordinary
+    /// `bind_material_layer` way — samples that FBO by name
+    /// (`MaterialTextureBind::RenderTarget`) and draws it fullscreen.
+    /// Proves the whole FBO chain end to end: target creation+clear,
+    /// pass compilation against `effect_render_pass`, the per-frame
+    /// replay, and `resolve_texture_slots`' `RenderTarget` lookup all
+    /// work together on a real device. Skip-by-default: needs a Vulkan
+    /// device — run with `KWE_TEST_DEVICE` set.
+    #[test]
+    fn effect_chain_renders_through_an_intermediate_fbo() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "effect_chain_renders_through_an_intermediate_fbo: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 32, 24).expect("create renderer");
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let solid_fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);\n}\n";
+        let sample_fragment_source = "uniform sampler2D g_Texture0;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = texSample2D(g_Texture0, v_TexCoord);\n}\n";
+
+        let compile = |source_vert: &str, source_frag: &str, label: &str| {
+            let mut locations = std::collections::BTreeMap::new();
+            let mut include: Box<crate::shaderpre::IncludeLookup<'static>> =
+                Box::new(|_: &str| None);
+            let vertex_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Vertex,
+                &format!("{label}.vert"),
+                source_vert,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("vertex preprocesses");
+            let fragment_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Fragment,
+                &format!("{label}.frag"),
+                source_frag,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("fragment preprocesses");
+            let vertex_spirv = crate::materialshader::compile_stage(
+                &vertex_pre.source,
+                crate::materialshader::Stage::Vertex,
+                &format!("{label}.vert"),
+            )
+            .expect("vertex compiles");
+            let fragment_spirv = crate::materialshader::compile_stage(
+                &fragment_pre.source,
+                crate::materialshader::Stage::Fragment,
+                &format!("{label}.frag"),
+            )
+            .expect("fragment compiles");
+            (vertex_spirv, fragment_spirv)
+        };
+
+        // 1. Create the target FBO and compile+bind a pass that draws a
+        //    solid opaque red into it.
+        let created = renderer
+            .prepare_effect_targets(&[EffectTargetRequest {
+                name: "_rt_TestTarget".to_string(),
+                width: 8,
+                height: 8,
+            }])
+            .expect("prepare effect targets");
+        // The requested target plus the automatically-created
+        // `_rt_FullFrameBuffer` (created whenever `requests` is
+        // non-empty — at least one layer has a resolved effect chain).
+        assert_eq!(created, 2, "the requested target plus _rt_FullFrameBuffer");
+
+        let (solid_vertex, solid_fragment) = compile(vertex_source, solid_fragment_source, "solid");
+        let binding_index = renderer
+            .compile_effect_pass(
+                &solid_vertex,
+                &solid_fragment,
+                BlendMode::Normal,
+                "_rt_TestTarget",
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+            )
+            .expect("compile effect pass");
+        renderer.queue_effect_render(binding_index);
+
+        // 2. Replay the effect chain once — this is what a real frame
+        //    does before the main composite pass.
+        renderer
+            .render_effect_chains()
+            .expect("render effect chains");
+
+        // 3. Bind a normal layer material that samples "_rt_TestTarget"
+        //    at texture slot 0, and draw it fullscreen.
+        let (sample_vertex, sample_fragment) =
+            compile(vertex_source, sample_fragment_source, "sample");
+        let key = MaterialKey::compute(
+            "sample",
+            &std::collections::BTreeMap::new(),
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &sample_vertex,
+                &sample_fragment,
+                BlendMode::Normal,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[
+                    Some(MaterialTextureBind::RenderTarget(
+                        "_rt_TestTarget".to_string(),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[32.0, 0.0], [0.0, 24.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .expect("render once");
+        assert_eq!(pixels.len(), 32 * 24 * 4);
+        // B8G8R8A8 readback of opaque red: B=0, G=0, R=255, A=255.
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel, &[0, 0, 255, 255]);
+        }
+    }
+
+    /// S3: `_rt_FullFrameBuffer` and every effect target are created
+    /// cleared to transparent black — sampling one that has NEVER been
+    /// rendered into (a chain that references an FBO before anything
+    /// writes it, or a scene with an effect target no pass ever targets)
+    /// must never crash and must sample a defined, transparent value.
+    #[test]
+    fn unwritten_effect_target_samples_transparent_black_not_garbage() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "unwritten_effect_target_samples_transparent_black_not_garbage: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 16, 16).expect("create renderer");
+        renderer
+            .prepare_effect_targets(&[EffectTargetRequest {
+                name: "_rt_Untouched".to_string(),
+                width: 4,
+                height: 4,
+            }])
+            .expect("prepare effect targets");
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let sample_fragment_source = "uniform sampler2D g_Texture0;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = texSample2D(g_Texture0, v_TexCoord) + vec4(0.0, 0.0, 0.0, 1.0);\n}\n";
+        let mut locations = std::collections::BTreeMap::new();
+        let mut include: Box<crate::shaderpre::IncludeLookup<'static>> = Box::new(|_: &str| None);
+        let vertex_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Vertex,
+            "untouched.vert",
+            vertex_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("vertex preprocesses");
+        let fragment_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Fragment,
+            "untouched.frag",
+            sample_fragment_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("fragment preprocesses");
+        let vertex_spirv = crate::materialshader::compile_stage(
+            &vertex_pre.source,
+            crate::materialshader::Stage::Vertex,
+            "untouched.vert",
+        )
+        .expect("vertex compiles");
+        let fragment_spirv = crate::materialshader::compile_stage(
+            &fragment_pre.source,
+            crate::materialshader::Stage::Fragment,
+            "untouched.frag",
+        )
+        .expect("fragment compiles");
+        let key = MaterialKey::compute(
+            "untouched",
+            &fragment_pre.combos,
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                BlendMode::Normal,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[
+                    Some(MaterialTextureBind::RenderTarget(
+                        "_rt_Untouched".to_string(),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[16.0, 0.0], [0.0, 16.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        // Never crashes/panics/hangs — the point of the test.
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .expect("render once");
+        assert_eq!(pixels.len(), 16 * 16 * 4);
+        // The shader adds opaque alpha unconditionally: any sampled RGB
+        // (transparent black's RGB channels are 0) composited straight
+        // through with no blending contribution from the (all-zero)
+        // clear color underneath is black, alpha 255.
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel, &[0, 0, 0, 255]);
         }
     }
 

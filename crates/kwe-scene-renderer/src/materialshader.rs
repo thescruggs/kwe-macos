@@ -232,21 +232,24 @@ pub fn compile_stage(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>
 /// conservative, purely textual check — it flags a `_rt_` mention
 /// anywhere, including inside a shader's own dead-combo branches (e.g.
 /// `genericimage2.frag`'s `#if BLENDMODE` block, which every material
-/// using default combos never reaches). Refusing every such material
-/// would defeat this slice's point: `genericimage2` is the corpus's most
-/// common material shader and always carries a combo-gated `_rt_`
-/// texture default that is normally unreachable. This function asks
-/// `shaderc`'s own C-preprocessor (which actually evaluates `#if`/`#ifdef`
-/// against the combo `#define`s already baked into `source`) whether
-/// `_rt_` survives into the LIVE text, which is the precise answer: a
-/// dead branch is stripped before this check ever sees it. Fails closed
-/// (returns `true`, i.e. "treat as referencing a render target" ->
-/// fallback) if the compiler is unavailable, the preprocess call itself
-/// errors, or the `MATERIAL_COMPILE_TIMEOUT` bound (`with_timeout`,
-/// shared with `compile_stage`) elapses — the same shader is about to be
-/// handed to `compile_stage` anyway, so any failure here just means the
-/// caller will see the same failure moments later via
-/// `CompileError::Failed`.
+/// using default combos never reaches). This function asks `shaderc`'s
+/// own C-preprocessor (which actually evaluates `#if`/`#ifdef` against
+/// the combo `#define`s already baked into `source`) whether `_rt_`
+/// survives into the LIVE text, which is the precise answer: a dead
+/// branch is stripped before this check ever sees it.
+///
+/// S2 used this to REJECT any material whose live text referenced a
+/// render target (S2 had no FBO infrastructure to satisfy one). S3 gives
+/// every `_rt_`/`Previous` texture slot a real resolution path (a live
+/// FBO, or the shared dummy texture — never a failure), so
+/// `compile_material_layers` no longer calls this to gate compilation.
+/// Kept `pub` (not deleted) as an independently useful, independently
+/// tested (`dead_branch_render_target_reference_does_not_survive_live_
+/// preprocess`) diagnostic primitive — a future slice wanting to warn
+/// "this material's live shader samples a render target we cannot
+/// currently satisfy" has this ready rather than needing to re-derive
+/// the live-vs-dead-branch distinction.
+#[allow(dead_code)]
 pub fn references_live_render_target(source: &str, stage: Stage, label: &str) -> bool {
     if compiler().is_none() {
         return true;

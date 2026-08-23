@@ -280,15 +280,21 @@ pub struct PreprocessOutput {
     /// need to know which indices a given shader actually references.
     #[allow(dead_code)]
     pub sampler_slots: Vec<u32>,
-    /// True if any `_rt_`-prefixed name (a runtime FBO render target —
-    /// out of scope this slice, effects/FBO chains are S3) appears
-    /// anywhere in the preprocessed text, including in scraped uniform
-    /// JSON metadata (a `"default":"_rt_FullFrameBuffer"` sampler default
-    /// is exactly how upstream shaders reference one). Conservative by
-    /// design: some `_rt_` mentions may be behind a combo this material
-    /// never enables, but treating every mention as disqualifying is the
-    /// honest-degrade choice the task calls for over trying to prove
-    /// reachability.
+    /// True if any `_rt_`-prefixed name (a runtime FBO render target)
+    /// appears anywhere in the preprocessed text, including in scraped
+    /// uniform JSON metadata (a `"default":"_rt_FullFrameBuffer"` sampler
+    /// default is exactly how upstream shaders reference one).
+    /// Conservative by design: some `_rt_` mentions may be behind a combo
+    /// this material never enables (see `materialshader::
+    /// references_live_render_target` for the precise, live-preprocessed
+    /// check). S2 used this as a fast pre-filter before gating
+    /// compilation on a render-target reference; S3 gives every such
+    /// reference a real resolution path (module doc comment,
+    /// `kwe_core::sceneeffect`), so nothing currently gates on this flag
+    /// — kept as diagnostic/test surface (`references_render_target`'s
+    /// own scrape tests) for the same reason
+    /// `references_live_render_target` is kept.
+    #[allow(dead_code)]
     pub references_render_target: bool,
     /// Uniform names this module could not map to either a WE-standard
     /// slot or a material-constant slot — each got a local zero-valued
@@ -683,16 +689,35 @@ fn fold_declarations(
     Ok((out, attributes, sampler_slots, unsupported))
 }
 
+/// GLSL precision qualifiers that may precede a type in a declaration
+/// (`attribute mediump vec2 a_TexCoord;` — one real corpus shader,
+/// `puppettexturechannels.vert`, uses this). Stripped by `parse_decl` so
+/// `glsl_type` is always the bare type (`"vec2"`, never `"mediump
+/// vec2"`) — every caller (attribute-shape matching in
+/// `main.rs::material_vertex_format_supported`, uniform-slot mapping in
+/// `standard_uniform_expr`, the folded `layout(...)` line this module
+/// emits) compares/formats `glsl_type` as a bare type name.
+const PRECISION_QUALIFIERS: [&str; 3] = ["lowp", "mediump", "highp"];
+
 /// Parse `TYPE NAME` (or `TYPE NAME[N]`) up to the first `;`, tolerating a
-/// trailing `// comment`. Returns `None` for anything that does not match
-/// (arrays are returned WITH the brackets still in `name`/`glsl_type`, so
-/// callers can detect and skip them explicitly rather than silently
-/// mis-parsing).
+/// trailing `// comment` and an optional leading precision qualifier.
+/// Returns `None` for anything that does not match (arrays are returned
+/// WITH the brackets still in `name`/`glsl_type`, so callers can detect
+/// and skip them explicitly rather than silently mis-parsing).
 fn parse_decl(rest: &str) -> Option<(String, String)> {
     let semicolon = rest.find(';')?;
     let body = rest[..semicolon].trim();
     let last_space = body.rfind(' ')?;
-    let glsl_type = body[..last_space].trim().to_string();
+    let mut glsl_type = body[..last_space].trim();
+    for qualifier in PRECISION_QUALIFIERS {
+        if let Some(rest) = glsl_type.strip_prefix(qualifier)
+            && rest.starts_with(char::is_whitespace)
+        {
+            glsl_type = rest.trim_start();
+            break;
+        }
+    }
+    let glsl_type = glsl_type.to_string();
     let name = body[last_space + 1..].trim().to_string();
     if glsl_type.is_empty() || name.is_empty() {
         return None;
@@ -1298,6 +1323,57 @@ mod tests {
             out.source
                 .contains("layout(location = 0) attribute vec3 a_Position;")
         );
+        assert!(
+            out.source
+                .contains("layout(location = 1) attribute vec2 a_TexCoord;")
+        );
+    }
+
+    /// Regression: `attribute mediump vec2 a_TexCoord;` (the real corpus
+    /// shader `puppettexturechannels.vert` — see
+    /// `/media/crushinator/steamapps/common/wallpaper_engine/assets/
+    /// shaders/puppettexturechannels.vert` — declares its `a_Position`
+    /// with no precision qualifier but its own vertex format differs in
+    /// a way this renderer does not implement; other corpus shaders DO
+    /// carry a bare precision-qualified `a_TexCoord`) must scrape as
+    /// `glsl_type: "vec2"`, not `"mediump vec2"` — before this fix, the
+    /// qualifier stayed glued to the type, so
+    /// `main.rs::material_vertex_format_supported`'s `attributes[1].
+    /// glsl_type == "vec2"` string-equality check always failed for a
+    /// shader whose second attribute happened to carry ANY precision
+    /// qualifier, needlessly falling back to the flat quad for an
+    /// otherwise fully-supported vertex shape.
+    #[test]
+    fn precision_qualifier_is_stripped_from_the_scraped_type() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute mediump vec2 a_TexCoord;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Position".into()
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into()
+                },
+            ]
+        );
+        // The folded declaration also drops the qualifier (harmless on
+        // desktop GLSL/Vulkan, where precision qualifiers are advisory) —
+        // `fold_declarations` builds its `layout(...)` line from the same
+        // stripped `glsl_type` `parse_decl` returns.
         assert!(
             out.source
                 .contains("layout(location = 1) attribute vec2 a_TexCoord;")
