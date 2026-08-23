@@ -28,6 +28,14 @@ For `adapted` or `copied` code, place a nearby source comment such as:
 An idea-level influence belongs in the ADR or module documentation, not a
 misleading copyright header. Never copy code and label it only as an idea.
 
+## Relicensing (2026-08-22)
+
+The project was relicensed from Apache-2.0 to GPL-3.0-or-later by maintainer
+decision to permit adapting code from `Almamu/linux-wallpaperengine`. Scene
+renderer work now adapts or copies GPL-3.0 code from that project; every adapted
+file must carry a `Borrowed-From:` comment and a THIRD_PARTY.yml entry with the
+upstream commit. See THIRD_PARTY.yml for the current linked commits.
+
 ## Initial upstream ledger
 
 | Project | License observed | Intended use |
@@ -38,7 +46,7 @@ misleading copyright header. Never copy code and label it only as an idea.
 | `jagrat7/linux-wallpaper-engine` | MIT | Gallery, playlist, compatibility, and Steamworks.js workflow reference. |
 | `RainyPixel/wallpaper-engine-kde-plugin` and `catsout` upstream | GPL-2.0 | Compatibility and failure-mode reference only unless a deliberately GPL component is created. Do not paste it into permissively licensed core code. |
 | `waywallen/open-wallpaper-engine` | GPL-2.0 | Behavior, format, and failure-mode reference only for the original renderer; no copied/adapted code. |
-| `Almamu/linux-wallpaperengine` | GPL-3.0 | Behavior and format reference only; do not link or copy into permissive core code. |
+| `Almamu/linux-wallpaperengine` | GPL-3.0 | GPL-3.0; adapted/copied code permitted now that the project is GPL-3.0-or-later — record every adapted file with a `Borrowed-From:` comment and a THIRD_PARTY.yml entry with the upstream commit. |
 | Valve Steamworks SDK / `ISteamUGC` | proprietary SDK terms | Optional isolated Steam bridge only after distribution review. |
 
 License labels above are planning observations and must be rechecked at the

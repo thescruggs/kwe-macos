@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // QuickJS SceneScript engine for the M3a slice.
 //
 // One QuickJS runtime + context per worker (rquickjs 0.12.2, MIT, see

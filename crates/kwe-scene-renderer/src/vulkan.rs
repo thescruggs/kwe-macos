@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Original offscreen Vulkan compositor for the M3a..M3c slices (ADR 0001).
 //
 // No window, no swapchain, no extensions: a Vulkan 1.2 instance, the first

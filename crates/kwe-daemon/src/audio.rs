@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! BETA_M1d audio capture management: owns the `kwe-audio-worker` child,
 //! restarts it on unexpected exit (bounded: at most `MAX_RESTARTS` restarts
 //! within a rolling `RESTART_WINDOW`, then disabled with a one-time log),

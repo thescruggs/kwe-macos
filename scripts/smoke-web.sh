@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Supervised sandboxed-web-renderer smoke suite (BETA_M2b; grants lane
 # BETA_M2c).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast

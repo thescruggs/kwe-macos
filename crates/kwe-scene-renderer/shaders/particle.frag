@@ -6,7 +6,7 @@
 // brightness × tint on the sampled RGB, alpha scaled by the pushed layer
 // alpha (1.0 for particle draws). Straight color output; the pipeline's
 // blend state (the system's blend-mode variant) combines with the frame.
-// Original KWE shader (SPDX: Apache-2.0). Generated with:
+// Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o particle.frag.spv particle.frag
 layout(set = 0, binding = 0) uniform sampler2D tex;
 

@@ -186,3 +186,17 @@ understandable instead of hiding unsupported behavior.
 
 This repository contains no Workshop payloads or Wallpaper Engine runtime
 assets. Users must own Wallpaper Engine and obtain content through Steam.
+
+## License
+
+KDE Wallpaper Engine is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) as of 2026-08-22. Earlier releases were licensed under the Apache License 2.0.
+
+## Credits
+
+The scene renderer architecture and implementation adapt code and research from [Almamu/linux-wallpaperengine](https://github.com/Almamu/linux-wallpaperengine), licensed under GPL-3.0. Adapted files are marked with `Borrowed-From:` comments and detailed in THIRD_PARTY.yml.
+
+This project also references the wallpaper behaviour and format design from:
+- [RainyPixel/wallpaper-engine-kde-plugin](https://github.com/RainyPixel/wallpaper-engine-kde-plugin)
+- [waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine)
+
+See [docs/PROVENANCE.md](docs/PROVENANCE.md) for the full provenance ledger.

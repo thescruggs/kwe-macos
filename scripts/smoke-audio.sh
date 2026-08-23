@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Bounded audio-capture smoke suite (BETA_M1d).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. Audio

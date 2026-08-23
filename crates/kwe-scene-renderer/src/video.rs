@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // VideoLayer textures via libmpv software rendering (M3g).
 //
 // A scene object carrying a `video` key (and no `image`) is a video layer:

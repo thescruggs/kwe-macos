@@ -1,6 +1,6 @@
 #version 450
 // M3c layer compositor: the unit quad (one vertex buffer of 4 × (pos, uv)).
-// Original KWE shader (SPDX: Apache-2.0). Generated with:
+// Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o quad.vert.spv quad.vert
 // Per-layer push constants carry the model matrix:
 //   m0 = (a, c, tx, 0)      column 0 of the linear part + translate x

@@ -137,11 +137,11 @@ entries:
   - id: almamu-linux-wallpaperengine
     project: Almamu/linux-wallpaperengine
     url: https://github.com/Almamu/linux-wallpaperengine
-    revision: null
-    license_observed: GPL-3.0
-    use: idea
-    approved_for_code_use: false
-    notes: Behavior, format, and compatibility concepts only; no code copied and not a runtime backend.
+    revision: b016d7d1fdcf4e5fd2f9c9fa420a8aaa07fee02d
+    license_observed: GPL-3.0-only (check upstream LICENSE)
+    use: adapted
+    approved_for_code_use: true
+    notes: relicensed project to GPL-3.0-or-later 2026-08-22; scene renderer work adapts this project
 
   - id: pipewire-tools
     project: PipeWire tools (pw-record, pw-dump)

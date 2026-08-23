@@ -1,6 +1,6 @@
 #version 450
 // M3a minimal publish path: a fullscreen triangle covering the viewport.
-// Original KWE shader (SPDX: Apache-2.0). Generated with:
+// Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o fullscreen.vert.spv fullscreen.vert
 layout(location = 0) out vec2 v_uv;
 void main() {

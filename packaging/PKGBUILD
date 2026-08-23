@@ -1,5 +1,5 @@
 # Maintainer: KDE Wallpaper Engine developers
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 #
 # AUR package for KDE Wallpaper Engine.
 #
@@ -34,7 +34,7 @@ pkgrel=9
 pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon"
 arch=('x86_64')
 url="https://github.com/kde-wallpaper-engine/kde-wallpaper-engine"
-license=('Apache-2.0')
+license=('GPL-3.0-or-later')
 # Package names reflect the 2026 KDE split renames: Kirigami ships as
 # `kirigami`, and Qt Quick Controls 2 is part of `qt6-declarative`.
 depends=(

@@ -10,7 +10,7 @@
         "Description": "Crash-contained animated wallpapers rendered outside Plasma",
         "Icon": "preferences-desktop-wallpaper",
         "Id": "org.kde.kwe.wallpaper",
-        "License": "Apache-2.0",
+        "License": "GPL-3.0-or-later",
         "Name": "KDE Wallpaper Engine",
         "Version": "0.1.0"
     },

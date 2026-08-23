@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! BETA_M2a spike: drive an installed Chromium over `--remote-debugging-pipe`
 //! and pin the screencast contract the M2b renderer will rely on.
 //!

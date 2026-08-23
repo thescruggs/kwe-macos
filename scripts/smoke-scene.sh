@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Supervised SceneScript smoke suite (BETA_M3a..M3g).
 # Mirrors scripts/smoke-video.sh: isolated smoke root, daemon with fast
 # bounded supervisor timings, and jq assertions on the local JSON API. The

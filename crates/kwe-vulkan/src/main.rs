@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Original Vulkan preflight worker. It creates an instance and a logical
 //! graphics device but does not attach to Plasma or create a display surface.
 

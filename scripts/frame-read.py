@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Bounded shared-frame-file reader used by the smoke suites (smoke-video.sh
 # keeps its own inline copy; smoke-web.sh uses this one).
 #

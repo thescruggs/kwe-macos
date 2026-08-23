@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Defensive local discovery for Wallpaper Engine Workshop projects.
 //!
 //! This is an original implementation informed by Steam's documented library

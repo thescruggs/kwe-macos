@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded offline metadata cache for subscribed Workshop items.
 //!
 //! Steam's local manifests only carry ids and progress; titles, tags, and

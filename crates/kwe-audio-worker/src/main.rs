@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Bounded PipeWire capture worker (BETA_M1d): captures the system audio sink
 // through `pw-record --raw`, converts every bounded PCM window into a

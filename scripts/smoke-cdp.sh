@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # BETA_M2a CDP smoke suite: drives installed Chromium over
 # --remote-debugging-pipe and asserts the screencast contract that M2b's
 # renderer will rely on (ASCIIZ framing on fds 3/4, flattened session

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Layer runtime model for the M3c slice of the original SceneScript engine.
 //
 // One layer is one `objects` entry with an image reference, in scene.json

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded, dependency-free audio analysis used by a future PipeWire worker.
 
 use std::f32::consts::PI;

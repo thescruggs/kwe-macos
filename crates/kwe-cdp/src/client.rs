@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! The CDP client: request/response correlation with timeouts over the
 //! bounded [`Connection`].
 //!

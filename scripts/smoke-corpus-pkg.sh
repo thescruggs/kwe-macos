@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Corpus scene.pkg smoke (BETA_M3b): run the kwe-cli structural preflight
 # over real Workshop scene packages and record version/count/safe stats.
 # Reproduces the M3b corpus evidence (docs/BETA_M3.md acceptance table) on

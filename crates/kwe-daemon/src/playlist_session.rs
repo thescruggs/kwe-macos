@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Daemon-owned playlist session.
 //!
 //! The manager edits playlist definitions through the daemon API; this module

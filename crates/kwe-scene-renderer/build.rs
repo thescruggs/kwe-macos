@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Compiles the vendored stb_truetype C shim (M3e text rasterizer).
 // See vendor/stb/stb_shim.c and THIRD_PARTY.yml for provenance.
 

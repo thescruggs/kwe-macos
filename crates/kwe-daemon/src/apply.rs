@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Daemon-side live wallpaper apply transactions (BETA_M4a).
 //!
 //! `wallpaper.apply` is the daemon half of "set this wallpaper on that

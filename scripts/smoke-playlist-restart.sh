@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -213,7 +213,7 @@ EOF
     # then sees our plugin).
     cat >"$smoke_root/plasma-stub.sh" <<EOF
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 log_file="$smoke_root/switch.log"
 script="\$1"
 if [[ "\$script" == *'wallpaperPlugin = "org.kde.kwe.wallpaper"'* ]]; then
@@ -236,7 +236,7 @@ EOF
     # Fake kscreen-doctor: one enabled, connected output "DP-1".
     cat >"$smoke_root/fake-kscreen-doctor.sh" <<'EOF'
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 printf 'Output: 1 DP-1 62b8c814-6503-41cf-a04d-8743a967c99b\n\tenabled\n\tconnected\n\tGeometry: 0,0 2926x823\n'
 EOF
     chmod +x "$smoke_root/fake-kscreen-doctor.sh"

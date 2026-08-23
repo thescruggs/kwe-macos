@@ -5,7 +5,7 @@
 // layer alpha folded with the tint alpha, pushed in m1.w), and output
 // straight color. The pipeline's blend state (the layer's blend-mode
 // variant) combines the result with the frame; the shader never
-// premultiplies. Original KWE shader (SPDX: Apache-2.0). Generated with:
+// premultiplies. Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o texture.frag.spv texture.frag
 layout(set = 0, binding = 0) uniform sampler2D tex;
 

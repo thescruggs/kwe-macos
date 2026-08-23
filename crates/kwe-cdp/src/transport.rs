@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Nonblocking pipe transport over the fds the renderer hands the browser.
 //!
 //! Chromium reads CDP messages from fd 3 and writes them to fd 4

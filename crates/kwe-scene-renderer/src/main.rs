@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // kwe-scene-renderer: the M3a..M3c SceneScript worker (original
 // implementation, ADR 0001). The daemon spawns it as:
 //

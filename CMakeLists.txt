@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 cmake_minimum_required(VERSION 3.28)
 project(KDEWallpaperEngine VERSION 0.1.0 LANGUAGES CXX)
 

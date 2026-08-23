@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Versioned, bounded shared-frame fallback transport.
 //!
 //! The wire format and seqlock are original to this project. The architectural

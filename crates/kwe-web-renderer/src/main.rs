@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Isolated KWE web renderer (BETA_M2b): spawns a sandboxed headless
 // Chromium (bubblewrap + `--remote-debugging-pipe` on fds 3/4) and

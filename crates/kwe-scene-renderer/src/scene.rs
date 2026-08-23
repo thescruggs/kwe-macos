@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Scene.json parsing for the M3a slice of the original SceneScript engine.
 //
 // The M3a worker understands exactly one input: a scene.json file laid out per

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Bounded image decoding for 2D layer textures (M3c).
 //
 // Mirrors the web renderer's decode limits (kwe-web-renderer

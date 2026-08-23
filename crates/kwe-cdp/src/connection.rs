@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! CDP message correlation: requests carry monotonic u32 ids; responses are
 //! matched back to their pending slot, events land in a bounded queue.
 //!

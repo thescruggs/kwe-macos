@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Shared minimal FFI to the system libmpv client + software render APIs.
 //
 // # Why this crate exists

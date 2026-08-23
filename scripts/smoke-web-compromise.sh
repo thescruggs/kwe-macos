@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Sandbox-compromise smoke suite (BETA_M2d). A runtime-generated fixture
 # page attempts four sandbox escapes in order — (1) a network fetch to a
 # host STALL listener (a scratch loopback port whose listener accepts every

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // M3e text-layer rasterizer shim: a tiny opaque wrapper around the vendored
 // stb_truetype.h (public domain OR MIT; pinned revision 6e9f34d5 — see
 // THIRD_PARTY.yml). The Rust side (src/text.rs) never depends on the C

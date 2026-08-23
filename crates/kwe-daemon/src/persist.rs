@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Shared private-directory and atomic-write helpers for daemon state files.
 //! Extracted from the supervisor so playlist state persists with the same
 //! guarantees (real directory, 0700, 0600 files, no symlink following,

@@ -7,7 +7,7 @@
 // particle draw pushes the identity model (particle positions are scene
 // coordinates baked by the CPU), so the same push-constant layout serves
 // both shaders.
-// Original KWE shader (SPDX: Apache-2.0). Generated with:
+// Original KWE shader (SPDX: GPL-3.0-or-later). Generated with:
 //   glslangValidator -V --target-env vulkan1.2 -o particle.vert.spv particle.vert
 // Vertex input (binding 0, stride 40): pos.xy, uv.xy, color.rgba, size.
 layout(location = 0) in vec2 aPos;

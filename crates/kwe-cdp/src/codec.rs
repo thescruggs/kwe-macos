@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! ASCIIZ wire framing of the Chromium remote-debugging pipe.
 //!
 //! Chromium's `devtools_pipe_handler` (PipeReaderASCIIZ/PipeWriterASCIIZ)

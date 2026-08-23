@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 post_install() {
     echo ":: The wallpaper service (kwe-daemon) runs as a per-user systemd unit"
     echo ":: and is not started automatically. Enable and start it with:"

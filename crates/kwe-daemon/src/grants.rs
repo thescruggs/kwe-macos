@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Daemon-owned per-wallpaper permission grants (BETA_M2c).
 //!
 //! The grant record for a wallpaper answers the three known permissions —

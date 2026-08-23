@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Isolated KWE video renderer: decodes a video file through libmpv's software
 // render API (MPV_RENDER_API_TYPE_SW) and publishes BGRA8888 frames through

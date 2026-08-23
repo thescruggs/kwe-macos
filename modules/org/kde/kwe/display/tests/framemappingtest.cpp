@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // F1: the frame -> item destination rectangle per scaling mode, and the
 // pointer normalisation that follows it (docs/backlog/WALLPAPER_SCALING_MODES.md).
 #include <QtTest>

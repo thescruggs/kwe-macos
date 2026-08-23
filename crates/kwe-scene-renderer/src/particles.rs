@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-3.0-or-later
 // M3f particle systems: a bounded, deterministic CPU particle simulation
 // for the original SceneScript engine.
 //
