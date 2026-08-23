@@ -43,9 +43,13 @@ pub enum SceneObjectKind {
     /// or texture: it can draw today.
     Particle,
     /// A particle system whose `particle` value is a string — an external
-    /// particle definition file. The system registers with defaults, but
-    /// the definition (and therefore its material) is never read, so it
-    /// draws nothing until the file-level merge lands.
+    /// particle definition file (pkg entry, scene directory, or
+    /// `<assets>/particles/`). S4b: the file's own `material` field is
+    /// resolved through `crate::particlefile::resolve_particle_file`
+    /// exactly like a model's `material` field (`crate::scenemodel`) — a
+    /// particle-file system counts as drawable only when that resolves a
+    /// real texture (`SceneObjectSummary::particle_files_resolved`), the
+    /// same honesty split S1 established for models.
     ParticleFile,
     /// A `text` object (BETA_M3e).
     Text,
@@ -140,6 +144,11 @@ pub struct SceneObjectSummary {
     pub videos: usize,
     pub particles: usize,
     pub particle_files: usize,
+    /// Of `particle_files`, how many resolved a material texture through
+    /// the caller's lookup (S4b, `summarize_scene_objects_resolved`; stays
+    /// 0 under the plain `summarize_scene_objects`). Never exceeds
+    /// `particle_files`.
+    pub particle_files_resolved: usize,
     pub texts: usize,
     pub textureless_images: usize,
     pub other: usize,
@@ -153,7 +162,12 @@ impl SceneObjectSummary {
     /// resolvable texture — see the module doc's B2 reference and
     /// deliverable 4 of the S1 task).
     pub fn drawable(&self) -> usize {
-        self.images + self.videos + self.particles + self.texts + self.models_resolved
+        self.images
+            + self.videos
+            + self.particles
+            + self.texts
+            + self.models_resolved
+            + self.particle_files_resolved
     }
 
     /// Why a scene with no drawable object draws nothing, one clause per
@@ -194,10 +208,16 @@ impl SceneObjectSummary {
                 self.textureless_images
             ));
         }
-        if self.particle_files > 0 {
+        // S4b: external particle files now resolve through the same
+        // honesty gate models use — what remains unsupported is
+        // specifically resolution failure (missing file, invalid JSON, or
+        // an unresolvable `material` chain), not "never read".
+        let unresolved_particle_files = self
+            .particle_files
+            .saturating_sub(self.particle_files_resolved);
+        if unresolved_particle_files > 0 {
             reasons.push(format!(
-                "{} particle system(s) reference external particle files, which this build does not read yet",
-                self.particle_files
+                "{unresolved_particle_files} particle system(s) reference external particle files whose material could not be resolved"
             ));
         }
         reasons
@@ -260,38 +280,76 @@ pub fn summarize_scene_objects(root: &Value) -> SceneObjectSummary {
 /// what the worker would actually do.
 pub const MAX_MODEL_RESOLUTIONS: usize = 256;
 
+/// Same cap and reasoning as `MAX_MODEL_RESOLUTIONS`, applied to external
+/// particle-file resolution attempts (S4b): each attempt costs up to four
+/// lookup-closure calls (the particle file, its `material` reference, the
+/// material's primary texture, plus `MAX_MATERIAL_TEXTURES - 1` best-effort
+/// extra slots), so an uncapped attempt count is the same control-plane DoS
+/// surface `MAX_MODEL_RESOLUTIONS` was written to close.
+pub const MAX_PARTICLE_FILE_RESOLUTIONS: usize = 256;
+
 pub fn summarize_scene_objects_resolved(
     root: &Value,
     resolve: &mut crate::scenemodel::AssetLookup<'_>,
 ) -> SceneObjectSummary {
     let mut summary = summarize_scene_objects(root);
-    if summary.models == 0 {
-        return summary;
-    }
     let Some(objects) = root.get("objects").and_then(Value::as_array) else {
         return summary;
     };
-    let mut attempted = 0usize;
-    for entry in objects {
-        if attempted >= MAX_MODEL_RESOLUTIONS {
-            break;
+    if summary.models > 0 {
+        let mut attempted = 0usize;
+        for entry in objects {
+            if attempted >= MAX_MODEL_RESOLUTIONS {
+                break;
+            }
+            let Some(object) = entry.as_object() else {
+                continue;
+            };
+            if classify_scene_object(object) != SceneObjectKind::Model {
+                continue;
+            }
+            let Some(reference) = object
+                .get("image")
+                .map(scene_property_value)
+                .and_then(Value::as_str)
+            else {
+                continue; // malformed model reference: stays unresolved
+            };
+            attempted += 1;
+            if crate::scenemodel::resolve_model(reference, resolve).is_ok() {
+                summary.models_resolved += 1;
+            }
         }
-        let Some(object) = entry.as_object() else {
-            continue;
-        };
-        if classify_scene_object(object) != SceneObjectKind::Model {
-            continue;
-        }
-        let Some(reference) = object
-            .get("image")
-            .map(scene_property_value)
-            .and_then(Value::as_str)
-        else {
-            continue; // malformed model reference: stays unresolved
-        };
-        attempted += 1;
-        if crate::scenemodel::resolve_model(reference, resolve).is_ok() {
-            summary.models_resolved += 1;
+    }
+    // S4b: a particle-file reference resolves through
+    // `crate::particlefile::resolve_particle_file` (particle file ->
+    // `material` field -> `crate::scenemodel::resolve_material`), the same
+    // honesty gate as models above, reusing the identical caller-composed
+    // lookup closure (models and particle files live under the same
+    // pkg/scene-dir/assets-root lanes, so no new lookup wiring is needed).
+    if summary.particle_files > 0 {
+        let mut attempted = 0usize;
+        for entry in objects {
+            if attempted >= MAX_PARTICLE_FILE_RESOLUTIONS {
+                break;
+            }
+            let Some(object) = entry.as_object() else {
+                continue;
+            };
+            if classify_scene_object(object) != SceneObjectKind::ParticleFile {
+                continue;
+            }
+            let Some(reference) = object
+                .get("particle")
+                .map(scene_property_value)
+                .and_then(Value::as_str)
+            else {
+                continue; // malformed particle reference: stays unresolved
+            };
+            attempted += 1;
+            if crate::particlefile::resolve_particle_file(reference, resolve).is_ok() {
+                summary.particle_files_resolved += 1;
+            }
         }
     }
     summary
@@ -353,6 +411,88 @@ mod tests {
         assert!(
             calls.get() <= MAX_MODEL_RESOLUTIONS * 3,
             "resolution attempts must stay bounded: {} lookup calls for {total} declared models",
+            calls.get()
+        );
+    }
+
+    /// S4b: an external particle file whose `material` chain resolves
+    /// counts as drawable, the same honesty gate models already have.
+    #[test]
+    fn particle_file_resolution_counts_toward_drawable() {
+        let root: Value = serde_json::from_str(
+            r#"{"objects": [
+                {"image": null, "particle": "particles/good.json"},
+                {"image": null, "particle": "particles/bad.json"}
+            ]}"#,
+        )
+        .expect("test scene");
+        let mut resolve = |reference: &str| -> Option<Vec<u8>> {
+            match reference {
+                "particles/good.json" => Some(br#"{"material": "materials/good.json"}"#.to_vec()),
+                "particles/bad.json" => Some(br#"{"material": "materials/missing.json"}"#.to_vec()),
+                "materials/good.json" => Some(br#"{"passes": [{"textures": ["good"]}]}"#.to_vec()),
+                "materials/good.tex" => Some(b"bytes".to_vec()),
+                _ => None,
+            }
+        };
+        let summary = summarize_scene_objects_resolved(&root, &mut resolve);
+        assert_eq!(summary.particle_files, 2);
+        assert_eq!(summary.particle_files_resolved, 1);
+        assert_eq!(summary.drawable(), 1);
+        assert!(
+            summary.unsupported_reasons()[0]
+                .contains("1 particle system(s) reference external particle files"),
+            "{:?}",
+            summary.unsupported_reasons()
+        );
+    }
+
+    /// The attempt cap mirrors `model_resolution_attempts_are_capped`: a
+    /// scene declaring far more particle-file objects than
+    /// `MAX_PARTICLE_FILE_RESOLUTIONS` must not turn preflight into an
+    /// unbounded number of lookup-closure calls.
+    #[test]
+    fn particle_file_resolution_attempts_are_capped() {
+        let total = MAX_PARTICLE_FILE_RESOLUTIONS + 50;
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..total {
+            objects.push_str(&format!(
+                r#"{{"image": null, "particle": "particles/p{i}.json"}},"#
+            ));
+        }
+        objects.push_str(r#"{"image": null, "particle": {"texture": "t.png"}}]}"#);
+        let root: Value = serde_json::from_str(&objects).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        let mut resolve = |reference: &str| {
+            calls.set(calls.get() + 1);
+            if let Some(name) = reference
+                .strip_prefix("particles/")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                return Some(format!(r#"{{"material": "materials/{name}.json"}}"#).into_bytes());
+            }
+            if let Some(name) = reference
+                .strip_prefix("materials/")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                return Some(format!(r#"{{"passes": [{{"textures": ["{name}"]}}]}}"#).into_bytes());
+            }
+            if reference.starts_with("materials/") && reference.ends_with(".tex") {
+                return Some(b"bytes".to_vec());
+            }
+            None
+        };
+
+        let summary = summarize_scene_objects_resolved(&root, &mut resolve);
+        assert_eq!(summary.particle_files, total);
+        assert_eq!(
+            summary.particle_files_resolved, MAX_PARTICLE_FILE_RESOLUTIONS,
+            "every particle file is resolvable, so a correct cap stops attempts at exactly the cap"
+        );
+        assert!(
+            calls.get() <= MAX_PARTICLE_FILE_RESOLUTIONS * 4,
+            "resolution attempts must stay bounded: {} lookup calls for {total} declared particle files",
             calls.get()
         );
     }

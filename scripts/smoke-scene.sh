@@ -2645,7 +2645,8 @@ echo "scene smoke passed (B2 b): one drawable layer -> applied, model texture sk
 # colour through the daemon lane end to end, exactly the headline S1
 # behaviour: a model layer draws its base texture as a textured quad.
 s1_model_pkg="$smoke_root/s1-model.pkg"
-python3 - "$s1_model_pkg" <<'S1PY'
+s4b_particle_pkg="$smoke_root/s4b-particle.pkg"
+python3 - "$s1_model_pkg" "$s4b_particle_pkg" <<'S1PY'
 import struct
 import sys
 
@@ -2711,6 +2712,42 @@ open(sys.argv[1], "wb").write(
         ]
     )
 )
+
+# S4b case: a particle system whose "particle" value is a STRING external
+# file reference, entirely packaged (particles/spark.json, its "material"
+# field's materials/spark.json, and materials/spark.tex are all pkg
+# entries, mirroring the S1 model case's all-pkg layout above). The
+# particle file declares a boxrandom emitter with zero distance (spawns
+# exactly at the system's own origin -- scene (0,0) = frame (80,45), the
+# M3c convention) and a lifetimerandom long enough that the population is
+# stable well before the poll below times out.
+s4b_scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "spark", "image": null, "particle": "particles/spark.json"}]}'
+)
+s4b_particle_json = (
+    b'{"material": "materials/spark.json", "maxcount": 64,'
+    b' "emitter": [{"name": "boxrandom", "rate": 120}],'
+    b' "initializer": ['
+    b'   {"name": "lifetimerandom", "min": 5, "max": 5},'
+    b'   {"name": "sizerandom", "min": 40, "max": 40},'
+    b'   {"name": "velocityrandom", "min": "0 0 0", "max": "0 0 0"}'
+    b' ],'
+    b' "operator": [{"name": "movement", "gravity": "0 0 0"}]}'
+)
+s4b_material_json = b'{"passes": [{"textures": ["spark"]}]}'
+s4b_texture = texv_argb8888(4, 4, (0, 255, 0, 255))
+
+open(sys.argv[2], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", s4b_scene_json),
+            ("particles/spark.json", s4b_particle_json),
+            ("materials/spark.json", s4b_material_json),
+            ("materials/spark.tex", s4b_texture),
+        ]
+    )
+)
 S1PY
 
 call_daemon renderer.start "$(jq -cn --arg content "$s1_model_pkg" \
@@ -2725,6 +2762,45 @@ scene_pixel_oracle "$s1_model_frame" 80 45 "0,200,255,255" 1
 s1_model_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$s1_model_status")"
 [[ "$s1_model_tail" != *"model_texture_skip"* ]]
 echo "scene smoke passed (S1): pkg model layer with a real TEXV0005 texture -> resolves, decodes, and draws its colour"
+
+# Case S4b: an external particle definition file (particle: "particles/
+# spark.json", not an inline object) resolves its material chain and
+# actually simulates: a boxrandom emitter at the system's own origin plus
+# a zero-velocity initializer means particles accumulate and sit exactly
+# on the frame center pixel (80,45), so the oracle is a straightforward
+# "did the black background turn into the particle's texture colour"
+# check: pure green (R=B=0), so the frame's BGRA memory order reads the
+# same tuple "0,255,0,255" either way. Before S4b this scene registered a
+# particle system with all-default M3f flat-model behaviour but never
+# opened the file at all (`event=renderer.scene.particle_file_ref`, no
+# resolution attempt) — this case pins that the file is now actually read.
+call_daemon renderer.start "$(jq -cn --arg content "$s4b_particle_pkg" \
+    '{wallpaper_id:"scene-s4b-particle",content_hash:"hash-s4b-particle",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+s4b_status="$(wait_phase live)"
+s4b_frame="$(jq -r '.result.frame_file' <<<"$s4b_status")"
+s4b_fg=0
+for _attempt in {1..120}; do
+    if s4b_probe="$(scene_region_probe "$s4b_frame" 60 25 40 40 "0,255,0,255" 30 2>/dev/null)"; then
+        s4b_fg="${s4b_probe#foreground=}"
+        (( s4b_fg >= 100 )) && break
+    fi
+    sleep 0.25
+done
+[[ "$s4b_fg" -ge 100 ]] || {
+    echo "S4b failure: only $s4b_fg green px in the 40x40 origin region, frame=$s4b_frame" >&2
+    call_daemon renderer.status | jq -r '.result | "phase=\(.phase) frame_file=\(.frame_file) last_failure_detail=\(.last_failure_detail)", (.stderr_tail | join("\n"))' >&2
+    exit 1
+}
+scene_pixel_oracle "$s4b_frame" 80 45 "0,255,0,255" 1
+s4b_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$(call_daemon renderer.status)")"
+[[ "$s4b_tail" != *"event=renderer.scene.particle_file_skip"* ]] || {
+    echo "S4b failure: particle_file_skip fired, file did not resolve; tail:" >&2
+    printf '%s\n' "$s4b_tail" >&2
+    exit 1
+}
+echo "scene smoke passed (S4b): external particle definition file resolves and simulates — $s4b_fg green px at the spawn origin"
+call_daemon renderer.stop >/dev/null
+wait_phase stopped >/dev/null
 
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null

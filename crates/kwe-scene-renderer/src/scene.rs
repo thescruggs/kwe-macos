@@ -423,6 +423,22 @@ pub struct ParticleSpec {
     /// material is missing, unreadable, over budget, or not decodable —
     /// the system stays registered but draws nothing.
     pub texture: Option<DecodedTexture>,
+    /// S4b: the raw `particle` value when it was a STRING — an external
+    /// particle definition file reference — set by `parse_particle_system`
+    /// instead of parsing any flat-model fields (a string value carries no
+    /// inline definition). `main.rs`'s `load_particle_file_definitions`
+    /// resolves this the same way a model layer's `image` resolves
+    /// (`kwe_core::particlefile::resolve_particle_file`) and fills
+    /// `component`/`max_count`/`texture` on success; `None` for every
+    /// inline (object-valued) particle system.
+    pub file_ref: Option<String>,
+    /// S4b: the parsed component model (emitter/initializer/operator
+    /// arrays), filled by `load_particle_file_definitions` only when
+    /// `file_ref` resolved AND parsed. `None` keeps this system on the
+    /// flat M3f model (every inline system, and any file reference that
+    /// failed to resolve/parse — the existing honest fallback: the system
+    /// stays registered with its M3f defaults rather than vanishing).
+    pub component: Option<particles::ComponentModel>,
 }
 
 /// One `objects` entry interpreted as a text layer (M3e). Field names
@@ -1363,6 +1379,8 @@ fn particle_spec_defaults(common: CommonProps, index: usize) -> ParticleSpec {
         visible: common.visible,
         brightness: common.brightness,
         texture: None,
+        file_ref: None,
+        component: None,
     }
 }
 
@@ -1384,10 +1402,19 @@ fn parse_particle_system(
 ) -> Result<ParticleSpec, SceneError> {
     let common = parse_common_props(object, index, "particle")?;
     let mut spec = particle_spec_defaults(common, index);
-    let Value::Object(definition) =
-        scene_property_value(object.get("particle").expect("caller checked"))
-    else {
-        return Ok(spec); // file reference or malformed value: defaults
+    let raw = scene_property_value(object.get("particle").expect("caller checked"));
+    if let Value::String(reference) = raw {
+        // S4b: an external particle definition file reference. The actual
+        // component-model parse happens at load time (main.rs's
+        // `load_particle_file_definitions`, which has the lane-specific
+        // lookup closure this pure-parse stage does not) — record the
+        // reference so that step can find it; the spec keeps its M3f flat
+        // defaults until (and unless) the file resolves.
+        spec.file_ref = Some(reference.clone());
+        return Ok(spec);
+    }
+    let Value::Object(definition) = raw else {
+        return Ok(spec); // malformed value (not object, not string): defaults
     };
 
     // A bounded float-or-numeric-string scalar (the brightness style):
@@ -1641,7 +1668,7 @@ fn field(index: usize, name: &str) -> String {
 /// caller). Every component must be finite and within ±1e6; `non_negative`
 /// additionally forbids negative values (sizes — a mirror goes through
 /// scale, per WE semantics).
-fn parse_vector(
+pub(crate) fn parse_vector(
     value: &Value,
     field: &str,
     allowed: &[usize],

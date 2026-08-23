@@ -37,6 +37,7 @@
 mod js;
 mod layers;
 mod materialshader;
+mod particlefile;
 mod particles;
 mod scene;
 mod shaderpre;
@@ -1030,7 +1031,7 @@ fn main() -> Result<()> {
     }
     if config.particle_file_refs > 0 {
         eprintln!(
-            "event=renderer.scene.particle_file_ref count={} (external particle files are planned; defaults used)",
+            "event=renderer.scene.particle_file_ref count={} (S4b: external particle definition files are resolved and parsed; a reference that fails to resolve keeps the M3f flat-model defaults, see particle_file_skip)",
             config.particle_file_refs
         );
     }
@@ -1159,6 +1160,15 @@ fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
                 })
             },
         );
+        // S4b: external particle files resolve model -> material -> texture
+        // the same lookup order as model layers just above (scene
+        // directory first, Wallpaper Engine assets root second).
+        config.drawable_objects +=
+            load_particle_file_definitions(&mut config.particles, &mut used_bytes, |reference| {
+                resolve_layer_image(&root, reference).ok().or_else(|| {
+                    assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
+                })
+            });
         // M3g: stage every file-scene video into the worker-owned private
         // directory before libmpv sees it. The source is opened with
         // O_NOFOLLOW and copied through that already-open fd, so a later
@@ -1243,6 +1253,23 @@ fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
             assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
         },
     );
+    // S4b: external particle files resolve the same lookup order as model
+    // layers just above (pkg entries first, the pkg's own directory
+    // second, the Wallpaper Engine assets root last).
+    config.drawable_objects +=
+        load_particle_file_definitions(&mut config.particles, &mut used_bytes, |reference| {
+            if let Ok(index) = kwe_core::image_entry(reference, reader.entries())
+                && let Ok(bytes) = reader.read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
+            {
+                return Some(bytes);
+            }
+            if let Some(dir) = &pkg_dir
+                && let Ok(bytes) = resolve_layer_image(dir, reference)
+            {
+                return Some(bytes);
+            }
+            assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
+        });
     // M3g: a packaged video is extracted into the worker's private HOME,
     // because libmpv opens a path rather than a byte slice. Bounded by
     // MAX_VIDEO_SOURCE_BYTES and by the concurrency cap the parse enforced.
@@ -1425,6 +1452,89 @@ fn load_particle_textures(
         *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
         particle.texture = Some(texture);
     }
+}
+
+/// S4b: fill `particles[*].component`/`texture`/`max_count` for every
+/// system whose `particle` value was an external file reference
+/// (`file_ref`, set by `scene::parse_particle_system`): resolve the file
+/// and its `material` chain (`kwe_core::particlefile::
+/// resolve_particle_file`, shared with preflight's honesty gate), decode
+/// the resolved texture the same way a model layer's material resolves
+/// (`texv::decode_model_texture` — a particle file's `material` field
+/// names a `materials/*.json` pass exactly like a model's does, not a
+/// direct texture file), parse the component model
+/// (`particlefile::parse_component_model`) for the worker's own
+/// simulation, and set `max_count` from the file's own `maxcount`.
+///
+/// A particle system whose file does not resolve, is not valid JSON, or
+/// whose material texture does not resolve/decode/fit the shared budget
+/// keeps its M3f flat-model defaults — the existing honest fallback (the
+/// system stays registered and simulates the flat model rather than
+/// vanishing); never a scene rejection. Returns the count of systems whose
+/// component texture actually resolved and decoded — the honest addend to
+/// `drawable_objects`, mirroring `load_model_textures`'s return value.
+fn load_particle_file_definitions(
+    systems: &mut [scene::ParticleSpec],
+    used_bytes: &mut u64,
+    mut resolve_asset: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> usize {
+    let mut resolved = 0usize;
+    let mut skipped = 0usize;
+    let mut unsupported = particlefile::ComponentParseStats::default();
+    for particle in systems.iter_mut() {
+        let Some(file_ref) = particle.file_ref.as_deref() else {
+            continue;
+        };
+        let resolved_file = match kwe_core::resolve_particle_file(file_ref, &mut resolve_asset) {
+            Ok(resolved) => resolved,
+            Err(_detail) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let is_render_target_base =
+            kwe_core::is_runtime_target_name(&resolved_file.material.texture_name);
+        let texture = if is_render_target_base {
+            None // a particle sprite sampling a live render target is not
+        // implemented this slice — degrades to the M3f defaults like
+        // any other unresolved texture, never a crash.
+        } else {
+            texv::decode_model_texture(&resolved_file.material.texture_bytes)
+        };
+        let Some(texture) = texture else {
+            skipped += 1;
+            continue;
+        };
+        let pixels = u64::from(texture.width) * u64::from(texture.height);
+        if !texture_budget_allows(*used_bytes, texture.width, texture.height) {
+            skipped += 1;
+            continue;
+        }
+        *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
+        let (component, stats) = particlefile::parse_component_model(&resolved_file.particle_json);
+        unsupported.unsupported_emitters += stats.unsupported_emitters;
+        unsupported.unsupported_initializers += stats.unsupported_initializers;
+        unsupported.unsupported_operators += stats.unsupported_operators;
+        particle.max_count = particles::clamp_max_count(u64::from(component.maxcount));
+        particle.texture = Some(texture);
+        particle.component = Some(component);
+        resolved += 1;
+    }
+    if skipped > 0 {
+        eprintln!("event=renderer.scene.particle_file_skip count={skipped}");
+    }
+    if unsupported.unsupported_emitters > 0
+        || unsupported.unsupported_initializers > 0
+        || unsupported.unsupported_operators > 0
+    {
+        eprintln!(
+            "event=renderer.scene.particle_file_unsupported_items emitters={} initializers={} operators={} note=unrecognized-kind-skipped",
+            unsupported.unsupported_emitters,
+            unsupported.unsupported_initializers,
+            unsupported.unsupported_operators
+        );
+    }
+    resolved
 }
 
 /// Fill `layers[*].texture` for every model layer (S1): resolve

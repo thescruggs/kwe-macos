@@ -146,6 +146,16 @@ impl SplitMix64 {
 /// (y down); `life` is the effective per-particle life (spec × the
 /// instance lifetime factor, clamped to at least one fixed step so the
 /// interpolation fraction age/life is always well-defined).
+///
+/// S4b: `size`/`alpha`/`color`/`initial_*` are meaningful only for a
+/// component-model system (`ParticleSystemState.component.is_some()`) —
+/// the flat model (M3f, unchanged) keeps computing size/color/alpha at
+/// `build_vertex_bytes` time from the SPEC's start/end endpoints and the
+/// age/life fraction, exactly as before this slice, so every existing M3f
+/// test keeps pinning the same formula. A component-model particle's
+/// current size/alpha/color are instead maintained by its own operators
+/// each fixed step (`step_fixed_component`), initialized by its
+/// initializers at spawn (`spawn_component`).
 #[derive(Debug, Clone)]
 pub(crate) struct Particle {
     x: f32,
@@ -154,6 +164,290 @@ pub(crate) struct Particle {
     vy: f32,
     age: f32,
     life: f32,
+    /// Component-model only (S4b): current size (px half-extent), alpha,
+    /// and straight RGB, mutated by operators each fixed step.
+    size: f32,
+    alpha: f32,
+    color: [f32; 3],
+    /// Component-model only (S4b): the values initializers set at spawn —
+    /// `sizechange`/`alphafade`/`colorchange` read these as their fade
+    /// baseline instead of re-deriving from a spec-level start/end pair
+    /// (upstream `ParticleInstance::initial`, `CParticle.h`).
+    initial_size: f32,
+    initial_alpha: f32,
+    initial_color: [f32; 3],
+    /// Component-model only (S4b): per-particle (frequency, phase) for the
+    /// `oscillatealpha`/`oscillatesize` operators, drawn once at spawn from
+    /// the system's PRNG (upstream randomizes these once per particle too,
+    /// lazily on first use — spawn-time is equivalent and simpler).
+    osc_alpha: [f32; 2],
+    osc_size: [f32; 2],
+}
+
+impl Default for Particle {
+    /// Every field zeroed except `life` (1.0, so an accidentally-unset
+    /// particle's age/life fraction is well-defined rather than a
+    /// division-adjacent NaN) — used as the `..Default::default()` base by
+    /// both the flat-model spawn path (which only ever sets x/y/vx/vy/age/
+    /// life) and `spawn_component` (which sets every field explicitly).
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            age: 0.0,
+            life: 1.0,
+            size: 0.0,
+            alpha: 0.0,
+            color: [1.0, 1.0, 1.0],
+            initial_size: 0.0,
+            initial_alpha: 0.0,
+            initial_color: [1.0, 1.0, 1.0],
+            osc_alpha: [0.0, 0.0],
+            osc_size: [0.0, 0.0],
+        }
+    }
+}
+
+// ---- S4b: the component model (external particle definition files). ----
+//
+// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+// src/WallpaperEngine/Render/Objects/CParticle.cpp (createBoxEmitter,
+// createSphereEmitter, the *RandomInitializer family, and
+// createMovementOperator/createAlphaFadeOperator/createSizeChangeOperator/
+// createColorChangeOperator/createOscillateAlphaOperator/
+// createOscillateSizeOperator/createControlPointAttractOperator/
+// createTurbulenceOperator) @ b016d7d1 — adapted, not ported verbatim. Two
+// deliberate scope cuts, documented once here rather than at every call
+// site:
+//
+// * everything stays 2D (x, y) — the existing M3f particle model has no z
+//   axis, matching every other scene2d object in this renderer, so a
+//   parsed vector field's z component is read (bounds-checked) and then
+//   dropped, and the sphere emitter always takes upstream's 2D-disk branch
+//   (`flags & 4 == 0`), never the 3D spherical-shell one.
+// * control points are NOT tracked (no live mouse/audio-reactive
+//   attractor position): `controlpointattract` anchors at the system's own
+//   spawn origin plus the operator's own `origin` offset instead of a
+//   `Scene.getParticleSystem`-independent mouse-linked control point.
+//   `rotationrandom`/`angularvelocityrandom`/`angularmovement`/
+//   `oscillateposition`/`vortex`/`mapsequencearoundcontrolpoint` are not
+//   implemented (unknown-kind, tolerated — the flags/mask fields on
+//   supported operators outside the plan above are ignored the same way).
+//   `turbulence` is a bounded deterministic APPROXIMATION (a sine/cosine
+//   directional field, not upstream's Perlin curl noise) — see
+//   `apply_turbulence` for the exact formula and why.
+//
+// Every bound below is a hard cap enforced at PARSE time
+// (`crate::particlefile::parse_component_model`), independent of anything
+// upstream declares, so a hostile particle file cannot grow the runtime's
+// per-frame work past a small constant multiple of the existing M3f bounds
+// (MAX_PARTICLE_SYSTEMS systems x MAX_PARTICLES particles, unchanged).
+
+/// Cap on emitters/initializers/operators per component-model system. Real
+/// WE particle files declare 1-5 of each (verified against the local WE
+/// asset corpus's `assets/particles/*.json` examples); this is generous
+/// headroom while keeping one system's per-step operator/emitter loop a
+/// small constant, not attacker-controlled.
+pub const MAX_COMPONENT_ITEMS: usize = 16;
+
+/// One emitter kind (S4b). Distances/directions/origin are already
+/// axis-clamped to ±1e6 and non-finite-safe at parse time (mirrors the
+/// flat model's `clamp_gravity`/`clamp_direction` bounds).
+#[derive(Debug, Clone)]
+pub(crate) enum Emitter {
+    /// `boxrandom`: a per-axis random offset in `[distance_min,
+    /// distance_max]` (sign randomized), scaled by `directions`, from
+    /// `origin`. `distance_min == distance_max == [0,0]` (the WE default
+    /// when unspecified) spawns exactly at `origin`.
+    Box {
+        rate: f32,
+        origin: [f32; 2],
+        directions: [f32; 2],
+        distance_min: [f32; 2],
+        distance_max: [f32; 2],
+    },
+    /// `sphererandom`: a random point in the 2D annulus between
+    /// `distance_min` and `distance_max` (uniform by area — upstream's
+    /// `sqrt(uniform(minR², maxR²))`), scaled by `directions`, from
+    /// `origin`. If `speed_max > 0`, velocity points radially outward at a
+    /// uniform-random speed in `[speed_min, speed_max]`; otherwise
+    /// velocity stays zero (an initializer sets it — the corpus examples
+    /// all pair `sphererandom` with a `velocityrandom` initializer).
+    Sphere {
+        rate: f32,
+        origin: [f32; 2],
+        directions: [f32; 2],
+        distance_min: f32,
+        distance_max: f32,
+        speed_min: f32,
+        speed_max: f32,
+    },
+}
+
+impl Emitter {
+    fn rate(&self) -> f32 {
+        match self {
+            Emitter::Box { rate, .. } | Emitter::Sphere { rate, .. } => *rate,
+        }
+    }
+}
+
+/// One initializer kind (S4b): runs once per particle at spawn, in file
+/// order, after the emitter sets its starting position/velocity.
+#[derive(Debug, Clone)]
+// The shared `Random` suffix mirrors upstream's own type names verbatim
+// (`ColorRandomInitializer`, `SizeRandomInitializer`, ... `CParticle.h`) —
+// every WE initializer IS a "pick a random value" kind, so the names stay
+// as close to the researched format as this renderer's other WE-derived
+// enums (e.g. `Emitter::Box`/`Sphere` matching `boxrandom`/`sphererandom`)
+// rather than dropping the suffix and losing that traceability.
+#[allow(clippy::enum_variant_names)]
+pub(crate) enum Initializer {
+    LifetimeRandom {
+        min: f32,
+        max: f32,
+    },
+    /// `size = uniform(min, max)`, fed directly into `build_vertex_bytes`'s
+    /// existing `half = size * 0.5` (the SAME convention the flat model's
+    /// `size_start`/`size_end` already use — authored size is the quad's
+    /// FULL width). Upstream's own `createSizeRandomInitializer` divides
+    /// by 2 here because ITS renderer consumes `p.size` as a half-extent
+    /// directly; this renderer's single shared vertex builder already
+    /// halves once, so replicating upstream's extra `/2` would halve twice
+    /// and render authored sizes at a quarter scale — deliberately NOT
+    /// ported verbatim (documented deviation). `exponent` biases the
+    /// random draw (1 = uniform, matching `CParticle::
+    /// createSizeRandomInitializer`), clamped to a safe range at parse
+    /// time so `powf` never sees 0/negative/absurdly large exponents.
+    SizeRandom {
+        min: f32,
+        max: f32,
+        exponent: f32,
+    },
+    AlphaRandom {
+        min: f32,
+        max: f32,
+    },
+    /// Adds to whatever velocity the emitter already set (upstream:
+    /// `p.velocity += ...`), not a replacement.
+    VelocityRandom {
+        min: [f32; 2],
+        max: [f32; 2],
+    },
+    /// Components are already normalized 0..=1 at parse time (the WE file
+    /// format writes 0..=255).
+    ColorRandom {
+        min: [f32; 3],
+        max: [f32; 3],
+    },
+}
+
+/// One operator kind (S4b): runs every fixed step, over every alive
+/// particle, in file order.
+#[derive(Debug, Clone)]
+pub(crate) enum Operator {
+    Movement {
+        gravity: [f32; 2],
+        drag: f32,
+    },
+    /// Life-fraction (age/life, 0..=1) gated fade: `initial_alpha` scaled
+    /// to 0 below `fade_in` and above `fade_out`, full between.
+    AlphaFade {
+        fade_in: f32,
+        fade_out: f32,
+    },
+    /// `size = initial_size * fade(life_fraction, start_time, end_time,
+    /// start_value, end_value)` — a linear ramp clamped at the endpoints.
+    SizeChange {
+        start_time: f32,
+        end_time: f32,
+        start_value: f32,
+        end_value: f32,
+    },
+    ColorChange {
+        start_time: f32,
+        end_time: f32,
+        start_value: [f32; 3],
+        end_value: [f32; 3],
+    },
+    /// Multiplies the CURRENT alpha/size (i.e., stacks on top of whatever
+    /// `alphafade`/`sizechange` already computed this step, matching file
+    /// order) by `mix(scale_min, scale_max, (cos(freq*age+phase)+1)/2)`,
+    /// using the per-particle (freq, phase) drawn at spawn
+    /// (`Particle::osc_alpha`/`osc_size`).
+    OscillateAlpha {
+        freq_min: f32,
+        freq_max: f32,
+        scale_min: f32,
+        scale_max: f32,
+        phase_min: f32,
+        phase_max: f32,
+    },
+    OscillateSize {
+        freq_min: f32,
+        freq_max: f32,
+        scale_min: f32,
+        scale_max: f32,
+        phase_min: f32,
+        phase_max: f32,
+    },
+    /// A constant-force pull toward `origin` (relative to the system's own
+    /// spawn origin — see the module-level doc's control-point scope cut)
+    /// for particles within `threshold` px.
+    ControlPointAttract {
+        origin: [f32; 2],
+        scale: f32,
+        threshold: f32,
+    },
+    /// A bounded deterministic APPROXIMATION of upstream's curl-noise
+    /// turbulence (see the module doc) — NOT upstream's algorithm.
+    /// `phase_min/max`/`speed_min/max` are resolved into a single (phase,
+    /// speed) pair ONCE per system, at `ParticleSystemState::from_spec`
+    /// (`turbulence_runtime`, indexed by encounter order among this
+    /// system's Turbulence operators) — matching upstream's "randomized
+    /// once per operator instance, not per particle/frame" behavior.
+    Turbulence {
+        scale: f32,
+        time_scale: f32,
+        speed_min: f32,
+        speed_max: f32,
+        phase_min: f32,
+        phase_max: f32,
+    },
+}
+
+/// One parsed component-model particle file (S4b), bounded at parse time.
+/// Immutable after parse; `ParticleSystemState::from_spec` derives its own
+/// per-system runtime extras (emitter accumulators, resolved turbulence
+/// phase/speed) from it once at construction.
+#[derive(Debug, Clone, Default)]
+pub struct ComponentModel {
+    pub maxcount: u32,
+    pub(crate) emitters: Vec<Emitter>,
+    pub(crate) initializers: Vec<Initializer>,
+    pub(crate) operators: Vec<Operator>,
+}
+
+fn uniform(prng: &mut SplitMix64, min: f32, max: f32) -> f32 {
+    if max > min {
+        min + (max - min) * prng.next_f32()
+    } else {
+        min
+    }
+}
+
+/// Upstream's `fadeValue`: a linear ramp from `(from, start)` to `(to,
+/// end)`, clamped to `[start, end]`'s range at the endpoints (matches
+/// `glm::clamp(mix(...), min(start,end), max(start,end))` semantics without
+/// needing glm — `t` here is already the life fraction, 0..=1).
+fn fade_value(t: f32, from: f32, to: f32, start: f32, end: f32) -> f32 {
+    if to <= from {
+        return end; // upstream: a zero-or-negative-width window is "past it"
+    }
+    let k = ((t - from) / (to - from)).clamp(0.0, 1.0);
+    start + (end - start) * k
 }
 
 /// The runtime state of one particle system: the immutable flat emitter
@@ -242,6 +536,29 @@ pub struct ParticleSystemState {
     /// Vertices currently uploaded (6 × alive); 0 means "nothing to draw".
     /// Kept by the worker after each rebuild.
     pub vertex_count: u32,
+    /// S4b: the parsed component model, when this system's `particle`
+    /// value was an external file reference that resolved. `None` (every
+    /// pre-S4b system, and any file reference that failed to resolve or
+    /// parse) keeps the flat M3f model unchanged — `step_fixed`/
+    /// `build_vertex_bytes` branch on this.
+    pub(crate) component: Option<ComponentModel>,
+    /// S4b: one spawn-rate accumulator per `component.emitters` entry
+    /// (index-aligned), same floor-per-step/carry-leftover scheme as the
+    /// flat model's single `spawn_accumulator`. Empty when `component` is
+    /// `None`.
+    pub(crate) emitter_accumulators: Vec<f32>,
+    /// S4b: one resolved (phase, speed) pair per `Operator::Turbulence` in
+    /// `component.operators`, in that order — drawn from `prng` ONCE at
+    /// construction (mirrors upstream drawing these once per operator
+    /// instance, not per particle or per frame). Empty when `component`
+    /// has no turbulence operator (or is `None`).
+    pub(crate) turbulence_runtime: Vec<(f32, f32)>,
+    /// S4b: accumulated fixed-step simulation seconds, used only by the
+    /// turbulence approximation's time-varying phase. Component-model only
+    /// (unread by the flat model); f32 seconds, same precision-over-very-
+    /// long-uptime caveat every other age/time field in this module
+    /// already carries.
+    pub(crate) sim_time: f32,
 }
 
 impl ParticleSystemState {
@@ -249,6 +566,36 @@ impl ParticleSystemState {
     /// system's position in the scene (the deterministic PRNG seed — the
     /// draw-order merge uses spec.scene_order instead).
     pub fn from_spec(spec: &ParticleSpec, system_index: usize) -> Self {
+        let mut prng = SplitMix64::new(PRNG_SEED ^ (system_index as u64));
+        let component = spec.component.clone();
+        let emitter_accumulators = vec![0.0f32; component.as_ref().map_or(0, |c| c.emitters.len())];
+        // Resolve each Turbulence operator's (phase, speed) ONCE here, in
+        // file order, consuming `prng` before any particle spawns —
+        // deterministic per system, independent of simulate()'s later
+        // per-step PRNG draws. `step_fixed_component` re-derives the same
+        // index by counting Turbulence operators in the same order.
+        let turbulence_runtime: Vec<(f32, f32)> = component
+            .as_ref()
+            .map(|component| {
+                component
+                    .operators
+                    .iter()
+                    .filter_map(|operator| match operator {
+                        Operator::Turbulence {
+                            speed_min,
+                            speed_max,
+                            phase_min,
+                            phase_max,
+                            ..
+                        } => Some((
+                            uniform(&mut prng, *phase_min, *phase_max),
+                            uniform(&mut prng, *speed_min, *speed_max),
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             name: spec.name.clone(),
             scene_order: spec.scene_order,
@@ -283,9 +630,13 @@ impl ParticleSystemState {
             spawn_accumulator: 0.0,
             sim_accumulator: 0.0,
             burst: 0,
-            prng: SplitMix64::new(PRNG_SEED ^ (system_index as u64)),
+            prng,
             capped_diag: false,
             vertex_count: 0,
+            component,
+            emitter_accumulators,
+            turbulence_runtime,
+            sim_time: 0.0,
         }
     }
 
@@ -315,9 +666,16 @@ impl ParticleSystemState {
         changed
     }
 
-    /// One fixed step, in the documented order: spawn, integrate, age out.
+    /// One fixed step. The flat model (M3f, `self.component.is_none()`)
+    /// runs exactly the pre-S4b order: spawn, integrate, age out — every
+    /// existing test/smoke oracle depends on this being byte-for-byte
+    /// unchanged. A component-model system (S4b) instead spawns via its
+    /// own emitters and runs its own operator chain
+    /// (`step_fixed_component`); age/life-out is shared by both.
     fn step_fixed(&mut self, h: f32) {
-        if self.emitting || self.burst > 0 {
+        if self.component.is_some() {
+            self.step_fixed_component(h);
+        } else if self.emitting || self.burst > 0 {
             let mut requested: u32 = 0;
             if self.emitting {
                 self.spawn_accumulator += self.spawn_rate * self.count * h;
@@ -344,19 +702,155 @@ impl ParticleSystemState {
             for _ in 0..take {
                 self.spawn_one();
             }
+            // Explicit Euler: velocity first, then position, then age — the
+            // order the unit tests and smoke oracles derive exact positions
+            // from. Component-mode movement (gravity/drag/position) is its
+            // own operator (`apply_movement`), run inside
+            // `step_fixed_component` instead — this loop is flat-model only.
+            for particle in &mut self.particles {
+                particle.vx += self.gravity[0] * h;
+                particle.vy += self.gravity[1] * h;
+                particle.x += particle.vx * h;
+                particle.y += particle.vy * h;
+                particle.age += h;
+            }
         }
-        // Explicit Euler: velocity first, then position, then age — the
-        // order the unit tests and smoke oracles derive exact positions from.
-        for particle in &mut self.particles {
-            particle.vx += self.gravity[0] * h;
-            particle.vy += self.gravity[1] * h;
-            particle.x += particle.vx * h;
-            particle.y += particle.vy * h;
-            particle.age += h;
+        if self.component.is_some() {
+            self.sim_time += h;
+            for particle in &mut self.particles {
+                particle.age += h;
+            }
         }
         if !self.particles.is_empty() {
             self.particles
                 .retain(|particle| particle.age < particle.life);
+        }
+    }
+
+    /// S4b component-model step: emit via every declared emitter (its own
+    /// floored spawn-rate accumulator, same never-evict/cap-and-report
+    /// contract as the flat model), then run every operator in file order
+    /// over every alive particle. Age-out and `sim_time` bookkeeping are
+    /// shared with the flat model in `step_fixed` above (both branches
+    /// converge before the final `retain`).
+    fn step_fixed_component(&mut self, h: f32) {
+        let component = self
+            .component
+            .clone()
+            .expect("step_fixed_component is only called when component is Some");
+        if self.emitting || self.burst > 0 {
+            let mut burst_remaining = self.burst;
+            self.burst = 0;
+            for (index, emitter) in component.emitters.iter().enumerate() {
+                let rate = emitter.rate();
+                let mut requested: u32 = 0;
+                if self.emitting && rate > 0.0 {
+                    let accumulator = &mut self.emitter_accumulators[index];
+                    *accumulator += rate * self.count * h;
+                    if *accumulator > MAX_SPAWN_ACCUMULATOR {
+                        *accumulator = MAX_SPAWN_ACCUMULATOR;
+                    }
+                    let due = accumulator.floor();
+                    *accumulator -= due;
+                    requested = due as u32;
+                }
+                // The burst (emitParticles()) is delivered through the
+                // FIRST emitter only — a component system's script surface
+                // is the same Scene.getParticleSystem() as the flat model,
+                // which has no concept of "which emitter"; matching the
+                // flat model's single accumulator is the simplest faithful
+                // reading.
+                if index == 0 {
+                    requested = requested.saturating_add(burst_remaining);
+                    burst_remaining = 0;
+                }
+                let free = self.max_count as usize - self.particles.len();
+                let take = (requested as usize).min(free);
+                let dropped = requested as usize - take;
+                if dropped > 0 && !self.capped_diag {
+                    self.capped_diag = true;
+                    eprintln!(
+                        "event=renderer.scene.particles_capped system={} requested={dropped} \
+                         note=spawn-queue-dropped-alive=never-evicted",
+                        self.name
+                    );
+                }
+                for _ in 0..take {
+                    self.spawn_component(&component, emitter);
+                }
+            }
+        }
+        let mut turbulence_index = 0usize;
+        for operator in &component.operators {
+            match operator {
+                Operator::Movement { gravity, drag } => {
+                    apply_movement(&mut self.particles, *gravity, *drag, h)
+                }
+                Operator::AlphaFade { fade_in, fade_out } => {
+                    apply_alpha_fade(&mut self.particles, *fade_in, *fade_out);
+                }
+                Operator::SizeChange {
+                    start_time,
+                    end_time,
+                    start_value,
+                    end_value,
+                } => apply_size_change(
+                    &mut self.particles,
+                    *start_time,
+                    *end_time,
+                    *start_value,
+                    *end_value,
+                ),
+                Operator::ColorChange {
+                    start_time,
+                    end_time,
+                    start_value,
+                    end_value,
+                } => apply_color_change(
+                    &mut self.particles,
+                    *start_time,
+                    *end_time,
+                    *start_value,
+                    *end_value,
+                ),
+                Operator::OscillateAlpha {
+                    scale_min,
+                    scale_max,
+                    ..
+                } => apply_oscillate_alpha(&mut self.particles, *scale_min, *scale_max),
+                Operator::OscillateSize {
+                    scale_min,
+                    scale_max,
+                    ..
+                } => apply_oscillate_size(&mut self.particles, *scale_min, *scale_max),
+                Operator::ControlPointAttract {
+                    origin,
+                    scale,
+                    threshold,
+                } => {
+                    let anchor = [self.origin[0] + origin[0], self.origin[1] + origin[1]];
+                    apply_control_point_attract(&mut self.particles, anchor, *scale, *threshold, h);
+                }
+                Operator::Turbulence {
+                    scale, time_scale, ..
+                } => {
+                    let (phase, speed) = self
+                        .turbulence_runtime
+                        .get(turbulence_index)
+                        .copied()
+                        .unwrap_or((0.0, 0.0));
+                    turbulence_index += 1;
+                    apply_turbulence(
+                        &mut self.particles,
+                        *scale,
+                        *time_scale,
+                        phase,
+                        speed,
+                        self.sim_time,
+                        h,
+                    );
+                }
+            }
         }
     }
 
@@ -386,7 +880,137 @@ impl ParticleSystemState {
             // life; at least one fixed step so the age/life fraction stays
             // defined (a zero factor spawns-and-dies next step).
             life: (self.life * self.lifetime).max(FIXED_STEP),
+            ..Default::default()
         });
+    }
+
+    /// S4b: spawn one particle for a component-model system through
+    /// `emitter`'s own position/velocity rule, then run every initializer
+    /// in file order (each may further adjust position/velocity/size/
+    /// alpha/color/life — matching upstream's "emitter sets a baseline,
+    /// initializers refine it" order, `CParticle::createBoxEmitter`/
+    /// `createSphereEmitter` calling `for (auto& init : m_initializers)`
+    /// immediately after setting the emitter defaults).
+    fn spawn_component(&mut self, component: &ComponentModel, emitter: &Emitter) {
+        let (position, velocity) = match *emitter {
+            Emitter::Box {
+                origin,
+                directions,
+                distance_min,
+                distance_max,
+                ..
+            } => {
+                let mut offset = [0.0f32; 2];
+                for axis in 0..2 {
+                    let mut d = uniform(&mut self.prng, distance_min[axis], distance_max[axis]);
+                    if self.prng.next_f32() < 0.5 {
+                        d = -d;
+                    }
+                    offset[axis] = d * directions[axis];
+                }
+                (
+                    [
+                        self.origin[0] + origin[0] + offset[0],
+                        self.origin[1] + origin[1] + offset[1],
+                    ],
+                    [0.0, 0.0],
+                )
+            }
+            Emitter::Sphere {
+                origin,
+                directions,
+                distance_min,
+                distance_max,
+                speed_min,
+                speed_max,
+                ..
+            } => {
+                let angle = uniform(&mut self.prng, 0.0, std::f32::consts::TAU);
+                let min_sq = distance_min * distance_min;
+                let max_sq = distance_max * distance_max;
+                let radius = uniform(&mut self.prng, min_sq, max_sq).max(0.0).sqrt();
+                let offset = [
+                    radius * angle.cos() * directions[0],
+                    radius * angle.sin() * directions[1],
+                ];
+                let velocity = if speed_max > 0.0 || speed_min != 0.0 {
+                    let length = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
+                    let direction = if length > 0.0 {
+                        [offset[0] / length, offset[1] / length]
+                    } else {
+                        [0.0, 1.0]
+                    };
+                    let speed = uniform(&mut self.prng, speed_min, speed_max);
+                    [direction[0] * speed, direction[1] * speed]
+                } else {
+                    [0.0, 0.0]
+                };
+                (
+                    [
+                        self.origin[0] + origin[0] + offset[0],
+                        self.origin[1] + origin[1] + offset[1],
+                    ],
+                    velocity,
+                )
+            }
+        };
+        let mut particle = Particle {
+            x: position[0],
+            y: position[1],
+            vx: velocity[0],
+            vy: velocity[1],
+            age: 0.0,
+            life: 1.0,
+            size: 20.0,
+            initial_size: 20.0,
+            alpha: 1.0,
+            initial_alpha: 1.0,
+            color: [1.0, 1.0, 1.0],
+            initial_color: [1.0, 1.0, 1.0],
+            osc_alpha: [0.0, 0.0],
+            osc_size: [0.0, 0.0],
+        };
+        for op in &component.operators {
+            if let Operator::OscillateAlpha {
+                freq_min,
+                freq_max,
+                phase_min,
+                phase_max,
+                ..
+            } = op
+            {
+                particle.osc_alpha = [
+                    uniform(&mut self.prng, *freq_min, *freq_max),
+                    uniform(
+                        &mut self.prng,
+                        *phase_min,
+                        phase_max + std::f32::consts::TAU,
+                    ),
+                ];
+            }
+            if let Operator::OscillateSize {
+                freq_min,
+                freq_max,
+                phase_min,
+                phase_max,
+                ..
+            } = op
+            {
+                particle.osc_size = [
+                    uniform(&mut self.prng, *freq_min, *freq_max),
+                    uniform(
+                        &mut self.prng,
+                        *phase_min,
+                        phase_max + std::f32::consts::TAU,
+                    ),
+                ];
+            }
+        }
+        for initializer in &component.initializers {
+            apply_initializer(initializer, &mut particle, &mut self.prng);
+        }
+        particle.life = particle.life.max(FIXED_STEP);
+        self.particles.push(particle);
     }
 
     /// Resume emission (researched WE play(): existing particles keep
@@ -439,17 +1063,40 @@ impl ParticleSystemState {
         scratch.reserve(self.particles.len() * 6 * PARTICLE_VERTEX_BYTES);
         let mut vertex_count = 0u32;
         for particle in &self.particles {
-            let k = (particle.age / particle.life).clamp(0.0, 1.0);
-            let size = (self.size_start + (self.size_end - self.size_start) * k) * self.size;
+            // S4b: a component-model particle carries its OWN current
+            // size/alpha/color, maintained by its operators each fixed
+            // step (`step_fixed_component`) — the flat model (unchanged)
+            // still derives them here from the spec's start/end endpoints
+            // and the age/life fraction, exactly as every pre-S4b test
+            // pins.
+            let (size, color) = if self.component.is_some() {
+                (
+                    particle.size,
+                    [
+                        particle.color[0],
+                        particle.color[1],
+                        particle.color[2],
+                        particle.alpha,
+                    ],
+                )
+            } else {
+                let k = (particle.age / particle.life).clamp(0.0, 1.0);
+                let size = (self.size_start + (self.size_end - self.size_start) * k) * self.size;
+                let color = [
+                    (self.color_start[0] + (self.color_end[0] - self.color_start[0]) * k)
+                        * self.colorn,
+                    (self.color_start[1] + (self.color_end[1] - self.color_start[1]) * k)
+                        * self.colorn,
+                    (self.color_start[2] + (self.color_end[2] - self.color_start[2]) * k)
+                        * self.colorn,
+                    (self.alpha_start + (self.alpha_end - self.alpha_start) * k)
+                        * self.alpha_factor,
+                ];
+                (size, color)
+            };
             let half = size * 0.5;
             let (x0, x1) = (particle.x - half, particle.x + half);
             let (y0, y1) = (particle.y - half, particle.y + half);
-            let color = [
-                (self.color_start[0] + (self.color_end[0] - self.color_start[0]) * k) * self.colorn,
-                (self.color_start[1] + (self.color_end[1] - self.color_start[1]) * k) * self.colorn,
-                (self.color_start[2] + (self.color_end[2] - self.color_start[2]) * k) * self.colorn,
-                (self.alpha_start + (self.alpha_end - self.alpha_start) * k) * self.alpha_factor,
-            ];
             // Corner order mirrors UNIT_QUAD and the text glyph quads:
             // tl, tr, br, br, bl, tl, full-texture UVs.
             for (px, py, u, v) in [
@@ -473,6 +1120,191 @@ impl ParticleSystemState {
             vertex_count += 6;
         }
         vertex_count
+    }
+}
+
+// ---- S4b: component-model initializer/operator free functions. Free
+// functions (not methods) so each is independently unit-testable against a
+// bare `&mut [Particle]`/`&mut Particle` without a whole ParticleSystemState.
+
+/// Apply one initializer to a freshly-spawned particle (S4b). Matches
+/// upstream's per-initializer behavior (`CParticle::create*RandomInitializer`)
+/// with the documented 2D/no-rotation scope cut.
+fn apply_initializer(initializer: &Initializer, particle: &mut Particle, prng: &mut SplitMix64) {
+    match initializer {
+        Initializer::LifetimeRandom { min, max } => {
+            particle.life = uniform(prng, *min, *max).max(FIXED_STEP);
+        }
+        Initializer::SizeRandom { min, max, exponent } => {
+            let t = prng.next_f32().max(0.0).powf(*exponent);
+            let value = (min + t * (max - min)).clamp(0.0, MAX_PARTICLE_SIZE);
+            particle.size = value;
+            particle.initial_size = value;
+        }
+        Initializer::AlphaRandom { min, max } => {
+            let value = uniform(prng, *min, *max).clamp(0.0, 1.0);
+            particle.alpha = value;
+            particle.initial_alpha = value;
+        }
+        Initializer::VelocityRandom { min, max } => {
+            particle.vx += uniform(prng, min[0], max[0]);
+            particle.vy += uniform(prng, min[1], max[1]);
+        }
+        Initializer::ColorRandom { min, max } => {
+            let color = [
+                uniform(prng, min[0], max[0]).clamp(0.0, 1.0),
+                uniform(prng, min[1], max[1]).clamp(0.0, 1.0),
+                uniform(prng, min[2], max[2]).clamp(0.0, 1.0),
+            ];
+            particle.color = color;
+            particle.initial_color = color;
+        }
+    }
+}
+
+/// `movement` operator (S4b): integrate position from the CURRENT
+/// velocity, then apply gravity and drag to velocity for the next step —
+/// upstream's exact order (`CParticle::createMovementOperator`,
+/// "Update position FIRST using current velocity ... Then apply forces to
+/// modify velocity for NEXT frame"), deliberately different from the flat
+/// model's velocity-then-position order (that order is pinned by the M3f
+/// tests and left untouched).
+fn apply_movement(particles: &mut [Particle], gravity: [f32; 2], drag: f32, h: f32) {
+    let drag_factor = (1.0 - drag * h).max(0.0);
+    for particle in particles {
+        particle.x += particle.vx * h;
+        particle.y += particle.vy * h;
+        particle.vx = (particle.vx + gravity[0] * h) * drag_factor;
+        particle.vy = (particle.vy + gravity[1] * h) * drag_factor;
+    }
+}
+
+fn apply_alpha_fade(particles: &mut [Particle], fade_in: f32, fade_out: f32) {
+    for particle in particles {
+        let life = (particle.age / particle.life).clamp(0.0, 1.0);
+        particle.alpha = if life <= fade_in {
+            particle.initial_alpha * fade_value(life, 0.0, fade_in, 0.0, 1.0)
+        } else if life > fade_out {
+            particle.initial_alpha * (1.0 - fade_value(life, fade_out, 1.0, 0.0, 1.0))
+        } else {
+            particle.initial_alpha
+        };
+    }
+}
+
+fn apply_size_change(
+    particles: &mut [Particle],
+    start_time: f32,
+    end_time: f32,
+    start_value: f32,
+    end_value: f32,
+) {
+    for particle in particles {
+        let life = (particle.age / particle.life).clamp(0.0, 1.0);
+        let multiplier = fade_value(life, start_time, end_time, start_value, end_value);
+        particle.size = (particle.initial_size * multiplier).clamp(0.0, MAX_PARTICLE_SIZE);
+    }
+}
+
+fn apply_color_change(
+    particles: &mut [Particle],
+    start_time: f32,
+    end_time: f32,
+    start_value: [f32; 3],
+    end_value: [f32; 3],
+) {
+    for particle in particles {
+        let life = (particle.age / particle.life).clamp(0.0, 1.0);
+        let mut color = [0.0f32; 3];
+        for channel in 0..3 {
+            let multiplier = fade_value(
+                life,
+                start_time,
+                end_time,
+                start_value[channel],
+                end_value[channel],
+            );
+            color[channel] = (particle.initial_color[channel] * multiplier).clamp(0.0, 1.0);
+        }
+        particle.color = color;
+    }
+}
+
+/// `oscillatealpha`/`oscillatesize` (S4b): multiply the CURRENT value
+/// (already set by an earlier `alphafade`/`sizechange` this same step, or
+/// left at its spawn value if neither ran) by a cosine wave between
+/// `scale_min` and `scale_max`, using the per-particle (freq, phase)
+/// `spawn_component` drew once. Matches upstream's
+/// `mix(scaleMin, scaleMax, (cos(freq*age+phase)+1)/2)`.
+fn apply_oscillate_alpha(particles: &mut [Particle], scale_min: f32, scale_max: f32) {
+    for particle in particles {
+        let [freq, phase] = particle.osc_alpha;
+        let cos_val = ((freq * particle.age + phase).cos() + 1.0) * 0.5;
+        let multiplier = scale_min + (scale_max - scale_min) * cos_val;
+        particle.alpha = (particle.alpha * multiplier).clamp(0.0, 1.0);
+    }
+}
+
+fn apply_oscillate_size(particles: &mut [Particle], scale_min: f32, scale_max: f32) {
+    for particle in particles {
+        let [freq, phase] = particle.osc_size;
+        let cos_val = ((freq * particle.age + phase).cos() + 1.0) * 0.5;
+        let multiplier = scale_min + (scale_max - scale_min) * cos_val;
+        particle.size = (particle.size * multiplier).clamp(0.0, MAX_PARTICLE_SIZE);
+    }
+}
+
+/// `controlpointattract` (S4b, scoped to a static anchor — see the module
+/// doc's control-point cut): a constant-force pull toward `anchor` for
+/// particles within `threshold` px, matching upstream's per-step
+/// `velocity += normalize(anchor - position) * scale * dt`.
+fn apply_control_point_attract(
+    particles: &mut [Particle],
+    anchor: [f32; 2],
+    scale: f32,
+    threshold: f32,
+    h: f32,
+) {
+    for particle in particles {
+        let dx = anchor[0] - particle.x;
+        let dy = anchor[1] - particle.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        if distance > 0.001 && distance < threshold {
+            particle.vx += (dx / distance) * scale * h;
+            particle.vy += (dy / distance) * scale * h;
+        }
+    }
+}
+
+/// `turbulence` (S4b) — a bounded deterministic APPROXIMATION of
+/// upstream's Perlin curl-noise field (see the module-level doc), NOT
+/// upstream's algorithm: a sine/cosine directional field sampled at each
+/// particle's own position (scaled by `scale`, clamped so the noise
+/// frequency itself stays bounded) plus a time term (`time_scale *
+/// sim_time`) and the per-system resolved `phase`, normalized to a unit
+/// vector and scaled by the per-system resolved `speed`. `speed <=
+/// 0.0001` is a no-op (matches upstream's own early-out for a degenerate
+/// draw).
+fn apply_turbulence(
+    particles: &mut [Particle],
+    scale: f32,
+    time_scale: f32,
+    phase: f32,
+    speed: f32,
+    sim_time: f32,
+    h: f32,
+) {
+    if speed <= 0.0001 {
+        return;
+    }
+    let freq = (scale.max(0.0) * 2.0).min(10.0);
+    let time_term = time_scale * sim_time;
+    for particle in particles {
+        let nx = (particle.x * freq + phase + time_term).sin();
+        let ny = (particle.y * freq + phase + time_term).cos();
+        let len = (nx * nx + ny * ny).sqrt().max(1e-4);
+        particle.vx += (nx / len) * speed * h;
+        particle.vy += (ny / len) * speed * h;
     }
 }
 
@@ -645,6 +1477,8 @@ mod tests {
             visible: true,
             brightness: 1.0,
             texture: None,
+            file_ref: None,
+            component: None,
         };
         f(&mut spec);
         spec
@@ -778,6 +1612,7 @@ mod tests {
             vy: 0.0,
             age: 0.5, // k = 0.5
             life: 1.0,
+            ..Default::default()
         });
         let mut scratch = Vec::new();
         let count = state.build_vertex_bytes(&mut scratch);
@@ -841,6 +1676,7 @@ mod tests {
             vy: 0.0,
             age: 0.0,
             life: 1.0,
+            ..Default::default()
         });
         let mut scratch = Vec::new();
         let _ = state.build_vertex_bytes(&mut scratch);
@@ -1126,5 +1962,432 @@ mod tests {
             MAX_PARTICLE_SYSTEMS <= 16 && MAX_PARTICLE_SYSTEMS <= MAX_LAYERS,
             "particle systems must stay within the fixed texture-slot layout"
         );
+    }
+
+    // ---- S4b: component-model simulation tests. ----
+
+    fn component_state(component: ComponentModel, max_count: u32) -> ParticleSystemState {
+        let mut spec = spec_with(|s| {
+            s.max_count = max_count;
+        });
+        spec.component = Some(component);
+        ParticleSystemState::from_spec(&spec, 0)
+    }
+
+    #[test]
+    fn box_emitter_defaults_spawn_exactly_at_origin() {
+        let component = ComponentModel {
+            maxcount: 100,
+            emitters: vec![Emitter::Box {
+                rate: 60.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: [0.0, 0.0],
+                distance_max: [0.0, 0.0],
+            }],
+            initializers: vec![],
+            operators: vec![],
+        };
+        let mut state = component_state(component, 100);
+        state.simulate(1.0 / 60.0);
+        assert_eq!(state.particles.len(), 1);
+        let p = &state.particles[0];
+        assert_eq!((p.x, p.y), (0.0, 0.0));
+        assert_eq!((p.vx, p.vy), (0.0, 0.0));
+        // No lifetimerandom initializer: the spawn-time default (1.0) holds.
+        assert_eq!(p.life, 1.0);
+    }
+
+    #[test]
+    fn sphere_emitter_with_speed_launches_radially_outward() {
+        let component = ComponentModel {
+            maxcount: 100,
+            emitters: vec![Emitter::Sphere {
+                rate: 60.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: 10.0,
+                distance_max: 10.0,
+                speed_min: 50.0,
+                speed_max: 50.0,
+            }],
+            initializers: vec![],
+            operators: vec![],
+        };
+        let mut state = component_state(component, 100);
+        state.simulate(1.0 / 60.0);
+        assert_eq!(state.particles.len(), 1);
+        let p = &state.particles[0];
+        let radius = (p.x * p.x + p.y * p.y).sqrt();
+        assert!((radius - 10.0).abs() < 1e-3, "radius = {radius}");
+        let speed = (p.vx * p.vx + p.vy * p.vy).sqrt();
+        assert!((speed - 50.0).abs() < 1e-3, "speed = {speed}");
+        // Velocity points radially outward: v is parallel to (x, y).
+        let cross = p.x * p.vy - p.y * p.vx;
+        assert!(cross.abs() < 1e-2, "velocity not radial: cross = {cross}");
+    }
+
+    #[test]
+    fn velocity_random_initializer_adds_to_emitter_velocity() {
+        let component = ComponentModel {
+            maxcount: 10,
+            emitters: vec![Emitter::Box {
+                rate: 60.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: [0.0, 0.0],
+                distance_max: [0.0, 0.0],
+            }],
+            initializers: vec![Initializer::VelocityRandom {
+                min: [30.0, 30.0],
+                max: [30.0, 30.0],
+            }],
+            operators: vec![],
+        };
+        let mut state = component_state(component, 10);
+        state.simulate(1.0 / 60.0);
+        assert_eq!((state.particles[0].vx, state.particles[0].vy), (30.0, 30.0));
+    }
+
+    #[test]
+    fn lifetime_size_alpha_color_random_initializers_set_exact_values_at_zero_spread() {
+        let component = ComponentModel {
+            maxcount: 10,
+            emitters: vec![Emitter::Box {
+                rate: 60.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: [0.0, 0.0],
+                distance_max: [0.0, 0.0],
+            }],
+            initializers: vec![
+                Initializer::LifetimeRandom { min: 4.0, max: 4.0 },
+                Initializer::SizeRandom {
+                    min: 40.0,
+                    max: 40.0,
+                    exponent: 1.0,
+                },
+                Initializer::AlphaRandom { min: 0.5, max: 0.5 },
+                Initializer::ColorRandom {
+                    min: [0.2, 0.4, 0.6],
+                    max: [0.2, 0.4, 0.6],
+                },
+            ],
+            operators: vec![],
+        };
+        let mut state = component_state(component, 10);
+        state.simulate(1.0 / 60.0);
+        let p = &state.particles[0];
+        assert_eq!(p.life, 4.0);
+        assert_eq!(
+            p.size, 40.0,
+            "sizerandom feeds build_vertex_bytes's own half=size*0.5 directly, no extra halving"
+        );
+        assert_eq!(p.initial_size, 40.0);
+        assert_eq!(p.alpha, 0.5);
+        assert_eq!(p.initial_alpha, 0.5);
+        assert_eq!(p.color, [0.2, 0.4, 0.6]);
+        assert_eq!(p.initial_color, [0.2, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn movement_operator_integrates_position_then_applies_gravity_and_drag() {
+        // Upstream order: position += velocity*h FIRST, then velocity +=
+        // gravity*h and *= (1 - drag*h) — verified directly on the free
+        // function against one particle so the order is pinned exactly.
+        let mut particles = vec![Particle {
+            x: 0.0,
+            y: 0.0,
+            vx: 10.0,
+            vy: 0.0,
+            ..Default::default()
+        }];
+        apply_movement(&mut particles, [0.0, 20.0], 0.5, 1.0);
+        let p = &particles[0];
+        assert_eq!(p.x, 10.0, "position used the PRE-update velocity");
+        assert_eq!(p.y, 0.0);
+        assert_eq!(p.vy, 20.0 * 0.5, "gravity applied, then drag halves it");
+        assert_eq!(p.vx, 10.0 * 0.5);
+    }
+
+    #[test]
+    fn movement_drag_never_reverses_velocity() {
+        let mut particles = vec![Particle {
+            vx: 10.0,
+            ..Default::default()
+        }];
+        // drag*h = 5.0 > 1.0: the drag factor clamps to 0, not negative.
+        apply_movement(&mut particles, [0.0, 0.0], 5.0, 1.0);
+        assert_eq!(particles[0].vx, 0.0);
+    }
+
+    #[test]
+    fn alpha_fade_ramps_in_and_out_and_holds_between() {
+        let mut particles = vec![
+            particle_at_life_fraction(0.05, 1.0), // inside fade-in
+            particle_at_life_fraction(0.5, 1.0),  // held
+            particle_at_life_fraction(0.95, 1.0), // inside fade-out
+        ];
+        apply_alpha_fade(&mut particles, 0.1, 0.9);
+        assert!(
+            (particles[0].alpha - 0.5).abs() < 1e-4,
+            "{}",
+            particles[0].alpha
+        );
+        assert_eq!(particles[1].alpha, 1.0);
+        assert!(
+            (particles[2].alpha - 0.5).abs() < 1e-4,
+            "{}",
+            particles[2].alpha
+        );
+    }
+
+    fn particle_at_life_fraction(fraction: f32, life: f32) -> Particle {
+        Particle {
+            age: fraction * life,
+            life,
+            initial_alpha: 1.0,
+            initial_size: 100.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn size_change_ramps_linearly_between_endpoints() {
+        // start_value/end_value are MULTIPLIERS on initial_size (upstream:
+        // `p.size = p.initial.size * fadeValue(...)`), typically 1.0 ->
+        // 0.0 (shrink to nothing over life) — not absolute sizes.
+        let mut particles = vec![particle_at_life_fraction(0.25, 4.0)];
+        apply_size_change(&mut particles, 0.0, 1.0, 1.0, 0.0);
+        // life fraction 0.25 of a linear 1.0 -> 0.0 ramp = 0.75, times the
+        // fixture's initial_size (100.0) = 75.
+        assert!(
+            (particles[0].size - 75.0).abs() < 1e-3,
+            "{}",
+            particles[0].size
+        );
+    }
+
+    #[test]
+    fn size_change_clamps_to_the_hard_size_cap() {
+        let mut particles = vec![particle_at_life_fraction(0.0, 1.0)];
+        apply_size_change(&mut particles, 0.0, 1.0, 1e9, 1e9);
+        assert!(particles[0].size <= MAX_PARTICLE_SIZE);
+        assert!(particles[0].size.is_finite());
+    }
+
+    #[test]
+    fn color_change_ramps_each_channel_independently() {
+        let mut particles = vec![Particle {
+            age: 0.5,
+            life: 1.0,
+            initial_color: [1.0, 1.0, 1.0],
+            ..Default::default()
+        }];
+        apply_color_change(&mut particles, 0.0, 1.0, [1.0, 0.0, 0.5], [0.0, 1.0, 0.5]);
+        let color = particles[0].color;
+        assert!((color[0] - 0.5).abs() < 1e-3);
+        assert!((color[1] - 0.5).abs() < 1e-3);
+        assert!((color[2] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn oscillate_alpha_and_size_stay_bounded_by_scale_range() {
+        let mut particles = vec![Particle {
+            age: 0.0,
+            alpha: 1.0,
+            size: 10.0,
+            osc_alpha: [1.0, 0.0],
+            osc_size: [1.0, std::f32::consts::PI], // phase pi: cos(0+pi) = -1 -> min
+            ..Default::default()
+        }];
+        apply_oscillate_alpha(&mut particles, 0.2, 0.8);
+        // age=0, phase=0: cos(0) = 1 -> cos_val = 1 -> multiplier = scale_max.
+        assert!(
+            (particles[0].alpha - 0.8).abs() < 1e-4,
+            "{}",
+            particles[0].alpha
+        );
+        apply_oscillate_size(&mut particles, 2.0, 4.0);
+        // phase=pi: cos_val = 0 -> multiplier = scale_min = 2.0.
+        assert!(
+            (particles[0].size - 20.0).abs() < 1e-3,
+            "{}",
+            particles[0].size
+        );
+    }
+
+    #[test]
+    fn control_point_attract_only_pulls_within_threshold() {
+        let mut particles = vec![
+            Particle {
+                x: 5.0,
+                y: 0.0,
+                ..Default::default()
+            }, // inside threshold
+            Particle {
+                x: 500.0,
+                y: 0.0,
+                ..Default::default()
+            }, // outside threshold
+        ];
+        apply_control_point_attract(&mut particles, [0.0, 0.0], 100.0, 50.0, 1.0);
+        assert!(particles[0].vx < 0.0, "pulled toward the anchor");
+        assert_eq!(particles[1].vx, 0.0, "outside threshold: untouched");
+    }
+
+    #[test]
+    fn turbulence_is_deterministic_bounded_and_off_below_the_speed_floor() {
+        let mut a = vec![Particle {
+            x: 12.0,
+            y: -7.0,
+            ..Default::default()
+        }];
+        let mut b = a.clone();
+        apply_turbulence(&mut a, 0.5, 1.0, 0.3, 200.0, 5.0, 1.0 / 60.0);
+        apply_turbulence(&mut b, 0.5, 1.0, 0.3, 200.0, 5.0, 1.0 / 60.0);
+        assert_eq!((a[0].vx, a[0].vy), (b[0].vx, b[0].vy), "deterministic");
+        let delta = (a[0].vx * a[0].vx + a[0].vy * a[0].vy).sqrt();
+        // Bounded: at most speed * h per step (a unit-length force scaled
+        // by speed and h).
+        assert!(delta <= 200.0 / 60.0 + 1e-3, "delta = {delta}");
+        // Below the speed floor: a documented no-op (matches upstream's
+        // own early-out for a degenerate draw).
+        let mut c = vec![Particle::default()];
+        apply_turbulence(&mut c, 0.5, 1.0, 0.3, 0.00001, 5.0, 1.0 / 60.0);
+        assert_eq!((c[0].vx, c[0].vy), (0.0, 0.0));
+    }
+
+    #[test]
+    fn component_system_respects_max_count_and_reports_capped_diag() {
+        let component = ComponentModel {
+            maxcount: 4,
+            emitters: vec![Emitter::Box {
+                rate: 4096.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: [0.0, 0.0],
+                distance_max: [0.0, 0.0],
+            }],
+            initializers: vec![Initializer::LifetimeRandom {
+                min: 60.0,
+                max: 60.0,
+            }],
+            operators: vec![],
+        };
+        let mut state = component_state(component, 4);
+        for _ in 0..120 {
+            state.simulate(1.0 / 60.0);
+        }
+        assert!(state.particles.len() <= 4);
+        assert!(state.capped_diag);
+    }
+
+    #[test]
+    fn component_system_stays_finite_and_bounded_under_a_hostile_operator_chain() {
+        // Every field at an extreme-but-parser-legal value (mirrors what
+        // particlefile.rs's clamps would actually let through): the sim
+        // must never produce NaN/Inf and must never exceed the hard caps,
+        // over many steps.
+        let component = ComponentModel {
+            maxcount: MAX_PARTICLES as u32,
+            emitters: vec![
+                Emitter::Box {
+                    rate: 100_000.0,
+                    origin: [0.0, 0.0],
+                    directions: [1.0, 1.0],
+                    distance_min: [0.0, 0.0],
+                    distance_max: [1e6, 1e6],
+                },
+                Emitter::Sphere {
+                    rate: 100_000.0,
+                    origin: [0.0, 0.0],
+                    directions: [1.0, 1.0],
+                    distance_min: 0.0,
+                    distance_max: 1e6,
+                    speed_min: 0.0,
+                    speed_max: MAX_PARTICLE_SPEED,
+                },
+            ],
+            initializers: vec![
+                Initializer::LifetimeRandom { min: 0.0, max: 1e6 },
+                Initializer::SizeRandom {
+                    min: 0.0,
+                    max: MAX_PARTICLE_SIZE * 4.0,
+                    exponent: 0.01,
+                },
+                Initializer::VelocityRandom {
+                    min: [-MAX_PARTICLE_SPEED, -MAX_PARTICLE_SPEED],
+                    max: [MAX_PARTICLE_SPEED, MAX_PARTICLE_SPEED],
+                },
+            ],
+            operators: vec![
+                Operator::Movement {
+                    gravity: [MAX_PARTICLE_GRAVITY, -MAX_PARTICLE_GRAVITY],
+                    drag: 1000.0,
+                },
+                Operator::AlphaFade {
+                    fade_in: 0.0,
+                    fade_out: 1.0,
+                },
+                Operator::SizeChange {
+                    start_time: 0.0,
+                    end_time: 1.0,
+                    start_value: 1e3,
+                    end_value: 0.0,
+                },
+                Operator::ColorChange {
+                    start_time: 0.0,
+                    end_time: 1.0,
+                    start_value: [1.0, 0.0, 0.5],
+                    end_value: [0.0, 1.0, 0.5],
+                },
+                Operator::OscillateAlpha {
+                    freq_min: 0.0,
+                    freq_max: 1000.0,
+                    scale_min: 0.0,
+                    scale_max: 1000.0,
+                    phase_min: -1e4,
+                    phase_max: 1e4,
+                },
+                Operator::OscillateSize {
+                    freq_min: 0.0,
+                    freq_max: 1000.0,
+                    scale_min: 0.0,
+                    scale_max: 1000.0,
+                    phase_min: -1e4,
+                    phase_max: 1e4,
+                },
+                Operator::ControlPointAttract {
+                    origin: [0.0, 0.0],
+                    scale: 1e7,
+                    threshold: 1e6,
+                },
+                Operator::Turbulence {
+                    scale: 1e6,
+                    time_scale: 1e6,
+                    speed_min: 0.0,
+                    speed_max: MAX_PARTICLE_SPEED,
+                    phase_min: -1e4,
+                    phase_max: 1e4,
+                },
+            ],
+        };
+        let mut state = component_state(component, MAX_PARTICLES as u32);
+        let start = std::time::Instant::now();
+        for _ in 0..300 {
+            state.simulate(1.0 / 30.0);
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(state.particles.len() <= MAX_PARTICLES);
+        let mut scratch = Vec::new();
+        state.build_vertex_bytes(&mut scratch);
+        for chunk in scratch.chunks_exact(4) {
+            let value = f32::from_le_bytes(chunk.try_into().unwrap());
+            assert!(
+                value.is_finite(),
+                "hostile component sim produced non-finite vertex data"
+            );
+        }
     }
 }

@@ -8,6 +8,7 @@
 mod audio;
 mod keyvalues;
 mod mpris;
+mod particlefile;
 mod permissions;
 mod pipewire;
 mod pkg;
@@ -26,6 +27,7 @@ mod websandbox;
 pub use audio::analyze_stereo;
 pub use keyvalues::{KvError, KvValue, parse_key_values};
 pub use mpris::{MprisStatus, probe_mpris};
+pub use particlefile::{MAX_PARTICLE_FILE_BYTES, ResolvedParticleFile, resolve_particle_file};
 pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
 pub use pkg::{
@@ -52,12 +54,13 @@ pub use sceneeffect::{
     resolve_object_effects,
 };
 pub use scenemodel::{
-    AssetLookup, MAX_MODEL_JSON_BYTES, ResolvedModel, confined_read, resolve_model,
-    texture_asset_path,
+    AssetLookup, MAX_MODEL_JSON_BYTES, ResolvedMaterial, ResolvedModel, TextureSlot, confined_read,
+    resolve_material, resolve_model, texture_asset_path,
 };
 pub use sceneobjects::{
-    MAX_MODEL_RESOLUTIONS, SceneObjectKind, SceneObjectSummary, classify_scene_object,
-    scene_property_value, summarize_scene_objects, summarize_scene_objects_resolved,
+    MAX_MODEL_RESOLUTIONS, MAX_PARTICLE_FILE_RESOLUTIONS, SceneObjectKind, SceneObjectSummary,
+    classify_scene_object, scene_property_value, summarize_scene_objects,
+    summarize_scene_objects_resolved,
 };
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{

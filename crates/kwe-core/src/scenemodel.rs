@@ -190,36 +190,41 @@ fn first_texture_name(textures: &Value) -> Option<(String, Vec<String>)> {
     Some((first, names))
 }
 
-/// Resolve one model layer's `image` reference (a `.json` model path) all
-/// the way to its first texture's bytes: model.json → `material` path →
-/// material.json → `passes[0]` → first non-null texture name →
-/// `materials/<name>.tex`. Every step goes through the caller's `lookup`
-/// closure — this function performs no file I/O itself. `Err` names the
-/// step that failed (missing reference, oversized/invalid JSON, no
-/// passes, no texture slot, or the texture asset itself not found through
-/// `lookup`) — the caller decides what an `Err` means (preflight: not
-/// drawable; the worker: a degraded layer).
-pub fn resolve_model(
-    model_ref: &str,
-    lookup: &mut AssetLookup<'_>,
-) -> Result<ResolvedModel, String> {
-    let model_bytes = lookup(model_ref)
-        .ok_or_else(|| format!("model reference \"{model_ref}\" could not be resolved"))?;
-    let model_json = bounded_json(model_bytes, "model.json")?;
-    let model_object = model_json
-        .as_object()
-        .ok_or_else(|| "model.json root must be an object".to_string())?;
-    let material_ref = model_object
-        .get("material")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "model.json has no string \"material\" field".to_string())?
-        .to_string();
-    let fullscreen = model_object
-        .get("fullscreen")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+/// A resolved material pass, independent of what referenced it (a model's
+/// `material` field, or — S4b — an external particle definition file's
+/// top-level `material` field, `Render/Objects/CParticle.cpp`'s `material`
+/// key, which names a `materials/*.json` pass exactly like a model's does).
+/// This is the material-chain half of `resolve_model` below, split out so
+/// both callers walk `material.json` → `passes[0]` → texture slots exactly
+/// once (S4b review: one implementation, not a second hand-copied walk).
+#[derive(Debug, Clone)]
+pub struct ResolvedMaterial {
+    pub material_ref: String,
+    pub texture_name: String,
+    pub texture_ref: String,
+    pub texture_bytes: Vec<u8>,
+    pub shader: Option<String>,
+    pub blending: Option<String>,
+    pub cullmode: Option<String>,
+    pub depthtest: Option<String>,
+    pub combos: serde_json::Map<String, Value>,
+    pub extra_textures: Vec<String>,
+    pub constant_shader_values: serde_json::Map<String, Value>,
+    pub texture_slots: Vec<Option<TextureSlot>>,
+}
 
-    let material_bytes = lookup(&material_ref)
+/// Resolve one `materials/*.json` reference to its first pass's texture
+/// chain: `material.json` → `passes[0]` → first non-null texture slot →
+/// `materials/<name>.tex`, plus every other positional `g_Texture<N>` slot
+/// (S2), best-effort. Shared by `resolve_model` (model → material → this)
+/// and `crate::particlefile::resolve_particle_file` (particle file →
+/// material → this, S4b) — both callers hand this the ALREADY-extracted
+/// `material` string; this function performs no file I/O beyond `lookup`.
+pub fn resolve_material(
+    material_ref: &str,
+    lookup: &mut AssetLookup<'_>,
+) -> Result<ResolvedMaterial, String> {
+    let material_bytes = lookup(material_ref)
         .ok_or_else(|| format!("material reference \"{material_ref}\" could not be resolved"))?;
     let material_json = bounded_json(material_bytes, "material.json")?;
     let material_object = material_json
@@ -372,9 +377,8 @@ pub fn resolve_model(
         .cloned()
         .unwrap_or_default();
 
-    Ok(ResolvedModel {
-        model_ref: model_ref.to_string(),
-        material_ref,
+    Ok(ResolvedMaterial {
+        material_ref: material_ref.to_string(),
         texture_name,
         texture_ref,
         texture_bytes,
@@ -386,6 +390,48 @@ pub fn resolve_model(
         extra_textures,
         constant_shader_values,
         texture_slots,
+    })
+}
+
+/// Resolve one model layer's `image` reference (a `.json` model path) all
+/// the way to its first texture's bytes: model.json → `material` path →
+/// [`resolve_material`] for the rest of the walk.
+pub fn resolve_model(
+    model_ref: &str,
+    lookup: &mut AssetLookup<'_>,
+) -> Result<ResolvedModel, String> {
+    let model_bytes = lookup(model_ref)
+        .ok_or_else(|| format!("model reference \"{model_ref}\" could not be resolved"))?;
+    let model_json = bounded_json(model_bytes, "model.json")?;
+    let model_object = model_json
+        .as_object()
+        .ok_or_else(|| "model.json root must be an object".to_string())?;
+    let material_ref = model_object
+        .get("material")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "model.json has no string \"material\" field".to_string())?
+        .to_string();
+    let fullscreen = model_object
+        .get("fullscreen")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let material = resolve_material(&material_ref, lookup)?;
+
+    Ok(ResolvedModel {
+        model_ref: model_ref.to_string(),
+        material_ref: material.material_ref,
+        texture_name: material.texture_name,
+        texture_ref: material.texture_ref,
+        texture_bytes: material.texture_bytes,
+        shader: material.shader,
+        blending: material.blending,
+        cullmode: material.cullmode,
+        depthtest: material.depthtest,
+        combos: material.combos,
+        extra_textures: material.extra_textures,
+        constant_shader_values: material.constant_shader_values,
+        texture_slots: material.texture_slots,
         fullscreen,
     })
 }
