@@ -136,6 +136,22 @@ const MAX_EFFECT_PASS_BINDINGS: usize = 256;
 /// textures) could make a single frame take on the order of a day.
 const MAX_EFFECT_FRAME_ACTIONS: usize = 512;
 
+/// S5: cap on how many times `render` will split its single render-pass
+/// instance to snapshot the scene-so-far into `_rt_FullFrameBuffer`
+/// before a layer that consumes it draws (task bound: "≤ 8 snapshots per
+/// frame"). Each split costs one render-pass end/begin pair plus a
+/// full-attachment `vkCmdCopyImage` with its barriers, all still within
+/// the SAME command buffer/submit as the rest of the frame (see
+/// `render`'s own doc comment) — bounded independently of
+/// `MAX_EFFECT_TARGETS_PER_SCENE`/`MAX_EFFECT_PASS_BINDINGS` because the
+/// cost here is per-frame GPU work, not one-time scene-load setup. A
+/// consumer past the cap is not refused — it simply is not given its own
+/// snapshot point, so it samples whatever `_rt_FullFrameBuffer` last held
+/// (the most recent snapshot inserted earlier this frame, or the
+/// previous frame's whole-scene content if none was — a documented,
+/// bounded degrade, not a crash or a black frame).
+pub const MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME: usize = 8;
+
 #[derive(Debug)]
 pub enum RenderError {
     Vulkan(String),
@@ -516,6 +532,21 @@ pub struct LayerRenderer {
     /// the first scene with a resolved effect chain) since most scenes
     /// have none.
     effect_render_pass: vk::RenderPass,
+    /// S5: a second render pass over the SAME main-framebuffer attachment
+    /// as `render_pass` (render-pass "compatible" — same format/sample
+    /// count/subpass shape, framebuffers are freely interchangeable
+    /// between compatible render passes per the Vulkan spec — so this
+    /// reuses `self.framebuffer` unchanged) used to RESUME drawing after
+    /// a same-frame `_rt_FullFrameBuffer` snapshot splits `render`'s
+    /// single render-pass instance into more than one
+    /// (`ensure_render_pass_resume`'s own doc comment has the full
+    /// rationale for the split). Differs from `render_pass` only in
+    /// `loadOp`/layout: `LOAD` (preserve what earlier segments already
+    /// drew) instead of `CLEAR`, `initial_layout` `TRANSFER_SRC_OPTIMAL`
+    /// (the exact layout the snapshot's own copy step leaves `self.image`
+    /// in) instead of `UNDEFINED`. Created once, lazily, the first time a
+    /// scene actually needs a same-frame snapshot — most scenes never do.
+    render_pass_resume: vk::RenderPass,
     /// S3 review MUST-FIX #1: effect passes' OWN descriptor pool, sized
     /// exactly to `MAX_EFFECT_PASS_BINDINGS` — NEVER shared with
     /// `material_descriptor_pool` (sized only for `MAX_LAYERS` base
@@ -1176,6 +1207,7 @@ impl LayerRenderer {
             material_bindings: Vec::new(),
             material_frame_counter: 0,
             effect_render_pass: vk::RenderPass::null(),
+            render_pass_resume: vk::RenderPass::null(),
             effect_descriptor_pool: vk::DescriptorPool::null(),
             effect_targets: HashMap::new(),
             effect_pass_bindings: Vec::new(),
@@ -3213,11 +3245,232 @@ impl LayerRenderer {
         true
     }
 
+    /// Create `render_pass_resume` (see its own doc comment) the first
+    /// time `render` actually needs to split its render pass. Idempotent.
+    fn ensure_render_pass_resume(&mut self) -> Result<(), RenderError> {
+        if self.render_pass_resume != vk::RenderPass::null() {
+            return Ok(());
+        }
+        let attachment = vk::AttachmentDescription::default()
+            .format(self.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let color_ref = vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref));
+        // Mirrors `render_pass`'s own two external dependencies exactly,
+        // except the entry dependency's `src_stage`/`src_access` cover
+        // TRANSFER (this segment's `initial_layout` is what the
+        // snapshot's copy step just left `self.image` in, not
+        // `UNDEFINED`) instead of `TOP_OF_PIPE`/empty.
+        let dependencies = [
+            vk::SubpassDependency::default()
+                .src_subpass(vk::SUBPASS_EXTERNAL)
+                .dst_subpass(0)
+                .src_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+            vk::SubpassDependency::default()
+                .src_subpass(0)
+                .dst_subpass(vk::SUBPASS_EXTERNAL)
+                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                .dst_stage_mask(vk::PipelineStageFlags::TRANSFER)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+        ];
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(&dependencies);
+        self.render_pass_resume =
+            unsafe { self.device.create_render_pass(&render_pass_info, None) }?;
+        Ok(())
+    }
+
+    /// Copy `self.image`'s CURRENT content into `_rt_FullFrameBuffer`,
+    /// recorded into the ALREADY-RECORDING `self.command_buffer` — no
+    /// separate submit/fence-wait, unlike `snapshot_full_frame_buffer`
+    /// (the post-`render` one-frame-stale refresh this complements, not
+    /// replaces: that one still runs for every OTHER scene, and for any
+    /// consumer past `MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME`). Must
+    /// be called with `self.image` already in `TRANSFER_SRC_OPTIMAL` —
+    /// true immediately after `cmd_end_render_pass` on either
+    /// `render_pass` or `render_pass_resume`, both of which declare that
+    /// exact `final_layout` for precisely this reason (no extra barrier
+    /// needed on the source side). Leaves `self.image` untouched
+    /// (still `TRANSFER_SRC_OPTIMAL`) — the caller's next
+    /// `cmd_begin_render_pass(render_pass_resume, ...)` performs the
+    /// `TRANSFER_SRC_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL` transition
+    /// itself via that render pass's own entry dependency.
+    fn snapshot_full_frame_buffer_inline(&mut self) -> Result<(), RenderError> {
+        let Some(fbo) = self.effect_targets.get(FULL_FRAME_BUFFER) else {
+            return Ok(());
+        };
+        let dst_image = fbo.image;
+        let copy_width = fbo.width.min(self.width);
+        let copy_height = fbo.height.min(self.height);
+        let subresource = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let to_transfer_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer_dst),
+            );
+        }
+        let subresource_layers = vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let region = vk::ImageCopy::default()
+            .src_subresource(subresource_layers)
+            .src_offset(vk::Offset3D::default())
+            .dst_subresource(subresource_layers)
+            .dst_offset(vk::Offset3D::default())
+            .extent(vk::Extent3D {
+                width: copy_width,
+                height: copy_height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                self.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+        }
+        let back_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&back_dst),
+            );
+        }
+        Ok(())
+    }
+
     /// Clear the attachment with `color` (straight RGBA), draw the given
     /// layers in order (scene.json order, src-over blending), read the
     /// pixels back, and return them premultiplied BGRA. In-flight 1: a
     /// single fence is waited on before the next submit.
-    pub fn render(&mut self, clear: [f32; 4], draws: &[LayerDraw]) -> Result<Vec<u8>, RenderError> {
+    ///
+    /// S5: `ffb_snapshot_before_layer` names LAYER indices (`LayerDraw::
+    /// layer_index`, NOT positions in `draws`) that need
+    /// `_rt_FullFrameBuffer` to hold the scene composited so far —
+    /// layers below this one, already drawn this SAME frame — before
+    /// their own draw call. For each one encountered (in `draws` order,
+    /// capped at `MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME` — a
+    /// defensive re-check of the caller's own cap), this ENDS the
+    /// current render-pass instance, copies `self.image`'s current
+    /// content into `_rt_FullFrameBuffer`
+    /// (`snapshot_full_frame_buffer_inline`), then BEGINS A NEW instance
+    /// (`render_pass_resume`, `LOAD_OP_LOAD`) to keep drawing — all
+    /// within this ONE command buffer/submit, no extra fence wait.
+    ///
+    /// Design note (task: "avoid splitting the render pass unless you can
+    /// prove the barriers are correct"): the alternative — a
+    /// second, separate subpass within the SAME render-pass instance —
+    /// was rejected. A subpass-local dependency can transition an
+    /// attachment's LAYOUT between subpasses, but it cannot express "read
+    /// this attachment via `vkCmdCopyImage` (TRANSFER, not a subpass
+    /// input attachment) between the two", and `_rt_FullFrameBuffer` is a
+    /// SEPARATE image/framebuffer entirely (not an attachment of this
+    /// render pass at all) — a transfer command is illegal inside a
+    /// render-pass instance regardless of subpass count. Ending the
+    /// instance is therefore not an optimization trade-off avoided for
+    /// its own sake; it is the only construct that admits a
+    /// `vkCmdCopyImage` at all. What IS proven correct here, explicitly:
+    /// (1) `self.image` is already `TRANSFER_SRC_OPTIMAL` the instant
+    /// `cmd_end_render_pass` returns, because both `render_pass` and
+    /// `render_pass_resume` declare that EXACT `final_layout` — the
+    /// snapshot's copy needs no barrier on the source side; (2)
+    /// `render_pass_resume`'s `initial_layout` is `TRANSFER_SRC_OPTIMAL`
+    /// too, matching that same post-copy state exactly, so its own entry
+    /// dependency performs the `TRANSFER_SRC_OPTIMAL ->
+    /// COLOR_ATTACHMENT_OPTIMAL` transition validly (a render pass's
+    /// declared `initial_layout` must match the image's actual layout at
+    /// `cmd_begin_render_pass` time — Vulkan spec — and it does, by
+    /// construction, for every segment after the first); (3) the
+    /// snapshot's own two barriers on `_rt_FullFrameBuffer` itself
+    /// (`SHADER_READ_ONLY_OPTIMAL <-> TRANSFER_DST_OPTIMAL`) are the
+    /// exact same pattern `copy_effect_target`/the post-`render`
+    /// `snapshot_full_frame_buffer` already use, verified correct there;
+    /// (4) every segment (including the very first, still `render_pass`)
+    /// ends in `TRANSFER_SRC_OPTIMAL`, so the FINAL segment's `self.image`
+    /// state is unchanged from before this feature existed — the
+    /// existing post-`cmd_end_render_pass` readback code below needs no
+    /// changes at all.
+    ///
+    /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    /// src/WallpaperEngine/Render/Wallpapers/CScene.cpp /
+    /// src/WallpaperEngine/Render/CWallpaper.cpp (per-object paint order:
+    /// a later object's effect chain samples the composite of every
+    /// object drawn before it, same frame — the semantic
+    /// `_rt_FullFrameBuffer` is meant to have) @ b016d7d1 — adapted:
+    /// upstream tracks this incrementally as part of its own per-object
+    /// draw loop; this renderer approximates it with a bounded, capped
+    /// number of render-pass splits plus a full-attachment
+    /// `vkCmdCopyImage`, scoped to a layer's own bound MATERIAL sampling
+    /// `_rt_FullFrameBuffer` directly (`ffb_snapshot_before_layer`) —
+    /// NOT to an effect chain's internal references to that name, which
+    /// remain the pre-S5 one-frame-stale snapshot (`main.rs`'s
+    /// `snapshot_full_frame_buffer` call after `render` returns). See
+    /// `docs/SCENE_FORMAT_V1.md` "_rt_FullFrameBuffer paint order (S5)"
+    /// for the full scope boundary.
+    pub fn render(
+        &mut self,
+        clear: [f32; 4],
+        draws: &[LayerDraw],
+        ffb_snapshot_before_layer: &[usize],
+    ) -> Result<Vec<u8>, RenderError> {
+        if !ffb_snapshot_before_layer.is_empty() {
+            self.ensure_render_pass_resume()?;
+        }
         unsafe { self.device.reset_fences(&[self.fence]) }?;
 
         let begin_info = vk::CommandBufferBeginInfo::default();
@@ -3248,7 +3501,48 @@ impl LayerRenderer {
                 vk::SubpassContents::INLINE,
             );
         }
+        let mut ffb_snapshots_done = 0usize;
         for draw in draws {
+            // S5: same-frame `_rt_FullFrameBuffer` paint order — this
+            // layer's material/effect needs the scene composited so far
+            // (every layer drawn earlier in THIS loop, i.e. below it in
+            // object order, this same frame). Split the render pass right
+            // here: end the current instance (leaves `self.image` in
+            // `TRANSFER_SRC_OPTIMAL`, both `render_pass` and
+            // `render_pass_resume` share that `final_layout`), copy its
+            // current content into `_rt_FullFrameBuffer`, then resume
+            // drawing in a NEW instance that LOADS (not clears) the
+            // existing content — see `render`'s own doc comment for why
+            // a render-pass split, not a second subpass, is the only
+            // construct that admits the `vkCmdCopyImage` this needs.
+            if ffb_snapshots_done < MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME
+                && ffb_snapshot_before_layer.contains(&draw.layer_index)
+            {
+                unsafe { self.device.cmd_end_render_pass(self.command_buffer) };
+                self.snapshot_full_frame_buffer_inline()?;
+                let resume_info = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.render_pass_resume)
+                    .framebuffer(self.framebuffer)
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: self.width,
+                            height: self.height,
+                        },
+                    })
+                    // `render_pass_resume` has no CLEAR-loadOp attachment,
+                    // so this is ignored — reused rather than an empty
+                    // slice purely to avoid a second `ClearValue` local.
+                    .clear_values(std::slice::from_ref(&clear_value));
+                unsafe {
+                    self.device.cmd_begin_render_pass(
+                        self.command_buffer,
+                        &resume_info,
+                        vk::SubpassContents::INLINE,
+                    );
+                }
+                ffb_snapshots_done += 1;
+            }
             // S2: a material draw goes through its own compiled pipeline
             // and 8-sampler+UBO descriptor set instead of the S1
             // single-sampler path below — `frame_draws` only ever sets
@@ -3690,6 +3984,10 @@ impl Drop for LayerRenderer {
             if self.effect_render_pass != vk::RenderPass::null() {
                 self.device
                     .destroy_render_pass(self.effect_render_pass, None);
+            }
+            if self.render_pass_resume != vk::RenderPass::null() {
+                self.device
+                    .destroy_render_pass(self.render_pass_resume, None);
             }
             if self.effect_descriptor_pool != vk::DescriptorPool::null() {
                 self.device
@@ -4849,7 +5147,7 @@ mod tests {
             material: true,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .render([0.0, 0.0, 0.0, 1.0], &draws, &[])
             .expect("render once");
         assert_eq!(pixels.len(), 64 * 48 * 4);
         // B8G8R8A8 readback: B=0.8*255≈204, G=0.6*255≈153, R=0.2*255≈51.
@@ -4960,7 +5258,7 @@ mod tests {
             material: true,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .render([0.0, 0.0, 0.0, 1.0], &draws, &[])
             .expect("render once");
         assert_eq!(pixels.len(), 64 * 48 * 4);
         // B8G8R8A8 readback of opaque pure blue: B=255, G=0, R=0.
@@ -5142,7 +5440,7 @@ mod tests {
             material: true,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .render([0.0, 0.0, 0.0, 1.0], &draws, &[])
             .expect("render once");
         assert_eq!(pixels.len(), 32 * 24 * 4);
         // B8G8R8A8 readback of opaque red: B=0, G=0, R=255, A=255.
@@ -5256,7 +5554,7 @@ mod tests {
         }];
         // Never crashes/panics/hangs — the point of the test.
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .render([0.0, 0.0, 0.0, 1.0], &draws, &[])
             .expect("render once");
         assert_eq!(pixels.len(), 16 * 16 * 4);
         // The shader adds opaque alpha unconditionally: any sampled RGB
@@ -5265,6 +5563,229 @@ mod tests {
         // clear color underneath is black, alpha 255.
         for pixel in pixels.chunks_exact(4) {
             assert_eq!(pixel, &[0, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn full_frame_buffer_snapshot_cap_matches_the_documented_bound() {
+        assert_eq!(MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME, 8);
+    }
+
+    /// S5 end-to-end: layer 0 draws solid opaque red covering the whole
+    /// canvas; layer 1's material just echoes whatever it samples at
+    /// `g_Texture0`, bound to `_rt_FullFrameBuffer`. `_rt_FullFrameBuffer`
+    /// starts transparent black (never written this frame, and this test
+    /// never calls the post-`render` one-frame-stale
+    /// `snapshot_full_frame_buffer` main.rs normally would) — so the ONLY
+    /// way layer 1 can see red is the SAME-FRAME snapshot `render` itself
+    /// inserts, right before layer 1's draw, when `1` is in
+    /// `ffb_snapshot_before_layer`. Two renderers isolate the control from
+    /// the treatment so neither can leak state into the other. Skip-by-
+    /// default: needs a Vulkan device — run with `KWE_TEST_DEVICE` set.
+    #[test]
+    fn full_frame_buffer_snapshot_sees_layers_drawn_earlier_this_same_frame() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "full_frame_buffer_snapshot_sees_layers_drawn_earlier_this_same_frame: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let solid_red_fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);\n}\n";
+        // Forces full opacity (RGB only, alpha pinned to 1) so layer 1
+        // always fully overwrites layer 0 in the FINAL composite either
+        // way — the test then distinguishes "saw red" from "saw nothing"
+        // by COLOR (red vs. opaque black), never by how much of layer
+        // 0's red shows through a partially-transparent draw.
+        let mirror_fragment_source = "uniform sampler2D g_Texture0;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(texSample2D(g_Texture0, v_TexCoord).rgb, 1.0);\n}\n";
+
+        let compile = |source_vert: &str, source_frag: &str, label: &str| {
+            let mut locations = std::collections::BTreeMap::new();
+            let mut include: Box<crate::shaderpre::IncludeLookup<'static>> =
+                Box::new(|_: &str| None);
+            let vertex_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Vertex,
+                &format!("{label}.vert"),
+                source_vert,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("vertex preprocesses");
+            let fragment_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Fragment,
+                &format!("{label}.frag"),
+                source_frag,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("fragment preprocesses");
+            let vertex_spirv = crate::materialshader::compile_stage(
+                &vertex_pre.source,
+                crate::materialshader::Stage::Vertex,
+                &format!("{label}.vert"),
+            )
+            .expect("vertex compiles");
+            let fragment_spirv = crate::materialshader::compile_stage(
+                &fragment_pre.source,
+                crate::materialshader::Stage::Fragment,
+                &format!("{label}.frag"),
+            )
+            .expect("fragment compiles");
+            (vertex_spirv, fragment_spirv)
+        };
+        let standard_attributes = vec![
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec3".into(),
+                name: "a_Position".into(),
+                location: 0,
+            },
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec2".into(),
+                name: "a_TexCoord".into(),
+                location: 1,
+            },
+        ];
+
+        // `setup` builds one 2x2 renderer with both layers bound: layer 0
+        // solid red, layer 1 mirrors `_rt_FullFrameBuffer`. Shared by the
+        // treatment (snapshot requested) and control (none requested)
+        // runs so only `ffb_snapshot_before_layer` differs between them.
+        let setup = || {
+            let mut renderer = LayerRenderer::new(Some(&binding), 2, 2).expect("create renderer");
+            // Any non-empty request makes `_rt_FullFrameBuffer` exist
+            // (see `prepare_effect_targets`'s own doc comment).
+            renderer
+                .prepare_effect_targets(&[EffectTargetRequest {
+                    name: "_rt_unused".to_string(),
+                    width: 1,
+                    height: 1,
+                }])
+                .expect("prepare effect targets");
+
+            let (red_vertex, red_fragment) =
+                compile(vertex_source, solid_red_fragment_source, "solid_red");
+            let red_key = MaterialKey::compute(
+                "solid_red",
+                &std::collections::BTreeMap::new(),
+                BlendMode::Normal.variant_index(),
+            );
+            renderer
+                .register_material_pipeline(
+                    red_key.clone(),
+                    &red_vertex,
+                    &red_fragment,
+                    BlendMode::Normal,
+                    &standard_attributes,
+                )
+                .expect("register red pipeline");
+            renderer
+                .bind_material_layer(
+                    0,
+                    red_key,
+                    &[None, None, None, None, None, None, None, None],
+                    MaterialUniforms::default(),
+                )
+                .expect("bind layer 0");
+
+            let (mirror_vertex, mirror_fragment) =
+                compile(vertex_source, mirror_fragment_source, "mirror");
+            let mirror_key = MaterialKey::compute(
+                "mirror",
+                &std::collections::BTreeMap::new(),
+                BlendMode::Normal.variant_index(),
+            );
+            renderer
+                .register_material_pipeline(
+                    mirror_key.clone(),
+                    &mirror_vertex,
+                    &mirror_fragment,
+                    BlendMode::Normal,
+                    &standard_attributes,
+                )
+                .expect("register mirror pipeline");
+            renderer
+                .bind_material_layer(
+                    1,
+                    mirror_key,
+                    &[
+                        Some(MaterialTextureBind::RenderTarget(
+                            FULL_FRAME_BUFFER.to_string(),
+                        )),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ],
+                    MaterialUniforms::default(),
+                )
+                .expect("bind layer 1");
+            renderer
+        };
+        let draws = [
+            LayerDraw {
+                kind: DrawKind::Image,
+                layer_index: 0,
+                scene_order: 0,
+                m: [[2.0, 0.0], [0.0, 2.0]],
+                t: [0.0, 0.0],
+                alpha: 1.0,
+                blend_mode: BlendMode::Normal,
+                brightness: 1.0,
+                tint: [1.0, 1.0, 1.0, 1.0],
+                material: true,
+            },
+            LayerDraw {
+                kind: DrawKind::Image,
+                layer_index: 1,
+                scene_order: 1,
+                m: [[2.0, 0.0], [0.0, 2.0]],
+                t: [0.0, 0.0],
+                alpha: 1.0,
+                blend_mode: BlendMode::Normal,
+                brightness: 1.0,
+                tint: [1.0, 1.0, 1.0, 1.0],
+                material: true,
+            },
+        ];
+
+        // Treatment: layer 1 is registered as an FFB consumer, so `render`
+        // snapshots the scene-so-far (layer 0's red) into
+        // `_rt_FullFrameBuffer` immediately before layer 1 draws.
+        let mut with_snapshot = setup();
+        let pixels = with_snapshot
+            .render([0.0, 0.0, 0.0, 0.0], &draws, &[1])
+            .expect("render with snapshot");
+        assert_eq!(pixels.len(), 2 * 2 * 4);
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(
+                pixel,
+                &[0, 0, 255, 255],
+                "layer 1 must see layer 0's red this SAME frame"
+            );
+        }
+
+        // Control: identical scene, but `ffb_snapshot_before_layer` is
+        // empty — `_rt_FullFrameBuffer` is never written (this test never
+        // calls the post-`render` one-frame-stale refresh either), so
+        // layer 1 mirrors transparent black exactly as it started.
+        let mut without_snapshot = setup();
+        let pixels = without_snapshot
+            .render([0.0, 0.0, 0.0, 0.0], &draws, &[])
+            .expect("render without snapshot");
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(
+                pixel,
+                &[0, 0, 0, 255],
+                "without the same-frame snapshot layer 1 must see (opaque) black, not red"
+            );
         }
     }
 
@@ -5300,7 +5821,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.1, 0.2, 0.3, 1.0], &draws)
+            .render([0.1, 0.2, 0.3, 1.0], &draws, &[])
             .expect("render once");
         assert_eq!(pixels.len(), 64 * 48 * 4);
         // B8G8R8A8 readback is already B,G,R,A in memory order; premultiplied
@@ -5311,7 +5832,7 @@ mod tests {
         // A clear-only pass (no draws) shows the clear color: B=0.3*255,
         // G=0.2*255, R=0.1*255, A=255 (rounding varies by driver).
         let cleared = renderer
-            .render([0.1, 0.2, 0.3, 1.0], &[])
+            .render([0.1, 0.2, 0.3, 1.0], &[], &[])
             .expect("render clear");
         for pixel in cleared.chunks_exact(4) {
             assert_eq!(pixel[3], 255);
@@ -5359,7 +5880,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .render([0.0, 0.0, 0.0, 1.0], &draws, &[])
             .expect("render once");
         let at = |x: usize, y: usize| -> [u8; 4] {
             let i = (y * 64 + x) * 4;
@@ -5466,7 +5987,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 0.0], &draws)
+            .render([0.0, 0.0, 0.0, 0.0], &draws, &[])
             .expect("render the refreshed frame");
         // The B8G8R8A8 readback is B,G,R,A in memory order, so the blue
         // texel reads back [255, 0, 0, 255] — the red first frame would
@@ -5527,7 +6048,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.0, 0.0, 0.0, 0.0], &draws)
+            .render([0.0, 0.0, 0.0, 0.0], &draws, &[])
             .expect("render once");
         // The shader outputs straight (64,103,142) with alpha 191/255; the
         // blend stores it straight (color factor ONE) and the readback
@@ -5710,7 +6231,7 @@ mod tests {
                 material: false,
             }];
             let pixels = renderer
-                .render([0.4, 0.25, 0.1, 1.0], &draws)
+                .render([0.4, 0.25, 0.1, 1.0], &draws, &[])
                 .expect("render once");
             for pixel in pixels.chunks_exact(4) {
                 assert_eq!(pixel, &expected, "mode {mode:?}: BGRA");
@@ -5748,7 +6269,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.4, 0.25, 0.1, 1.0], &draws)
+            .render([0.4, 0.25, 0.1, 1.0], &draws, &[])
             .expect("render once");
         let g = pixels[1];
         assert!(g == 51 || g == 52, "G={g} (51.5 → round-to-nearest)");
@@ -5796,7 +6317,7 @@ mod tests {
             material: false,
         }];
         let pixels = renderer
-            .render([0.4, 0.25, 0.1, 0.5], &draws)
+            .render([0.4, 0.25, 0.1, 0.5], &draws, &[])
             .expect("render once");
         for pixel in pixels.chunks_exact(4) {
             assert_eq!(

@@ -432,6 +432,14 @@ struct SceneWorker {
     /// layer with no model reference, and for any material that fell
     /// back (see `compile_material_layers`).
     material_ok: Vec<bool>,
+    /// S5: layer indices whose final bound material samples
+    /// `_rt_FullFrameBuffer` (`compile_material_layers`, capped at
+    /// `vulkan::MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME`) — fixed for
+    /// the worker's lifetime (which layers reference this name by name is
+    /// a load-time scene property), handed to `renderer.render` every
+    /// frame so it can snapshot the scene composited so far immediately
+    /// before each one draws.
+    ffb_snapshot_layers: Vec<usize>,
     /// M3f: the script-visible particle-system states, index-aligned with
     /// the scene's `objects` array (particle entries) and with
     /// `particle_texture_ok`. Simulated every frame (particles.rs) with
@@ -530,10 +538,14 @@ impl SceneWorker {
         if let Err(error) = self.renderer.render_effect_chains() {
             reject_render(&error, "fence timeout while replaying effect chains");
         }
-        let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
-            Ok(pixels) => pixels,
-            Err(error) => reject_render(&error, "initial render failure"),
-        };
+        let initial =
+            match self
+                .renderer
+                .render(self.engine.clear_color(), &draws, &self.ffb_snapshot_layers)
+            {
+                Ok(pixels) => pixels,
+                Err(error) => reject_render(&error, "initial render failure"),
+            };
         // S3: refresh `_rt_FullFrameBuffer` with THIS frame's finished
         // composite, ready for the NEXT frame's `render_effect_chains`
         // call — a one-frame lag, documented on
@@ -609,7 +621,10 @@ impl SceneWorker {
                     if let Err(error) = self.renderer.render_effect_chains() {
                         reject_render(&error, "fence timeout while replaying effect chains");
                     }
-                    match self.renderer.render(color, &draws) {
+                    match self
+                        .renderer
+                        .render(color, &draws, &self.ffb_snapshot_layers)
+                    {
                         Ok(pixels) if pixels.len() == self.spec.pixel_bytes() => {
                             // Exact-size check: the conversion is exact by
                             // construction; a mismatch means a malformed
@@ -964,7 +979,7 @@ fn main() -> Result<()> {
     //     failure the layer keeps drawing through the S1 base-texture
     //     quad above (texture_ok already covers it) — this step only ever
     //     ADDS the material pipeline on top, never removes drawability.
-    let material_ok = compile_material_layers(
+    let (material_ok, ffb_snapshot_layers) = compile_material_layers(
         &mut config.layers,
         &mut renderer,
         world_w,
@@ -1047,6 +1062,7 @@ fn main() -> Result<()> {
         layers,
         texture_ok,
         material_ok,
+        ffb_snapshot_layers,
         particles,
         particle_texture_ok,
         videos,
@@ -1947,6 +1963,34 @@ fn texture_slots_are_bare_render_target_only(
         .any(|slot| matches!(slot, Some(scene::MaterialTextureSource::Bytes(_))))
 }
 
+/// True when at least one slot in `slots` names `_rt_FullFrameBuffer`
+/// specifically. S5: marks a layer whose final bound material needs the
+/// same-frame snapshot `vulkan::LayerRenderer::render` inserts right
+/// before it draws (`ffb_consumer_layers`), and (paired with
+/// `texture_slots_reference_only_full_frame_buffer`) whether a bare
+/// render-target-only passthrough is safe to draw at all.
+fn texture_slots_reference_full_frame_buffer(
+    slots: &[Option<scene::MaterialTextureSource>],
+) -> bool {
+    slots.iter().any(|slot| {
+        matches!(slot, Some(scene::MaterialTextureSource::RenderTarget(name)) if name == kwe_core::FULL_FRAME_BUFFER)
+    })
+}
+
+/// True when `slots` has NO `RenderTarget` slot naming anything OTHER
+/// than `_rt_FullFrameBuffer` (vacuously true when it has no
+/// render-target slots at all — callers combine this with
+/// `texture_slots_reference_full_frame_buffer`, which is false in that
+/// case, so the combination is never true for an all-`None`/all-`Bytes`
+/// material).
+fn texture_slots_reference_only_full_frame_buffer(
+    slots: &[Option<scene::MaterialTextureSource>],
+) -> bool {
+    !slots.iter().any(|slot| {
+        matches!(slot, Some(scene::MaterialTextureSource::RenderTarget(name)) if name != kwe_core::FULL_FRAME_BUFFER)
+    })
+}
+
 /// S3 review MUST-FIX #3, pure and unit-tested: true when `texture_slots`
 /// names `target_name` as one of its OWN `RenderTarget` slots — a
 /// targeted effect pass sampling the same FBO it renders into is an
@@ -1960,19 +2004,22 @@ fn effect_pass_samples_its_own_target(
     })
 }
 
-/// S3: one layer's resolved effect chain, walked in scene-declared order
-/// (every visible `ObjectEffect`, each effect's `passes[]` in file
-/// order): `final_material` — the LAST material pass with no `target`
-/// across the whole chain, which becomes this layer's OWN material
-/// (upstream's "no target = draws directly onto the compositor" case is
-/// exactly what a layer's own draw already does — folding it in reuses
-/// 100% of the existing per-layer pipeline/bind machinery instead of a
-/// second draw call). A chain with MORE than one untargeted pass keeps
-/// only the last one — a documented, bounded simplification (see
-/// `docs/SCENE_FORMAT_V1.md` "Effects and render targets"): every earlier
-/// untargeted pass's own visual contribution is not drawn. `intermediate`
-/// — every material pass WITH a `target`, compiled+bound to its own FBO
-/// each scene load and re-rendered every frame. `commands` — every
+/// S3/S5: one layer's resolved effect chain, walked in scene-declared
+/// order (every visible `ObjectEffect`, each effect's `passes[]` in file
+/// order, flattened into one list — see `plan_effect_chain`):
+/// `final_material` — the LAST material pass with no `target` across the
+/// whole chain, which becomes this layer's OWN material (upstream's "no
+/// target = draws directly onto the compositor" case is exactly what a
+/// layer's own draw already does — folding it in reuses 100% of the
+/// existing per-layer pipeline/bind machinery instead of a second draw
+/// call). `intermediate` — every material pass WITH a `target`, PLUS (S5)
+/// every untargeted pass that is NOT the chain's last one, each
+/// compiled+bound to its own FBO each scene load and re-rendered every
+/// frame; a targeted pass's FBO is the scene-declared `fbos[]` name
+/// (`scoped_target_name`), an intermediate untargeted pass's is this
+/// object's own reused <= 2-target ping-pong pair
+/// (`pingpong_target_name`) — see `plan_effect_chain`'s doc comment for
+/// the full upstream-matching mechanics. `commands` — every
 /// `command: copy`/`swap` pass, `(source, target)` with the `"previous"`
 /// sentinel already substituted for the concrete FBO name it meant at
 /// that point in the chain, plus the original `EffectCommand` (S3
@@ -2003,8 +2050,7 @@ fn combos_as_i64(
 /// instead of merely "not observed in the local corpus" (the prior
 /// wording on `effect_targets`'s own doc comment) — this directly
 /// addresses the interaction flagged in `docs/SCENE_FORMAT_V1.md`'s
-/// "Scope boundary" note: an object whose chain runs but whose final
-/// pass is NOT applied (`base_is_passthrough == false`) can no longer
+/// "Scope boundary" note: an object whose chain runs can no longer
 /// silently feed a different object's same-named target, because after
 /// scoping the two objects' declared names never collide in the first
 /// place.
@@ -2068,6 +2114,21 @@ fn effect_pass_texture_sources(
 /// material's OWN slot-0 seed is left UNSCOPED, since it is already
 /// object-specific by construction (it came from THIS layer's own
 /// `resolve_model` walk, not from a shared `effects[]` namespace).
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Objects/CImage.cpp:729-880
+/// (`setupPasses`/`pinpongFramebuffer`/`configurePassTarget`: the
+/// per-object two-target ping-pong pair an untargeted pass writes into
+/// versus a targeted pass's own named FBO, and the "previous"/"input"
+/// threading between them) @ b016d7d1 — adapted: this renderer has no
+/// "draw to an unnamed target" GPU primitive, so an intermediate
+/// untargeted pass (S5, see the `None` match arm below) reuses the SAME
+/// named-target machinery a targeted pass uses
+/// (`vulkan::LayerRenderer::compile_effect_pass`), against a
+/// synthesized per-object name (`pingpong_target_name`) instead of a
+/// scene-declared one; upstream's separate base color-blend `CPass` is
+/// not materialized as its own pass here — this function's `last_output`
+/// seed above plays that role directly.
 fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChainPlan {
     let mut last_output = layer
         .material
@@ -2080,66 +2141,117 @@ fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChai
     let mut intermediate = Vec::new();
     let mut commands = Vec::new();
     let mut final_material = None;
-    for object_effect in &layer.effects {
-        if !object_effect.visible {
-            continue;
-        }
-        for pass in &object_effect.effect.passes {
-            match pass {
-                kwe_core::EffectPass::Command(command) => {
-                    // A command's source/target are always meant to be
-                    // named FBOs (an image copy, not a byte source) — if
-                    // `last_output` is not itself a named render target
-                    // at this point (the chain's very first pass and the
-                    // base material samples a real photo, not a render
-                    // target), "previous" has no FBO name to substitute;
-                    // falling through to the literal string is safe
-                    // (`copy_effect_target` no-ops on an unresolvable
-                    // name, this module's universal degrade contract). A
-                    // literal (non-"previous") name is scoped the same
-                    // way a material pass's texture slots are.
-                    let resolve = |name: &str| {
-                        if name != kwe_core::PREVIOUS_INPUT {
-                            return scoped_target_name(layer_index, name);
+    // S5: this object's OWN two-target ping-pong pair (upstream
+    // `_rt_imageLayerComposite_<id>_a`/`_b`, `CImage.cpp`'s
+    // `m_currentMainFBO`/`m_currentSubFBO`) — `write_slot` is which of
+    // the two an UNTARGETED, non-final pass writes into next; it
+    // alternates after every such write, exactly like upstream's
+    // `pinpongFramebuffer`. A TARGETED pass (one naming an `fbos[]`
+    // entry) never touches this pair, matching upstream's `writesToTarget`
+    // branch (`configurePassTarget`), which restores the pre-sequence
+    // ping-pong state (`prevDrawTo`) once the targeted run ends.
+    let mut write_slot: u8 = 0;
+    // Flatten every visible effect's passes into ONE ordered list, the
+    // same way upstream concatenates every effect's `CPass`es into one
+    // per-object `m_passes` (after its own base color-blend pass, which
+    // this renderer instead seeds via `last_output` above rather than
+    // materializing as its own pass — see this function's own doc
+    // comment on why that seed already carries the object's real texture
+    // through pass 1 either way). Needed so the LAST untargeted pass —
+    // wherever in the whole per-object chain it falls, not merely the
+    // last pass of its OWN effect — can be told apart from an
+    // INTERMEDIATE untargeted pass that must ping-pong instead of
+    // becoming the layer's own material.
+    let passes: Vec<&kwe_core::EffectPass> = layer
+        .effects
+        .iter()
+        .filter(|object_effect| object_effect.visible)
+        .flat_map(|object_effect| object_effect.effect.passes.iter())
+        .collect();
+    let last_pass_index = passes.len().checked_sub(1);
+    for (pass_index, pass) in passes.into_iter().enumerate() {
+        let is_last_pass = Some(pass_index) == last_pass_index;
+        match pass {
+            kwe_core::EffectPass::Command(command) => {
+                // A command's source/target are always meant to be
+                // named FBOs (an image copy, not a byte source) — if
+                // `last_output` is not itself a named render target
+                // at this point (the chain's very first pass and the
+                // base material samples a real photo, not a render
+                // target), "previous" has no FBO name to substitute;
+                // falling through to the literal string is safe
+                // (`copy_effect_target` no-ops on an unresolvable
+                // name, this module's universal degrade contract). A
+                // literal (non-"previous") name is scoped the same
+                // way a material pass's texture slots are.
+                let resolve = |name: &str| {
+                    if name != kwe_core::PREVIOUS_INPUT {
+                        return scoped_target_name(layer_index, name);
+                    }
+                    match &last_output {
+                        scene::MaterialTextureSource::RenderTarget(target) => target.clone(),
+                        scene::MaterialTextureSource::Bytes(_) => {
+                            kwe_core::PREVIOUS_INPUT.to_string()
                         }
-                        match &last_output {
-                            scene::MaterialTextureSource::RenderTarget(target) => target.clone(),
-                            scene::MaterialTextureSource::Bytes(_) => {
-                                kwe_core::PREVIOUS_INPUT.to_string()
-                            }
-                        }
-                    };
-                    commands.push((
-                        resolve(&command.source),
-                        resolve(&command.target),
-                        command.command,
-                    ));
-                }
-                kwe_core::EffectPass::Material(material_pass) => {
-                    let texture_slots = effect_pass_texture_sources(
-                        layer_index,
-                        &material_pass.texture_slots,
-                        &last_output,
-                    );
-                    let planned = PlannedMaterial {
-                        shader: material_pass.shader.clone(),
-                        blending: material_pass.blending.clone(),
-                        combos: combos_as_i64(&material_pass.combos),
-                        constant_shader_values: material_pass
-                            .constant_shader_values
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value.clone()))
-                            .collect(),
-                        texture_slots,
-                    };
-                    match &material_pass.target {
-                        Some(target_name) => {
-                            let scoped = scoped_target_name(layer_index, target_name);
-                            last_output =
-                                scene::MaterialTextureSource::RenderTarget(scoped.clone());
-                            intermediate.push((planned, scoped));
-                        }
-                        None => final_material = Some(planned),
+                    }
+                };
+                commands.push((
+                    resolve(&command.source),
+                    resolve(&command.target),
+                    command.command,
+                ));
+            }
+            kwe_core::EffectPass::Material(material_pass) => {
+                let texture_slots = effect_pass_texture_sources(
+                    layer_index,
+                    &material_pass.texture_slots,
+                    &last_output,
+                );
+                let planned = PlannedMaterial {
+                    shader: material_pass.shader.clone(),
+                    blending: material_pass.blending.clone(),
+                    combos: combos_as_i64(&material_pass.combos),
+                    constant_shader_values: material_pass
+                        .constant_shader_values
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect(),
+                    texture_slots,
+                };
+                match &material_pass.target {
+                    Some(target_name) => {
+                        let scoped = scoped_target_name(layer_index, target_name);
+                        last_output = scene::MaterialTextureSource::RenderTarget(scoped.clone());
+                        intermediate.push((planned, scoped));
+                    }
+                    None if is_last_pass => {
+                        // Upstream draws this one straight to the
+                        // screen FBO (`setupPasses`'s
+                        // `shouldRenderFinalPass` branch); this
+                        // renderer's equivalent is "becomes the
+                        // layer's own bound material" (main.rs's
+                        // caller draws every layer through the normal
+                        // per-layer quad either way).
+                        final_material = Some(planned);
+                    }
+                    None => {
+                        // S5: an INTERMEDIATE untargeted pass — not
+                        // the chain's last pass overall (a later
+                        // effect, or a later pass of THIS effect,
+                        // still follows). Upstream writes this into
+                        // the object's own ping-pong FBO and swaps
+                        // (`pinpongFramebuffer`); this renderer has no
+                        // "draw to an unnamed target" primitive, so it
+                        // reuses the exact same named-target machinery
+                        // a targeted pass uses (`compile_effect_pass`
+                        // via `intermediate`), just against a
+                        // SYNTHESIZED, per-object, REUSED (<= 2 total)
+                        // name instead of a scene-declared `fbos[]`
+                        // one — see `pingpong_target_name`.
+                        let target = pingpong_target_name(layer_index, write_slot);
+                        last_output = scene::MaterialTextureSource::RenderTarget(target.clone());
+                        intermediate.push((planned, target));
+                        write_slot = 1 - write_slot;
                     }
                 }
             }
@@ -2150,6 +2262,18 @@ fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChai
         intermediate,
         commands,
     }
+}
+
+/// This object's own ping-pong render-target name (upstream
+/// `_rt_imageLayerComposite_<id>_a`/`_b`) — `slot` is 0 or 1. Scoped to
+/// `layer_index` so distinct objects never collide, and prefixed
+/// distinctly from `scoped_target_name`'s own `"{name}#obj{layer_index}"`
+/// shape (a `__` name a scene-declared `fbos[]` entry cannot itself use,
+/// since upstream's own FBO names never start with a double underscore)
+/// so a hostile/adversarial scene cannot alias its own effect's target
+/// onto an object's private ping-pong buffer.
+fn pingpong_target_name(layer_index: usize, slot: u8) -> String {
+    format!("__pingpong{slot}#obj{layer_index}")
 }
 
 /// Build the `MAX_MATERIAL_TEXTURES` texture-bind list AND populate
@@ -2374,6 +2498,25 @@ fn effect_target_requests(
         1.0
     };
     for (layer_index, layer) in layers.iter().enumerate() {
+        // S5: this object's own <= 2 ping-pong targets (see
+        // `pingpong_target_name`/`plan_effect_chain`), sized to the
+        // OBJECT's own pixel size (matching upstream's `_a`/`_b`, and
+        // every other request in this loop) — requested unconditionally
+        // whenever the object has ANY resolved effect, mirroring
+        // upstream creating both unconditionally in `CImage`'s own
+        // constructor (whether or not the object's chain ever actually
+        // has an intermediate untargeted pass that needs them).
+        if !layer.effects.is_empty() {
+            let width = (layer.size[0] * scale_x).round().max(1.0) as u32;
+            let height = (layer.size[1] * scale_y).round().max(1.0) as u32;
+            for slot in 0..2u8 {
+                requests.push(EffectTargetRequest {
+                    name: pingpong_target_name(layer_index, slot),
+                    width,
+                    height,
+                });
+            }
+        }
         for object_effect in &layer.effects {
             if !object_effect.visible {
                 continue;
@@ -2433,8 +2576,13 @@ fn compile_material_layers(
     canvas_height: u32,
     content: &Path,
     assets_dir: Option<&Path>,
-) -> Vec<bool> {
+) -> (Vec<bool>, Vec<usize>) {
     let mut material_ok = vec![false; layers.len()];
+    // S5: layer indices whose final bound material samples
+    // `_rt_FullFrameBuffer` — capped and diagnosed below, then handed to
+    // `vulkan::LayerRenderer::render` so it can snapshot the scene
+    // composited so far immediately before each one draws.
+    let mut ffb_consumer_layers: Vec<usize> = Vec::new();
     let assets_root = assets_dir.and_then(|dir| dir.canonicalize().ok());
     // S3: a scene can bundle its OWN custom shaders inside its `scene.pkg`
     // (the real corpus's godrays/tint effects both do — none of their
@@ -2452,7 +2600,7 @@ fn compile_material_layers(
         None
     };
     if assets_root.is_none() && pkg_reader.is_none() {
-        return material_ok;
+        return (material_ok, ffb_consumer_layers);
     }
     let pkg_dir = content
         .parent()
@@ -2533,36 +2681,27 @@ fn compile_material_layers(
 
     for (index, layer) in layers.iter_mut().enumerate() {
         let plan = plans[index].as_ref();
-        // S3 scope decision, safety-first: an effect chain's own final
-        // untargeted pass replaces the layer's base material ONLY when
-        // the base material has nothing real of its own to lose (its
-        // slot-0 is empty or already a `_rt_`/render-target name — the
-        // `copybackground` pattern this slice's flagship scene,
-        // 1652229298, uses). For an object whose base material samples a
-        // REAL photo/texture (the far more common real-corpus pattern —
-        // e.g. Workshop 1131061888's "trigun" image with FOUR attached
-        // effects: waterripple/waterflow/godrays/waterwaves), this
-        // renderer's single-`last_output`-chain model (concatenating
-        // every effect's passes in `effects[]` order into one linear
-        // "previous" chain) does not correctly capture upstream's real
-        // per-effect layering semantics — verified via the corpus
-        // regression sweep: letting the last effect's pass replace the
-        // base draw there discarded the real photo entirely (the object
-        // stopped drawing anything but the scene clear color), a
-        // regression the S1/S2 baseline never had. Until each effect's
-        // OWN "previous" seeding (independent of the others, or properly
-        // chained through actual upstream visibility) is implemented,
-        // this is the safe boundary: draw the effect's own output only
-        // for objects that have no real base content to protect, keep
-        // every other object's existing, already-correct S1/S2 material
-        // draw exactly as it was.
-        let base_is_passthrough = layer.material.as_ref().is_none_or(|material| {
-            texture_slots_are_bare_render_target_only(&material.texture_slots)
-        });
-        let planned = if let Some(final_material) = plan
-            .filter(|_| base_is_passthrough)
-            .and_then(|p| p.final_material.as_ref())
-        {
+        // S5: the effect chain's own final untargeted pass (if any) now
+        // ALWAYS becomes the layer's own bound material, regardless of
+        // whether the base material had a real texture of its own to
+        // "lose" — the S3-era `base_is_passthrough` gate that used to
+        // restrict this to bare passthrough objects only (the
+        // `copybackground` pattern) is gone. It existed because S3's
+        // chain model carried only an opaque `MaterialTextureSource`
+        // seed from the base material into pass 1, with no real GPU
+        // target for any INTERMEDIATE untargeted pass to render into —
+        // an object like Workshop 1131061888's "trigun" (a real photo
+        // with four chained effects: waterripple/waterflow/godrays/
+        // waterwaves) needs its own untargeted intermediate passes to
+        // actually composite, and S3 had nowhere to put them, so letting
+        // the chain's last pass win discarded the real photo outright.
+        // `plan_effect_chain` (S5) now gives every object with effects a
+        // real <= 2-target ping-pong pair (`pingpong_target_name`) and
+        // compiles+queues EVERY untargeted pass, not just the final one
+        // — pass 1 still samples the base material's own real texture
+        // (the seed is unchanged), so the base image survives the whole
+        // chain instead of being replaced by it.
+        let planned = if let Some(final_material) = plan.and_then(|p| p.final_material.as_ref()) {
             Some(PlannedMaterial {
                 shader: final_material.shader.clone(),
                 blending: final_material.blending.clone(),
@@ -2583,34 +2722,52 @@ fn compile_material_layers(
             continue; // not a model layer, or its base texture never resolved (load_model_textures)
         };
 
-        // S3 safety guard: a layer with NO resolved effect chain whose
-        // material has NOTHING but `_rt_`/render-target texture slots (no
-        // real `.tex` bytes anywhere) must NOT draw. This is exactly the
-        // real corpus's `models/util/fullscreenlayer.json` used bare (no
+        // S3 safety guard, narrowed in S5: a layer with NO resolved
+        // effect chain whose material has NOTHING but `_rt_`/render-
+        // target texture slots (no real `.tex` bytes anywhere) must NOT
+        // draw UNLESS its only render-target reference is
+        // `_rt_FullFrameBuffer` specifically. This is exactly the real
+        // corpus's `models/util/fullscreenlayer.json` used bare (no
         // `effects[]` at all — a `copybackground` recomposite utility
         // layer several scenes place elsewhere in their object stack):
         // pre-S3, its unresolvable `_rt_FullFrameBuffer` slot meant
-        // `resolve_model` failed outright, `layer.material` stayed
-        // `None`, and the layer silently never drew (a true no-op,
-        // matching upstream's intent when nothing else in the frame
-        // needs it "copied back"). Now that slot resolves (the honesty
-        // fix), binding it live would draw `_rt_FullFrameBuffer` as an
-        // ordinary opaque/translucent quad — but this renderer's
-        // `_rt_FullFrameBuffer` is a ONE-FRAME-STALE snapshot
-        // (`snapshot_full_frame_buffer`'s doc comment), starting fully
-        // TRANSPARENT BLACK before the first frame. A bare passthrough
-        // drawn with an opaque source at ANY point in the object stack —
-        // worst case, last, on top of everything — paints stale/black
-        // over real same-frame content instead of the harmless no-op
-        // upstream's true same-frame causality would produce. An object
-        // WITH a resolved effect chain is fine: its `final_material`
-        // (this same `material` value) is the effect's OWN deliberate
-        // output, not a blind passthrough, and IS meant to draw.
-        if plan.is_none() && texture_slots_are_bare_render_target_only(&material.texture_slots) {
+        // `resolve_model` failed outright and the layer silently never
+        // drew (a true no-op, matching upstream's intent when nothing
+        // else in the frame needs it "copied back"). S3 kept refusing it
+        // even once the slot resolved, because `_rt_FullFrameBuffer` was
+        // only ever a ONE-FRAME-STALE, transparent-black-at-startup
+        // snapshot — drawing it at any point in the object stack could
+        // paint stale/black over real same-frame content. S5 makes
+        // `_rt_FullFrameBuffer` a genuine SAME-FRAME snapshot for any
+        // layer registered in `ffb_consumer_layers` below
+        // (`vulkan::LayerRenderer::render` snapshots the scene-so-far
+        // immediately before that layer draws — see its own doc
+        // comment), so this exact bare-`copybackground` pattern is now
+        // safe: it sees this frame's already-drawn layers below it, not
+        // stale data. Any OTHER bare render-target reference (a name
+        // this layer's own effects never wrote, which should not occur
+        // in a well-formed scene) still has nothing real to show and
+        // stays refused. An object WITH a resolved effect chain is fine
+        // regardless: its `final_material` (this same `material` value)
+        // is the chain's OWN deliberate output, not a blind passthrough.
+        let ffb_only_passthrough =
+            texture_slots_reference_full_frame_buffer(&material.texture_slots)
+                && texture_slots_reference_only_full_frame_buffer(&material.texture_slots);
+        if plan.is_none()
+            && texture_slots_are_bare_render_target_only(&material.texture_slots)
+            && !ffb_only_passthrough
+        {
             *fallback_reasons
                 .entry("render_target_only_without_effects")
                 .or_insert(0) += 1;
             continue;
+        }
+        // S5: this layer's final bound material samples
+        // `_rt_FullFrameBuffer` — register it so `renderer.render` can
+        // snapshot the scene composited so far immediately before this
+        // layer's own draw (bounded, capped, and diagnosed below).
+        if texture_slots_reference_full_frame_buffer(&material.texture_slots) {
+            ffb_consumer_layers.push(index);
         }
 
         let Some((vertex_spirv, fragment_spirv, blend_mode, key, vertex_attributes)) =
@@ -2808,7 +2965,23 @@ fn compile_material_layers(
              fallback={effect_fallback_total} targets={targets_created} swap_used={swap_used}"
         );
     }
-    material_ok
+    // S5: bound the number of same-frame `_rt_FullFrameBuffer` snapshots
+    // `renderer.render` will insert this frame (each one splits the main
+    // render pass and does a full-attachment copy — see that function's
+    // own doc comment for why this is bounded rather than "one per
+    // consumer"). A scene with more consumers than the cap keeps drawing
+    // every layer; only the snapshot TIMING degrades for the excess ones
+    // (they see whatever the most recent snapshot held, one documented,
+    // bounded fallback among many in this module).
+    if ffb_consumer_layers.len() > vulkan::MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME {
+        eprintln!(
+            "event=renderer.scene.full_frame_buffer_snapshot_cap consumers={} cap={}",
+            ffb_consumer_layers.len(),
+            vulkan::MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME
+        );
+        ffb_consumer_layers.truncate(vulkan::MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME);
+    }
+    (material_ok, ffb_consumer_layers)
 }
 
 /// Upload the decoded layer textures into the compositor. Index-aligned
@@ -3752,12 +3925,17 @@ mod tests {
 
     #[test]
     fn effect_final_material_only_overrides_a_bare_passthrough_base() {
-        // A real base photo (Bytes at slot 0) keeps its OWN material even
-        // though it has a resolved effect chain — the S3 safety decision
-        // that prevents the corpus regression this slice found (Workshop
-        // 1131061888's "trigun" photo losing its real image entirely once
-        // its FOUR attached effects' single shared `last_output` chain
-        // discarded everything but the textually-last effect's pass).
+        // S5: `plan_effect_chain`'s `final_material` is populated
+        // regardless of whether the base material has a real texture of
+        // its own — the S3-era `base_is_passthrough` gate that used to
+        // ignore it for real-texture objects lived in
+        // `compile_material_layers`'s CALLER-side selection, not in
+        // `plan_effect_chain` itself, and has been removed (see
+        // `plan_effect_chain_ping_pongs_multiple_untargeted_passes_
+        // reusing_two_targets` below for the real fix: pass 1 samples
+        // the base photo's own real bytes either way, so nothing is
+        // discarded — matching Workshop 1131061888's "trigun" photo with
+        // its four attached effects).
         let mut photo = layer("photo", None);
         photo.material = Some(scene::MaterialSpec {
             shader: Some("photo_shader".into()),
@@ -3765,15 +3943,14 @@ mod tests {
             ..Default::default()
         });
         photo.effects = vec![single_previous_pass_effect()];
+        let plan = plan_effect_chain(0, &photo);
         assert!(
-            !photo
-                .material
-                .as_ref()
-                .is_none_or(|m| texture_slots_are_bare_render_target_only(&m.texture_slots))
+            plan.final_material.is_some(),
+            "a real-texture base must still resolve a final_material from its effect chain"
         );
 
-        // A bare `copybackground` passthrough (no real texture) DOES let
-        // its effect chain's final pass take over.
+        // A bare `copybackground` passthrough (no real texture) also
+        // resolves one, the same way.
         let mut passthrough = layer("passthrough", None);
         passthrough.material = Some(scene::MaterialSpec {
             shader: Some("passthrough_shader".into()),
@@ -3783,12 +3960,147 @@ mod tests {
             ..Default::default()
         });
         passthrough.effects = vec![single_previous_pass_effect()];
-        assert!(
-            passthrough
-                .material
-                .as_ref()
-                .is_none_or(|m| texture_slots_are_bare_render_target_only(&m.texture_slots))
+        let plan = plan_effect_chain(0, &passthrough);
+        assert!(plan.final_material.is_some());
+    }
+
+    /// Build an `ObjectEffect` from an ordered list of untargeted-vs-
+    /// targeted markers: `None` for an untargeted pass (`target: None`),
+    /// `Some(name)` for a pass targeting the named FBO — shared by the
+    /// S5 ping-pong tests below, which only care about each pass's
+    /// target shape, not its shader/combos/constants.
+    fn effect_with_pass_targets(targets: &[Option<&str>]) -> kwe_core::ObjectEffect {
+        kwe_core::ObjectEffect {
+            id: 1,
+            name: "test".into(),
+            visible: true,
+            effect: kwe_core::EffectSpec {
+                name: "test".into(),
+                fbos: Vec::new(),
+                passes: targets
+                    .iter()
+                    .map(|target| {
+                        kwe_core::EffectPass::Material(kwe_core::EffectMaterialPass {
+                            material_ref: "materials/effects/test.json".into(),
+                            shader: Some("test".into()),
+                            blending: None,
+                            combos: serde_json::Map::new(),
+                            constant_shader_values: serde_json::Map::new(),
+                            texture_slots: vec![Some(kwe_core::EffectTextureSlot::Previous)],
+                            target: target.map(str::to_string),
+                        })
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    /// S5: TWO untargeted passes on a real-texture base — the first is
+    /// NOT the chain's last pass, so it must ping-pong into this
+    /// object's own reused target (`pingpong_target_name`) instead of
+    /// becoming `final_material` outright; the second (the true last
+    /// pass) becomes `final_material` and samples the first pass's
+    /// ping-pong output as its `"previous"` input. This is the exact
+    /// mechanism that lets a multi-effect real-texture object (Workshop
+    /// 1131061888's "trigun") composite correctly instead of losing its
+    /// base photo.
+    #[test]
+    fn plan_effect_chain_ping_pongs_multiple_untargeted_passes_reusing_two_targets() {
+        let mut base = layer("photo", None);
+        base.material = Some(scene::MaterialSpec {
+            texture_slots: vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))],
+            ..Default::default()
+        });
+        base.effects = vec![effect_with_pass_targets(&[None, None])];
+        let plan = plan_effect_chain(0, &base);
+
+        assert_eq!(
+            plan.intermediate.len(),
+            1,
+            "only the FIRST (non-last) untargeted pass is intermediate"
         );
+        let (first_pass, first_target) = &plan.intermediate[0];
+        assert_eq!(first_target, &pingpong_target_name(0, 0));
+        // Pass 1 samples the base photo's OWN real bytes, not a stale/
+        // empty render target — the fix that keeps the photo alive.
+        assert!(matches!(
+            &first_pass.texture_slots[0],
+            Some(scene::MaterialTextureSource::Bytes(bytes)) if bytes == &[1, 2, 3, 4]
+        ));
+
+        let final_material = plan
+            .final_material
+            .expect("second pass is the chain's last");
+        assert!(matches!(
+            &final_material.texture_slots[0],
+            Some(scene::MaterialTextureSource::RenderTarget(name)) if name == &pingpong_target_name(0, 0)
+        ));
+    }
+
+    /// S5 bound: however many intermediate untargeted passes a chain has,
+    /// they cycle through exactly TWO reused target names (upstream's
+    /// `_a`/`_b`) — never allocate a third.
+    #[test]
+    fn plan_effect_chain_ping_pong_targets_stay_bounded_to_two() {
+        let mut base = layer("photo", None);
+        base.material = Some(scene::MaterialSpec {
+            texture_slots: vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))],
+            ..Default::default()
+        });
+        // Five untargeted passes: the first four are intermediate (not
+        // the chain's last), the fifth becomes final_material.
+        base.effects = vec![effect_with_pass_targets(&[None, None, None, None, None])];
+        let plan = plan_effect_chain(0, &base);
+
+        assert_eq!(plan.intermediate.len(), 4);
+        let names: std::collections::BTreeSet<&String> =
+            plan.intermediate.iter().map(|(_, name)| name).collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                &pingpong_target_name(0, 0),
+                &pingpong_target_name(0, 1),
+            ]),
+            "must reuse exactly two target names, never allocate more: {names:?}"
+        );
+        // Alternation order: 0, 1, 0, 1.
+        let order: Vec<&String> = plan.intermediate.iter().map(|(_, name)| name).collect();
+        assert_eq!(
+            order,
+            vec![
+                &pingpong_target_name(0, 0),
+                &pingpong_target_name(0, 1),
+                &pingpong_target_name(0, 0),
+                &pingpong_target_name(0, 1),
+            ]
+        );
+    }
+
+    /// A TARGETED pass (naming a scene-declared `fbos[]` entry) never
+    /// touches the object's own ping-pong pair — matches upstream's
+    /// `configurePassTarget`/`writesToTarget` branch, which restores the
+    /// pre-sequence ping-pong state instead of swapping it.
+    #[test]
+    fn plan_effect_chain_targeted_passes_do_not_consume_ping_pong_slots() {
+        let mut base = layer("photo", None);
+        base.material = Some(scene::MaterialSpec {
+            texture_slots: vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))],
+            ..Default::default()
+        });
+        // pass 0: targeted ("Blur"); pass 1: untargeted intermediate;
+        // pass 2: targeted ("Blur2"); pass 3: untargeted final.
+        base.effects = vec![effect_with_pass_targets(&[
+            Some("Blur"),
+            None,
+            Some("Blur2"),
+            None,
+        ])];
+        let plan = plan_effect_chain(0, &base);
+        assert_eq!(plan.intermediate.len(), 3);
+        // The untargeted intermediate pass (index 1 in source order,
+        // which is intermediate[1]) still uses ping-pong slot 0 — the
+        // targeted passes around it never advanced `write_slot`.
+        assert_eq!(plan.intermediate[1].1, pingpong_target_name(0, 0));
     }
 
     #[test]
