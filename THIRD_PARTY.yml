@@ -180,6 +180,43 @@ entries:
       workshop/<id>/<file> -> zcompat/scene/shaders/<id>/<file> compat
       redirect) -> crates/kwe-scene-renderer/src/main.rs
       (resolve_shader_reference).
+      S3 (effect passes / FBO chains / _rt_* render targets) adapted files,
+      each carrying a Borrowed-From comment at the adapted function/struct:
+      src/WallpaperEngine/Data/Parsers/EffectParser.cpp (effect .json schema:
+      fbos[]/passes[], material-pass vs command-pass shape) ->
+      crates/kwe-core/src/sceneeffect.rs;
+      src/WallpaperEngine/Data/Parsers/ObjectParser.cpp (parseEffect: an
+      object's effects[] entry id/name/visible/file/passes[] override list)
+      -> crates/kwe-core/src/sceneeffect.rs;
+      src/WallpaperEngine/Render/Objects/Effects/CPass.cpp
+      (setupTextureUniforms's texture-slot resolution priority order:
+      material's own textures < usertextures < override textures < override
+      usertextures < binds, highest priority last) ->
+      crates/kwe-core/src/sceneeffect.rs (resolves references to
+      bytes/sentinels; does not touch a GPU);
+      src/WallpaperEngine/Render/CFBO.cpp (explicit clear-to-transparent-
+      black fix at FBO creation) -> crates/kwe-scene-renderer/src/vulkan.rs
+      (adapted: clears via one throwaway Vulkan render-pass instance instead
+      of glClear against a live GL context);
+      src/WallpaperEngine/Render/CWallpaper.cpp (setupFramebuffers creates
+      _rt_FullFrameBuffer as the wallpaper's own main composite target) ->
+      crates/kwe-core/src/sceneeffect.rs (name only; this renderer takes one
+      whole-frame snapshot per frame rather than tracking incremental
+      per-object paint order);
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::texture's
+      "materials/<name>.tex" naming rule, re-applied to the _rt_/_alias_
+      runtime-target exception) -> crates/kwe-core/src/scenemodel.rs
+      (resolve_model's slot-0 honesty-gate fix) and
+      crates/kwe-scene-renderer/src/main.rs (the pkg-entries -> scene-dir ->
+      assets-root shader lookup chain, extended in S3 so a scene's own
+      bundled custom effect shaders resolve, not just the WE assets tree).
+      `command: swap` is upstream's own unexecuted enum value
+      (CImage.cpp only handles Command_Copy) — this renderer's swap-as-copy
+      behavior is an original completion, not a port of executed upstream
+      behavior. Puppet mesh geometry (CImage.cpp's MDLV0021/0023 binary
+      blob heuristic scan) was researched but NOT ported this slice — zero
+      local corpus usage found; see docs/SCENE_FORMAT_V1.md "Mesh/puppet
+      vertex formats" for the citation and the decision record.
       Verified cross-checked against real Workshop payloads under
       /media/crushinator/steamapps/workshop/content/431960/*/ and the real
       Wallpaper Engine asset shaders under

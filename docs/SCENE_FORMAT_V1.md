@@ -693,11 +693,16 @@ failure at any step falls back honestly to the S1 quad; a layer never
 stops drawing because its material shader could not be used.
 
 **Scope**: image/model layers only, quad geometry only (mesh/puppet
-attribute layouts — bone weights, tangents, per-vertex color — are S1's
-existing quad-only scope, unchanged). Effect passes, FBO render-target
-chains (`_rt_*` textures), and lighting objects are **out of scope**
-(S3) — a material whose live (post-`#if`) shader text still references a
-render target keeps the S1 quad path.
+attribute layouts — bone weights, tangents, per-vertex color — are
+**partially implemented as of S3**; see "Mesh/puppet" below for exactly
+which shapes). Effect passes and FBO render-target chains (`_rt_*`
+textures) are **implemented as of S3** — see "Effects and render
+targets" below; the S2-era `render_target_reference` fallback (reject
+any material whose live shader text mentioned `_rt_` at all) is gone,
+since a `_rt_`/`Previous` texture slot now resolves to a live render
+target or the shared dummy texture instead. Lighting objects remain
+**out of scope**: `#require LightingV1` still resolves to a
+zero-contribution stub.
 
 **Preprocessor** (`crates/kwe-scene-renderer/src/shaderpre.rs`, adapted
 from `ShaderUnit::preprocess`/`compile`, GPL-3.0-or-later — see
@@ -777,11 +782,232 @@ unknown) → the same alpha-blended src-over every other layer uses.
 **Diagnostics**: `event=renderer.scene.shader_fallback reason=... count=N`
 once per distinct reason after load (`no_shader_name`,
 `shader_source_missing`, `preprocess_failed`, `unsupported_vertex_format`,
-`render_target_reference`, `pipeline_cap`, `compile_failed`,
-`pipeline_creation_failed`, `bind_failed`), then
+`pipeline_cap`, `compile_failed`, `pipeline_creation_failed`,
+`bind_failed`, and S3's `render_target_only_without_effects` — see
+"Effects and render targets"), then
 `event=renderer.scene.shaders compiled=N fallback=M` once. A material
 that falls back stays covered by S1's `texture_ok`/base-texture path —
 this step only ever ADDS a material draw on top, never removes one.
+
+## Effects and render targets (S3)
+
+**Implemented (S3)**: an object's `effects[]` array — an ordered list of
+effect-chain references, each naming an effect `.json` file
+(`effects/<name>/effect.json` in the real corpus) plus per-object pass
+overrides (combos/textures/usertextures/constantshadervalues, matched
+positionally to the effect file's own MATERIAL passes only — command
+passes consume no override). An effect file declares `fbos[]` (name/
+format/scale/`unique`, sized to the OWNING OBJECT's own pixel size ÷
+`scale` — not the scene's) and an ordered `passes[]`, each either a
+material pass (`material`, optional `bind` list, optional `target` FBO
+name) or a `command` (`copy`/`swap`, `source`/`target` names).
+
+**Resolution** (`crates/kwe-core/src/sceneeffect.rs`, adapted from
+`EffectParser.cpp`/`ObjectParser::parseEffect`/`CPass::
+setupTextureUniforms`'s texture-slot priority order, GPL-3.0-or-later —
+see THIRD_PARTY.yml): every texture-slot name is classified once, no
+GPU/render-time knowledge needed — a `_rt_`/`_alias_`-prefixed name is a
+live render target (`is_runtime_target_name`), the literal string
+`"previous"` is the chain-local "reuse the input this slot would
+otherwise have used" sentinel, anything else is a normal `.tex` asset
+resolved and TEXV-header-checked exactly like a base material's texture
+slot. **Honesty rule**: resolving an object's `effects[]` NEVER fails
+the object — a malformed or unresolvable effect entry (missing file,
+unresolvable declared texture, malformed JSON) is simply omitted from
+the resolved list; the object keeps drawing through its base material
+(or nothing, if that was already unresolvable) exactly as if it had no
+`effects[]` at all. Bounded: ≤ 32 effects/object, ≤ 16 passes/effect,
+≤ 16 fbos/effect, effect JSON ≤ 1 MiB.
+
+**`_rt_` runtime-target honesty fix**: before S3, a material's texture
+slot naming `_rt_FullFrameBuffer` (the corpus's `models/util/
+fullscreenlayer.json` `copybackground` utility material's ONLY texture)
+unconditionally tried `materials/_rt_FullFrameBuffer.tex` on disk — a
+path that can never exist — failing model resolution outright. This was
+the exact defect keeping Workshop scene `1652229298` refused after S1/S2
+(BETA_PLAN.md). `scenemodel::resolve_model` now recognizes a
+`_rt_`/`_alias_`-prefixed slot-0 name as resolved-but-render-target
+(empty bytes, `is_render_target: true`) instead of a filesystem lookup —
+the B2 honesty gate passes, and the object's real pixel content is
+decided by the renderer's effect chain at draw time.
+
+**Render pipeline mapping** (`crates/kwe-scene-renderer/src/vulkan.rs`):
+upstream draws every material pass as its OWN draw call, either into a
+named FBO (`target: Some(name)`) or, with no target, directly onto the
+compositor. This renderer maps that onto its existing single-composite-
+pass architecture with one simplification: **the chain's LAST pass with
+no target REPLACES the layer's own base material** for compile/bind
+purposes (a layer with a resolved effect chain draws through the
+effect's own final shader, not its base material — matching upstream's
+practical effect, since a bare `copybackground` passthrough base
+material is otherwise a content-free no-op). Every OTHER pass with a
+`target` gets its own compiled pipeline (`compile_effect_pass` — a
+separate, uncached pipeline object per pass, since its viewport is the
+TARGET's own pixel size, not the canvas: this renderer's pipelines bake
+a static, non-dynamic viewport) and is RE-RENDERED into its FBO every
+frame (`render_effect_chains`, called before the main composite pass
+each frame) so later passes and the layer's own final draw sample
+fresh content. `command: copy` executes as a direct `vkCmdCopyImage`
+between two named FBOs; `command: swap` — upstream itself never executes
+`swap` (`CImage.cpp` only handles `Command_Copy`) — executes identically
+to `copy` in this renderer, since a true pointer swap would require
+re-resolving every LATER pass's already-baked descriptor-set view
+bindings each frame, which this renderer's load-time-only binding design
+does not support.
+
+**`"previous"` seeding**: for the FIRST pass in an object's whole effect
+chain, `"previous"` resolves to the object's OWN base material's slot-0
+content — its real photo texture if it has one, or `_rt_FullFrameBuffer`
+if its base material's slot 0 is itself empty or already a render target
+(the `copybackground` pattern). Getting this right matters: seeding it
+to `_rt_FullFrameBuffer` unconditionally would make an ordinary photo
+layer's colour-grade effect sample the (one-frame-stale, initially
+transparent) scene composite instead of its own photo — a real
+corpus-observed failure mode caught and fixed during this slice (see the
+"safety guard" note below and `main.rs::plan_effect_chain`'s doc
+comment).
+
+**`_rt_FullFrameBuffer`**: a copy of the composited scene so far. This
+renderer takes ONE whole-frame snapshot per frame
+(`snapshot_full_frame_buffer`, called after the main composite pass
+finishes, before the NEXT frame's `render_effect_chains`) rather than
+tracking upstream's true incremental, per-object paint-order visibility
+— a documented, bounded simplification: every effect chain that reads
+`_rt_FullFrameBuffer` sees the PREVIOUS frame's fully composited output,
+a one-frame lag imperceptible for a steady-state animated wallpaper.
+Every effect render target (including `_rt_FullFrameBuffer` itself) is
+created cleared to transparent black (`CFBO.cpp`'s documented fix for
+effects otherwise drawing solid rectangles) and stays that way until
+something writes it — a chain that references a target nothing ever
+populates samples defined transparent black, never garbage, never a
+crash (`vulkan::tests::unwritten_effect_target_samples_transparent_black_not_garbage`).
+
+**Safety guard — bare `_rt_` passthrough without an effect chain**: a
+layer whose EFFECTIVE material (its own base material, since it has no
+resolved `effects[]`) has NOTHING but `_rt_`/render-target texture slots
+— no real `.tex` bytes anywhere — never draws
+(`render_target_only_without_effects` fallback reason). This is exactly
+the corpus's bare `models/util/fullscreenlayer.json` pattern used
+WITHOUT an attached effect (several real scenes place one at a fixed
+point in their object stack purely as a `copybackground` utility, with
+no `effects[]` of its own): before S3 its unresolvable `_rt_
+FullFrameBuffer` slot meant the whole object silently never drew — a
+true no-op. Once the honesty fix above made that slot resolve, binding
+it live would draw the one-frame-stale, transparent-on-frame-1 `_rt_
+FullFrameBuffer` as an ordinary opaque/translucent quad — painting stale
+or fully black content over whatever else this frame already drew,
+wherever in the object stack it sits (worst case, last, hiding
+everything). This guard was found and fixed via the corpus regression
+sweep documented in `AI-Skills/BETA_PLAN.md`'s S3 entry, not by
+inspection alone — real Workshop content exercises it.
+
+**Scope boundary — an effect chain only replaces a BARE base material**:
+an effect chain's own final untargeted pass replaces the layer's base
+material for drawing purposes ONLY when the base material itself is
+ALSO the bare-passthrough shape above (no real `.tex` bytes anywhere —
+the `copybackground` case). An object whose base material samples a
+REAL photo/texture always keeps drawing that base material unchanged
+(its S1/S2 behavior), regardless of how many `effects[]` entries are
+attached. This is a deliberate scope boundary, not an oversight: this
+renderer's chain model concatenates EVERY attached effect's passes into
+one linear `"previous"` chain and only the textually-LAST untargeted
+pass across ALL of them ever becomes a candidate final material — for
+an object with multiple STACKED effects (the real corpus has objects
+with up to four: waterripple/waterflow/godrays/waterwaves on one photo
+layer), this discards every earlier effect's contribution rather than
+correctly layering them, which can produce materially wrong output (the
+corpus regression sweep caught exactly this: a real photo losing its
+image entirely and showing flat clear-colour instead). Restricting the
+override to bare-passthrough base materials keeps that wrong case from
+ever reaching a REAL object's rendering, at the cost of not yet
+rendering effects for the (more common) "real photo + attached effect"
+pattern — an honest, verified-safe trade-off pinned by
+`main.rs::tests::effect_final_material_only_overrides_a_bare_passthrough_base`
+and by the corpus-wide before/after pixel sweep (zero regressions across
+54 comparable scenes). Correctly layering multiple stacked effects on a
+real base texture is a real, scoped follow-up.
+
+**Bounds**: `MAX_EFFECT_TARGETS_PER_SCENE` = 64 live FBOs/scene,
+`MAX_EFFECT_TARGET_BYTES` = 256 MiB cumulative, `MAX_EFFECT_TARGET_
+DIMENSION` = 4096 px/side, `MAX_EFFECT_PASS_BINDINGS` = 256 compiled
+effect-pass pipelines/scene — all enforced in `vulkan.rs`, independent
+of the parse-time caps in `kwe-core::sceneeffect`.
+
+**Diagnostics**: `event=renderer.scene.effect_fallback reason=...
+count=N` per distinct reason (currently only `compile_failed`, since a
+texture/target reference degrades silently by design rather than
+failing), then `event=renderer.scene.effects objects=N passes=M
+fallback=K targets=T` once per scene load — only emitted when at least
+one layer has a resolved effect chain.
+
+## Mesh/puppet vertex formats (S3, partial)
+
+**Implemented**: the precision-qualifier scraping bug fixed this slice
+(`shaderpre::parse_decl` previously left a leading `lowp`/`mediump`/
+`highp` glued onto the scraped GLSL type, e.g. `"mediump vec2"` instead
+of `"vec2"`, so `main.rs::material_vertex_format_supported`'s bare
+string-equality check against `"vec2"` always failed for a shader whose
+second attribute carried ANY precision qualifier — a real corpus shader,
+`puppettexturechannels.vert`, does exactly this), pinned by a direct
+unit test (`shaderpre::tests::precision_qualifier_is_stripped_from_the_scraped_type`).
+Its net effect on the corpus-wide `unsupported_vertex_format` count is
+NOT cleanly isolable from this slice's other changes (the pkg-bundled-
+shader lookup fix and the effect-safety restriction below both change
+which materials are even attempted) — the local 60-scene sweep's final
+`unsupported_vertex_format` count is 55 (vs 53 in the S2 baseline),
+essentially unchanged in aggregate once every other S3 change is
+accounted for, which says most of the corpus's "mesh/puppet" fallbacks
+were never about THIS scraping bug specifically — they are the
+genuinely different attribute shapes surveyed below. The qualifier fix
+is still real and correct (confirmed by the unit test and by manual
+inspection of `puppettexturechannels.vert`'s own shape), just not the
+large aggregate win an earlier, less-safety-restricted build of this
+slice appeared to show.
+
+**Deliberately left out** (documented, not silently dropped): a survey
+of the WE asset shader corpus (`assets/shaders/*.vert`, not just this
+machine's Workshop content) found the FIRST-TWO-ATTRIBUTE shapes this
+renderer does NOT implement, in descending frequency: `a_Position(vec3)
++ a_Normal(vec3)` (7 shaders — lighting-only positions, no UV; these
+need `#require LightingV1`'s real implementation, out of scope), `a_
+PositionVec4(vec4) + ...` (7 — a different position type entirely,
+observed on foliage/billboard-family shaders), `a_Position(vec3) + a_
+Color(vec4)` (3 — vertex-painted/particle-style materials), `a_
+Position(vec3) + a_TexCoordVec4(vec4)` (3, including
+`puppettexturechannels.vert` — MULTI-CHANNEL texture blending for
+puppet-style character coloring; this is the one shape whose name
+literally says "puppet"), `a_Position(vec3) + a_BlendIndices` alone with
+no texcoord (1 — a shadow/depth-only pass shader, never a material's
+PRIMARY pass in the corpus). None of these were observed attributable to
+an ACCEPTED local scene's actual visible material in this pass's
+11-remaining-fallback count — the residual 11 are a mix of these shapes
+and genuinely broken/unusual shader text. Adding support for any of
+these is a real, scoped follow-up (extending
+`material_vertex_format_supported`'s matcher AND the Vulkan pipeline's
+vertex-input state to a second/third supported layout, plus building the
+extra per-vertex data for a flat quad) — not attempted this slice given
+the low remaining fallback count and the risk of a broader Vulkan
+pipeline change this late in the slice.
+
+**Puppet MESH geometry (custom triangle lists, not just attribute
+shape)**: upstream's only mesh-beyond-the-quad path is a `model.json`
+`puppet` field naming a binary blob (magic `MDLV0021`/`MDLV0023`, a
+heuristically-scanned vertex/index block — stride-80 vertices,
+position(vec3) at offset 0 + uv(vec2) at offset 72, u16 index triples;
+CImage.cpp's own comment gives no name to the 64 bytes between offset
+12 and 72, and no other code path reads them). Critically, upstream's
+puppet vertex SHADER uses the SAME two attributes (`a_Position`+
+`a_TexCoord`) as the flat quad — puppet is a GEOMETRY change (many
+triangles instead of 6 quad vertices), not a vertex-FORMAT change. **Not
+ported this slice**: a full grep of this machine's local `assets/
+models/*.json` (6 files) found zero `"puppet"` keys, and the local
+60-scene Workshop corpus's packed `scene.pkg` model.json entries were
+not exhaustively re-checked for `puppet` fields given the time budget —
+treat puppet mesh support as implemented-nowhere, not
+implemented-but-unexercised, until a real fixture is found. Given zero
+observed local usage, this is left out with the reason recorded here
+rather than built against a synthetic-only fixture with no real-corpus
+signal to validate it against.
 
 ## scene.pkg
 
