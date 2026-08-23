@@ -506,7 +506,12 @@ call_daemon renderer.start "$(jq -cn --arg content "$pkg_nested" \
     '{wallpaper_id:"scene-nested",content_hash:"hash-nested",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
 nested_rollback="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.pid' <<<"$nested_rollback")" == "$base_pid" ]]
-[[ "$(jq -r '.result.last_failure' <<<"$nested_rollback")" == "process_exit" ]]
+# Pre-existing staleness fixed while running this suite for S1 (unrelated
+# to S1 itself): B4 classifies exit_code_73/74 candidate failures as
+# FailureKind::Refused ("refused"), not ProcessExit — this and the other
+# three exit-73 rollback cases below were still asserting the pre-B4
+# value.
+[[ "$(jq -r '.result.last_failure' <<<"$nested_rollback")" == "refused" ]]
 # The nested worker's own stderr is captured in the failure detail (the
 # ring tail belongs to the restarted base worker at this point).
 [[ "$(jq -r '.result.last_failure_detail' <<<"$nested_rollback")" == *"exit_code_73"* ]]
@@ -606,7 +611,7 @@ garbage_params="$(jq -cn --arg content "$garbage_scene" \
 call_daemon renderer.start "$garbage_params" >/dev/null
 rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.pid' <<<"$rollback_status")" == "$base_pid" ]]
-[[ "$(jq -r '.result.last_failure' <<<"$rollback_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$rollback_status")" == "refused" ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$rollback_status")" == *"exit_code_73"* ]]
 kill -0 "$base_pid"
 echo "scene smoke passed: garbage scene.json -> worker exit 73 -> rolled_back with exit_code_73"
@@ -619,7 +624,7 @@ missing_params="$(jq -cn --arg content "$missing_scene" \
 call_daemon renderer.start "$missing_params" >/dev/null
 missing_rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.pid' <<<"$missing_rollback_status")" == "$base_pid" ]]
-[[ "$(jq -r '.result.last_failure' <<<"$missing_rollback_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$missing_rollback_status")" == "refused" ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$missing_rollback_status")" == *"exit_code_73"* ]]
 kill -0 "$base_pid"
 echo "scene smoke passed: missing script file -> worker exit 73 -> rolled_back with exit_code_73"
@@ -1958,7 +1963,7 @@ m3c_e_params="$(jq -cn --arg content "$m3c_e_scene" \
     '{wallpaper_id:"scene-m3c-e",content_hash:"hash-m3c-e",width:160,height:90,fps:30,kind:"scene",content:$content}')"
 call_daemon renderer.start "$m3c_e_params" >/dev/null
 m3c_e_status="$(wait_phase rolled_back)"
-[[ "$(jq -r '.result.last_failure' <<<"$m3c_e_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$m3c_e_status")" == "refused" ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$m3c_e_status")" == *"exit_code_73"* ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$m3c_e_status")" == *"over the 256 layer cap"* ]]
 [[ "$(jq -r '.result.pid' <<<"$m3c_e_status")" == "$(jq -r '.result.pid' <<<"$m3c_d_status")" ]]
@@ -2610,7 +2615,10 @@ b2_reject="$(call_daemon renderer.start "$(jq -cn --arg content "$b2_models_scen
 [[ "$(jq -r '.result.error' <<<"$b2_reject")" == "invalid_params" ]]
 [[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"scene preflight rejected"* ]]
 [[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"draws nothing in this build"* ]]
-[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"scene3d"* ]]
+# S1: the model-only reason text changed from "scene3d" to the honest
+# resolution failure (no --wallpaper-engine-assets is configured for this
+# daemon instance, so neither model layer's material texture resolves).
+[[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"material textures could not be resolved"* ]]
 [[ "$(jq -r '.result.detail' <<<"$b2_reject")" == *"external particle files"* ]]
 echo "scene smoke passed (B2 a): model-only scene -> preflight invalid_params, never applied"
 
@@ -2623,8 +2631,100 @@ b2_partial_status="$(wait_phase live)"
 b2_partial_frame="$(jq -r '.result.frame_file' <<<"$b2_partial_status")"
 scene_pixel_oracle "$b2_partial_frame" 80 45 "0,0,255,255" 1
 b2_partial_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$b2_partial_status")"
-[[ "$b2_partial_tail" == *"event=renderer.scene.model_layer_skip count=1"* ]]
-echo "scene smoke passed (B2 b): one drawable layer -> applied, model skip reported"
+# S1: the model layer's own texture-resolution diagnostic (no assets
+# configured, so "bg" cannot resolve) replaces the old blanket skip.
+[[ "$b2_partial_tail" == *"event=renderer.scene.model_texture_skip count=1"* ]]
+echo "scene smoke passed (B2 b): one drawable layer -> applied, model texture skip reported"
+
+# ---------------------------------------------------------------------------
+# S1 case: a model layer whose material texture is a real TEXV0005 (raw
+# ARGB8888) container, packaged entirely inside a scene.pkg — model.json,
+# material.json, and the .tex asset are all pkg entries, so this case needs
+# no --wallpaper-engine-assets configured (pkg-entries-first resolution
+# finds everything). The model must resolve, decode, and draw its solid
+# colour through the daemon lane end to end, exactly the headline S1
+# behaviour: a model layer draws its base texture as a textured quad.
+s1_model_pkg="$smoke_root/s1-model.pkg"
+python3 - "$s1_model_pkg" <<'S1PY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))  # uncompressedSize
+    out += struct.pack("<i", len(pixels))  # compressedSize
+    out += pixels
+    return bytes(out)
+
+
+scene_json = (
+    b'{"general": {"clearcolor": [0.1, 0.1, 0.1, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "solid", "image": "models/solid.json",'
+    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+)
+model_json = b'{"material": "materials/solid.json"}'
+material_json = b'{"passes": [{"shader": "genericimage2", "textures": ["solid"]}]}'
+texture = texv_argb8888(4, 4, (255, 200, 0, 255))
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/solid.json", model_json),
+            ("materials/solid.json", material_json),
+            ("materials/solid.tex", texture),
+        ]
+    )
+)
+S1PY
+
+call_daemon renderer.start "$(jq -cn --arg content "$s1_model_pkg" \
+    '{wallpaper_id:"scene-s1-model",content_hash:"hash-s1-model",width:160,height:90,fps:30,kind:"scene",content:$content}')" >/dev/null
+s1_model_status="$(wait_phase live)"
+s1_model_frame="$(jq -r '.result.frame_file' <<<"$s1_model_status")"
+# scene_pixel_oracle expects BGRA memory order (its own doc comment);
+# the texture pixel is R=255,G=200,B=0 (the pkg fixture builder's literal
+# ARGB8888 payload bytes, expand_raw's identity copy), so in the frame's
+# B8G8R8A8_UNORM order that is B,G,R,A = 0,200,255,255.
+scene_pixel_oracle "$s1_model_frame" 80 45 "0,200,255,255" 1
+s1_model_tail="$(jq -r '.result.stderr_tail | join("\n")' <<<"$s1_model_status")"
+[[ "$s1_model_tail" != *"model_texture_skip"* ]]
+echo "scene smoke passed (S1): pkg model layer with a real TEXV0005 texture -> resolves, decodes, and draws its colour"
 
 # Final stop: the daemon stops the active worker and stays healthy.
 call_daemon renderer.stop >/dev/null
@@ -3119,7 +3219,10 @@ if [[ "$b2_standalone_status" != "74" ]]; then
     sed -n '1,120p' "$b2_standalone_log" >&2
     exit 1
 fi
-grep -q "event=renderer.scene.model_layer_skip count=2" "$b2_standalone_log"
+# S1: both model layers still fail to resolve standalone (no
+# --assets-dir given here either), so the worker's own texture-skip
+# diagnostic fires with the same count the old model_layer_skip did.
+grep -q "event=renderer.scene.model_texture_skip count=2" "$b2_standalone_log"
 grep -q "event=renderer.scene.no_drawable_content objects=3" "$b2_standalone_log"
 grep -q "event=renderer.scene.unsupported exit_code=74" "$b2_standalone_log"
 [[ ! -f "$smoke_root/standalone-b2.bin" ]]
