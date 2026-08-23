@@ -1,7 +1,7 @@
 pkgbase = kde-wallpaper-engine
 	pkgdesc = Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon
 	pkgver = 0.1.0.alpha.1
-	pkgrel = 5
+	pkgrel = 20
 	url = https://github.com/kde-wallpaper-engine/kde-wallpaper-engine
 	install = kde-wallpaper-engine.install
 	arch = x86_64
@@ -13,6 +13,7 @@ pkgbase = kde-wallpaper-engine
 	makedepends = qt6-base
 	makedepends = qt6-declarative
 	makedepends = kirigami
+	makedepends = shaderc
 	depends = qt6-base
 	depends = qt6-declarative
 	depends = kirigami
@@ -20,6 +21,7 @@ pkgbase = kde-wallpaper-engine
 	depends = vulkan-driver
 	depends = kscreen
 	depends = qt6-tools
+	depends = shaderc
 	source = kde-wallpaper-engine::git+https://github.com/kde-wallpaper-engine/kde-wallpaper-engine.git#commit=4477783
 	sha256sums = SKIP
 

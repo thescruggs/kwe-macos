@@ -30,7 +30,7 @@ install=kde-wallpaper-engine.install
 
 pkgname=kde-wallpaper-engine
 pkgver=0.1.0.alpha.1
-pkgrel=19
+pkgrel=20
 pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon"
 arch=('x86_64')
 url="https://github.com/kde-wallpaper-engine/kde-wallpaper-engine"
