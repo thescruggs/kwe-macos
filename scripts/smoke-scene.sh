@@ -3357,4 +3357,169 @@ grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s2_standalone_log
 stop_standalone "$s2_standalone_pid" "$s2_standalone_log" "standalone S2 material renderer"
 echo "scene smoke passed (S2): pkg model layer with a custom material shader -> compiles and draws through the material pipeline, not the S1 base texture"
 
+# S3: a model layer with a resolvable but visually-irrelevant base
+# material, plus one resolved `effects[]` entry naming a synthetic
+# effect file that declares one FBO (`_rt_Solid`) and two material
+# passes: pass 0 renders a deterministic hard-coded colour INTO that FBO
+# (`target: "_rt_Solid"`); pass 1 has no target (upstream's "draws
+# directly onto the compositor" case, which this renderer folds into the
+# layer's own material — see `EffectChainPlan`'s doc comment in main.rs)
+# and samples `_rt_Solid` via its OWN material.json `textures` array,
+# passing the sampled colour straight through. The oracle proves the
+# whole S3 chain end to end on a real scene load (not just the device
+# test in vulkan.rs): FBO creation+clear, the intermediate pass actually
+# rendering into it, and the final pass sampling it by name.
+s3_assets_dir="$smoke_root/s3-assets"
+mkdir -p "$s3_assets_dir/shaders"
+cat >"$s3_assets_dir/shaders/s3base.vert" <<'VERT'
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+uniform mat4 g_ModelViewProjectionMatrix;
+varying vec2 v_TexCoord;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+}
+VERT
+cat >"$s3_assets_dir/shaders/s3base.frag" <<'FRAG'
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = vec4(1.0, 1.0, 1.0, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);
+}
+FRAG
+cp "$s3_assets_dir/shaders/s3base.vert" "$s3_assets_dir/shaders/s3solid.vert"
+cat >"$s3_assets_dir/shaders/s3solid.frag" <<'FRAG'
+varying vec2 v_TexCoord;
+void main() {
+	// A deliberately distinctive hard-coded colour, unrelated to any
+	// sampled texture -- proves this pass's OWN draw ran, not a
+	// coincidental default.
+	gl_FragColor = vec4(0.2, 0.5, 0.9, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);
+}
+FRAG
+cp "$s3_assets_dir/shaders/s3base.vert" "$s3_assets_dir/shaders/s3sample.vert"
+cat >"$s3_assets_dir/shaders/s3sample.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = texSample2D(g_Texture0, v_TexCoord);
+}
+FRAG
+
+s3_effects_pkg="$smoke_root/s3-effects.pkg"
+python3 - "$s3_effects_pkg" <<'S3PY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))
+    out += struct.pack("<i", len(pixels))
+    out += pixels
+    return bytes(out)
+
+
+scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "fx", "image": "models/fx.json",'
+    b' "origin": [0.0, 0.0], "size": [160.0, 90.0],'
+    b' "effects": [{"file": "effects/test.json", "visible": true, "passes": [{}]}]}]}'
+)
+model_json = b'{"material": "materials/fx.json", "fullscreen": true}'
+# The base material's ONLY texture is the `_rt_FullFrameBuffer` runtime
+# target (the real corpus's `copybackground` pattern,
+# `materials/util/fullscreenlayer.json`) -- deliberately, not a real
+# `.tex` asset: compile_material_layers only lets an effect chain's own
+# final untargeted pass replace a layer's base material when the base
+# material has nothing real of its own to lose (main.rs's
+# `texture_slots_are_bare_render_target_only` safety decision, added
+# after the corpus regression sweep found a REAL base photo's effect
+# chain discarding the photo entirely). Testing that exact safe-boundary
+# case here, not a real-photo-plus-effect case this slice does not yet
+# handle.
+material_json = b'{"passes": [{"shader": "s3base", "textures": ["_rt_FullFrameBuffer"]}]}'
+
+effect_json = (
+    b'{"name": "test",'
+    b' "fbos": [{"name": "_rt_Solid", "scale": 1.0, "format": "rgba8888"}],'
+    b' "passes": ['
+    b'  {"material": "materials/effects/solid.json", "target": "_rt_Solid"},'
+    b'  {"material": "materials/effects/sample.json"}'
+    b' ]}'
+)
+solid_material_json = b'{"passes": [{"shader": "s3solid"}]}'
+sample_material_json = b'{"passes": [{"shader": "s3sample", "textures": ["_rt_Solid"]}]}'
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/fx.json", model_json),
+            ("materials/fx.json", material_json),
+            ("effects/test.json", effect_json),
+            ("materials/effects/solid.json", solid_material_json),
+            ("materials/effects/sample.json", sample_material_json),
+        ]
+    )
+)
+S3PY
+
+s3_standalone_log="$smoke_root/standalone-s3-effects.log"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-s3-effects.bin" --width 160 --height 90 --fps 30 \
+    --content "$s3_effects_pkg" --assets-dir "$s3_assets_dir" --device llvmpipe \
+    >"$s3_standalone_log" 2>&1 &
+s3_standalone_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$smoke_root/standalone-s3-effects.bin" ]] && head -c 8 "$smoke_root/standalone-s3-effects.bin" | grep -q KWEFRM1 && break
+    kill -0 "$s3_standalone_pid" 2>/dev/null || {
+        echo "standalone S3 effects renderer exited early" >&2
+        sed -n '1,120p' "$s3_standalone_log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$smoke_root/standalone-s3-effects.bin" | grep -q KWEFRM1
+# B8G8R8A8 memory order: B=0.9*255=229.5, G=0.5*255=127.5, R=0.2*255=51.
+scene_pixel_wait "$smoke_root/standalone-s3-effects.bin" 80 45 "230,128,51,255" 2 "$s3_standalone_log"
+grep -q "event=renderer.scene.effects objects=1 passes=1 fallback=0" "$s3_standalone_log"
+grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s3_standalone_log"
+stop_standalone "$s3_standalone_pid" "$s3_standalone_log" "standalone S3 effects renderer"
+echo "scene smoke passed (S3): pkg model layer with a resolved effect chain -> a targeted pass renders a deterministic colour into an FBO, a second (untargeted) pass samples it and becomes the layer's own material draw"
+
 echo "all scene smoke cases passed"
