@@ -515,6 +515,35 @@ private slots:
         QCOMPARE(m_daemon.receivedMethods.size(), before);
     }
 
+    void frameRateLimitTravelsOnlyWhenNotDefault() {
+        // F2: 30 (the daemon default) is omitted; 15 travels; the retry
+        // replays it; out-of-range never reaches the wire.
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")),
+                              QStringLiteral("aspect"), 30);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
+        QVERIFY(!m_daemon.receivedParams.first().contains(QStringLiteral("fps")));
+        m_daemon.failByMethod.insert(QStringLiteral("wallpaper.apply"),
+                                     {QStringLiteral("apply_failed"), QStringLiteral("boom")});
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")),
+                              QStringLiteral("aspect"), 15);
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        const int failedIndex = m_daemon.receivedParams.size() - 1;
+        QCOMPARE(m_daemon.receivedParams.at(failedIndex).value(QStringLiteral("fps")).toInt(), 15);
+        m_daemon.failByMethod.clear();
+        client.retry();
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
+        QCOMPARE(m_daemon.receivedParams.at(failedIndex + 1).value(QStringLiteral("fps")).toInt(), 15);
+        const int before = m_daemon.receivedMethods.size();
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")),
+                              QStringLiteral("aspect"), 500);
+        QCOMPARE(client.state(), ApplyClient::Failed);
+        QCOMPARE(m_daemon.receivedMethods.size(), before);
+    }
+
     void retryRerunsAFailedRestore() {
         m_daemon.failByMethod.insert(QStringLiteral("wallpaper.restore"),
                                      {QStringLiteral("restore_failed"), QStringLiteral("boom")});

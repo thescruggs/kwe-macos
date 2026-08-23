@@ -65,15 +65,20 @@ void ApplyClient::listOutputs() {
 
 void ApplyClient::applyWallpaper(const QString &output, const QString &wallpaperId,
                                  const QString &kind, const QUrl &content,
-                                 const QString &scaling) {
-    sendApply(output, wallpaperId, kind, content, scaling, false);
+                                 const QString &scaling, int fps) {
+    sendApply(output, wallpaperId, kind, content, scaling, fps, false);
 }
 
 void ApplyClient::sendApply(const QString &output, const QString &wallpaperId,
                             const QString &kind, const QUrl &content, const QString &scaling,
-                            bool retry) {
+                            int fps, bool retry) {
     if (!validScaling(scaling)) {
         setErrorMessage(tr("The scaling mode is invalid for applying."));
+        setState(Failed);
+        return;
+    }
+    if (fps < 0 || fps > 240) {
+        setErrorMessage(tr("The frame rate limit must be between 1 and 240."));
         setState(Failed);
         return;
     }
@@ -98,7 +103,7 @@ void ApplyClient::sendApply(const QString &output, const QString &wallpaperId,
                      if (ok)
                          refreshAssignments();
                  },
-                 retry, scaling});
+                 retry, scaling, fps});
 }
 
 void ApplyClient::restoreWallpaper(const QString &output) {
@@ -136,7 +141,7 @@ void ApplyClient::retry() {
         // flag the daemon would answer apply_quarantined again.
         sendApply(m_lastFailedOutput, m_lastFailedWallpaperId, m_lastFailedKind,
                   QUrl::fromLocalFile(m_lastFailedContent), m_lastFailedScaling,
-                  m_lastFailedQuarantined);
+                  m_lastFailedFps, m_lastFailedQuarantined);
     } else if (m_lastFailedMethod == Restore) {
         restoreWallpaper(m_lastFailedOutput);
     } else if (m_lastFailedMethod == ListOutputs) {
@@ -216,6 +221,9 @@ void ApplyClient::writeRequest() {
         // for the default path).
         if (!m_current.scaling.isEmpty() && m_current.scaling != QStringLiteral("aspect"))
             params.insert(QStringLiteral("scaling"), m_current.scaling);
+        // F2: only a non-default rate travels (30 is the daemon default).
+        if (m_current.fps > 0 && m_current.fps != 30)
+            params.insert(QStringLiteral("fps"), m_current.fps);
         break;
     case Restore:
         params.insert(QStringLiteral("output"), m_current.output);
@@ -283,6 +291,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
     const auto kind = m_current.kind;
     const auto content = m_current.content;
     const auto scaling = m_current.scaling;
+    const auto fps = m_current.fps;
     const auto callback = std::move(m_current.callback);
     m_current = {};
     emit busyChanged();
@@ -299,6 +308,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_lastFailedKind = kind;
             m_lastFailedContent = content;
             m_lastFailedScaling = scaling.isEmpty() ? QStringLiteral("aspect") : scaling;
+            m_lastFailedFps = fps;
             m_lastFailedQuarantined = errorCode == QStringLiteral("apply_quarantined");
             clearResult();
             // The UI's Try Again only makes sense for operations with a

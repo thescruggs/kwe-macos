@@ -2156,6 +2156,14 @@ impl PlaylistApplyLane for ApplyHandle {
             .as_ref()
             .map(|assignment| assignment.scaling)
             .unwrap_or_default();
+        // F2: the output's chosen frame-rate limit survives playlist advances.
+        if let Some(fps) = old_assignment
+            .as_ref()
+            .map(|assignment| assignment.fps)
+            .filter(|fps| (1..=240).contains(fps))
+        {
+            spec.fps = fps;
+        }
         let result = self.complete_apply(
             &spec,
             &content,

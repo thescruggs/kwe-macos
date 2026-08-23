@@ -78,9 +78,12 @@ public:
     /// starts its own catalog content.
     /// `scaling` (F1): "aspect" (default) | "fill" | "stretch" — how the
     /// picture maps onto the output; persisted per output by the daemon.
+    /// `fps` (F2): the renderer's publish rate limit, 1..=240 (30 default);
+    /// persisted per output by the daemon like `scaling`.
     Q_INVOKABLE void applyWallpaper(const QString &output, const QString &wallpaperId,
                                     const QString &kind, const QUrl &content,
-                                    const QString &scaling = QStringLiteral("aspect"));
+                                    const QString &scaling = QStringLiteral("aspect"),
+                                    int fps = 30);
     /// Safe-mode restore (wallpaper.restore): reverts the saved previous
     /// wallpaper config on the output, or restores the stock image wallpaper
     /// when no assignment exists.
@@ -122,6 +125,8 @@ private:
         /// Last on purpose: the other lanes aggregate-initialise Pending
         /// positionally and stop before it.
         QString scaling;
+        /// F2 frame-rate limit for an apply (1..=240; 0 = daemon default).
+        int fps = 0;
     };
 
     void send(Pending pending);
@@ -137,7 +142,7 @@ private:
     void recordFailure(const Pending &pending);
     /// The apply request builder shared by applyWallpaper() and retry().
     void sendApply(const QString &output, const QString &wallpaperId, const QString &kind,
-                   const QUrl &content, const QString &scaling, bool retry);
+                   const QUrl &content, const QString &scaling, int fps, bool retry);
     int requestTimeoutMilliseconds(Method method) const;
     void drainQueue();
     void retryLater();
@@ -182,6 +187,7 @@ private:
     QString m_lastFailedKind;
     QString m_lastFailedContent;
     QString m_lastFailedScaling;
+    int m_lastFailedFps = 0;
     /// The last apply failed with `apply_quarantined`: Try Again must ask
     /// the daemon to clear the record (retry: true) or it would fail again
     /// with the same answer.

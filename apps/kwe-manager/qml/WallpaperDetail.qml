@@ -278,6 +278,35 @@ Kirigami.ScrollablePage {
                 Controls.ToolTip.text: Accessible.description
             }
         }
+        // F2: the renderer's publish-rate limit. The renderer paces its
+        // frames to this; lower values cost less CPU/GPU (web screencast
+        // decode, libmpv software render, Vulkan composite all scale with
+        // it). Persisted per output with the assignment.
+        RowLayout {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length > 0
+            Controls.Label {
+                text: qsTr("Frame rate limit")
+            }
+            Controls.ComboBox {
+                id: fpsPicker
+                Layout.fillWidth: true
+                textRole: "text"
+                valueRole: "value"
+                currentIndex: 2
+                model: [
+                    { text: qsTr("15 fps"), value: 15 },
+                    { text: qsTr("24 fps"), value: 24 },
+                    { text: qsTr("30 fps (default)"), value: 30 },
+                    { text: qsTr("60 fps"), value: 60 }
+                ]
+                enabled: !applyClient.busy
+                Accessible.name: qsTr("Frame rate limit")
+                Accessible.description: qsTr("Maximum frames per second the wallpaper renderer publishes; lower values use less CPU and GPU")
+                Controls.ToolTip.visible: hovered
+                Controls.ToolTip.text: Accessible.description
+            }
+        }
         Controls.Label {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length === 0
@@ -310,7 +339,7 @@ Kirigami.ScrollablePage {
                         : qsTr("Apply this wallpaper to the selected display output")
             onClicked: applyClient.applyWallpaper(outputPicker.currentText,
                 WallpaperSelection.selectedId, WallpaperSelection.selectedKind,
-                detailPage.applyContentUrl(), scalingPicker.currentValue)
+                detailPage.applyContentUrl(), scalingPicker.currentValue, fpsPicker.currentValue)
         }
         Controls.Label {
             Layout.fillWidth: true
