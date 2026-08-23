@@ -1674,35 +1674,53 @@ fn read_shader_stage(
     String::from_utf8(bytes).ok()
 }
 
-/// S2 scope: the material pipeline draws exactly one vertex format — a
-/// quad with `a_Position` (vec2 or vec3, z implicitly 0) then `a_TexCoord`
-/// (vec2), the attribute list every `genericimage*`-family vertex shader
-/// declares with default combos (mesh/puppet geometry, which needs more
-/// attributes — bone indices/weights, tangents, per-vertex color — stays
-/// out this slice). Anything else falls back to the S1 quad.
+/// S4: the material pipeline draws through a flat quad
+/// (`vulkan::MATERIAL_UNIT_QUAD`) carrying constant per-vertex data for
+/// every attribute name an image-object vertex shader is known to
+/// declare: `a_Position`/`a_PositionVec4` (the quad's own xy, z/w
+/// implicit), `a_TexCoord`/`a_TexCoordVec4` (the quad's own uv, z/w
+/// implicit), `a_Normal` (always `+Z` — the quad is flat, matching
+/// upstream's `CImage`/`CPass` convention for a 2D object with no real
+/// surface normal), and `a_Color` (always opaque white — the same
+/// "no per-vertex tint" default upstream's flat quad geometry carries).
+/// Puppet/mesh geometry (bone indices/weights, tangents, the
+/// multi-UV-channel `C1`/`C2`/... variants used only by rope/mesh
+/// particle shaders) stays out of this slice — zero local-corpus usage
+/// on an image object, see `docs/SCENE_FORMAT_V1.md`.
 ///
-/// Checks only the first two declared attributes, not the full count:
-/// `shaderpre::preprocess` scrapes `attribute` lines by simple textual
-/// scan, with no `#if`/`#ifdef` evaluation (that happens later, inside
-/// `shaderc`'s real GLSL preprocessor, once this text reaches
-/// `compile_stage`) — a shader like `genericimage2.vert`, whose
-/// `SKINNING`-gated `a_BlendIndices`/`a_BlendWeights` never actually
-/// reach the compiled SPIR-V because `SKINNING` is never `#define`d
-/// (undefined macros in `#if` evaluate to 0, verified against `glslc`),
-/// would otherwise show 4 scraped attributes and always fall back — for
-/// the corpus's most common material shader, that would defeat this
-/// slice's point. A rare shader whose extra attributes ARE genuinely
-/// live (its gating combo defaults on) still degrades safely: pipeline
-/// creation validates the vertex shader's actual input interface against
-/// `MATERIAL_UNIT_QUAD`'s fixed 2-attribute layout and fails cleanly if
-/// they do not match, which the caller already treats as one more
-/// fallback reason (`pipeline_creation_failed`) — never a crash.
+/// `attributes` must already be the LIVE set for this material's actual
+/// combo values (`shaderpre::preprocess`'s S4 `#if`/`#ifdef` tracking —
+/// see `shaderpre::fold_declarations` — filters out attributes behind a
+/// combo branch that is not actually taken, so a shader whose
+/// `SKINNING`/`MORPHING`/... guard defaults off no longer shows dead
+/// attributes here the way the pre-S4 textual scraper did). Every
+/// remaining attribute name must be one of the six known names above,
+/// with the matching declared type, no duplicate names (a scraper/shader
+/// disagreement that arithmetic can't safely fill in for), and at least
+/// one position-like and one texcoord-like attribute. Anything else
+/// falls back to the S1 base-texture quad.
 fn material_vertex_format_supported(attributes: &[shaderpre::AttributeDecl]) -> bool {
-    attributes.len() >= 2
-        && matches!(attributes[0].glsl_type.as_str(), "vec2" | "vec3")
-        && attributes[0].name == "a_Position"
-        && attributes[1].glsl_type == "vec2"
-        && attributes[1].name == "a_TexCoord"
+    if attributes.is_empty() || attributes.len() > vulkan::KNOWN_MATERIAL_ATTRIBUTES.len() {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut has_position = false;
+    let mut has_texcoord = false;
+    for attribute in attributes {
+        if !seen.insert(attribute.name.as_str()) {
+            return false;
+        }
+        match (attribute.name.as_str(), attribute.glsl_type.as_str()) {
+            ("a_Position", "vec2" | "vec3") => has_position = true,
+            ("a_PositionVec4", "vec4") => has_position = true,
+            ("a_TexCoord", "vec2") => has_texcoord = true,
+            ("a_TexCoordVec4", "vec4") => has_texcoord = true,
+            ("a_Normal", "vec3") => {}
+            ("a_Color", "vec4") => {}
+            _ => return false,
+        }
+    }
+    has_position && has_texcoord
 }
 
 /// `blending` (`normal`/`translucent`/`additive` in the corpus) onto the
@@ -2069,6 +2087,19 @@ fn build_material_textures(
     textures
 }
 
+/// `(vertex SPIR-V, fragment SPIR-V, blend mode, pipeline key, live-branch
+/// scraped vertex attributes)` — `compile_one_material`'s success shape,
+/// named to satisfy `clippy::type_complexity`. The attribute list feeds
+/// `vulkan::LayerRenderer::register_material_pipeline`/`compile_effect_pass`
+/// (S4).
+type CompiledMaterial = (
+    Vec<u32>,
+    Vec<u32>,
+    layers::BlendMode,
+    materialshader::MaterialKey,
+    Vec<shaderpre::AttributeDecl>,
+);
+
 /// Preprocess+compile one material's vertex/fragment pair (shared by the
 /// base/final-material path and every targeted effect pass). `label`
 /// (e.g. `"layer[3]"` or `"layer[3] effect[0] pass[2]"`) only reaches
@@ -2082,12 +2113,7 @@ fn compile_one_material(
     material: &PlannedMaterial,
     fallback_reasons: &mut std::collections::BTreeMap<&'static str, usize>,
     unsupported_uniform_names: &mut std::collections::BTreeSet<String>,
-) -> Option<(
-    Vec<u32>,
-    Vec<u32>,
-    layers::BlendMode,
-    materialshader::MaterialKey,
-)> {
+) -> Option<CompiledMaterial> {
     let shader_name = material.shader.as_deref().or_else(|| {
         *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
         None
@@ -2174,8 +2200,18 @@ fn compile_one_material(
         &vertex_label,
     ) {
         Ok(spirv) => spirv,
-        Err(_) => {
+        Err(error) => {
             *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+            // S4 deliverable 5: one bounded, truncated diagnostic line
+            // per failed compile (this function runs once per material
+            // at scene load, never per frame, so this is a one-time cost
+            // matching every other `fallback_reasons` diagnostic in this
+            // file) -- lets a maintainer collect the actual `shaderc`
+            // error text across the corpus without re-instrumenting.
+            eprintln!(
+                "event=renderer.scene.shader_compile_error stage=vertex shader={shader_name} detail={}",
+                text::truncate_chars(&error.to_string(), 300)
+            );
             return None;
         }
     };
@@ -2185,12 +2221,22 @@ fn compile_one_material(
         &fragment_label,
     ) {
         Ok(spirv) => spirv,
-        Err(_) => {
+        Err(error) => {
             *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+            eprintln!(
+                "event=renderer.scene.shader_compile_error stage=fragment shader={shader_name} detail={}",
+                text::truncate_chars(&error.to_string(), 300)
+            );
             return None;
         }
     };
-    Some((vertex_spirv, fragment_spirv, blend_mode, key))
+    Some((
+        vertex_spirv,
+        fragment_spirv,
+        blend_mode,
+        key,
+        vertex_pre.attributes,
+    ))
 }
 
 /// S3: every `fbos[]` request across every layer's resolved, visible
@@ -2457,12 +2503,14 @@ fn compile_material_layers(
             continue;
         }
 
-        let Some((vertex_spirv, fragment_spirv, blend_mode, key)) = compile_one_material(
-            &mut shader_lookup,
-            &material,
-            &mut fallback_reasons,
-            &mut unsupported_uniform_names,
-        ) else {
+        let Some((vertex_spirv, fragment_spirv, blend_mode, key, vertex_attributes)) =
+            compile_one_material(
+                &mut shader_lookup,
+                &material,
+                &mut fallback_reasons,
+                &mut unsupported_uniform_names,
+            )
+        else {
             continue;
         };
         if !compiled_pipelines.contains(&key.0)
@@ -2472,7 +2520,13 @@ fn compile_material_layers(
             continue;
         }
         if renderer
-            .register_material_pipeline(key.clone(), &vertex_spirv, &fragment_spirv, blend_mode)
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                blend_mode,
+                &vertex_attributes,
+            )
             .is_err()
         {
             *fallback_reasons
@@ -2550,12 +2604,14 @@ fn compile_material_layers(
                     .or_insert(0) += 1;
                 continue;
             }
-            let Some((vertex_spirv, fragment_spirv, blend_mode, _key)) = compile_one_material(
-                &mut shader_lookup,
-                pass_material,
-                &mut effect_fallback_reasons,
-                &mut unsupported_uniform_names,
-            ) else {
+            let Some((vertex_spirv, fragment_spirv, blend_mode, _key, vertex_attributes)) =
+                compile_one_material(
+                    &mut shader_lookup,
+                    pass_material,
+                    &mut effect_fallback_reasons,
+                    &mut unsupported_uniform_names,
+                )
+            else {
                 continue;
             };
             let mut uniforms = materialshader::MaterialUniforms::default();
@@ -2577,6 +2633,7 @@ fn compile_material_layers(
                 target_name,
                 &textures,
                 uniforms,
+                &vertex_attributes,
             ) {
                 Ok(binding_index) => {
                     // S3 review MUST-FIX #2: `queue_effect_render` is

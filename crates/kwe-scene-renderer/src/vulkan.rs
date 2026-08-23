@@ -1526,10 +1526,17 @@ impl LayerRenderer {
         vertex_spirv: &[u32],
         fragment_spirv: &[u32],
         blend_mode: BlendMode,
+        vertex_attributes: &[crate::shaderpre::AttributeDecl],
     ) -> Result<(), RenderError> {
         if self.material_pipelines.contains_key(&key.0) {
             return Ok(());
         }
+        // S4: build the attribute-description list before touching any
+        // Vulkan resource — an unknown attribute name is a bug (the
+        // caller's `material_vertex_format_supported` should already
+        // have refused this material), not a resource leak waiting to
+        // happen on the early-return path.
+        let attributes = material_vertex_attributes(vertex_attributes)?;
         let vertex_module = shader_module(&self.device, vertex_spirv)?;
         let fragment_module = match shader_module(&self.device, fragment_spirv) {
             Ok(module) => module,
@@ -1550,20 +1557,8 @@ impl LayerRenderer {
         ];
         let binding = vk::VertexInputBindingDescription::default()
             .binding(0)
-            .stride(20)
+            .stride(MATERIAL_UNIT_QUAD_STRIDE)
             .input_rate(vk::VertexInputRate::VERTEX);
-        let attributes = [
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(1)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(12),
-        ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(std::slice::from_ref(&binding))
             .vertex_attribute_descriptions(&attributes);
@@ -2605,6 +2600,7 @@ impl LayerRenderer {
     /// shared unchanged). Bounded by `MAX_EFFECT_PASS_BINDINGS`. Returns
     /// the new binding's index into `effect_pass_bindings` — the caller
     /// records it in `effect_frame_actions` as `EffectFrameAction::Render`.
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_effect_pass(
         &mut self,
         vertex_spirv: &[u32],
@@ -2613,12 +2609,16 @@ impl LayerRenderer {
         target: &str,
         textures: &[Option<MaterialTextureBind>],
         mut uniforms: MaterialUniforms,
+        vertex_attributes: &[crate::shaderpre::AttributeDecl],
     ) -> Result<usize, RenderError> {
         if self.effect_pass_bindings.len() >= MAX_EFFECT_PASS_BINDINGS {
             return Err(RenderError::Vulkan(
                 "compile_effect_pass: MAX_EFFECT_PASS_BINDINGS reached".to_string(),
             ));
         }
+        // S4: same "build before touching Vulkan" rule as
+        // `register_material_pipeline`.
+        let attributes = material_vertex_attributes(vertex_attributes)?;
         let (width, height) = match self.effect_targets.get(target) {
             Some(fbo) => (fbo.width, fbo.height),
             None => {
@@ -2647,20 +2647,8 @@ impl LayerRenderer {
         ];
         let binding_desc = vk::VertexInputBindingDescription::default()
             .binding(0)
-            .stride(20)
+            .stride(MATERIAL_UNIT_QUAD_STRIDE)
             .input_rate(vk::VertexInputRate::VERTEX);
-        let attributes = [
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .binding(0)
-                .location(1)
-                .format(vk::Format::R32G32_SFLOAT)
-                .offset(12),
-        ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(std::slice::from_ref(&binding_desc))
             .vertex_attribute_descriptions(&attributes);
@@ -4468,23 +4456,215 @@ const UNIT_QUAD: [f32; 24] = [
     -0.5, -0.5, 0.0, 0.0,
 ];
 
-/// S2's material pipeline vertex format: `a_Position` (vec3, z always 0)
-/// plus `a_TexCoord` (vec2) — the attribute list every
-/// `genericimage*`-family vertex shader declares with default combos.
-/// Same 6-vertex layout and uv convention as `UNIT_QUAD`, just with the
-/// extra `z = 0.0` component WE's own vertex shaders expect.
-const MATERIAL_UNIT_QUAD: [f32; 30] = [
-    -0.5, -0.5, 0.0, 0.0, 0.0, //
-    0.5, -0.5, 0.0, 1.0, 0.0, //
-    0.5, 0.5, 0.0, 1.0, 1.0, //
-    0.5, 0.5, 0.0, 1.0, 1.0, //
-    -0.5, 0.5, 0.0, 0.0, 1.0, //
-    -0.5, -0.5, 0.0, 0.0, 0.0,
+/// S4: the material pipeline's superset vertex format — every attribute
+/// name `main.rs::material_vertex_format_supported` accepts, by name ->
+/// `(Vulkan format, byte offset)` within one `MATERIAL_UNIT_QUAD` vertex.
+/// A material pipeline only declares `VertexInputAttributeDescription`s
+/// for the subset its OWN shader actually scraped (`material_vertex_attributes`
+/// below) — reading extra, unused bytes from a wider shared buffer is
+/// spec-legal and exactly how S1/S2's original 2-attribute pipelines
+/// already behaved relative to `UNIT_QUAD`'s narrower record. Order here
+/// has no significance to Vulkan; `main.rs::material_vertex_format_supported`
+/// keeps its own name list in sync (tested by
+/// `known_material_attribute_names_have_a_layout` below).
+pub const KNOWN_MATERIAL_ATTRIBUTES: &[&str] = &[
+    "a_Position",
+    "a_TexCoord",
+    "a_Normal",
+    "a_Color",
+    "a_PositionVec4",
+    "a_TexCoordVec4",
+];
+
+/// `KNOWN_MATERIAL_ATTRIBUTES`' layout within one `MATERIAL_UNIT_QUAD`
+/// vertex (20 floats / 80 bytes): `a_Position` (vec3, offset 0),
+/// `a_TexCoord` (vec2, offset 12), `a_Normal` (vec3, offset 20, always
+/// `+Z` — the quad is flat), `a_Color` (vec4, offset 32, always opaque
+/// white), `a_PositionVec4` (vec4, offset 48, the same xy as
+/// `a_Position` with z=0/w=1), `a_TexCoordVec4` (vec4, offset 64, the
+/// same uv as `a_TexCoord` with z=0/w=1). `None` for any other name —
+/// `material_vertex_attributes` treats that as a bug (a name
+/// `main.rs::material_vertex_format_supported` accepted but this table
+/// does not know), never a silent fallback, since the two lists are
+/// meant to be kept in lock-step.
+fn material_attribute_layout(name: &str) -> Option<(vk::Format, u32)> {
+    match name {
+        "a_Position" => Some((vk::Format::R32G32B32_SFLOAT, 0)),
+        "a_TexCoord" => Some((vk::Format::R32G32_SFLOAT, 12)),
+        "a_Normal" => Some((vk::Format::R32G32B32_SFLOAT, 20)),
+        "a_Color" => Some((vk::Format::R32G32B32A32_SFLOAT, 32)),
+        "a_PositionVec4" => Some((vk::Format::R32G32B32A32_SFLOAT, 48)),
+        "a_TexCoordVec4" => Some((vk::Format::R32G32B32A32_SFLOAT, 64)),
+        _ => None,
+    }
+}
+
+/// One `MATERIAL_UNIT_QUAD` vertex's byte stride — every material
+/// pipeline's `VertexInputBindingDescription` uses this (not a literal),
+/// so the buffer and every pipeline reading it can never drift apart.
+const MATERIAL_UNIT_QUAD_STRIDE: u32 = 80;
+
+/// Build this material's `VertexInputAttributeDescription` list from its
+/// OWN scraped, live-only attribute set (`crate::shaderpre::AttributeDecl`,
+/// already filtered to the taken `#if` branch by S4's preprocessor —
+/// see `shaderpre::fold_declarations`). Each description uses the
+/// attribute's OWN assigned `layout(location=)` (`AttributeDecl::location`),
+/// not its position in this slice — the two coincide today but nothing
+/// enforces they always will, and using the wrong one would silently
+/// bind the wrong attribute's data to a shader input.
+fn material_vertex_attributes(
+    attributes: &[crate::shaderpre::AttributeDecl],
+) -> Result<Vec<vk::VertexInputAttributeDescription>, RenderError> {
+    let mut descriptions = Vec::with_capacity(attributes.len());
+    for attribute in attributes {
+        let Some((attr_format, offset)) = material_attribute_layout(&attribute.name) else {
+            return Err(RenderError::Vulkan(format!(
+                "material_vertex_attributes: no layout for attribute \"{}\" \
+                 (main.rs::material_vertex_format_supported should have refused this material)",
+                attribute.name
+            )));
+        };
+        descriptions.push(
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(attribute.location)
+                .format(attr_format)
+                .offset(offset),
+        );
+    }
+    Ok(descriptions)
+}
+
+/// S4: 20 floats (80 bytes) per vertex — `a_Position` (vec3, z=0),
+/// `a_TexCoord` (vec2), `a_Normal` (vec3, always `+Z`), `a_Color` (vec4,
+/// always opaque white), `a_PositionVec4` (vec4, mirrors `a_Position`
+/// with w=1), `a_TexCoordVec4` (vec4, mirrors `a_TexCoord` with w=1) —
+/// see `material_attribute_layout`. Same 6-vertex layout and uv
+/// convention as `UNIT_QUAD` and S1/S2's original 5-float record, just
+/// widened so a pipeline whose shader declares any of the extra known
+/// attributes can be fed real (not garbage) data through the SAME shared
+/// buffer every material pipeline already binds.
+const MATERIAL_UNIT_QUAD: [f32; 120] = [
+    -0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -0.5, -0.5, 0.0, 1.0, 0.0, 0.0,
+    0.0, 1.0, //
+    0.5, -0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, -0.5, 0.0, 1.0, 1.0, 0.0,
+    0.0, 1.0, //
+    0.5, 0.5, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0,
+    1.0, //
+    0.5, 0.5, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.0, 1.0, 1.0, 1.0, 0.0,
+    1.0, //
+    -0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -0.5, 0.5, 0.0, 1.0, 0.0, 1.0,
+    0.0, 1.0, //
+    -0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -0.5, -0.5, 0.0, 1.0, 0.0, 0.0,
+    0.0, 1.0,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S4: every name `KNOWN_MATERIAL_ATTRIBUTES` lists (and
+    /// `main.rs::material_vertex_format_supported` accepts) must have a
+    /// real layout entry — the two lists are meant to be kept in
+    /// lock-step, and `material_vertex_attributes` treats a miss as a
+    /// bug rather than a fallback.
+    #[test]
+    fn known_material_attribute_names_have_a_layout() {
+        for name in KNOWN_MATERIAL_ATTRIBUTES {
+            assert!(
+                material_attribute_layout(name).is_some(),
+                "no layout for {name}"
+            );
+        }
+    }
+
+    /// The six attributes' byte ranges must not overlap, and must all
+    /// fit within `MATERIAL_UNIT_QUAD_STRIDE` — a future edit to
+    /// `material_attribute_layout` or `MATERIAL_UNIT_QUAD` that
+    /// introduces an overlap or an out-of-range offset would otherwise
+    /// silently feed a shader garbage from a NEIGHBORING attribute's
+    /// bytes instead of failing loudly.
+    #[test]
+    fn material_attribute_layout_offsets_do_not_overlap() {
+        fn byte_size(format: vk::Format) -> u32 {
+            match format {
+                vk::Format::R32G32_SFLOAT => 8,
+                vk::Format::R32G32B32_SFLOAT => 12,
+                vk::Format::R32G32B32A32_SFLOAT => 16,
+                other => panic!("unexpected format in test: {other:?}"),
+            }
+        }
+        let mut ranges: Vec<(u32, u32)> = KNOWN_MATERIAL_ATTRIBUTES
+            .iter()
+            .map(|name| {
+                let (format, offset) = material_attribute_layout(name).unwrap();
+                (offset, offset + byte_size(format))
+            })
+            .collect();
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "overlap: {:?} and {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(ranges.last().unwrap().1 <= MATERIAL_UNIT_QUAD_STRIDE);
+    }
+
+    /// `MATERIAL_UNIT_QUAD`'s declared length must actually equal 6
+    /// vertices at `MATERIAL_UNIT_QUAD_STRIDE` bytes each — the buffer
+    /// upload (`LayerRenderer::new`) computes its byte size FROM this
+    /// array's length, so a drift here would silently upload the wrong
+    /// number of bytes rather than fail to compile.
+    #[test]
+    fn material_unit_quad_matches_the_declared_stride() {
+        let floats_per_vertex = (MATERIAL_UNIT_QUAD_STRIDE / 4) as usize;
+        assert_eq!(MATERIAL_UNIT_QUAD.len() % floats_per_vertex, 0);
+        assert_eq!(MATERIAL_UNIT_QUAD.len() / floats_per_vertex, 6);
+    }
+
+    /// `material_vertex_attributes` on the two-attribute S1/S2 shape
+    /// (still the corpus's most common material) must reproduce exactly
+    /// the fixed layout S1/S2 hardcoded — a regression test for the S4
+    /// generalization.
+    #[test]
+    fn material_vertex_attributes_reproduces_the_s2_two_attribute_shape() {
+        let attributes = vec![
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec3".into(),
+                name: "a_Position".into(),
+                location: 0,
+            },
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec2".into(),
+                name: "a_TexCoord".into(),
+                location: 1,
+            },
+        ];
+        let descriptions = material_vertex_attributes(&attributes).unwrap();
+        assert_eq!(descriptions.len(), 2);
+        assert_eq!(descriptions[0].location, 0);
+        assert_eq!(descriptions[0].format, vk::Format::R32G32B32_SFLOAT);
+        assert_eq!(descriptions[0].offset, 0);
+        assert_eq!(descriptions[1].location, 1);
+        assert_eq!(descriptions[1].format, vk::Format::R32G32_SFLOAT);
+        assert_eq!(descriptions[1].offset, 12);
+    }
+
+    /// An unknown attribute name (a bug — `material_vertex_format_supported`
+    /// should already have refused this material) must error, not panic
+    /// or silently drop the attribute.
+    #[test]
+    fn material_vertex_attributes_rejects_an_unknown_name() {
+        let attributes = vec![crate::shaderpre::AttributeDecl {
+            glsl_type: "vec4".into(),
+            name: "a_BlendWeights".into(),
+            location: 0,
+        }];
+        assert!(material_vertex_attributes(&attributes).is_err());
+    }
 
     /// S3 review MUST-FIX #1: pins the relationship between
     /// `descriptor_pool_capacity`'s output and each pool's documented
@@ -4644,6 +4824,7 @@ mod tests {
                 &vertex_spirv,
                 &fragment_spirv,
                 BlendMode::Normal,
+                &vertex_pre.attributes,
             )
             .expect("register pipeline");
         renderer
@@ -4677,6 +4858,117 @@ mod tests {
             assert!((152..=154).contains(&pixel[1]), "G={}", pixel[1]);
             assert!((50..=52).contains(&pixel[2]), "R={}", pixel[2]);
             assert_eq!(pixel[3], 255);
+        }
+    }
+
+    /// S4 end-to-end: a vertex shader declaring `a_Normal` AND `a_Color`
+    /// (the corpus's `genericimage3`/`genericimage4`-family shape, S4's
+    /// deliverable 1) actually receives real per-vertex data from the
+    /// widened `MATERIAL_UNIT_QUAD` buffer, not garbage/uninitialized
+    /// bytes — the fragment shader multiplies `a_Color` (expected
+    /// (1,1,1,1), opaque white) by `a_Normal` (expected (0,0,1), always
+    /// `+Z` on this flat quad), so a correct draw is pure opaque blue
+    /// ((0,0,1,1)) and any misrouted attribute (wrong offset, wrong
+    /// format, uninitialized) would produce a visibly different colour
+    /// or an all-zero (transparent) draw. Skip-by-default: needs a
+    /// Vulkan device — run with `KWE_TEST_DEVICE` set.
+    #[test]
+    fn material_pipeline_draws_using_a_color_and_a_normal_attributes() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "material_pipeline_draws_using_a_color_and_a_normal_attributes: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nattribute vec3 a_Normal;\nattribute vec4 a_Color;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec4 v_Color;\nvarying vec3 v_Normal;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_Color = a_Color;\n    v_Normal = a_Normal;\n}\n";
+        let fragment_source = "varying vec4 v_Color;\nvarying vec3 v_Normal;\nvoid main() {\n    gl_FragColor = v_Color * vec4(v_Normal, 1.0);\n}\n";
+        let mut locations = std::collections::BTreeMap::new();
+        let mut include: Box<crate::shaderpre::IncludeLookup<'static>> = Box::new(|_: &str| None);
+        let vertex_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Vertex,
+            "normal_color.vert",
+            vertex_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("vertex preprocesses");
+        // The scraper now sees FOUR live attributes (no `#if` gating in
+        // this synthetic source) — proves `material_vertex_format_supported`'s
+        // caller-side check and this test are exercising the actual S4
+        // superset path, not the S1/S2 two-attribute fallback.
+        assert_eq!(vertex_pre.attributes.len(), 4);
+        let fragment_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Fragment,
+            "normal_color.frag",
+            fragment_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("fragment preprocesses");
+        let vertex_spirv = crate::materialshader::compile_stage(
+            &vertex_pre.source,
+            crate::materialshader::Stage::Vertex,
+            "normal_color.vert",
+        )
+        .expect("vertex compiles");
+        let fragment_spirv = crate::materialshader::compile_stage(
+            &fragment_pre.source,
+            crate::materialshader::Stage::Fragment,
+            "normal_color.frag",
+        )
+        .expect("fragment compiles");
+
+        let key = MaterialKey::compute(
+            "normal_color",
+            &fragment_pre.combos,
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                BlendMode::Normal,
+                &vertex_pre.attributes,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .expect("render once");
+        assert_eq!(pixels.len(), 64 * 48 * 4);
+        // B8G8R8A8 readback of opaque pure blue: B=255, G=0, R=0.
+        for pixel in pixels.chunks_exact(4) {
+            assert_eq!(pixel[0], 255, "B");
+            assert_eq!(pixel[1], 0, "G");
+            assert_eq!(pixel[2], 0, "R");
+            assert_eq!(pixel[3], 255, "A");
         }
     }
 
@@ -4759,6 +5051,24 @@ mod tests {
         assert_eq!(created, 2, "the requested target plus _rt_FullFrameBuffer");
 
         let (solid_vertex, solid_fragment) = compile(vertex_source, solid_fragment_source, "solid");
+        // Every `vertex_source` in this test declares the standard S1/S2
+        // two-attribute shape (see the literal above) — `compile`'s
+        // closure only returns SPIR-V, not the scraped `AttributeDecl`s,
+        // so reconstruct them here rather than plumb a third return
+        // value through a closure every other call site in this test
+        // already relies on.
+        let standard_attributes = vec![
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec3".into(),
+                name: "a_Position".into(),
+                location: 0,
+            },
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec2".into(),
+                name: "a_TexCoord".into(),
+                location: 1,
+            },
+        ];
         let binding_index = renderer
             .compile_effect_pass(
                 &solid_vertex,
@@ -4767,6 +5077,7 @@ mod tests {
                 "_rt_TestTarget",
                 &[None, None, None, None, None, None, None, None],
                 MaterialUniforms::default(),
+                &standard_attributes,
             )
             .expect("compile effect pass");
         assert!(
@@ -4795,6 +5106,7 @@ mod tests {
                 &sample_vertex,
                 &sample_fragment,
                 BlendMode::Normal,
+                &standard_attributes,
             )
             .expect("register pipeline");
         renderer
@@ -4908,6 +5220,7 @@ mod tests {
                 &vertex_spirv,
                 &fragment_spirv,
                 BlendMode::Normal,
+                &vertex_pre.attributes,
             )
             .expect("register pipeline");
         renderer

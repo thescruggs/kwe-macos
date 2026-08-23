@@ -254,6 +254,16 @@ pub struct UniformMeta {
 pub struct AttributeDecl {
     pub glsl_type: String,
     pub name: String,
+    /// The `layout(location = N)` this declaration was folded to. S4:
+    /// assigned only to attributes `fold_declarations` scraped from a
+    /// LIVE `#if`/`#ifdef` branch (see `CondFrame`) — an attribute behind
+    /// a combo that defaults off (or that the material does not
+    /// override) never consumes a location, matching what `shaderc`'s
+    /// real preprocessor actually hands the compiler. Callers (the
+    /// material-pipeline vertex-input build in `vulkan.rs`) must use
+    /// THIS field, not the attribute's position in the `Vec`, since both
+    /// happen to match today but nothing enforces they always will.
+    pub location: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -506,6 +516,34 @@ fn standard_uniform_expr(name: &str) -> Option<String> {
     {
         return Some(format!("u_Std.g_TextureResolution_[{index}]"));
     }
+    // S4: `g_Texture<N>Rotation` (vec4) feeds every corpus `genericimage*`
+    // vertex shader's own UV transform verbatim —
+    // `v_TexCoord.xy = g_Texture<N>Translation + a_TexCoord.x *
+    // g_Texture<N>Rotation.xy + a_TexCoord.y * g_Texture<N>Rotation.zw`
+    // (`genericimage2.vert:102`/`genericimage3.vert:153`/
+    // `genericimage4.vert:177`/`genericimage.vert:30` in the local WE
+    // asset corpus, byte-identical formula in all four). This renderer
+    // does not implement WE's scripted per-texture rotate/scale property
+    // (out of scope — no corpus scene load path feeds it a live value),
+    // but the identity transform for that formula is `vec4(1.0, 0.0,
+    // 0.0, 1.0)`, NOT the zero this name previously fell through to via
+    // `fold_declarations`'s generic zero-default path: a ZERO rotation
+    // matrix collapses every sampled UV to a single point, so a
+    // previously-refused material (S4 widened `material_vertex_format_supported`
+    // to accept it) would compile and bind cleanly but draw a flat,
+    // wrong colour instead of its real texture — found via the 60-scene
+    // corpus sweep (Workshop 3100709479's `genericimage3` material).
+    // `g_Texture<N>Translation` (vec2) is left on the ordinary
+    // zero-default path: `vec2(0.0, 0.0)` IS the correct identity
+    // translation for the same formula, so no special case is needed
+    // there.
+    if let Some(rest) = name.strip_prefix("g_Texture")
+        && let Some(index_str) = rest.strip_suffix("Rotation")
+        && let Ok(index) = index_str.parse::<u32>()
+        && index < MAX_MATERIAL_TEXTURES as u32
+    {
+        return Some("vec4(1.0, 0.0, 0.0, 1.0)".to_string());
+    }
     if let Some(rest) = name.strip_prefix("g_Point")
         && let Ok(index) = rest.parse::<u32>()
         && index < 8
@@ -523,6 +561,24 @@ fn standard_uniform_expr(name: &str) -> Option<String> {
             "g_Time" => "u_Std.g_TimeAlphaBrightness_.x",
             "g_UserAlpha" => "u_Std.g_TimeAlphaBrightness_.y",
             "g_Brightness" => "u_Std.g_TimeAlphaBrightness_.z",
+            // S4: `g_Color4` (vec4) is the "newer material `VERSION`"
+            // replacement for the `g_Brightness`/`g_UserAlpha` pair
+            // above — `genericimage2.frag`/`genericimage3.frag`/
+            // `genericimage4.frag` (local WE asset corpus) all gate on
+            // `#ifndef VERSION { uniform g_Brightness; uniform
+            // g_UserAlpha; ... color.rgb *= g_Brightness; color.a *=
+            // g_UserAlpha; } #else { uniform vec4 g_Color4; ... color *=
+            // g_Color4; }` — the SAME per-draw brightness/alpha values
+            // this pipeline already threads through
+            // `u_Std.g_TimeAlphaBrightness_`, just packed into one vec4
+            // instead of two scalars. Before this fix, `g_Color4` fell
+            // through to the generic zero-default (`vec4(0.0)`), which
+            // multiplies every `VERSION`-tagged material's sampled
+            // colour to fully transparent black regardless of the
+            // object's real brightness/alpha — found via the 60-scene
+            // corpus sweep (Workshop 3100709479's `genericimage3`
+            // material, `combos={"VERSION": 2}`).
+            "g_Color4" => "vec4(u_Std.g_TimeAlphaBrightness_.zzz, u_Std.g_TimeAlphaBrightness_.y)",
             _ => return None,
         }
         .to_string(),
@@ -568,6 +624,221 @@ fn material_constant_swizzle(glsl_type: &str) -> Option<&'static str> {
     }
 }
 
+/// One `#if`/`#ifdef`/`#ifndef` nesting frame while `fold_declarations`
+/// scans a shader (S4). `branch_taken` is true once SOME branch at this
+/// level (the opening condition or a later `#elif`) has evaluated true —
+/// it blocks any further `#elif` from re-taking and is what `#else`
+/// inverts. `active_here` is true while the CURRENTLY open branch at
+/// this level is the taken one, already folding in every enclosing
+/// frame's liveness at the moment this frame was pushed or last updated
+/// (well-formed nesting means an ancestor is always fully settled before
+/// a child frame can exist — see `fold_declarations`'s `is_live`). A
+/// line is only scraped/folded while EVERY frame on the stack has
+/// `active_here == true`.
+struct CondFrame {
+    branch_taken: bool,
+    active_here: bool,
+}
+
+/// Evaluate a `#if`/`#elif` boolean/integer expression against known
+/// combo values, for `fold_declarations`'s live-branch tracking. Combo
+/// names are matched case-insensitively (the shader text always
+/// references them upper-cased; `combos_upper`'s keys already are).
+/// Supports `||`, `&&`, `==`, `!=`, unary `!`, parentheses, decimal
+/// integer literals, bare identifiers (truthy iff nonzero — an unknown
+/// identifier is `0`, matching the real GLSL preprocessor's "undefined
+/// macro in `#if` is 0" rule, already relied on by `scrape`'s doc
+/// comment), and `defined(NAME)` / `defined NAME`. Returns `None` for
+/// any expression shape this minimal recursive-descent parser does not
+/// fully consume — the caller then falls back to "always live", the
+/// pre-S4 behavior, rather than risk silently dropping a real attribute
+/// behind an expression it misjudged.
+fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<bool> {
+    #[derive(Debug, Clone, PartialEq)]
+    enum Token {
+        Ident(String),
+        Num(i64),
+        And,
+        Or,
+        Eq,
+        Ne,
+        Not,
+        LParen,
+        RParen,
+    }
+    fn tokenize(expr: &str) -> Option<Vec<Token>> {
+        let bytes = expr.as_bytes();
+        let mut i = 0usize;
+        let mut tokens = Vec::new();
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            match c {
+                '(' => {
+                    tokens.push(Token::LParen);
+                    i += 1;
+                }
+                ')' => {
+                    tokens.push(Token::RParen);
+                    i += 1;
+                }
+                '&' if bytes.get(i + 1) == Some(&b'&') => {
+                    tokens.push(Token::And);
+                    i += 2;
+                }
+                '|' if bytes.get(i + 1) == Some(&b'|') => {
+                    tokens.push(Token::Or);
+                    i += 2;
+                }
+                '=' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(Token::Eq);
+                    i += 2;
+                }
+                '!' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(Token::Ne);
+                    i += 2;
+                }
+                '!' => {
+                    tokens.push(Token::Not);
+                    i += 1;
+                }
+                _ if c.is_ascii_digit() => {
+                    let start = i;
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                        i += 1;
+                    }
+                    let n: i64 = expr[start..i].parse().ok()?;
+                    tokens.push(Token::Num(n));
+                }
+                _ if c.is_ascii_alphabetic() || c == '_' => {
+                    let start = i;
+                    while i < bytes.len()
+                        && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    tokens.push(Token::Ident(expr[start..i].to_string()));
+                }
+                _ => return None,
+            }
+        }
+        Some(tokens)
+    }
+    fn lookup(name: &str, combos_upper: &BTreeMap<String, i64>) -> i64 {
+        combos_upper.get(&name.to_uppercase()).copied().unwrap_or(0)
+    }
+    struct Parser<'a> {
+        tokens: &'a [Token],
+        pos: usize,
+        combos_upper: &'a BTreeMap<String, i64>,
+    }
+    impl<'a> Parser<'a> {
+        fn peek(&self) -> Option<&Token> {
+            self.tokens.get(self.pos)
+        }
+        fn or_expr(&mut self) -> Option<i64> {
+            let mut lhs = self.and_expr()?;
+            while self.peek() == Some(&Token::Or) {
+                self.pos += 1;
+                let rhs = self.and_expr()?;
+                lhs = i64::from(lhs != 0 || rhs != 0);
+            }
+            Some(lhs)
+        }
+        fn and_expr(&mut self) -> Option<i64> {
+            let mut lhs = self.eq_expr()?;
+            while self.peek() == Some(&Token::And) {
+                self.pos += 1;
+                let rhs = self.eq_expr()?;
+                lhs = i64::from(lhs != 0 && rhs != 0);
+            }
+            Some(lhs)
+        }
+        fn eq_expr(&mut self) -> Option<i64> {
+            let mut lhs = self.unary_expr()?;
+            loop {
+                match self.peek() {
+                    Some(Token::Eq) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs == rhs);
+                    }
+                    Some(Token::Ne) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs != rhs);
+                    }
+                    _ => break,
+                }
+            }
+            Some(lhs)
+        }
+        fn unary_expr(&mut self) -> Option<i64> {
+            if self.peek() == Some(&Token::Not) {
+                self.pos += 1;
+                let v = self.unary_expr()?;
+                return Some(i64::from(v == 0));
+            }
+            self.primary_expr()
+        }
+        fn primary_expr(&mut self) -> Option<i64> {
+            match self.tokens.get(self.pos)?.clone() {
+                Token::Num(n) => {
+                    self.pos += 1;
+                    Some(n)
+                }
+                Token::Ident(name) => {
+                    self.pos += 1;
+                    if name == "defined" {
+                        let has_parens = self.peek() == Some(&Token::LParen);
+                        if has_parens {
+                            self.pos += 1;
+                        }
+                        let Some(Token::Ident(target)) = self.tokens.get(self.pos).cloned() else {
+                            return None;
+                        };
+                        self.pos += 1;
+                        if has_parens {
+                            if self.peek() != Some(&Token::RParen) {
+                                return None;
+                            }
+                            self.pos += 1;
+                        }
+                        return Some(i64::from(
+                            self.combos_upper.contains_key(&target.to_uppercase()),
+                        ));
+                    }
+                    Some(lookup(&name, self.combos_upper))
+                }
+                Token::LParen => {
+                    self.pos += 1;
+                    let v = self.or_expr()?;
+                    if self.peek() != Some(&Token::RParen) {
+                        return None;
+                    }
+                    self.pos += 1;
+                    Some(v)
+                }
+                _ => None,
+            }
+        }
+    }
+    let tokens = tokenize(expr)?;
+    let mut parser = Parser {
+        tokens: &tokens,
+        pos: 0,
+        combos_upper,
+    };
+    let value = parser.or_expr()?;
+    if parser.pos != tokens.len() {
+        return None;
+    }
+    Some(value != 0)
+}
+
 /// Rewrite every `attribute`/`varying`/non-sampler-`uniform` declaration
 /// this module recognizes so the result is legal Vulkan GLSL (see the
 /// module doc's point 2). Declarations this function does not recognize
@@ -593,7 +864,12 @@ fn fold_declarations(
     source: &str,
     material_constants: &[String],
     varying_locations: &mut BTreeMap<String, u32>,
+    combos: &BTreeMap<String, i64>,
 ) -> Result<FoldedDeclarations, PreprocessError> {
+    let combos_upper: BTreeMap<String, i64> = combos
+        .iter()
+        .map(|(name, value)| (name.to_uppercase(), *value))
+        .collect();
     let mut out = String::with_capacity(source.len());
     let mut attributes = Vec::new();
     let mut sampler_slots = Vec::new();
@@ -601,11 +877,88 @@ fn fold_declarations(
     let mut next_attribute_location = 0u32;
     let mut next_sampler_slot = 0u32;
     let mut used_sampler_slots: [bool; MAX_MATERIAL_TEXTURES] = [false; MAX_MATERIAL_TEXTURES];
+    // S4: `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif` nesting stack —
+    // see `CondFrame`. A declaration is only scraped/folded (and only
+    // consumes an attribute location / sampler slot / varying location)
+    // while every frame on the stack is `live`; an unbalanced `#endif`
+    // (more pops than pushes) is tolerated by simply not popping past
+    // empty — this function does not attempt to validate shader syntax,
+    // only to track it well enough to avoid mis-scraping dead branches
+    // (`shaderc`, later, is the actual arbiter of validity).
+    let mut cond_stack: Vec<CondFrame> = Vec::new();
+    let is_live = |stack: &[CondFrame]| stack.iter().all(|frame| frame.active_here);
 
     for line in source.split_inclusive('\n') {
         let trimmed = line.trim();
         let indent = &line[..line.len() - line.trim_start().len()];
         let newline = if line.ends_with('\n') { "\n" } else { "" };
+
+        if let Some(rest) = trimmed.strip_prefix("#ifdef ") {
+            let parent_live = is_live(&cond_stack);
+            let taken = parent_live && combos_upper.contains_key(&rest.trim().to_uppercase());
+            cond_stack.push(CondFrame {
+                branch_taken: taken,
+                active_here: taken,
+            });
+            out.push_str(line);
+            continue;
+        } else if let Some(rest) = trimmed.strip_prefix("#ifndef ") {
+            let parent_live = is_live(&cond_stack);
+            let taken = parent_live && !combos_upper.contains_key(&rest.trim().to_uppercase());
+            cond_stack.push(CondFrame {
+                branch_taken: taken,
+                active_here: taken,
+            });
+            out.push_str(line);
+            continue;
+        } else if let Some(rest) = trimmed.strip_prefix("#if ") {
+            let parent_live = is_live(&cond_stack);
+            let taken = parent_live && evaluate_if_expr(rest.trim(), &combos_upper).unwrap_or(true);
+            cond_stack.push(CondFrame {
+                branch_taken: taken,
+                active_here: taken,
+            });
+            out.push_str(line);
+            continue;
+        } else if let Some(rest) = trimmed.strip_prefix("#elif ") {
+            // Parent liveness is everything BELOW the top frame.
+            let parent_live = cond_stack.len() < 2
+                || cond_stack[..cond_stack.len() - 1]
+                    .iter()
+                    .all(|frame| frame.active_here);
+            if let Some(frame) = cond_stack.last_mut() {
+                if frame.branch_taken {
+                    frame.active_here = false;
+                } else {
+                    let taken =
+                        parent_live && evaluate_if_expr(rest.trim(), &combos_upper).unwrap_or(true);
+                    frame.branch_taken = taken;
+                    frame.active_here = taken;
+                }
+            }
+            out.push_str(line);
+            continue;
+        } else if trimmed == "#else" {
+            let parent_live = cond_stack.len() < 2
+                || cond_stack[..cond_stack.len() - 1]
+                    .iter()
+                    .all(|frame| frame.active_here);
+            if let Some(frame) = cond_stack.last_mut() {
+                frame.active_here = parent_live && !frame.branch_taken;
+                frame.branch_taken = true;
+            }
+            out.push_str(line);
+            continue;
+        } else if trimmed == "#endif" {
+            cond_stack.pop();
+            out.push_str(line);
+            continue;
+        }
+
+        if !is_live(&cond_stack) {
+            out.push_str(line);
+            continue;
+        }
 
         if let Some(rest) = trimmed.strip_prefix("attribute ") {
             if let Some((glsl_type, name)) = parse_decl(rest) {
@@ -614,6 +967,7 @@ fn fold_declarations(
                 attributes.push(AttributeDecl {
                     glsl_type: glsl_type.clone(),
                     name: name.clone(),
+                    location,
                 });
                 out.push_str(indent);
                 out.push_str(&format!(
@@ -775,7 +1129,7 @@ pub fn preprocess(
     }
 
     let (folded, attributes, sampler_slots, unsupported_uniforms) =
-        fold_declarations(&required, material_constants, varying_locations)?;
+        fold_declarations(&required, material_constants, varying_locations, &combos)?;
 
     let mut source_out = String::new();
     source_out.push_str(&format!(
@@ -1311,11 +1665,13 @@ mod tests {
             vec![
                 AttributeDecl {
                     glsl_type: "vec3".into(),
-                    name: "a_Position".into()
+                    name: "a_Position".into(),
+                    location: 0,
                 },
                 AttributeDecl {
                     glsl_type: "vec2".into(),
-                    name: "a_TexCoord".into()
+                    name: "a_TexCoord".into(),
+                    location: 1,
                 },
             ]
         );
@@ -1327,6 +1683,197 @@ mod tests {
             out.source
                 .contains("layout(location = 1) attribute vec2 a_TexCoord;")
         );
+    }
+
+    /// S4: the real corpus's `genericimage3.vert`/`genericimage4.vert`
+    /// pattern — `#if MORPHING` gates `a_PositionVec4` vs. the `#else`
+    /// branch's `a_Position`. Before S4, `fold_declarations` scraped
+    /// EVERY `attribute` line textually regardless of `#if` nesting, so
+    /// this shader always scraped THREE attributes
+    /// (`a_PositionVec4`, `a_Position`, `a_TexCoord`) with `a_TexCoord`
+    /// landing at location 2 — `main.rs::material_vertex_format_supported`
+    /// then always refused it (attributes[1] was `a_Position`, not
+    /// `a_TexCoord`) no matter what the material's actual `combos` said.
+    /// With `MORPHING` left at its default (unset — no material combo
+    /// override, no `// [COMBO]` default other than 0), only the `#else`
+    /// branch is live: exactly `a_Position` (location 0) then
+    /// `a_TexCoord` (location 1), matching what `shaderc` actually
+    /// compiles.
+    #[test]
+    fn if_else_gated_attribute_scrapes_only_the_live_branch() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "#if MORPHING\nattribute vec4 a_PositionVec4;\n#else\nattribute vec3 a_Position;\n#endif\nattribute vec2 a_TexCoord;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Position".into(),
+                    location: 0,
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into(),
+                    location: 1,
+                },
+            ]
+        );
+    }
+
+    /// Same shader shape, but with the material overriding `MORPHING=1`
+    /// (`combos` reaching `preprocess` the way `material.json`'s own
+    /// `combos` map would) — now the `#if` branch is live instead: only
+    /// `a_PositionVec4` (location 0) then `a_TexCoord` (location 1).
+    #[test]
+    fn if_else_gated_attribute_respects_a_material_combo_override() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut combos = BTreeMap::new();
+        combos.insert("MORPHING".to_string(), 1);
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "#if MORPHING\nattribute vec4 a_PositionVec4;\n#else\nattribute vec3 a_Position;\n#endif\nattribute vec2 a_TexCoord;\nvoid main(){}\n",
+            &combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec4".into(),
+                    name: "a_PositionVec4".into(),
+                    location: 0,
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into(),
+                    location: 1,
+                },
+            ]
+        );
+    }
+
+    /// `#ifdef`/`#ifndef` and a compound `||`/`&&`/`==` expression, the
+    /// shapes actually used by the local shader corpus
+    /// (`LIGHTING || REFLECTION`, `(LIGHTING || REFLECTION) && NORMALMAP
+    /// == 0`) — all default off, so every gated attribute here is dead.
+    #[test]
+    fn ifdef_and_compound_expressions_default_dead() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
+             #ifdef SKINNING\nattribute uvec4 a_BlendIndices;\n#endif\n\
+             #if LIGHTING || REFLECTION\nattribute vec3 a_Normal;\n#endif\n\
+             #if (LIGHTING || REFLECTION) && NORMALMAP == 0\nattribute vec4 a_Color;\n#endif\n\
+             void main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Position".into(),
+                    location: 0,
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into(),
+                    location: 1,
+                },
+            ]
+        );
+    }
+
+    /// The same compound expression, but `LIGHTING=1` this time — the
+    /// `a_Normal` branch becomes live (`LIGHTING || REFLECTION` is now
+    /// true), while the `NORMALMAP == 0` branch stays dead
+    /// (`NORMALMAP` defaults to 0, so `== 0` is actually TRUE — pick a
+    /// combo shape that isolates just the `||` behavior instead:
+    /// `SKINNING` via `#ifdef`).
+    #[test]
+    fn ifdef_becomes_live_once_the_material_defines_the_combo() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut combos = BTreeMap::new();
+        combos.insert("SKINNING".to_string(), 1);
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
+             #ifdef SKINNING\nattribute vec3 a_Normal;\n#endif\n\
+             void main(){}\n",
+            &combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Position".into(),
+                    location: 0,
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into(),
+                    location: 1,
+                },
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Normal".into(),
+                    location: 2,
+                },
+            ]
+        );
+    }
+
+    /// An unparseable `#if` expression must fall back to "always live" —
+    /// the pre-S4 behavior — rather than silently dropping a real
+    /// attribute behind an expression this minimal evaluator cannot
+    /// judge.
+    #[test]
+    fn unparseable_if_expression_falls_back_to_live() {
+        assert_eq!(evaluate_if_expr("SOME_FUNC(X)", &BTreeMap::new()), None);
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
+             #if SOME_FUNC(X)\nattribute vec3 a_Normal;\n#endif\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(out.attributes.len(), 3);
+        assert_eq!(out.attributes[2].name, "a_Normal");
     }
 
     /// Regression: `attribute mediump vec2 a_TexCoord;` (the real corpus
@@ -1362,11 +1909,13 @@ mod tests {
             vec![
                 AttributeDecl {
                     glsl_type: "vec3".into(),
-                    name: "a_Position".into()
+                    name: "a_Position".into(),
+                    location: 0,
                 },
                 AttributeDecl {
                     glsl_type: "vec2".into(),
-                    name: "a_TexCoord".into()
+                    name: "a_TexCoord".into(),
+                    location: 1,
                 },
             ]
         );
@@ -1481,5 +2030,97 @@ mod tests {
             !out.source
                 .contains("uniform mat4 g_ModelViewProjectionMatrix;")
         );
+    }
+
+    /// S4 regression (found via the 60-scene corpus sweep, Workshop
+    /// 3100709479's `genericimage3` material): `g_Texture0Rotation`
+    /// must fold to the IDENTITY transform `vec4(1.0, 0.0, 0.0, 1.0)`,
+    /// not the generic zero-default every other unrecognized uniform
+    /// gets — a zero rotation matrix collapses every corpus
+    /// `genericimage*.vert`'s `v_TexCoord` computation to a single
+    /// point, turning a real, varied texture into one flat colour.
+    #[test]
+    fn texture_rotation_uniform_folds_to_identity_not_zero() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut unsupported = std::collections::BTreeSet::new();
+        for index in 0..MAX_MATERIAL_TEXTURES {
+            let out = preprocess(
+                Stage::Vertex,
+                "t.vert",
+                &format!(
+                    "uniform vec4 g_Texture{index}Rotation;\nvoid main(){{ gl_Position = g_Texture{index}Rotation; }}\n"
+                ),
+                &BTreeMap::new(),
+                &[],
+                &mut locs,
+                &mut include,
+            )
+            .unwrap();
+            assert!(
+                out.source.contains(&format!(
+                    "#define g_Texture{index}Rotation vec4(1.0, 0.0, 0.0, 1.0)"
+                )),
+                "slot {index}: {}",
+                out.source
+            );
+            // Not counted as an "unsupported uniform" diagnostic — this
+            // name IS understood, just always-identity (no scripted
+            // per-texture rotation support), unlike a genuinely unknown
+            // name.
+            unsupported.extend(out.unsupported_uniforms.iter().cloned());
+        }
+        assert!(unsupported.is_empty(), "{unsupported:?}");
+    }
+
+    /// `g_Texture<N>Translation` needs no special case: the generic
+    /// zero-default (`vec2(0.0, 0.0)`) IS the correct identity for the
+    /// same UV formula — pinned so a future change to the zero-default
+    /// path can't silently break this pairing without a test noticing.
+    #[test]
+    fn texture_translation_uniform_keeps_the_generic_zero_default() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "uniform vec2 g_Texture0Translation;\nvoid main(){ gl_Position = vec4(g_Texture0Translation, 0.0, 1.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("const vec2 g_Texture0Translation = vec2(0.0);")
+        );
+        assert_eq!(out.unsupported_uniforms, vec!["g_Texture0Translation"]);
+    }
+
+    /// S4 regression (found via the 60-scene corpus sweep, Workshop
+    /// 3100709479's `genericimage3` material, `VERSION` combo present):
+    /// `g_Color4` must fold to the live per-draw brightness/alpha
+    /// values, not the generic zero-default — a zero `g_Color4`
+    /// multiplies EVERY `VERSION`-tagged genericimage-family material's
+    /// sampled colour to fully transparent black.
+    #[test]
+    fn color4_uniform_folds_to_brightness_alpha_not_zero() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform vec4 g_Color4;\nvoid main(){ gl_FragColor = g_Color4; }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains(
+            "#define g_Color4 vec4(u_Std.g_TimeAlphaBrightness_.zzz, u_Std.g_TimeAlphaBrightness_.y)"
+        ));
+        assert!(!out.unsupported_uniforms.contains(&"g_Color4".to_string()));
     }
 }
