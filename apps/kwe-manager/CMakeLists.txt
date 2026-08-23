@@ -17,6 +17,8 @@ qt_add_executable(kwe-manager
     src/playlistcontroller.h
     src/playlistclient.cpp
     src/playlistclient.h
+    src/issuereporter.cpp
+    src/issuereporter.h
 )
 
 # WallpaperSelection is a pragma Singleton; the generated qmldir must
@@ -63,6 +65,10 @@ qt_add_qml_module(kwe-manager
 # The generated kwe-manager_qmltyperegistrations.cpp includes each registered
 # class's header as <applyclient.h>, so src/ must be on the include path.
 target_include_directories(kwe-manager PRIVATE src)
+
+# F4: IssueReporter's package-version fallback when `pacman -Q
+# kde-wallpaper-engine` is unavailable.
+target_compile_definitions(kwe-manager PRIVATE KWE_APP_VERSION="${PROJECT_VERSION}")
 
 target_link_libraries(kwe-manager PRIVATE
     KF6Kirigami

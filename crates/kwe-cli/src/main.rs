@@ -100,6 +100,10 @@ enum Command {
         #[arg(long, default_value = "{}")]
         params: String,
     },
+    /// List F4 rendering-issue reports recorded by the manager
+    /// (~/.local/share/kwe/reports/*/report.md), newest first, with the
+    /// note's first line — a quick index for the next debugging session.
+    Reports,
 }
 
 fn main() -> Result<()> {
@@ -317,8 +321,48 @@ fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Command::Reports => {
+            let root = reports_root();
+            let mut names: Vec<_> = fs::read_dir(&root)
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            // Report directory names are <timestamp>-<wallpaperId>, so a
+            // reverse lexicographic sort is newest first.
+            names.sort_unstable_by(|a, b| b.cmp(a));
+            if names.is_empty() {
+                println!("no reports found in {}", root.display());
+            }
+            for name in names {
+                let note = fs::read_to_string(root.join(&name).join("report.md"))
+                    .ok()
+                    .and_then(|text| {
+                        let marker = "## Note\n\n";
+                        let start = text.find(marker)? + marker.len();
+                        text[start..].lines().next().map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "(unreadable report.md)".to_string());
+                println!("{name}: {note}");
+            }
+        }
     }
     Ok(())
+}
+
+/// ~/.local/share/kwe/reports (honouring XDG_DATA_HOME), matching the
+/// manager's IssueReporter (apps/kwe-manager/src/issuereporter.cpp).
+fn reports_root() -> PathBuf {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local/share"))
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+    data_home.join("kwe/reports")
 }
 
 /// Outcome of a renderer `--probe` lane; each failure mode prints a

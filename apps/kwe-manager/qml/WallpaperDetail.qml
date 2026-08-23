@@ -21,6 +21,15 @@ Kirigami.ScrollablePage {
     visible: detailPage.detailsVisible
     title: qsTr("Wallpaper Details")
 
+    // F4: "Report rendering issue". A local diagnostic bundle recorded by
+    // hand right after seeing a problem; nothing here is uploaded anywhere.
+    property bool issueReportOpen: false
+
+    function openIssueReport() {
+        issueReportNoteField.text = "";
+        detailPage.issueReportOpen = true;
+    }
+
     // Mirror the selected wallpaper's daemon-held grant record whenever the
     // details pane appears or the selection changes.
     function refreshPermissions() {
@@ -355,6 +364,52 @@ Kirigami.ScrollablePage {
             opacity: 0.75
             wrapMode: Text.Wrap
         }
+        // F4: "Report rendering issue". Available whenever a wallpaper is
+        // selected, whether or not Apply succeeded — a problem noticed later
+        // (after the desktop already shows it) still needs a report. Recording
+        // is local and bounded; nothing is uploaded anywhere.
+        Controls.Button {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== ""
+            text: issueReporter.busy ? qsTr("Saving report…") : qsTr("Report rendering issue…")
+            icon.name: "tools-report-bug-symbolic"
+            enabled: WallpaperSelection.selectedId !== "" && !issueReporter.busy
+            Accessible.description: qsTr("Record a note about what looks wrong with this wallpaper, together with the current renderer diagnostics, for the next debugging session")
+            onClicked: detailPage.openIssueReport()
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && issueReporter.lastReportPath !== ""
+            type: Kirigami.MessageType.Positive
+            text: qsTr("Saved rendering issue report to:")
+            actions: [
+                Kirigami.Action {
+                    text: qsTr("Copy path")
+                    icon.name: "edit-copy-symbolic"
+                    onTriggered: {
+                        issueReportPathField.selectAll();
+                        issueReportPathField.copy();
+                        issueReportPathField.deselect();
+                    }
+                }
+            ]
+        }
+        Controls.TextField {
+            id: issueReportPathField
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && issueReporter.lastReportPath !== ""
+            readOnly: true
+            selectByMouse: true
+            text: issueReporter.lastReportPath
+            Accessible.name: qsTr("Saved report folder path")
+            Accessible.description: qsTr("The folder containing the recorded rendering issue report; select and copy this path to share it in the next debugging session")
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: issueReporter.errorMessage !== ""
+            type: Kirigami.MessageType.Error
+            text: issueReporter.errorMessage
+        }
         Controls.Button {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== ""
@@ -456,6 +511,60 @@ Kirigami.ScrollablePage {
             visible: webPreview.errorMessage !== ""
             type: Kirigami.MessageType.Warning
             text: webPreview.errorMessage
+        }
+    }
+
+    // F4: the report note dialog. Recording is bounded and local — the
+    // daemon's current renderer/assignment/health state, its recent journal,
+    // and the last rendered frame are captured alongside the note; nothing
+    // is uploaded anywhere.
+    Controls.Dialog {
+        id: issueReportDialog
+        modal: true
+        title: qsTr("Report rendering issue")
+        visible: detailPage.issueReportOpen
+        standardButtons: Controls.Dialog.NoButton
+        width: Math.min(parent ? parent.width * 0.8 : 480, 480)
+        onRejected: detailPage.issueReportOpen = false
+
+        contentItem: ColumnLayout {
+            spacing: Kirigami.Units.smallSpacing
+            Controls.Label {
+                Layout.fillWidth: true
+                text: qsTr("Describe what looks wrong with %1. Saved to disk with the current renderer status, assignments, health, recent daemon journal, and the last rendered frame — nothing is sent anywhere.")
+                    .arg(WallpaperSelection.selectedTitle)
+                wrapMode: Text.Wrap
+            }
+            Controls.TextArea {
+                id: issueReportNoteField
+                Layout.fillWidth: true
+                Layout.preferredHeight: Kirigami.Units.gridUnit * 6
+                wrapMode: TextEdit.Wrap
+                placeholderText: qsTr("What looks wrong? e.g. black layer, wrong colours, missing effect, offset, slow")
+                Accessible.name: qsTr("Rendering issue note")
+                Accessible.description: placeholderText
+            }
+        }
+
+        footer: Controls.DialogButtonBox {
+            Controls.Button {
+                text: qsTr("Cancel")
+                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.RejectRole
+            }
+            Controls.Button {
+                text: issueReporter.busy ? qsTr("Saving…") : qsTr("Save report")
+                icon.name: "document-save-symbolic"
+                enabled: !issueReporter.busy
+                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.AcceptRole
+            }
+            onAccepted: issueReportDialog.accept()
+            onRejected: issueReportDialog.reject()
+        }
+
+        onAccepted: {
+            issueReporter.record(WallpaperSelection.selectedId, WallpaperSelection.selectedTitle,
+                WallpaperSelection.selectedKind, issueReportNoteField.text);
+            detailPage.issueReportOpen = false;
         }
     }
 }

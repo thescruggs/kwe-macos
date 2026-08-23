@@ -3,6 +3,7 @@
 #include "catalogclient.h"
 #include "catalogmodel.h"
 #include "daemonactivator.h"
+#include "issuereporter.h"
 #include "packageinstaller.h"
 #include "permissionsclient.h"
 #include "workshopclient.h"
@@ -28,6 +29,10 @@ int main(int argc, char *argv[]) {
     application.setApplicationName(QStringLiteral("KDE Wallpaper Engine"));
     application.setOrganizationDomain(QStringLiteral("org.kde"));
     application.setDesktopFileName(QStringLiteral("org.kde.kwe"));
+    // F4: the issue reporter falls back to this when `pacman -Q
+    // kde-wallpaper-engine` is unavailable (a dev build, or a non-Arch
+    // checkout).
+    application.setApplicationVersion(QStringLiteral(KWE_APP_VERSION));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("KDE Wallpaper Engine Alpha gallery"));
@@ -108,6 +113,10 @@ int main(int argc, char *argv[]) {
     // (relaunching once if the loaded record differs).
     WebPreview webPreview(&permissionsClient);
     PlaylistController playlistController(socketPath);
+    // F4: "Report rendering issue" — a local diagnostic bundle the
+    // maintainer records by hand, written under ~/.local/share/kwe/reports/.
+    // Nothing here is uploaded anywhere.
+    IssueReporter issueReporter(socketPath);
     // When the daemon socket is absent, start the user service before the
     // catalog begins. Defaults to the systemd user unit; the smoke suite
     // injects a stub command instead of touching the user's real unit.
@@ -154,6 +163,7 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("rendererStatus"), &rendererStatus);
     engine.rootContext()->setContextProperty(QStringLiteral("webPreview"), &webPreview);
     engine.rootContext()->setContextProperty(QStringLiteral("playlistController"), &playlistController);
+    engine.rootContext()->setContextProperty(QStringLiteral("issueReporter"), &issueReporter);
     engine.load(QUrl(QStringLiteral("qrc:/qt/qml/org/kde/kwe/qml/Main.qml")));
     if (engine.rootObjects().isEmpty()) return 1;
     client.refresh();

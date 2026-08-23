@@ -58,3 +58,11 @@ qt_add_executable(kwe-web-preview-test
 )
 target_link_libraries(kwe-web-preview-test PRIVATE Qt6::Core Qt6::Network Qt6::Qml Qt6::Test)
 add_test(NAME kwe-web-preview-test COMMAND kwe-web-preview-test)
+
+qt_add_executable(kwe-issue-reporter-test
+    issuereportertest.cpp
+    ../src/issuereporter.cpp
+    ../src/issuereporter.h
+)
+target_link_libraries(kwe-issue-reporter-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+add_test(NAME kwe-issue-reporter-test COMMAND kwe-issue-reporter-test)
