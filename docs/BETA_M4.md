@@ -327,6 +327,12 @@ bounded one):
   replaced by the honest current state; the playlist frame's stale
   "Display assignment is not enabled yet" line now reads "Playlist display
   assignment arrives in a later milestone".
+- **Report rendering issue…** (F4, added later) — below the Apply row,
+  enabled whenever a wallpaper is selected regardless of apply state; opens
+  a note dialog and calls `IssueReporter::record()` to write a local
+  diagnostic bundle under `~/.local/share/kwe/reports/`; a success message
+  shows the saved folder path (selectable) with a Copy path action. Nothing
+  is uploaded anywhere. See `docs/backlog/ISSUE_REPORTS.md`.
 
 ### Test surface
 
