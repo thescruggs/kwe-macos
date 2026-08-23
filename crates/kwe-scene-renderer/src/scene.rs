@@ -104,6 +104,9 @@ pub struct SceneConfig {
     script_reference: Option<String>,
     /// Optional `general.resolution` (the worker still renders at the size
     /// the daemon asked for; the field is only validated and reported).
+    /// S7: real Wallpaper Engine's `general.orthogonalprojection
+    /// {"width","height"}` is accepted as the same thing when
+    /// `general.resolution` is absent — see `parse_resolution`.
     pub resolution: Option<(u32, u32)>,
     /// Optional `general.fps` hint (unused by the worker in M3a; the daemon
     /// owns the pacing).
@@ -1888,11 +1891,28 @@ fn parse_clear_color(general: &serde_json::Map<String, Value>) -> Result<[f32; 4
     Ok(color)
 }
 
+/// S7: `general.resolution` wins when present (unchanged M3a behaviour,
+/// including its strict-reject errors below). Otherwise falls back to real
+/// Wallpaper Engine's own scene-size key, `general.orthogonalprojection`
+/// (`{"width": W, "height": H}`, optional `"auto": true` — ignored here,
+/// `width`/`height` are read whenever present regardless of `auto`): every
+/// Workshop scene declares this instead of `general.resolution` (a
+/// kwe-only convenience key no real WE scene writes), so before this
+/// fallback `config.resolution` was `None` for every Workshop scene and
+/// every layer drew zoomed/offset by the scene/canvas mismatch (see
+/// `main.rs::world_extent`'s "scene units = canvas pixels" fallback).
+/// Unlike the strict `general.resolution` array above, a malformed
+/// `orthogonalprojection` is LENIENT (`Ok(None)`, never a reject) — it
+/// must not fail a scene the corpus renders fine today; upstream itself
+/// just reads whatever numbers are there.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp:28-29,74 @ b016d7d1
 fn parse_resolution(
     general: &serde_json::Map<String, Value>,
 ) -> Result<Option<(u32, u32)>, SceneError> {
     let Some(value) = general.get("resolution") else {
-        return Ok(None);
+        return Ok(parse_orthogonal_projection(general));
     };
     let array = value.as_array().ok_or_else(|| {
         SceneError::new(
@@ -1928,6 +1948,38 @@ fn parse_resolution(
         dims[i] = dim as u32;
     }
     Ok(Some((dims[0], dims[1])))
+}
+
+/// The `general.orthogonalprojection` fallback `parse_resolution` uses when
+/// `general.resolution` is absent (S7). Accepts a JSON number OR a numeric
+/// string for `width`/`height` (truncating a float toward zero, matching
+/// upstream's own numeric-string tolerance elsewhere in this parser); any
+/// shape this can't make sense of — not an object, missing either field,
+/// unparsable, non-finite, or out of `1..=MAX_DIMENSION` — returns `None`
+/// rather than rejecting the scene (see the caller's doc comment).
+fn parse_orthogonal_projection(general: &serde_json::Map<String, Value>) -> Option<(u32, u32)> {
+    let projection = general.get("orthogonalprojection")?.as_object()?;
+    let dim = |name: &str| -> Option<u32> {
+        let value = projection.get(name)?;
+        let number = if let Some(number) = value.as_f64() {
+            number
+        } else if let Some(text) = value.as_str() {
+            text.parse::<f64>().ok()?
+        } else {
+            return None;
+        };
+        if !number.is_finite() {
+            return None;
+        }
+        let truncated = number.trunc();
+        if truncated < 1.0 || truncated > f64::from(MAX_DIMENSION) {
+            return None;
+        }
+        Some(truncated as u32)
+    };
+    let width = dim("width")?;
+    let height = dim("height")?;
+    Some((width, height))
 }
 
 fn parse_fps(general: &serde_json::Map<String, Value>) -> Result<Option<f32>, SceneError> {
@@ -2075,6 +2127,68 @@ mod tests {
         assert_eq!(config.resolution, Some((1920, 1080)));
         assert_eq!(config.fps, Some(30.0));
         assert!(config.script_path.is_none());
+    }
+
+    /// S7: `general.orthogonalprojection {"width","height"}` fallback —
+    /// real Wallpaper Engine's own scene-size key, read when
+    /// `general.resolution` is absent (`parse_resolution`'s P1 fix).
+    #[test]
+    fn orthogonal_projection_fallback_when_resolution_absent() {
+        let general = serde_json::json!({
+            "orthogonalprojection": { "width": 3840, "height": 2160 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), Some((3840, 2160)));
+    }
+
+    #[test]
+    fn orthogonal_projection_accepts_numeric_strings_and_truncates_floats() {
+        let general = serde_json::json!({
+            "orthogonalprojection": { "width": "1920.7", "height": 1080.9 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn orthogonal_projection_missing_height_is_none() {
+        let general = serde_json::json!({
+            "orthogonalprojection": { "width": 1920 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), None);
+    }
+
+    #[test]
+    fn general_resolution_wins_over_orthogonal_projection_when_both_present() {
+        let general = serde_json::json!({
+            "resolution": [1280, 720],
+            "orthogonalprojection": { "width": 3840, "height": 2160 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), Some((1280, 720)));
+    }
+
+    #[test]
+    fn orthogonal_projection_out_of_range_is_lenient_none_not_a_reject() {
+        // A malformed WE projection must never fail the scene (unlike the
+        // strict `general.resolution` array) — matches upstream, which
+        // just takes whatever numbers are there.
+        let general = serde_json::json!({
+            "orthogonalprojection": { "width": 0, "height": 2160 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), None);
+
+        let general = serde_json::json!({
+            "orthogonalprojection": { "width": 999_999_999, "height": 2160 }
+        });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), None);
+
+        let general = serde_json::json!({ "orthogonalprojection": "not an object" });
+        let general = general.as_object().unwrap();
+        assert_eq!(parse_resolution(general).unwrap(), None);
     }
 
     #[test]
