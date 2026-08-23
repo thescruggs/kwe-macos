@@ -780,6 +780,7 @@ mod tests {
         };
         let layer = LayerState::from_spec(&LayerSpec {
             name: "t".into(),
+            id: None,
             scene_order: 0,
             image: None,
             model_ref: None,

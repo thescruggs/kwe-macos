@@ -934,10 +934,12 @@ none touch the material pipeline or Vulkan layer.
    in just before the file's own `main(` definition, so every top-level
    declaration in the file — regardless of whether it sits before or
    after the `#include` line — is visible to whatever the included text
-   defines. A combo-gated `main(` (behind its own `#if`) is not handled
-   the way upstream's `#if`-aware placement search would — the local
-   corpus has none — and falls back to appending at the very end (never
-   silently dropping the included text) if no `main(` is found at all.
+   defines. (S5 update: this S4b description of "just before `main(`"
+   and "a combo-gated `main(` is not handled" is now the PRE-S5 behavior
+   — see "Shader preprocessor: comment-aware `main` finder and
+   declaration-aware include placement (S5)" below for the current,
+   upstream-matching placement rule and the `#if`-stack search this
+   paragraph originally deferred.)
 2. **`g_Point<N>` type narrowing** (`standard_uniform_expr`): the shared
    `MaterialUniforms` UBO backs every `g_Point<N>` with a `vec4` slot, but
    `effects/perspective.vert` (used by the large majority of the local
@@ -1003,6 +1005,57 @@ hostile-input siblings for each). See the S4b change-log entry in
 `AI-Skills/BETA_PLAN.md` for the before/after corpus `compile_failed`
 count and the byte-identity sweep result.
 
+### Shader preprocessor: comment-aware `main` finder and declaration-aware include placement (S5)
+
+Two adversarial-review follow-ups on the S4b `#include`-placement fix
+above, both `crates/kwe-scene-renderer/src/shaderpre.rs` only:
+
+1. **Comment-aware `main` finder** (`find_main_token`): the pre-S5 scan
+   matched a bare `main` token anywhere in the preprocessed text — a
+   shader with `main` mentioned inside a `//` line comment or a `/* */`
+   block comment ABOVE its real `main(` definition (e.g. `// see main()
+   above` or a commented-out old entry point) would be mistaken for the
+   real one, splicing included text into the wrong place. `find_main_
+   token` now tracks comment state as it scans (a single linear pass) so
+   both comment styles are skipped; an unterminated block comment runs
+   to end-of-file, matching how a real GLSL compiler would treat the
+   same malformed input. This is an original robustness fix, not a port
+   — upstream's own `find(" main")` has the identical weakness.
+2. **Declaration/`#if`-aware include placement** (`find_include_
+   insertion_point`, `move_point_outside_conditionals`): the S4b fix
+   spliced every `#include`'s resolved text unconditionally right before
+   `main(`, documented at the time as "equivalent for every shader this
+   renderer has been measured against" because none of the then-covered
+   corpus shaders needed the real, upstream-matching search
+   (`ShaderUnit::preprocessIncludes`, `ShaderUnit.cpp:136-312`): insert
+   immediately after the LAST top-level `attribute`/`varying`/`uniform`
+   declaration before `main` (not merely before `main` itself), then walk
+   that point back outside any `#if`/`#ifdef`/`#ifndef` ... `#endif`
+   region it would otherwise land inside. This closes a REAL bug the old
+   rule would have hit on `blur_precise_gaussian.frag` (one of the S4b
+   fix targets itself) if its last declaration before `main` were ever
+   inside a conditional block — `blur_precise_gaussian.frag` declares
+   `varying vec2 v_TexCoordMask;` behind `#if MASK`, AFTER its last
+   unconditional `uniform`; splicing `common_blur.h`'s `blur13a`/`blur7a`/
+   `blur3a` function definitions inside that `#if MASK` block would leave
+   them undefined whenever a material has `MASK` off — the `#if`-stack
+   walk moves the insertion point back to right after the last
+   UNCONDITIONAL declaration instead, avoiding it entirely. All three
+   S4b fix-target shaders (`shine_gaussian.frag`, `godrays_gaussian.frag`,
+   `blur_precise_gaussian.frag`) still preprocess and compile to SPIR-V
+   after this rewrite — verified directly against the real WE asset tree
+   by `shaderpre::tests::s4b_fix_target_shaders_still_compile_after_
+   the_placement_rewrite` (skipped, not failed, when the assets tree is
+   not mounted — a local-verification test over real, un-committed
+   assets, matching this module's other asset-path-gated tests).
+
+Pinned by `shaderpre.rs` unit tests: `find_main_token_skips_line_and_
+block_comments`, `find_main_token_returns_none_when_main_only_appears_
+in_comments`, `find_main_token_handles_an_unterminated_block_comment`,
+`include_splices_after_the_last_top_level_declaration_before_main`,
+`include_splice_point_is_moved_outside_an_enclosing_if_block`,
+`include_splice_point_handles_nested_if_blocks`.
+
 ## Effects and render targets (S3)
 
 **Implemented (S3)**: an object's `effects[]` array — an ordered list of
@@ -1049,25 +1102,27 @@ decided by the renderer's effect chain at draw time.
 upstream draws every material pass as its OWN draw call, either into a
 named FBO (`target: Some(name)`) or, with no target, directly onto the
 compositor. This renderer maps that onto its existing single-composite-
-pass architecture with one simplification: **the chain's LAST pass with
-no target REPLACES the layer's own base material** for compile/bind
-purposes (a layer with a resolved effect chain draws through the
-effect's own final shader, not its base material — matching upstream's
-practical effect, since a bare `copybackground` passthrough base
-material is otherwise a content-free no-op). Every OTHER pass with a
-`target` gets its own compiled pipeline (`compile_effect_pass` — a
-separate, uncached pipeline object per pass, since its viewport is the
-TARGET's own pixel size, not the canvas: this renderer's pipelines bake
-a static, non-dynamic viewport) and is RE-RENDERED into its FBO every
-frame (`render_effect_chains`, called before the main composite pass
-each frame) so later passes and the layer's own final draw sample
-fresh content. `command: copy` executes as a direct `vkCmdCopyImage`
-between two named FBOs; `command: swap` — upstream itself never executes
-`swap` (`CImage.cpp` only handles `Command_Copy`) — executes identically
-to `copy` in this renderer, since a true pointer swap would require
-re-resolving every LATER pass's already-baked descriptor-set view
-bindings each frame, which this renderer's load-time-only binding design
-does not support.
+pass architecture: **the chain's LAST pass with no target REPLACES the
+layer's own base material** for compile/bind purposes (a layer with a
+resolved effect chain draws through the effect's own final shader, not
+its base material). Every OTHER pass — one with a `target`, PLUS (S5)
+any untargeted pass that is NOT the chain's last one — gets its own
+compiled pipeline (`compile_effect_pass` — a separate, uncached pipeline
+object per pass, since its viewport is the TARGET's own pixel size, not
+the canvas: this renderer's pipelines bake a static, non-dynamic
+viewport) and is RE-RENDERED into its FBO every frame
+(`render_effect_chains`, called before the main composite pass each
+frame) so later passes and the layer's own final draw sample fresh
+content. A targeted pass's FBO is the scene-declared `fbos[]` name
+(scoped, see below); an intermediate untargeted pass's FBO is this
+OBJECT's own reused ping-pong pair — see "Stacked multi-effect
+compositing (S5)" below. `command: copy` executes as a direct
+`vkCmdCopyImage` between two named FBOs; `command: swap` — upstream
+itself never executes `swap` (`CImage.cpp` only handles `Command_Copy`)
+— executes identically to `copy` in this renderer, since a true pointer
+swap would require re-resolving every LATER pass's already-baked
+descriptor-set view bindings each frame, which this renderer's
+load-time-only binding design does not support.
 
 **`"previous"` seeding**: for the FIRST pass in an object's whole effect
 chain, `"previous"` resolves to the object's OWN base material's slot-0
@@ -1081,65 +1136,36 @@ corpus-observed failure mode caught and fixed during this slice (see the
 "safety guard" note below and `main.rs::plan_effect_chain`'s doc
 comment).
 
-**`_rt_FullFrameBuffer`**: a copy of the composited scene so far. This
-renderer takes ONE whole-frame snapshot per frame
-(`snapshot_full_frame_buffer`, called after the main composite pass
-finishes, before the NEXT frame's `render_effect_chains`) rather than
-tracking upstream's true incremental, per-object paint-order visibility
-— a documented, bounded simplification: every effect chain that reads
-`_rt_FullFrameBuffer` sees the PREVIOUS frame's fully composited output,
-a one-frame lag imperceptible for a steady-state animated wallpaper.
-Every effect render target (including `_rt_FullFrameBuffer` itself) is
-created cleared to transparent black (`CFBO.cpp`'s documented fix for
-effects otherwise drawing solid rectangles) and stays that way until
-something writes it — a chain that references a target nothing ever
-populates samples defined transparent black, never garbage, never a
-crash (`vulkan::tests::unwritten_effect_target_samples_transparent_black_not_garbage`).
+**`_rt_FullFrameBuffer`**: a copy of the composited scene so far — see
+"Stacked multi-effect compositing / `_rt_FullFrameBuffer` paint order
+(S5)" below for the full, current semantics (a genuine same-frame
+snapshot for a layer's own bound material; still one-frame-stale for an
+effect chain's internal references, as S3 originally shipped it).
 
 **Safety guard — bare `_rt_` passthrough without an effect chain**: a
 layer whose EFFECTIVE material (its own base material, since it has no
 resolved `effects[]`) has NOTHING but `_rt_`/render-target texture slots
 — no real `.tex` bytes anywhere — never draws
-(`render_target_only_without_effects` fallback reason). This is exactly
-the corpus's bare `models/util/fullscreenlayer.json` pattern used
-WITHOUT an attached effect (several real scenes place one at a fixed
-point in their object stack purely as a `copybackground` utility, with
-no `effects[]` of its own): before S3 its unresolvable `_rt_
+(`render_target_only_without_effects` fallback reason), UNLESS (S5) its
+only render-target reference is `_rt_FullFrameBuffer` specifically —
+that case is now safe (see S5 below) and draws. This is exactly the
+corpus's bare `models/util/fullscreenlayer.json` pattern used WITHOUT an
+attached effect (several real scenes place one at a fixed point in
+their object stack purely as a `copybackground` utility, with no
+`effects[]` of its own): before S3 its unresolvable `_rt_
 FullFrameBuffer` slot meant the whole object silently never drew — a
-true no-op. Once the honesty fix above made that slot resolve, binding
-it live would draw the one-frame-stale, transparent-on-frame-1 `_rt_
-FullFrameBuffer` as an ordinary opaque/translucent quad — painting stale
-or fully black content over whatever else this frame already drew,
-wherever in the object stack it sits (worst case, last, hiding
-everything). This guard was found and fixed via the corpus regression
-sweep documented in `AI-Skills/BETA_PLAN.md`'s S3 entry, not by
-inspection alone — real Workshop content exercises it.
-
-**Scope boundary — an effect chain only replaces a BARE base material**:
-an effect chain's own final untargeted pass replaces the layer's base
-material for drawing purposes ONLY when the base material itself is
-ALSO the bare-passthrough shape above (no real `.tex` bytes anywhere —
-the `copybackground` case). An object whose base material samples a
-REAL photo/texture always keeps drawing that base material unchanged
-(its S1/S2 behavior), regardless of how many `effects[]` entries are
-attached. This is a deliberate scope boundary, not an oversight: this
-renderer's chain model concatenates EVERY attached effect's passes into
-one linear `"previous"` chain and only the textually-LAST untargeted
-pass across ALL of them ever becomes a candidate final material — for
-an object with multiple STACKED effects (the real corpus has objects
-with up to four: waterripple/waterflow/godrays/waterwaves on one photo
-layer), this discards every earlier effect's contribution rather than
-correctly layering them, which can produce materially wrong output (the
-corpus regression sweep caught exactly this: a real photo losing its
-image entirely and showing flat clear-colour instead). Restricting the
-override to bare-passthrough base materials keeps that wrong case from
-ever reaching a REAL object's rendering, at the cost of not yet
-rendering effects for the (more common) "real photo + attached effect"
-pattern — an honest, verified-safe trade-off pinned by
-`main.rs::tests::effect_final_material_only_overrides_a_bare_passthrough_base`
-and by the corpus-wide before/after pixel sweep (zero regressions across
-54 comparable scenes). Correctly layering multiple stacked effects on a
-real base texture is a real, scoped follow-up.
+true no-op. S3 kept refusing it even once the slot resolved, because
+`_rt_FullFrameBuffer` was only ever the one-frame-stale, transparent-
+on-frame-1 whole-scene snapshot — drawing it at any point in the object
+stack could paint stale/black content over real same-frame content. S5
+makes `_rt_FullFrameBuffer` a genuine same-frame snapshot for exactly
+this pattern (a layer's own bound material sampling it directly), so it
+is now safe to draw; any OTHER bare render-target reference (a name
+this layer's own effects never wrote, which should not occur in a
+well-formed scene) still has nothing real to show and stays refused.
+This guard was found and fixed via the corpus regression sweep
+documented in `AI-Skills/BETA_PLAN.md`'s S3 entry, not by inspection
+alone — real Workshop content exercises it.
 
 **Per-object render-target namespace** (adversarial review RECOMMENDED
 #5): every effect-declared FBO name — a `fbos[]` entry, a pass's own
@@ -1192,6 +1218,114 @@ real-world exposure from `command: copy`, where it is a no-op
 difference. A separate `event=renderer.scene.effect_asset_budget_exceeded
 bytes=... cap=...` line (RECOMMENDED #4) fires once if the aggregate
 effect-asset read budget is hit during scene load.
+
+## Stacked multi-effect compositing / `_rt_FullFrameBuffer` paint order (S5)
+
+S3 shipped two deliberate, documented boundaries: an effect chain's own
+output only ever replaced a bare-passthrough base material (real photos
+with attached effects kept drawing their unmodified base texture, since
+the chain model had nowhere to put an intermediate untargeted pass), and
+`_rt_FullFrameBuffer` was a whole-scene, one-frame-stale snapshot. S5
+closes both.
+
+**Effect compositing rule**: every pass in an object's resolved chain
+(every visible `effects[]` entry's `passes[]`, concatenated in file
+order — `main.rs::plan_effect_chain`) is now real:
+
+- A **targeted** pass (`target: Some(name)`) renders into that
+  scene-declared `fbos[]` name, scoped to the object
+  (`scoped_target_name`) — unchanged from S3.
+- An **untargeted, non-last** pass — the new S5 case — renders into this
+  OBJECT's own PRIVATE, reused ping-pong pair (`pingpong_target_name`,
+  upstream's `_rt_imageLayerComposite_<id>_a`/`_b`,
+  `CImage.cpp:729-880`): AT MOST 2 targets per object regardless of how
+  many intermediate passes it has, alternating after each write. Pass 1
+  of a chain samples the object's OWN base material's real texture
+  directly (no FBO needed for that — the seed `plan_effect_chain`
+  already used since S3); every later pass samples whatever the
+  previous pass just wrote.
+- The **untargeted, last** pass in the whole chain becomes
+  `final_material` — this layer's own bound material, exactly as S3 —
+  now unconditionally, regardless of whether the base material had a
+  real texture of its own.
+
+The S3-era `base_is_passthrough` gate (restricting the override to
+bare-passthrough objects only) is removed: it existed purely because the
+old chain model had no real GPU target for an intermediate untargeted
+pass, so letting the chain's last pass win for a real-photo object with
+multiple stacked effects (the corpus's own worked example, Workshop
+`1131061888`'s "trigun" — a real photo with FOUR attached effects:
+waterripple/waterflow/godrays/waterwaves) discarded the photo outright.
+With a real per-object ping-pong pair, pass 1 still samples the real
+photo, so nothing is discarded. Bounds: ≤ 2 ping-pong targets per object
+(within the existing `MAX_EFFECT_TARGETS_PER_SCENE`/`MAX_EFFECT_TARGET_
+BYTES` scene-wide caps), ≤ 16 passes/effect (unchanged, parse-time cap).
+Pinned by `main.rs::tests::plan_effect_chain_ping_pongs_multiple_
+untargeted_passes_reusing_two_targets`,
+`plan_effect_chain_ping_pong_targets_stay_bounded_to_two`, and
+`plan_effect_chain_targeted_passes_do_not_consume_ping_pong_slots`.
+
+**`_rt_FullFrameBuffer` same-frame paint order**: a layer whose OWN
+bound material (its base material, or an effect chain's `final_material`
+— the thing actually drawn through the normal per-layer quad) samples
+`_rt_FullFrameBuffer` now sees the scene composited so far THIS SAME
+FRAME — every layer drawn earlier in object order — not last frame's
+whole-scene snapshot. Implemented in
+`vulkan::LayerRenderer::render`: `main.rs::compile_material_layers`
+collects the layer indices whose final bound material references
+`_rt_FullFrameBuffer` by name (`ffb_consumer_layers`, capped at
+`MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME` = 8, one bounded diagnostic
+— `event=renderer.scene.full_frame_buffer_snapshot_cap` — if truncated)
+and hands it to `render`, which, immediately before each registered
+layer's draw, ENDS the current render-pass instance, copies
+`self.image`'s current content into `_rt_FullFrameBuffer`
+(`vkCmdCopyImage` with the same barrier pattern the pre-existing
+`copy_effect_target`/`snapshot_full_frame_buffer` already use), then
+RESUMES drawing in a new render-pass instance (`render_pass_resume`,
+`LOAD_OP_LOAD`) — all within the SAME command buffer/submit as the rest
+of the frame, no extra fence wait. A consumer past the 8-cap is not
+refused; it simply is not given its own snapshot point, so it samples
+whatever `_rt_FullFrameBuffer` last held (the most recent snapshot
+inserted earlier this frame, or the previous frame's whole-scene content
+if none was — a documented, bounded degrade). This directly unblocks
+the "safety guard" case above: a bare `copybackground` passthrough with
+no effect chain, sampling `_rt_FullFrameBuffer` as its only texture,
+now draws correctly instead of being refused. Pinned by
+`vulkan::tests::full_frame_buffer_snapshot_sees_layers_drawn_earlier_
+this_same_frame` (a two-renderer, treatment-vs-control device test:
+layer 1 mirrors layer 0's red WITH the snapshot registered, and mirrors
+opaque black WITHOUT it — proving the mechanism, not a coincidence),
+verified on both an NVIDIA RTX 3070 and llvmpipe.
+
+**Scope boundary — the same-frame fix covers a layer's OWN bound
+material only**: an effect chain's INTERNAL references to
+`_rt_FullFrameBuffer` (a pass's own texture slot naming it directly, or
+`plan_effect_chain`'s "previous" seed falling back to it when the base
+material has no real texture) are NOT covered — `render_effect_chains`
+still runs once, in one batch, before ANY layer's on-screen draw this
+frame, so an effect pass reading `_rt_FullFrameBuffer` still sees the
+PREVIOUS frame's whole-scene snapshot (`main.rs`'s post-`render` call to
+`snapshot_full_frame_buffer`, unchanged from S3). Interleaving effect-
+chain execution into true per-object paint order — running each
+object's own chain actions at its own position in the draw loop, rather
+than as one bulk pre-pass — would close this remaining gap; it was
+judged out of scope for this slice (a bigger architectural change to
+`render_effect_chains`'s per-frame replay model, not a bounded addition
+like the render-pass-split mechanism above) and is a real, scoped
+follow-up.
+
+**Design note — why a render-pass split, not a second subpass**: a
+subpass-local dependency can transition an attachment's LAYOUT between
+subpasses of the SAME render-pass instance, but `_rt_FullFrameBuffer` is
+a separate image/framebuffer entirely, and the copy into it is a
+TRANSFER command (`vkCmdCopyImage`), which is illegal inside a
+render-pass instance regardless of subpass count. Ending the instance is
+therefore the only construct that admits this at all, not an
+optimization traded away — see `vulkan::LayerRenderer::render`'s own doc
+comment for the full barrier/layout proof (both `render_pass` and the
+new `render_pass_resume` share the exact `final_layout`/`initial_layout`
+the snapshot's copy step needs, so no manual image-layout barrier on
+`self.image` itself is needed at any split point).
 
 ## Vertex attribute shapes (S4) / mesh/puppet vertex formats
 

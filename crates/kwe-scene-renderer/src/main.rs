@@ -2248,7 +2248,7 @@ fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChai
                         // SYNTHESIZED, per-object, REUSED (<= 2 total)
                         // name instead of a scene-declared `fbos[]`
                         // one — see `pingpong_target_name`.
-                        let target = pingpong_target_name(layer_index, write_slot);
+                        let target = pingpong_target_name(layer_index, layer.id, write_slot);
                         last_output = scene::MaterialTextureSource::RenderTarget(target.clone());
                         intermediate.push((planned, target));
                         write_slot = 1 - write_slot;
@@ -2264,16 +2264,54 @@ fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChai
     }
 }
 
-/// This object's own ping-pong render-target name (upstream
-/// `_rt_imageLayerComposite_<id>_a`/`_b`) — `slot` is 0 or 1. Scoped to
-/// `layer_index` so distinct objects never collide, and prefixed
-/// distinctly from `scoped_target_name`'s own `"{name}#obj{layer_index}"`
-/// shape (a `__` name a scene-declared `fbos[]` entry cannot itself use,
-/// since upstream's own FBO names never start with a double underscore)
-/// so a hostile/adversarial scene cannot alias its own effect's target
-/// onto an object's private ping-pong buffer.
-fn pingpong_target_name(layer_index: usize, slot: u8) -> String {
-    format!("__pingpong{slot}#obj{layer_index}")
+/// This object's own ping-pong render-target name — matches upstream's
+/// EXACT naming, `_rt_imageLayerComposite_<id>_a`/`_b` (`slot` 0 = `_a`,
+/// the FIRST buffer an object's chain writes into, matching
+/// `CImage.cpp`'s own `m_currentMainFBO = m_mainFBO` initial state; `slot`
+/// 1 = `_b`). `object_id` is the object's own WE `"id"` field
+/// (`scene::LayerSpec::id`) when present, falling back to `layer_index`
+/// when absent (defensive; every real corpus object carries one).
+///
+/// S5 review finding: a REAL corpus scene (Workshop `1131061888`
+/// "trigun") explicitly REFERENCES this exact name — its `godrays`
+/// effect's own "combine" pass overrides one texture slot to the literal
+/// string `_rt_imageLayerComposite_46_a` (`46` being that scene's
+/// `trigun` object's own declared `id`) — to read back an earlier state
+/// of the SAME per-object ping-pong buffer the rest of its chain is
+/// already implicitly threading through `"previous"`. Naming this
+/// module's own buffers anything else (an earlier revision used a
+/// private, unguessable `__pingpong<N>#obj<index>` name specifically to
+/// avoid any possible collision) meant that reference always resolved to
+/// the shared, empty `dummy_texture` instead — never a crash, but never
+/// the real content either. Matching upstream's name exactly closes
+/// that gap: `scoped_target_name` (applied to the base name below, same
+/// as any other effect-declared FBO reference) makes a LITERAL
+/// `_rt_imageLayerComposite_<id>_a` texture-slot override resolve to the
+/// SAME key this function produces for that object, so it samples this
+/// renderer's actual ping-pong content instead of nothing.
+///
+/// Known bounded gap this does NOT fully close: upstream's swap timing
+/// for a pass that reads the "off" ping-pong buffer while a chain of
+/// TARGETED passes runs in between (as `trigun`'s godrays chain does) is
+/// only approximated here — this renderer threads one linear
+/// `"previous"`/`last_output` value rather than upstream's separate
+/// `input`/`previousInput` pair, so a pass whose OWN declared write
+/// target happens to coincide with a literal `_rt_imageLayerComposite_
+/// <id>_a`/`_b` reference it also reads (as `trigun`'s combine pass
+/// does, in this specific real scene) is caught by the existing
+/// feedback-loop guard (`effect_pass_samples_its_own_target`, S3
+/// MUST-FIX #3) and degrades to `effect_self_reference` rather than
+/// running with a real same-image read+write bind — a genuine Vulkan
+/// constraint (undefined without `VK_EXT_attachment_feedback_loop_
+/// layout`), not a bug to route around. See `docs/SCENE_FORMAT_V1.md`'s
+/// S5 section for the full account.
+fn pingpong_target_name(layer_index: usize, object_id: Option<i64>, slot: u8) -> String {
+    let id = object_id.unwrap_or(layer_index as i64);
+    let letter = if slot == 0 { 'a' } else { 'b' };
+    scoped_target_name(
+        layer_index,
+        &format!("_rt_imageLayerComposite_{id}_{letter}"),
+    )
 }
 
 /// Build the `MAX_MATERIAL_TEXTURES` texture-bind list AND populate
@@ -2511,7 +2549,7 @@ fn effect_target_requests(
             let height = (layer.size[1] * scale_y).round().max(1.0) as u32;
             for slot in 0..2u8 {
                 requests.push(EffectTargetRequest {
-                    name: pingpong_target_name(layer_index, slot),
+                    name: pingpong_target_name(layer_index, layer.id, slot),
                     width,
                     height,
                 });
@@ -4020,7 +4058,7 @@ mod tests {
             "only the FIRST (non-last) untargeted pass is intermediate"
         );
         let (first_pass, first_target) = &plan.intermediate[0];
-        assert_eq!(first_target, &pingpong_target_name(0, 0));
+        assert_eq!(first_target, &pingpong_target_name(0, None, 0));
         // Pass 1 samples the base photo's OWN real bytes, not a stale/
         // empty render target — the fix that keeps the photo alive.
         assert!(matches!(
@@ -4033,7 +4071,7 @@ mod tests {
             .expect("second pass is the chain's last");
         assert!(matches!(
             &final_material.texture_slots[0],
-            Some(scene::MaterialTextureSource::RenderTarget(name)) if name == &pingpong_target_name(0, 0)
+            Some(scene::MaterialTextureSource::RenderTarget(name)) if name == &pingpong_target_name(0, None, 0)
         ));
     }
 
@@ -4058,8 +4096,8 @@ mod tests {
         assert_eq!(
             names,
             std::collections::BTreeSet::from([
-                &pingpong_target_name(0, 0),
-                &pingpong_target_name(0, 1),
+                &pingpong_target_name(0, None, 0),
+                &pingpong_target_name(0, None, 1),
             ]),
             "must reuse exactly two target names, never allocate more: {names:?}"
         );
@@ -4068,10 +4106,10 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                &pingpong_target_name(0, 0),
-                &pingpong_target_name(0, 1),
-                &pingpong_target_name(0, 0),
-                &pingpong_target_name(0, 1),
+                &pingpong_target_name(0, None, 0),
+                &pingpong_target_name(0, None, 1),
+                &pingpong_target_name(0, None, 0),
+                &pingpong_target_name(0, None, 1),
             ]
         );
     }
@@ -4100,7 +4138,7 @@ mod tests {
         // The untargeted intermediate pass (index 1 in source order,
         // which is intermediate[1]) still uses ping-pong slot 0 — the
         // targeted passes around it never advanced `write_slot`.
-        assert_eq!(plan.intermediate[1].1, pingpong_target_name(0, 0));
+        assert_eq!(plan.intermediate[1].1, pingpong_target_name(0, None, 0));
     }
 
     #[test]
@@ -4255,6 +4293,7 @@ mod tests {
     fn layer(name: &str, image: Option<&str>) -> scene::LayerSpec {
         scene::LayerSpec {
             name: name.into(),
+            id: None,
             scene_order: 0,
             image: image.map(Into::into),
             model_ref: None,

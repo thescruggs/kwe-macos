@@ -240,6 +240,50 @@ entries:
       `vortex`/`mapsequencearoundcontrolpoint`/the `spritetrail` renderer
       are not ported — see docs/SCENE_FORMAT_V1.md "External particle
       definition files (S4b)" for the full documented-scope-cut list).
+      S5 (stacked multi-effect compositing / _rt_FullFrameBuffer paint
+      order / shader preprocessor placement) adapted files, each carrying
+      a Borrowed-From comment at the adapted function:
+      src/WallpaperEngine/Render/Objects/CImage.cpp:729-880 (setupPasses/
+      pinpongFramebuffer/configurePassTarget: the per-object two-target
+      ping-pong FBO pair — `_a`/`_b` — an untargeted pass writes into,
+      alternated after each write, versus a targeted pass which writes
+      into its own named FBO without touching the pair) ->
+      crates/kwe-scene-renderer/src/main.rs (plan_effect_chain,
+      pingpong_target_name — adapted: this renderer has no "draw to an
+      unnamed target" GPU primitive, so an intermediate untargeted pass
+      reuses the SAME named-FBO machinery a targeted pass uses, against a
+      synthesized per-object name instead of a scene-declared one; the
+      object's own base-material pass is not materialized as its own
+      `CPass`/GPU draw the way upstream's colorBlending pass is — it
+      seeds the chain's first "previous" input directly from the base
+      material's own real texture bytes instead, which is
+      pixel-equivalent for this renderer's single-quad-per-layer draw
+      model);
+      src/WallpaperEngine/Render/Wallpapers/CScene.cpp /
+      src/WallpaperEngine/Render/CWallpaper.cpp (per-object paint order:
+      a later object samples the composite of every object drawn before
+      it, same frame) -> crates/kwe-scene-renderer/src/vulkan.rs
+      (LayerRenderer::render's same-frame `_rt_FullFrameBuffer` snapshot,
+      inserted immediately before a registered consumer's own draw —
+      adapted: implemented as a bounded, capped number of render-pass
+      splits plus a full-attachment `vkCmdCopyImage` rather than
+      upstream's true incremental per-object framebuffer tracking; scoped
+      to a layer's own bound MATERIAL only, not to an effect chain's
+      internal `_rt_FullFrameBuffer` references, which remain the
+      pre-S5 one-frame-stale snapshot — see docs/SCENE_FORMAT_V1.md
+      "_rt_FullFrameBuffer paint order (S5)");
+      src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-312
+      (preprocessIncludes: the attribute/varying/uniform-based insertion
+      point and the `#if`/`#endif` stack walk that keeps spliced
+      `#include` text outside any conditionally-compiled region) ->
+      crates/kwe-scene-renderer/src/shaderpre.rs
+      (find_include_insertion_point, move_point_outside_conditionals —
+      widens this file's prior citation, which covered only lines
+      136-171, the plain "splice before main()" placement without the
+      declaration/`#if`-aware search). The comment-aware `main(` token
+      scan itself (find_main_token, skipping `//`/`/* */` comments) has
+      no upstream equivalent — upstream's own `find(" main")` has the
+      same weakness this closes, an original robustness fix, not a port.
       Verified cross-checked against real Workshop payloads under
       /media/crushinator/steamapps/workshop/content/431960/*/ and the real
       Wallpaper Engine asset shaders under

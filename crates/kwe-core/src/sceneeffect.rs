@@ -436,7 +436,40 @@ fn resolve_material_pass(
         Vec::with_capacity(MAX_MATERIAL_TEXTURES);
     for index in 0..MAX_MATERIAL_TEXTURES as u32 {
         let Some(name) = names.get(&index) else {
-            texture_slots.push(None);
+            // S5 review finding, real-corpus-verified (Workshop
+            // `1131061888`'s waterripple/waterflow/waterwaves effects,
+            // and this exact shape appears across a large fraction of
+            // the local corpus): `g_Texture0`'s WE-standard metadata
+            // comment (`// {"material":"ui_editor_properties_
+            // framebuffer","hidden":true}`) marks it as upstream's
+            // ALWAYS-implicit "input" binding — `CImage::setupPasses`
+            // calls `pass->setInput(asInput)` UNCONDITIONALLY for every
+            // pass, entirely OUTSIDE `CPass::setupTextureUniforms`'s
+            // named-texture-resolution system this function otherwise
+            // implements. A real corpus material's own `"textures"`
+            // array (and the object's own pass override) routinely
+            // declares index 0 as JSON `null` for exactly this reason —
+            // "leave this to the renderer's implicit binding," not
+            // "leave this unbound." Before this fix, `null`/absent at
+            // index 0 fell through to a genuinely EMPTY slot (`None`,
+            // sampling the shared transparent-black dummy texture) —
+            // harmless while S3's `base_is_passthrough` gate discarded
+            // every such pass's real output anyway, but load-bearing
+            // wrong once S5 removed that gate: an effect whose OWN
+            // shader legitimately reads `g_Texture0` as its previous-
+            // stage input got fed transparent black instead, and its
+            // (fully opaque, since the shader still writes real alpha)
+            // computed-from-black output silently overwrote the real
+            // composite. Index 0 specifically defaults to the
+            // `"previous"` sentinel instead of staying unbound; every
+            // OTHER index keeps the old "absent = empty" behavior
+            // (there is no equivalent implicit-binding convention for
+            // g_Texture1 and up).
+            texture_slots.push(if index == 0 {
+                Some(EffectTextureSlot::Previous)
+            } else {
+                None
+            });
             continue;
         };
         let slot = resolve_texture_slot_name(name, lookup)?;
@@ -710,6 +743,95 @@ mod tests {
                 assert_eq!(c.target, "_rt_FullFrameBuffer");
             }
             other => panic!("expected command pass, got {other:?}"),
+        }
+    }
+
+    /// S5 review finding, real-corpus-verified (Workshop `1131061888`'s
+    /// waterripple/waterflow/waterwaves effects, and a large fraction of
+    /// the wider corpus): `g_Texture0`'s WE-standard metadata comment
+    /// marks it as upstream's ALWAYS-implicit "input" binding
+    /// (`CImage::setupPasses`'s unconditional `pass->setInput(asInput)`,
+    /// entirely outside `CPass::setupTextureUniforms`'s named-texture
+    /// system) — a real material's own `"textures"` array routinely
+    /// declares index 0 as JSON `null` for exactly this reason. Before
+    /// this fix, that fell through to a genuinely EMPTY slot (sampling
+    /// transparent black instead of the chain's real previous-stage
+    /// output) — see the fix site's own doc comment for the full
+    /// account of why this was silently harmless under S3 and
+    /// load-bearing wrong once S5 started using these outputs for real.
+    #[test]
+    fn unbound_texture_slot_zero_defaults_to_previous_every_other_slot_stays_empty() {
+        let mut files: HashMap<&str, Vec<u8>> = HashMap::new();
+        files.insert(
+            "effects/water.json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "water",
+                "passes": [{"material": "materials/water.json"}]
+            }))
+            .unwrap(),
+        );
+        // Slot 0 left `null` (the WE "framebuffer/hidden" convention);
+        // slot 1 also `null` (genuinely unbound, no implicit meaning).
+        files.insert("materials/water.json", material_json("water", &["", ""]));
+        let object = serde_json::json!({
+            "effects": [{"id": 1, "file": "effects/water.json", "passes": [{}]}]
+        });
+        let mut lookup = lookup_from(files);
+        let entries = object
+            .get("effects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let out = resolve_object_effects(&entries, &mut lookup);
+        assert_eq!(out.len(), 1);
+        match &out[0].effect.passes[0] {
+            EffectPass::Material(m) => {
+                assert!(
+                    matches!(m.texture_slots[0], Some(EffectTextureSlot::Previous)),
+                    "slot 0 must default to Previous, got {:?}",
+                    m.texture_slots[0]
+                );
+                assert!(
+                    m.texture_slots[1].is_none(),
+                    "slot 1 has no implicit-binding convention and must stay empty, got {:?}",
+                    m.texture_slots[1]
+                );
+            }
+            other => panic!("expected material pass, got {other:?}"),
+        }
+    }
+
+    /// An EXPLICIT reference at slot 0 (e.g. a `bind`/override naming a
+    /// real target or texture) still wins over the implicit default —
+    /// the default only fills in when nothing else claimed the slot.
+    #[test]
+    fn explicit_slot_zero_reference_overrides_the_previous_default() {
+        let mut files: HashMap<&str, Vec<u8>> = HashMap::new();
+        files.insert(
+            "effects/e.json",
+            serde_json::to_vec(&serde_json::json!({
+                "name": "e",
+                "passes": [{"material": "materials/e.json"}]
+            }))
+            .unwrap(),
+        );
+        files.insert("materials/e.json", material_json("e", &["_rt_Explicit"]));
+        let object = serde_json::json!({
+            "effects": [{"id": 1, "file": "effects/e.json", "passes": [{}]}]
+        });
+        let mut lookup = lookup_from(files);
+        let entries = object
+            .get("effects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let out = resolve_object_effects(&entries, &mut lookup);
+        match &out[0].effect.passes[0] {
+            EffectPass::Material(m) => match &m.texture_slots[0] {
+                Some(EffectTextureSlot::RenderTarget(name)) => assert_eq!(name, "_rt_Explicit"),
+                other => panic!("expected the explicit render target, got {other:?}"),
+            },
+            other => panic!("expected material pass, got {other:?}"),
         }
     }
 

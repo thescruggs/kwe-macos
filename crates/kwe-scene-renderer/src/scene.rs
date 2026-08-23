@@ -160,6 +160,9 @@ pub struct SceneConfig {
 pub struct LayerSpec {
     /// The script's identity for this layer (`Scene.getLayer(name)`).
     pub name: String,
+    /// S5: this object's own WE `"id"` field, when present — see
+    /// `CommonProps::id`'s doc comment.
+    pub id: Option<i64>,
     /// Position in the scene.json `objects` array — the file's object
     /// order. The per-kind draw lists merge by this key (layers.rs
     /// merged_draws), so an image that appears after a particle system in
@@ -783,6 +786,14 @@ fn parse_objects(
 #[derive(Debug, Clone)]
 struct CommonProps {
     name: String,
+    /// S5: the object's own WE `"id"` field, when present (an integer,
+    /// unique per scene — Workshop content routinely bakes it into
+    /// literal pass-override texture references, e.g.
+    /// `_rt_imageLayerComposite_<id>_a`, upstream's own per-object
+    /// ping-pong FBO name — see `main.rs::pingpong_target_name`).
+    /// `None` when absent (defensive; every real corpus object carries
+    /// one, but nothing in this parser required it before S5).
+    id: Option<i64>,
     origin: [f32; 2],
     angles: [f32; 3],
     scale: [f32; 2],
@@ -812,6 +823,7 @@ fn parse_common_props(
             ));
         }
     };
+    let id = object.get("id").and_then(Value::as_i64);
 
     // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
     // editor serializes user-bindable fields — corpus re-scan: 70%
@@ -962,6 +974,7 @@ fn parse_common_props(
 
     Ok(CommonProps {
         name,
+        id,
         origin,
         angles,
         scale,
@@ -1058,6 +1071,7 @@ fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> O
 
     Some(LayerSpec {
         name: common.name,
+        id: common.id,
         scene_order: index,
         image: None,
         model_ref: Some(model_ref),
@@ -1105,6 +1119,7 @@ fn parse_image_layer(
 
     Ok(LayerSpec {
         name: common.name,
+        id: common.id,
         scene_order: index,
         image,
         model_ref: None,
@@ -1211,6 +1226,7 @@ fn parse_text_layer(
 
     Ok(LayerSpec {
         name: common.name.clone(),
+        id: common.id,
         scene_order: index,
         image: None,
         model_ref: None,
@@ -1324,6 +1340,7 @@ fn parse_video_layer(
 
     Ok(LayerSpec {
         name: common.name,
+        id: common.id,
         scene_order: index,
         image: None,
         model_ref: None,

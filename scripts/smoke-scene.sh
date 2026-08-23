@@ -3731,4 +3731,307 @@ grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s4_standalone_log
 stop_standalone "$s4_standalone_pid" "$s4_standalone_log" "standalone S4 material renderer"
 echo "scene smoke passed (S4): pkg model layer with a_Normal/a_Color-declaring material shader -> compiles through the widened vertex-attribute pipeline and draws its real colour, not the S1 base texture"
 
+# S5 (a): a REAL base texture (solid red) with TWO SEPARATE effects[]
+# entries chained -- effect A's single untargeted pass is NOT the whole
+# chain's last pass (effect B follows), so it must ping-pong into this
+# object's own reused target (main.rs::pingpong_target_name) instead of
+# being discarded (the S3 base_is_passthrough gate this fixes). Pass A
+# samples the base photo via "previous" and turns it GREEN; pass B (the
+# chain's true last pass, becomes the layer's own material) samples
+# "previous" again -- if ping-pong correctly threads pass A's OUTPUT
+# forward, it sees GREEN and adds blue for CYAN; if it wrongly re-read
+# the untouched base texture instead (the exact S3-era regression this
+# slice fixes), it would see RED and add blue for MAGENTA. The oracle
+# pins CYAN, decisively distinguishing "composited both effects" from
+# "lost the first effect's contribution".
+s5a_assets_dir="$smoke_root/s5a-assets"
+mkdir -p "$s5a_assets_dir/shaders"
+cat >"$s5a_assets_dir/shaders/s5abase.vert" <<'VERT'
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+uniform mat4 g_ModelViewProjectionMatrix;
+varying vec2 v_TexCoord;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+}
+VERT
+cat >"$s5a_assets_dir/shaders/s5abase.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = texSample2D(g_Texture0, v_TexCoord);
+}
+FRAG
+cp "$s5a_assets_dir/shaders/s5abase.vert" "$s5a_assets_dir/shaders/s5apass.vert"
+cat >"$s5a_assets_dir/shaders/s5apass.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	// Deliberately IGNORES the sampled colour's own value (proves this
+	// pass's own draw ran, not a coincidental default) but still reads
+	// g_Texture0 so the binding is exercised.
+	gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0) + 0.0 * texSample2D(g_Texture0, v_TexCoord);
+}
+FRAG
+cp "$s5a_assets_dir/shaders/s5abase.vert" "$s5a_assets_dir/shaders/s5bpass.vert"
+cat >"$s5a_assets_dir/shaders/s5bpass.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	// Adds blue to whatever it sampled: green (pass A's real output) ->
+	// cyan; red (the un-ping-ponged base texture, the regression) ->
+	// magenta.
+	gl_FragColor = texSample2D(g_Texture0, v_TexCoord) + vec4(0.0, 0.0, 1.0, 0.0);
+}
+FRAG
+
+s5a_effects_pkg="$smoke_root/s5a-effects.pkg"
+python3 - "$s5a_effects_pkg" <<'S5APY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))
+    out += struct.pack("<i", len(pixels))
+    out += pixels
+    return bytes(out)
+
+
+scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "photo", "image": "models/photo.json",'
+    b' "origin": [0.0, 0.0], "size": [160.0, 90.0],'
+    b' "effects": ['
+    b'  {"file": "effects/s5eff_a.json", "visible": true, "passes": [{}]},'
+    b'  {"file": "effects/s5eff_b.json", "visible": true, "passes": [{}]}'
+    b' ]}]}'
+)
+model_json = b'{"material": "materials/photo.json", "fullscreen": true}'
+material_json = b'{"passes": [{"shader": "s5abase", "textures": ["photo"]}]}'
+texture = texv_argb8888(4, 4, (255, 0, 0, 255))
+
+# NOTE: the top-level effect files are named "s5eff_a"/"s5eff_b" (not
+# just "a"/"b") deliberately -- the package path resolver
+# (kwe_core::pkg::resolve_pkg_entry) matches a reference against BOTH an
+# exact path AND any entry whose path ENDS WITH "/<reference>", so an
+# effect file at "effects/a.json" would ambiguously collide with a pass
+# material at "materials/effects/a.json" (which also ends with
+# "/effects/a.json") and fail to resolve at all. Distinct basenames sidestep it.
+effect_a_json = b'{"name": "a", "fbos": [], "passes": [{"material": "materials/effects/a.json"}]}'
+a_material_json = b'{"passes": [{"shader": "s5apass", "textures": ["previous"]}]}'
+effect_b_json = b'{"name": "b", "fbos": [], "passes": [{"material": "materials/effects/b.json"}]}'
+b_material_json = b'{"passes": [{"shader": "s5bpass", "textures": ["previous"]}]}'
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/photo.json", model_json),
+            ("materials/photo.json", material_json),
+            ("materials/photo.tex", texture),
+            ("effects/s5eff_a.json", effect_a_json),
+            ("materials/effects/a.json", a_material_json),
+            ("effects/s5eff_b.json", effect_b_json),
+            ("materials/effects/b.json", b_material_json),
+        ]
+    )
+)
+S5APY
+
+s5a_standalone_log="$smoke_root/standalone-s5a-effects.log"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-s5a-effects.bin" --width 160 --height 90 --fps 30 \
+    --content "$s5a_effects_pkg" --assets-dir "$s5a_assets_dir" --device llvmpipe \
+    >"$s5a_standalone_log" 2>&1 &
+s5a_standalone_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$smoke_root/standalone-s5a-effects.bin" ]] && head -c 8 "$smoke_root/standalone-s5a-effects.bin" | grep -q KWEFRM1 && break
+    kill -0 "$s5a_standalone_pid" 2>/dev/null || {
+        echo "standalone S5a effects renderer exited early" >&2
+        sed -n '1,120p' "$s5a_standalone_log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$smoke_root/standalone-s5a-effects.bin" | grep -q KWEFRM1
+# B8G8R8A8 memory order, opaque cyan: B=255, G=255, R=0, A=255.
+scene_pixel_wait "$smoke_root/standalone-s5a-effects.bin" 80 45 "255,255,0,255" 2 "$s5a_standalone_log"
+grep -q "event=renderer.scene.effects objects=1 passes=1 fallback=0" "$s5a_standalone_log"
+grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s5a_standalone_log"
+stop_standalone "$s5a_standalone_pid" "$s5a_standalone_log" "standalone S5a effects renderer"
+echo "scene smoke passed (S5a): pkg model layer with a real base texture and TWO chained effects[] entries -> both effects composite (cyan), not just the last one (which would be magenta if the first effect's output were discarded)"
+
+# S5 (b): a bottom layer draws a REAL solid-red texture normally; a top
+# layer has NO effects[] and its ONLY texture slot is
+# `_rt_FullFrameBuffer` (the bare `copybackground` pattern) -- forces
+# full opacity regardless of what it samples, so the FINAL pixel is
+# driven entirely by what `_rt_FullFrameBuffer` held at the moment the
+# top layer drew: red if it saw the bottom layer's real content THIS
+# frame (S5's same-frame snapshot), opaque black if it saw nothing
+# (transparent-black-at-startup, the pre-S5 one-frame-stale state this
+# scene's first frame would have shown). `compiled=2 fallback=0` proves
+# the top layer actually drew at all (not refused by the S3 safety
+# guard, narrowed in S5 for exactly this pattern).
+s5b_assets_dir="$smoke_root/s5b-assets"
+mkdir -p "$s5b_assets_dir/shaders"
+cat >"$s5b_assets_dir/shaders/s5bbase.vert" <<'VERT'
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+uniform mat4 g_ModelViewProjectionMatrix;
+varying vec2 v_TexCoord;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+}
+VERT
+cat >"$s5b_assets_dir/shaders/s5bbelow.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = texSample2D(g_Texture0, v_TexCoord);
+}
+FRAG
+cp "$s5b_assets_dir/shaders/s5bbase.vert" "$s5b_assets_dir/shaders/s5babove.vert"
+cat >"$s5b_assets_dir/shaders/s5babove.frag" <<'FRAG'
+uniform sampler2D g_Texture0;
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = vec4(texSample2D(g_Texture0, v_TexCoord).rgb, 1.0);
+}
+FRAG
+
+s5b_ffb_pkg="$smoke_root/s5b-ffb.pkg"
+python3 - "$s5b_ffb_pkg" <<'S5BPY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))
+    out += struct.pack("<i", len(pixels))
+    out += pixels
+    return bytes(out)
+
+
+scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": ['
+    b'  {"name": "below", "image": "models/below.json", "origin": [0.0, 0.0], "size": [160.0, 90.0]},'
+    b'  {"name": "above", "image": "models/above.json", "origin": [0.0, 0.0], "size": [160.0, 90.0]}'
+    b' ]}'
+)
+below_model_json = b'{"material": "materials/below.json", "fullscreen": true}'
+below_material_json = b'{"passes": [{"shader": "s5bbelow", "textures": ["photo"]}]}'
+texture = texv_argb8888(4, 4, (255, 0, 0, 255))
+above_model_json = b'{"material": "materials/above.json", "fullscreen": true}'
+above_material_json = b'{"passes": [{"shader": "s5babove", "textures": ["_rt_FullFrameBuffer"]}]}'
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/below.json", below_model_json),
+            ("materials/below.json", below_material_json),
+            ("materials/photo.tex", texture),
+            ("models/above.json", above_model_json),
+            ("materials/above.json", above_material_json),
+        ]
+    )
+)
+S5BPY
+
+s5b_standalone_log="$smoke_root/standalone-s5b-ffb.log"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-s5b-ffb.bin" --width 160 --height 90 --fps 30 \
+    --content "$s5b_ffb_pkg" --assets-dir "$s5b_assets_dir" --device llvmpipe \
+    >"$s5b_standalone_log" 2>&1 &
+s5b_standalone_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$smoke_root/standalone-s5b-ffb.bin" ]] && head -c 8 "$smoke_root/standalone-s5b-ffb.bin" | grep -q KWEFRM1 && break
+    kill -0 "$s5b_standalone_pid" 2>/dev/null || {
+        echo "standalone S5b FullFrameBuffer renderer exited early" >&2
+        sed -n '1,120p' "$s5b_standalone_log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$smoke_root/standalone-s5b-ffb.bin" | grep -q KWEFRM1
+# B8G8R8A8 memory order, opaque red: B=0, G=0, R=255, A=255.
+scene_pixel_wait "$smoke_root/standalone-s5b-ffb.bin" 80 45 "0,0,255,255" 1 "$s5b_standalone_log"
+grep -q "event=renderer.scene.shaders compiled=2 fallback=0" "$s5b_standalone_log"
+stop_standalone "$s5b_standalone_pid" "$s5b_standalone_log" "standalone S5b FullFrameBuffer renderer"
+echo "scene smoke passed (S5b): a _rt_FullFrameBuffer post-process layer sees the layer drawn below it THIS SAME FRAME (same-frame paint order), not last frame's stale/transparent snapshot"
+
 echo "all scene smoke cases passed"
