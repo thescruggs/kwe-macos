@@ -927,18 +927,57 @@ and by the corpus-wide before/after pixel sweep (zero regressions across
 54 comparable scenes). Correctly layering multiple stacked effects on a
 real base texture is a real, scoped follow-up.
 
+**Per-object render-target namespace** (adversarial review RECOMMENDED
+#5): every effect-declared FBO name — a `fbos[]` entry, a pass's own
+`target`, a `bind`/texture-slot reference, a `command`'s literal
+`source`/`target` — is scoped to the declaring LAYER
+(`main.rs::scoped_target_name`, suffixing `#obj<layer_index>`) before it
+ever reaches the renderer's `effect_targets` map, EXCEPT the one
+deliberately scene-wide name, `_rt_FullFrameBuffer`, which stays global.
+Two different objects declaring the same raw `fbos[]` name can no
+longer alias — an object whose chain runs but whose final pass is not
+applied (the scope boundary below) cannot silently feed a different
+object's same-named target, because the two objects' declared names
+never collide in the first place.
+
+**Feedback-loop guard** (adversarial review MUST-FIX #3): a targeted
+material pass whose own resolved texture slots (via `bind`,
+`usertextures`, `textures`, or the base material) name the SAME `_rt_*`
+FBO the pass itself renders into is rejected before compilation
+(`effect_self_reference` fallback reason) — sampling an image through a
+descriptor set while it is bound as the color attachment being written
+in the same render-pass instance is an unguarded Vulkan feedback loop
+(undefined per spec absent `VK_EXT_attachment_feedback_loop_layout`),
+mirroring `copy_effect_target`'s existing `source == target` guard for
+the analogous command-pass case.
+
 **Bounds**: `MAX_EFFECT_TARGETS_PER_SCENE` = 64 live FBOs/scene,
 `MAX_EFFECT_TARGET_BYTES` = 256 MiB cumulative, `MAX_EFFECT_TARGET_
 DIMENSION` = 4096 px/side, `MAX_EFFECT_PASS_BINDINGS` = 256 compiled
-effect-pass pipelines/scene — all enforced in `vulkan.rs`, independent
-of the parse-time caps in `kwe-core::sceneeffect`.
+effect-pass pipelines/scene (its own dedicated `effect_descriptor_pool`
+as of the adversarial review's MUST-FIX #1 — previously shared with
+`material_descriptor_pool`'s `MAX_LAYERS` budget with no combined
+accounting), `MAX_EFFECT_FRAME_ACTIONS` = 512 queued per-frame
+`command`/render actions per scene (MUST-FIX #2 — a `command` pass
+needs neither a shader nor a texture asset to parse, so nothing else
+bounded how many a hostile `effects[]`/`effect.json` pair could queue
+before this fix), `MAX_EFFECT_ASSET_READ_BYTES` = 256 MiB cumulative
+across every effect-triggered asset read per scene load (RECOMMENDED
+#4) — all enforced in `vulkan.rs`/`main.rs`, independent of the
+parse-time caps in `kwe-core::sceneeffect`.
 
 **Diagnostics**: `event=renderer.scene.effect_fallback reason=...
-count=N` per distinct reason (currently only `compile_failed`, since a
-texture/target reference degrades silently by design rather than
-failing), then `event=renderer.scene.effects objects=N passes=M
-fallback=K targets=T` once per scene load — only emitted when at least
-one layer has a resolved effect chain.
+count=N` per distinct reason (`compile_failed`, `effect_self_reference`,
+`effect_frame_action_cap`), then `event=renderer.scene.effects
+objects=N passes=M fallback=K targets=T swap_used=S` once per scene
+load — only emitted when at least one layer has a resolved effect
+chain. `swap_used` (adversarial review NIT #7) counts how many resolved
+`command: swap` entries executed as a one-directional copy (see
+"Render pipeline mapping" above) — distinguishing that simplification's
+real-world exposure from `command: copy`, where it is a no-op
+difference. A separate `event=renderer.scene.effect_asset_budget_exceeded
+bytes=... cap=...` line (RECOMMENDED #4) fires once if the aggregate
+effect-asset read budget is hit during scene load.
 
 ## Mesh/puppet vertex formats (S3, partial)
 

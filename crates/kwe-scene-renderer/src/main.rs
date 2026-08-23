@@ -1482,6 +1482,20 @@ fn load_model_textures(
 ) -> usize {
     let mut resolved = 0usize;
     let mut skipped = 0usize;
+    // S3 review RECOMMENDED #4: aggregate byte budget across every
+    // effect-triggered asset read (effect.json/material.json/texture
+    // files, via `resolve_object_effects`'s `AssetLookup`) for this
+    // WHOLE scene load -- mirrors `used_bytes`/`texture_budget_allows`'s
+    // existing cap on the base-texture path. Each individual read is
+    // already bounded per-file (`MAX_EFFECT_JSON_BYTES`,
+    // `MAX_TEXTURE_SOURCE_BYTES`), but nothing capped the SUM: S3 raises
+    // the worst-case lookup count from ~10/layer (S1/S2) to up to
+    // ~4096/object (`MAX_PASSES_PER_EFFECT` x `MAX_EFFECTS_PER_OBJECT` x
+    // `MAX_MATERIAL_TEXTURES`), so a scene with many objects each
+    // re-reading large files across many `bind`/`usertextures`
+    // overrides could otherwise read gigabytes.
+    let mut used_effect_bytes: u64 = 0;
+    let mut effect_budget_exceeded = false;
     for layer in layers.iter_mut() {
         let Some(model_ref) = layer.model_ref.as_deref() else {
             continue; // not a model layer
@@ -1561,15 +1575,42 @@ fn load_model_textures(
         // happen inside `resolve_model` itself. Never fails the layer
         // (`resolve_object_effects`'s own honesty rule).
         if !layer.effects_raw.is_empty() {
+            let mut effect_lookup = |reference: &str| -> Option<Vec<u8>> {
+                if !effect_asset_budget_allows(used_effect_bytes) {
+                    effect_budget_exceeded = true;
+                    return None;
+                }
+                let bytes = resolve_asset(reference)?;
+                used_effect_bytes = used_effect_bytes.saturating_add(bytes.len() as u64);
+                Some(bytes)
+            };
             layer.effects =
-                kwe_core::resolve_object_effects(&layer.effects_raw, &mut resolve_asset);
+                kwe_core::resolve_object_effects(&layer.effects_raw, &mut effect_lookup);
         }
         resolved += 1;
     }
     if skipped > 0 {
         eprintln!("event=renderer.scene.model_texture_skip count={skipped}");
     }
+    if effect_budget_exceeded {
+        eprintln!(
+            "event=renderer.scene.effect_asset_budget_exceeded bytes={used_effect_bytes} \
+             cap={MAX_EFFECT_ASSET_READ_BYTES}"
+        );
+    }
     resolved
+}
+
+/// S3 review RECOMMENDED #4: cumulative byte budget across every
+/// effect-triggered asset read for one scene load (see
+/// `load_model_textures`'s doc comment on `used_effect_bytes`).
+const MAX_EFFECT_ASSET_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Pure, unit-tested budget check — mirrors
+/// `textures::texture_budget_allows`'s existing pattern for the
+/// base-texture path.
+fn effect_asset_budget_allows(used_bytes: u64) -> bool {
+    used_bytes < MAX_EFFECT_ASSET_READ_BYTES
 }
 
 /// Cap on one shader source file (`.vert`/`.frag`/`.h` include), read
@@ -1778,6 +1819,19 @@ fn texture_slots_are_bare_render_target_only(
         .any(|slot| matches!(slot, Some(scene::MaterialTextureSource::Bytes(_))))
 }
 
+/// S3 review MUST-FIX #3, pure and unit-tested: true when `texture_slots`
+/// names `target_name` as one of its OWN `RenderTarget` slots — a
+/// targeted effect pass sampling the same FBO it renders into is an
+/// unguarded Vulkan feedback loop (see the call site's doc comment).
+fn effect_pass_samples_its_own_target(
+    texture_slots: &[Option<scene::MaterialTextureSource>],
+    target_name: &str,
+) -> bool {
+    texture_slots.iter().any(|slot| {
+        matches!(slot, Some(scene::MaterialTextureSource::RenderTarget(name)) if name == target_name)
+    })
+}
+
 /// S3: one layer's resolved effect chain, walked in scene-declared order
 /// (every visible `ObjectEffect`, each effect's `passes[]` in file
 /// order): `final_material` — the LAST material pass with no `target`
@@ -1793,11 +1847,14 @@ fn texture_slots_are_bare_render_target_only(
 /// each scene load and re-rendered every frame. `commands` — every
 /// `command: copy`/`swap` pass, `(source, target)` with the `"previous"`
 /// sentinel already substituted for the concrete FBO name it meant at
-/// that point in the chain.
+/// that point in the chain, plus the original `EffectCommand` (S3
+/// review NIT #7: distinguishing `copy` from `swap` at the diagnostic
+/// level, since this renderer executes both identically -- see
+/// `vulkan.rs`'s `EffectFrameAction::Copy` doc comment for why).
 struct EffectChainPlan {
     final_material: Option<PlannedMaterial>,
     intermediate: Vec<(PlannedMaterial, String)>,
-    commands: Vec<(String, String)>,
+    commands: Vec<(String, String, kwe_core::EffectCommand)>,
 }
 
 fn combos_as_i64(
@@ -1809,10 +1866,35 @@ fn combos_as_i64(
         .collect()
 }
 
+/// S3 review RECOMMENDED #5: `effect_targets` (vulkan.rs) is a single
+/// scene-wide `HashMap`, so an FBO name written by one object's chain is
+/// visible to every other object's chain that happens to reference the
+/// same literal name. Scoping every effect-declared FBO name to the
+/// LAYER that declared it (except the one deliberately scene-wide name,
+/// `_rt_FullFrameBuffer`) makes that aliasing structurally impossible
+/// instead of merely "not observed in the local corpus" (the prior
+/// wording on `effect_targets`'s own doc comment) — this directly
+/// addresses the interaction flagged in `docs/SCENE_FORMAT_V1.md`'s
+/// "Scope boundary" note: an object whose chain runs but whose final
+/// pass is NOT applied (`base_is_passthrough == false`) can no longer
+/// silently feed a different object's same-named target, because after
+/// scoping the two objects' declared names never collide in the first
+/// place.
+fn scoped_target_name(layer_index: usize, name: &str) -> String {
+    if name == kwe_core::FULL_FRAME_BUFFER {
+        name.to_string()
+    } else {
+        format!("{name}#obj{layer_index}")
+    }
+}
+
 /// Convert one effect pass's resolved texture slots into
 /// `scene::MaterialTextureSource`, resolving the `"previous"` sentinel
-/// against `previous_source` (module doc comment on `plan_effect_chain`).
+/// against `previous_source` (module doc comment on `plan_effect_chain`)
+/// and scoping any OTHER `RenderTarget` name to `layer_index`
+/// (`scoped_target_name`).
 fn effect_pass_texture_sources(
+    layer_index: usize,
     slots: &[Option<kwe_core::EffectTextureSlot>],
     previous_source: &scene::MaterialTextureSource,
 ) -> Vec<Option<scene::MaterialTextureSource>> {
@@ -1824,7 +1906,10 @@ fn effect_pass_texture_sources(
                     scene::MaterialTextureSource::Bytes(bytes.clone())
                 }
                 kwe_core::EffectTextureSlot::RenderTarget(name) => {
-                    scene::MaterialTextureSource::RenderTarget(name.clone())
+                    scene::MaterialTextureSource::RenderTarget(scoped_target_name(
+                        layer_index,
+                        name,
+                    ))
                 }
                 kwe_core::EffectTextureSlot::Previous => previous_source.clone(),
             })
@@ -1849,8 +1934,13 @@ fn effect_pass_texture_sources(
 /// back to `_rt_FullFrameBuffer` only when that slot is itself empty or
 /// already a render target — the `models/util/fullscreenlayer.json`
 /// `copybackground` case, e.g. Workshop scene 1652229298) gets both real
-/// corpus patterns right with one rule.
-fn plan_effect_chain(layer: &scene::LayerSpec) -> EffectChainPlan {
+/// corpus patterns right with one rule. `layer_index` scopes every
+/// effect-declared FBO name this chain touches to this object
+/// (`scoped_target_name`, S3 review RECOMMENDED #5) — the base
+/// material's OWN slot-0 seed is left UNSCOPED, since it is already
+/// object-specific by construction (it came from THIS layer's own
+/// `resolve_model` walk, not from a shared `effects[]` namespace).
+fn plan_effect_chain(layer_index: usize, layer: &scene::LayerSpec) -> EffectChainPlan {
     let mut last_output = layer
         .material
         .as_ref()
@@ -1877,10 +1967,12 @@ fn plan_effect_chain(layer: &scene::LayerSpec) -> EffectChainPlan {
                     // target), "previous" has no FBO name to substitute;
                     // falling through to the literal string is safe
                     // (`copy_effect_target` no-ops on an unresolvable
-                    // name, this module's universal degrade contract).
+                    // name, this module's universal degrade contract). A
+                    // literal (non-"previous") name is scoped the same
+                    // way a material pass's texture slots are.
                     let resolve = |name: &str| {
                         if name != kwe_core::PREVIOUS_INPUT {
-                            return name.to_string();
+                            return scoped_target_name(layer_index, name);
                         }
                         match &last_output {
                             scene::MaterialTextureSource::RenderTarget(target) => target.clone(),
@@ -1889,11 +1981,18 @@ fn plan_effect_chain(layer: &scene::LayerSpec) -> EffectChainPlan {
                             }
                         }
                     };
-                    commands.push((resolve(&command.source), resolve(&command.target)));
+                    commands.push((
+                        resolve(&command.source),
+                        resolve(&command.target),
+                        command.command,
+                    ));
                 }
                 kwe_core::EffectPass::Material(material_pass) => {
-                    let texture_slots =
-                        effect_pass_texture_sources(&material_pass.texture_slots, &last_output);
+                    let texture_slots = effect_pass_texture_sources(
+                        layer_index,
+                        &material_pass.texture_slots,
+                        &last_output,
+                    );
                     let planned = PlannedMaterial {
                         shader: material_pass.shader.clone(),
                         blending: material_pass.blending.clone(),
@@ -1907,9 +2006,10 @@ fn plan_effect_chain(layer: &scene::LayerSpec) -> EffectChainPlan {
                     };
                     match &material_pass.target {
                         Some(target_name) => {
+                            let scoped = scoped_target_name(layer_index, target_name);
                             last_output =
-                                scene::MaterialTextureSource::RenderTarget(target_name.clone());
-                            intermediate.push((planned, target_name.clone()));
+                                scene::MaterialTextureSource::RenderTarget(scoped.clone());
+                            intermediate.push((planned, scoped));
                         }
                         None => final_material = Some(planned),
                     }
@@ -2117,7 +2217,7 @@ fn effect_target_requests(
     } else {
         1.0
     };
-    for layer in layers {
+    for (layer_index, layer) in layers.iter().enumerate() {
         for object_effect in &layer.effects {
             if !object_effect.visible {
                 continue;
@@ -2129,7 +2229,12 @@ fn effect_target_requests(
                 let width = ((layer.size[0] * scale_x) / fbo.scale).round().max(1.0) as u32;
                 let height = ((layer.size[1] * scale_y) / fbo.scale).round().max(1.0) as u32;
                 requests.push(EffectTargetRequest {
-                    name: fbo.name.clone(),
+                    // S3 review RECOMMENDED #5: scoped the same way
+                    // `plan_effect_chain` scopes every reference to this
+                    // name, so the target this creates and the target
+                    // the chain later renders into/samples are the same
+                    // key.
+                    name: scoped_target_name(layer_index, &fbo.name),
                     width,
                     height,
                 });
@@ -2231,11 +2336,12 @@ fn compile_material_layers(
     // exist.
     let plans: Vec<Option<EffectChainPlan>> = layers
         .iter()
-        .map(|layer| {
+        .enumerate()
+        .map(|(layer_index, layer)| {
             if layer.effects.is_empty() {
                 None
             } else {
-                Some(plan_effect_chain(layer))
+                Some(plan_effect_chain(layer_index, layer))
             }
         })
         .collect();
@@ -2263,6 +2369,11 @@ fn compile_material_layers(
     let mut effect_passes_attempted = 0usize;
     let mut effect_fallback_reasons: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
+    // S3 review NIT #7: how often a scene actually uses `command: swap`
+    // (executed identically to `copy` in this renderer — see
+    // `EffectChainPlan`'s doc comment) vs `copy`, where the
+    // simplification is a no-op difference.
+    let mut swap_used = 0usize;
 
     for (index, layer) in layers.iter_mut().enumerate() {
         let plan = plans[index].as_ref();
@@ -2424,6 +2535,21 @@ fn compile_material_layers(
         let Some(plan) = plan else { continue };
         for (pass_material, target_name) in &plan.intermediate {
             effect_passes_attempted += 1;
+            // S3 review MUST-FIX #3: a pass that samples the SAME `_rt_*`
+            // target it renders into is an unguarded Vulkan feedback loop
+            // (read via descriptor set + write via colour attachment, same
+            // image, same render-pass instance) -- undefined per spec
+            // absent VK_EXT_attachment_feedback_loop_layout. Reject it the
+            // same way an unresolvable reference already degrades
+            // (fallback, never a crash), mirroring `copy_effect_target`'s
+            // analogous `source == target` guard for the command-pass
+            // case.
+            if effect_pass_samples_its_own_target(&pass_material.texture_slots, target_name) {
+                *effect_fallback_reasons
+                    .entry("effect_self_reference")
+                    .or_insert(0) += 1;
+                continue;
+            }
             let Some((vertex_spirv, fragment_spirv, blend_mode, _key)) = compile_one_material(
                 &mut shader_lookup,
                 pass_material,
@@ -2452,7 +2578,19 @@ fn compile_material_layers(
                 &textures,
                 uniforms,
             ) {
-                Ok(binding_index) => renderer.queue_effect_render(binding_index),
+                Ok(binding_index) => {
+                    // S3 review MUST-FIX #2: `queue_effect_render` is
+                    // bounded (`MAX_EFFECT_FRAME_ACTIONS`); a `false`
+                    // means the pass compiled+bound fine but the scene's
+                    // total per-frame action budget is exhausted -- count
+                    // it as a bounded fallback, never silently drop it
+                    // without a trace.
+                    if !renderer.queue_effect_render(binding_index) {
+                        *effect_fallback_reasons
+                            .entry("effect_frame_action_cap")
+                            .or_insert(0) += 1;
+                    }
+                }
                 Err(error) => {
                     if is_fence_timeout(&error) {
                         reject_render(&error, "fence timeout while compiling an effect pass");
@@ -2461,8 +2599,19 @@ fn compile_material_layers(
                 }
             }
         }
-        for (source, target) in &plan.commands {
-            renderer.queue_effect_copy(source.clone(), target.clone());
+        for (source, target, command) in &plan.commands {
+            if *command == kwe_core::EffectCommand::Swap {
+                swap_used += 1;
+            }
+            // S3 review MUST-FIX #2: see the `queue_effect_render` note
+            // above -- the same shared per-scene action budget applies to
+            // `command` passes, which need neither a shader nor a texture
+            // asset to parse (the cheapest possible way to exhaust it).
+            if !renderer.queue_effect_copy(source.clone(), target.clone()) {
+                *effect_fallback_reasons
+                    .entry("effect_frame_action_cap")
+                    .or_insert(0) += 1;
+            }
         }
     }
 
@@ -2489,7 +2638,7 @@ fn compile_material_layers(
         }
         eprintln!(
             "event=renderer.scene.effects objects={effect_objects} passes={effect_passes_attempted} \
-             fallback={effect_fallback_total} targets={targets_created}"
+             fallback={effect_fallback_total} targets={targets_created} swap_used={swap_used}"
         );
     }
     material_ok
@@ -3369,7 +3518,7 @@ mod tests {
             ..Default::default()
         });
         base.effects = vec![single_previous_pass_effect()];
-        let plan = plan_effect_chain(&base);
+        let plan = plan_effect_chain(0, &base);
         let final_material = plan.final_material.expect("one untargeted pass");
         assert!(matches!(
             &final_material.texture_slots[0],
@@ -3387,7 +3536,7 @@ mod tests {
             ..Default::default()
         });
         base.effects = vec![single_previous_pass_effect()];
-        let plan = plan_effect_chain(&base);
+        let plan = plan_effect_chain(0, &base);
         let final_material = plan.final_material.expect("one untargeted pass");
         assert!(matches!(
             &final_material.texture_slots[0],
@@ -3398,7 +3547,7 @@ mod tests {
         let mut no_slots = layer("no-slots", None);
         no_slots.material = Some(scene::MaterialSpec::default());
         no_slots.effects = vec![single_previous_pass_effect()];
-        let plan2 = plan_effect_chain(&no_slots);
+        let plan2 = plan_effect_chain(0, &no_slots);
         let final_material2 = plan2.final_material.expect("one untargeted pass");
         assert!(matches!(
             &final_material2.texture_slots[0],
@@ -3473,6 +3622,154 @@ mod tests {
                 .as_ref()
                 .is_none_or(|m| texture_slots_are_bare_render_target_only(&m.texture_slots))
         );
+    }
+
+    #[test]
+    fn scoped_target_name_leaves_full_frame_buffer_global_and_scopes_everything_else() {
+        assert_eq!(
+            scoped_target_name(0, kwe_core::FULL_FRAME_BUFFER),
+            kwe_core::FULL_FRAME_BUFFER
+        );
+        assert_eq!(
+            scoped_target_name(7, kwe_core::FULL_FRAME_BUFFER),
+            kwe_core::FULL_FRAME_BUFFER
+        );
+        assert_eq!(scoped_target_name(0, "_rt_Foo"), "_rt_Foo#obj0");
+        assert_eq!(scoped_target_name(3, "_rt_Foo"), "_rt_Foo#obj3");
+        // Different objects declaring the SAME raw name never collide.
+        assert_ne!(
+            scoped_target_name(0, "_rt_Foo"),
+            scoped_target_name(1, "_rt_Foo")
+        );
+    }
+
+    #[test]
+    fn effect_pass_samples_its_own_target_detects_the_feedback_loop() {
+        let self_referencing = vec![
+            Some(scene::MaterialTextureSource::RenderTarget(
+                "_rt_Foo#obj0".into(),
+            )),
+            None,
+        ];
+        assert!(effect_pass_samples_its_own_target(
+            &self_referencing,
+            "_rt_Foo#obj0"
+        ));
+
+        let different_target = vec![Some(scene::MaterialTextureSource::RenderTarget(
+            "_rt_Bar#obj0".into(),
+        ))];
+        assert!(!effect_pass_samples_its_own_target(
+            &different_target,
+            "_rt_Foo#obj0"
+        ));
+
+        let real_texture = vec![Some(scene::MaterialTextureSource::Bytes(vec![1, 2, 3, 4]))];
+        assert!(!effect_pass_samples_its_own_target(
+            &real_texture,
+            "_rt_Foo#obj0"
+        ));
+    }
+
+    /// S3 review RECOMMENDED #5: two DIFFERENT objects (layer indices 0
+    /// and 1) each declare an effect with the SAME raw `fbos[]` name
+    /// (`_rt_Shared`) and a pass that binds it via `"previous"`. Their
+    /// resolved plans must end up with DIFFERENT scoped target/slot
+    /// names — the whole point of scoping being that these two objects'
+    /// FBOs can never alias.
+    #[test]
+    fn plan_effect_chain_scopes_fbo_names_so_different_objects_never_alias() {
+        fn shared_name_effect() -> kwe_core::ObjectEffect {
+            kwe_core::ObjectEffect {
+                id: 1,
+                name: "test".into(),
+                visible: true,
+                effect: kwe_core::EffectSpec {
+                    name: "test".into(),
+                    fbos: vec![kwe_core::FboSpec {
+                        name: "_rt_Shared".into(),
+                        format: "rgba8888".into(),
+                        scale: 1.0,
+                        unique: false,
+                    }],
+                    passes: vec![kwe_core::EffectPass::Material(
+                        kwe_core::EffectMaterialPass {
+                            material_ref: "materials/effects/test.json".into(),
+                            shader: Some("test".into()),
+                            blending: None,
+                            combos: serde_json::Map::new(),
+                            constant_shader_values: serde_json::Map::new(),
+                            texture_slots: vec![Some(kwe_core::EffectTextureSlot::Previous)],
+                            target: Some("_rt_Shared".into()),
+                        },
+                    )],
+                },
+            }
+        }
+
+        let mut layer_a = layer("a", None);
+        layer_a.effects = vec![shared_name_effect()];
+        let mut layer_b = layer("b", None);
+        layer_b.effects = vec![shared_name_effect()];
+
+        let plan_a = plan_effect_chain(0, &layer_a);
+        let plan_b = plan_effect_chain(1, &layer_b);
+        assert_eq!(plan_a.intermediate.len(), 1);
+        assert_eq!(plan_b.intermediate.len(), 1);
+        let target_a = &plan_a.intermediate[0].1;
+        let target_b = &plan_b.intermediate[0].1;
+        assert_ne!(
+            target_a, target_b,
+            "same raw fbo name, different objects, must not alias"
+        );
+        assert_eq!(target_a, "_rt_Shared#obj0");
+        assert_eq!(target_b, "_rt_Shared#obj1");
+    }
+
+    /// A pass that `bind`s its own declared `target` name (the feedback
+    /// loop MUST-FIX #3 guards against) survives `plan_effect_chain`'s
+    /// resolution — the scoped target name and the scoped `RenderTarget`
+    /// slot name it produces are IDENTICAL, exactly what
+    /// `effect_pass_samples_its_own_target` is meant to catch at the
+    /// `compile_material_layers` call site.
+    #[test]
+    fn plan_effect_chain_resolves_a_self_referencing_pass_to_a_detectable_shape() {
+        let object_effect = kwe_core::ObjectEffect {
+            id: 1,
+            name: "test".into(),
+            visible: true,
+            effect: kwe_core::EffectSpec {
+                name: "test".into(),
+                fbos: vec![kwe_core::FboSpec {
+                    name: "_rt_Foo".into(),
+                    format: "rgba8888".into(),
+                    scale: 1.0,
+                    unique: false,
+                }],
+                passes: vec![kwe_core::EffectPass::Material(
+                    kwe_core::EffectMaterialPass {
+                        material_ref: "materials/effects/test.json".into(),
+                        shader: Some("test".into()),
+                        blending: None,
+                        combos: serde_json::Map::new(),
+                        constant_shader_values: serde_json::Map::new(),
+                        texture_slots: vec![Some(kwe_core::EffectTextureSlot::RenderTarget(
+                            "_rt_Foo".into(),
+                        ))],
+                        target: Some("_rt_Foo".into()),
+                    },
+                )],
+            },
+        };
+        let mut self_ref = layer("self-ref", None);
+        self_ref.effects = vec![object_effect];
+        let plan = plan_effect_chain(0, &self_ref);
+        assert_eq!(plan.intermediate.len(), 1);
+        let (pass_material, target_name) = &plan.intermediate[0];
+        assert!(effect_pass_samples_its_own_target(
+            &pass_material.texture_slots,
+            target_name
+        ));
     }
 
     /// An image layer with every field at its default, `image` optional.
@@ -3614,6 +3911,16 @@ mod tests {
         out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
         out.extend_from_slice(&pixels);
         out
+    }
+
+    /// S3 review RECOMMENDED #4: pins the aggregate effect-asset budget
+    /// boundary without allocating anywhere near 256 MiB in a test.
+    #[test]
+    fn effect_asset_budget_allows_pins_the_boundary() {
+        assert!(effect_asset_budget_allows(0));
+        assert!(effect_asset_budget_allows(MAX_EFFECT_ASSET_READ_BYTES - 1));
+        assert!(!effect_asset_budget_allows(MAX_EFFECT_ASSET_READ_BYTES));
+        assert!(!effect_asset_budget_allows(MAX_EFFECT_ASSET_READ_BYTES + 1));
     }
 
     /// S1 end-to-end: a model layer whose model -> material -> texture

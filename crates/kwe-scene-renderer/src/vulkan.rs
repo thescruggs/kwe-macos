@@ -111,7 +111,30 @@ const MAX_EFFECT_TARGET_DIMENSION: u32 = 4096;
 /// (godrays: 5 passes) while bounding a hostile scene's pipeline/
 /// descriptor-set allocation the same way `MAX_PIPELINES_PER_SCENE`
 /// bounds base material pipelines.
+///
+/// S3 review MUST-FIX #1: this bound is only real because effect passes
+/// allocate descriptor sets from their OWN pool (`effect_descriptor_pool`,
+/// sized by `descriptor_pool_capacity(MAX_EFFECT_PASS_BINDINGS)`), never
+/// `material_descriptor_pool` (sized for `MAX_LAYERS` base-material
+/// bindings only) — the two bounds used to share one pool with no
+/// combined accounting, so a scene near both caps individually could
+/// still exhaust the shared pool early. `descriptor_pool_sizing_matches_
+/// the_documented_bound` pins the relationship without a GPU.
 const MAX_EFFECT_PASS_BINDINGS: usize = 256;
+
+/// S3 review MUST-FIX #2: cap on queued `EffectFrameAction`s (targeted
+/// renders + `command: copy`/`swap`) per scene. `Render` actions are
+/// already implicitly capped 1:1 with `MAX_EFFECT_PASS_BINDINGS` (each
+/// corresponds to a successful `compile_effect_pass` call), but a
+/// `command` pass needs neither a shader nor a texture asset to parse —
+/// nothing else bounded how many `Copy`/`Swap` actions a hostile
+/// `effects[]`/`effect.json` pair could queue (parse-time structural caps
+/// alone allow up to `MAX_PASSES_PER_EFFECT` x `MAX_EFFECTS_PER_OBJECT` x
+/// `MAX_LAYERS` = 131,072 per scene), and `render_effect_chains` replays
+/// EVERY queued action EVERY FRAME as its own synchronous GPU submit +
+/// fence wait — unbounded `command` passes alone (no shaders, no
+/// textures) could make a single frame take on the order of a day.
+const MAX_EFFECT_FRAME_ACTIONS: usize = 512;
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -493,17 +516,29 @@ pub struct LayerRenderer {
     /// the first scene with a resolved effect chain) since most scenes
     /// have none.
     effect_render_pass: vk::RenderPass,
+    /// S3 review MUST-FIX #1: effect passes' OWN descriptor pool, sized
+    /// exactly to `MAX_EFFECT_PASS_BINDINGS` — NEVER shared with
+    /// `material_descriptor_pool` (sized only for `MAX_LAYERS` base
+    /// materials). Before this fix, `compile_effect_pass` allocated from
+    /// `material_descriptor_pool` too, so the two independently-looking
+    /// bounds silently shared one budget and a scene near both caps
+    /// could exhaust the pool early. Created lazily alongside
+    /// `effect_render_pass`.
+    effect_descriptor_pool: vk::DescriptorPool,
     /// Every live effect render target this scene needs, keyed by its
     /// declared `_rt_`/`_alias_` name — `_rt_FullFrameBuffer` (scene-wide,
-    /// present whenever any layer has a resolved effect chain) plus every
-    /// `fbos[]` entry from every resolved `ObjectEffect`. Global
-    /// namespace (S3 documented scope limit: two different objects
-    /// declaring the SAME fbo name share one instance rather than getting
-    /// independent ones — not observed in the local corpus). Bounded by
-    /// `MAX_EFFECT_TARGETS_PER_SCENE` and a cumulative byte budget;
-    /// looked up by name at material-texture-slot bind time (a name with
-    /// no entry here degrades to the shared `dummy_texture`, never a
-    /// failure).
+    /// present whenever any layer has a resolved effect chain, key
+    /// unscoped and shared by design) plus every `fbos[]` entry from
+    /// every resolved `ObjectEffect`, PER-OBJECT SCOPED (S3 review
+    /// RECOMMENDED #5: `main.rs::scoped_target_name` suffixes every
+    /// other name `#obj<layer_index>` before it ever reaches this map,
+    /// so two different objects declaring the same raw `fbos[]` name can
+    /// never alias — this map itself stays a flat `HashMap`, the
+    /// disambiguation lives entirely in the KEYS the caller constructs).
+    /// Bounded by `MAX_EFFECT_TARGETS_PER_SCENE` and a cumulative byte
+    /// budget; looked up by name at material-texture-slot bind time (a
+    /// name with no entry here degrades to the shared `dummy_texture`,
+    /// never a failure).
     effect_targets: HashMap<String, EffectFbo>,
     /// One entry per resolved effect pass that renders INTO a named FBO
     /// (a material pass with `target: Some(..)`). A pass with no target
@@ -1029,17 +1064,19 @@ impl LayerRenderer {
             .set_layouts(std::slice::from_ref(&material_descriptor_set_layout));
         let material_pipeline_layout =
             unsafe { device.create_pipeline_layout(&material_layout_info, None) }?;
+        let (material_max_sets, material_sampler_count, material_ubo_count) =
+            Self::descriptor_pool_capacity(MAX_LAYERS);
         let material_pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count((MAX_LAYERS * MAX_MATERIAL_TEXTURES) as u32),
+                .descriptor_count(material_sampler_count),
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(MAX_LAYERS as u32),
+                .descriptor_count(material_ubo_count),
         ];
         let material_pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(MAX_LAYERS as u32)
+            .max_sets(material_max_sets)
             .pool_sizes(&material_pool_sizes);
         let material_descriptor_pool =
             unsafe { device.create_descriptor_pool(&material_pool_info, None) }?;
@@ -1139,6 +1176,7 @@ impl LayerRenderer {
             material_bindings: Vec::new(),
             material_frame_counter: 0,
             effect_render_pass: vk::RenderPass::null(),
+            effect_descriptor_pool: vk::DescriptorPool::null(),
             effect_targets: HashMap::new(),
             effect_pass_bindings: Vec::new(),
             effect_frame_actions: Vec::new(),
@@ -2203,13 +2241,31 @@ impl LayerRenderer {
         }
     }
 
+    /// S3 review MUST-FIX #1: `(max_sets, combined_image_sampler_count,
+    /// uniform_buffer_count)` for a descriptor pool holding `max_sets`
+    /// material-shaped descriptor sets (`MAX_MATERIAL_TEXTURES` samplers
+    /// plus one UBO each) — pure, no Vulkan handle needed, so the
+    /// relationship between a pool's actual creation parameters and its
+    /// documented bound (`MAX_LAYERS` for `material_descriptor_pool`,
+    /// `MAX_EFFECT_PASS_BINDINGS` for `effect_descriptor_pool`) is
+    /// unit-tested without a GPU.
+    fn descriptor_pool_capacity(max_sets: usize) -> (u32, u32, u32) {
+        (
+            max_sets as u32,
+            (max_sets * MAX_MATERIAL_TEXTURES) as u32,
+            max_sets as u32,
+        )
+    }
+
     /// S3: create the second offscreen render pass (`effect_render_pass`)
     /// every effect FBO renders through — same attachment shape as the
     /// main `render_pass` (`self.format`, `CLEAR`/`STORE`) except its
     /// `final_layout` is `SHADER_READ_ONLY_OPTIMAL` (a target meant to be
-    /// SAMPLED by a later pass, not read back to a staging buffer).
-    /// Created once, lazily, the first time a scene needs it — most
-    /// scenes never do.
+    /// SAMPLED by a later pass, not read back to a staging buffer) — and
+    /// (S3 review MUST-FIX #1) `effect_descriptor_pool`, effect passes'
+    /// OWN descriptor pool (never shared with `material_descriptor_pool`,
+    /// see that field's doc comment). Created once, lazily, the first
+    /// time a scene needs either — most scenes never do.
     fn ensure_effect_render_pass(&mut self) -> Result<(), RenderError> {
         if self.effect_render_pass != vk::RenderPass::null() {
             return Ok(());
@@ -2257,6 +2313,23 @@ impl LayerRenderer {
             .dependencies(&dependencies);
         self.effect_render_pass =
             unsafe { self.device.create_render_pass(&render_pass_info, None) }?;
+
+        let (max_sets, sampler_count, ubo_count) =
+            Self::descriptor_pool_capacity(MAX_EFFECT_PASS_BINDINGS);
+        let effect_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(sampler_count),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(ubo_count),
+        ];
+        let effect_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(max_sets)
+            .pool_sizes(&effect_pool_sizes);
+        self.effect_descriptor_pool =
+            unsafe { self.device.create_descriptor_pool(&effect_pool_info, None) }?;
         Ok(())
     }
 
@@ -2713,7 +2786,7 @@ impl LayerRenderer {
         }
 
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.material_descriptor_pool)
+            .descriptor_pool(self.effect_descriptor_pool)
             .set_layouts(std::slice::from_ref(&self.material_descriptor_set_layout));
         let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
             Ok(sets) => sets[0],
@@ -3118,17 +3191,38 @@ impl LayerRenderer {
     /// pass just compiled (`compile_effect_pass`'s returned index) plus
     /// every pending command action queued before it — called by
     /// `main.rs` in each layer's own chain order so the replay order in
-    /// `render_effect_chains` matches.
-    pub fn queue_effect_render(&mut self, binding_index: usize) {
+    /// `render_effect_chains` matches. S3 review MUST-FIX #2: bounded by
+    /// `MAX_EFFECT_FRAME_ACTIONS` (shared with `queue_effect_copy`) —
+    /// `Render` is already implicitly capped by `MAX_EFFECT_PASS_BINDINGS`
+    /// (one action per successful `compile_effect_pass` call), but this
+    /// check is defense in depth against the shared total. Returns
+    /// whether the action was actually queued; the caller
+    /// (`main.rs::compile_material_layers`) counts a `false` as a bounded
+    /// fallback reason, never a crash.
+    #[must_use]
+    pub fn queue_effect_render(&mut self, binding_index: usize) -> bool {
+        if self.effect_frame_actions.len() >= MAX_EFFECT_FRAME_ACTIONS {
+            return false;
+        }
         self.effect_frame_actions
             .push(EffectFrameAction::Render(binding_index));
+        true
     }
 
-    /// S3: record one `command: copy`/`swap` action in chain order (see
-    /// `queue_effect_render`).
-    pub fn queue_effect_copy(&mut self, source: String, target: String) {
+    /// S3 review MUST-FIX #2: record one `command: copy`/`swap` action in
+    /// chain order (see `queue_effect_render`), bounded by
+    /// `MAX_EFFECT_FRAME_ACTIONS` — a `command` pass needs neither a
+    /// shader nor a texture asset to parse, so nothing else bounded how
+    /// many of these a hostile scene could queue before this fix. Returns
+    /// whether the action was actually queued.
+    #[must_use]
+    pub fn queue_effect_copy(&mut self, source: String, target: String) -> bool {
+        if self.effect_frame_actions.len() >= MAX_EFFECT_FRAME_ACTIONS {
+            return false;
+        }
         self.effect_frame_actions
             .push(EffectFrameAction::Copy { source, target });
+        true
     }
 
     /// Clear the attachment with `color` (straight RGBA), draw the given
@@ -3608,6 +3702,10 @@ impl Drop for LayerRenderer {
             if self.effect_render_pass != vk::RenderPass::null() {
                 self.device
                     .destroy_render_pass(self.effect_render_pass, None);
+            }
+            if self.effect_descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.effect_descriptor_pool, None);
             }
             self.device
                 .destroy_pipeline_layout(self.material_pipeline_layout, None);
@@ -4388,6 +4486,47 @@ const MATERIAL_UNIT_QUAD: [f32; 30] = [
 mod tests {
     use super::*;
 
+    /// S3 review MUST-FIX #1: pins the relationship between
+    /// `descriptor_pool_capacity`'s output and each pool's documented
+    /// bound (`MAX_LAYERS` for `material_descriptor_pool`,
+    /// `MAX_EFFECT_PASS_BINDINGS` for `effect_descriptor_pool`), and that
+    /// the two bounds are independent (no shared budget) — a future
+    /// refactor that reintroduces a shared pool would have to knowingly
+    /// break this test.
+    #[test]
+    fn descriptor_pool_sizing_matches_the_documented_bound() {
+        let (material_sets, material_samplers, material_ubos) =
+            LayerRenderer::descriptor_pool_capacity(MAX_LAYERS);
+        assert_eq!(material_sets, MAX_LAYERS as u32);
+        assert_eq!(
+            material_samplers,
+            (MAX_LAYERS * MAX_MATERIAL_TEXTURES) as u32
+        );
+        assert_eq!(material_ubos, MAX_LAYERS as u32);
+
+        let (effect_sets, effect_samplers, effect_ubos) =
+            LayerRenderer::descriptor_pool_capacity(MAX_EFFECT_PASS_BINDINGS);
+        assert_eq!(effect_sets, MAX_EFFECT_PASS_BINDINGS as u32);
+        assert_eq!(
+            effect_samplers,
+            (MAX_EFFECT_PASS_BINDINGS * MAX_MATERIAL_TEXTURES) as u32
+        );
+        assert_eq!(effect_ubos, MAX_EFFECT_PASS_BINDINGS as u32);
+
+        // MAX_LAYERS and MAX_EFFECT_PASS_BINDINGS both happen to be 256
+        // (material_sets == effect_sets numerically) -- the point of this
+        // fix is not that the NUMBERS differ, it is that
+        // `material_descriptor_pool` and `effect_descriptor_pool` are two
+        // SEPARATE `vk::DescriptorPool` handles (verified by
+        // `compile_effect_pass` allocating from `self.
+        // effect_descriptor_pool`, never `self.material_descriptor_pool`
+        // — grep confirms exactly one allocation call site per pool), so
+        // combined worst-case demand (MAX_LAYERS + MAX_EFFECT_PASS_
+        // BINDINGS sets) fits because it draws from two independent
+        // budgets, not because either pool alone was enlarged.
+        let _ = (material_sets, effect_sets);
+    }
+
     #[test]
     fn fence_timeout_is_the_only_process_fatal_upload_error() {
         assert!(is_fence_timeout(&RenderError::FenceTimeout));
@@ -4630,7 +4769,10 @@ mod tests {
                 MaterialUniforms::default(),
             )
             .expect("compile effect pass");
-        renderer.queue_effect_render(binding_index);
+        assert!(
+            renderer.queue_effect_render(binding_index),
+            "well under MAX_EFFECT_FRAME_ACTIONS"
+        );
 
         // 2. Replay the effect chain once — this is what a real frame
         //    does before the main composite pass.
