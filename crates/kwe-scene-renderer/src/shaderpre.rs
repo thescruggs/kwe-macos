@@ -1111,7 +1111,10 @@ const MAX_IF_EXPR_TOKENS: usize = 256;
 /// name in the SAME upper-cased form to ever really match — folding case
 /// on the identifier side here (as an earlier version of this function
 /// did) would accept e.g. `#if skinning` as if it were `#if SKINNING`,
-/// which `shaderc` would not. Supports `||`, `&&`, `==`, `!=`, unary `!`,
+/// which `shaderc` would not. Supports `||`, `&&`, `==`, `!=`, the S7
+/// relational operators `<`/`<=`/`>`/`>=` (precedence between `==`/`!=`
+/// and unary `!`; needed for conditions like `NUMBLENDTEXTURES >= 2`,
+/// `effects/blend`'s standard day/night blend guard), unary `!`,
 /// parentheses, decimal integer literals, bare identifiers (truthy iff
 /// nonzero — an unknown identifier is `0`, matching the real GLSL
 /// preprocessor's "undefined macro in `#if` is 0" rule, already relied
@@ -1132,6 +1135,16 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
         Or,
         Eq,
         Ne,
+        // S7 (P3): relational operators, precedence between `==`/`!=` and
+        // unary `!`/`defined`/primary (standard C precedence) — added for
+        // conditions like `NUMBLENDTEXTURES >= 2` (effects/blend, the
+        // standard day/night blend effect), which this parser previously
+        // could not consume at all, forcing every caller into
+        // `AmbiguousCondition`.
+        Lt,
+        Le,
+        Gt,
+        Ge,
         Not,
         LParen,
         RParen,
@@ -1176,6 +1189,24 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
                 }
                 '!' => {
                     tokens.push(Token::Not);
+                    i += 1;
+                }
+                // S7 (P3): two-char forms checked before the one-char form,
+                // same pattern as `==`/`!=` above.
+                '<' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(Token::Le);
+                    i += 2;
+                }
+                '<' => {
+                    tokens.push(Token::Lt);
+                    i += 1;
+                }
+                '>' if bytes.get(i + 1) == Some(&b'=') => {
+                    tokens.push(Token::Ge);
+                    i += 2;
+                }
+                '>' => {
+                    tokens.push(Token::Gt);
                     i += 1;
                 }
                 _ if c.is_ascii_digit() => {
@@ -1254,18 +1285,51 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
             Some(lhs)
         }
         fn eq_expr(&mut self) -> Option<i64> {
-            let mut lhs = self.unary_expr()?;
+            let mut lhs = self.rel_expr()?;
             loop {
                 match self.peek() {
                     Some(Token::Eq) => {
                         self.pos += 1;
-                        let rhs = self.unary_expr()?;
+                        let rhs = self.rel_expr()?;
                         lhs = i64::from(lhs == rhs);
                     }
                     Some(Token::Ne) => {
                         self.pos += 1;
-                        let rhs = self.unary_expr()?;
+                        let rhs = self.rel_expr()?;
                         lhs = i64::from(lhs != rhs);
+                    }
+                    _ => break,
+                }
+            }
+            Some(lhs)
+        }
+        // S7 (P3): `<`/`<=`/`>`/`>=`, binding tighter than `==`/`!=` and
+        // looser than unary `!`/`defined`/primary — standard C precedence.
+        // Yields 1/0 (i64) like `==`/`!=` do; no arithmetic needed since
+        // every operand this grammar can produce is already an i64.
+        fn rel_expr(&mut self) -> Option<i64> {
+            let mut lhs = self.unary_expr()?;
+            loop {
+                match self.peek() {
+                    Some(Token::Lt) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs < rhs);
+                    }
+                    Some(Token::Le) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs <= rhs);
+                    }
+                    Some(Token::Gt) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs > rhs);
+                    }
+                    Some(Token::Ge) => {
+                        self.pos += 1;
+                        let rhs = self.unary_expr()?;
+                        lhs = i64::from(lhs >= rhs);
                     }
                     _ => break,
                 }
@@ -2747,6 +2811,51 @@ mod tests {
         assert_eq!(evaluate_if_expr(&nested, &BTreeMap::new()), None);
         let not_chain = format!("{}1", "!".repeat(10_000));
         assert_eq!(evaluate_if_expr(&not_chain, &BTreeMap::new()), None);
+    }
+
+    /// S7 (P3): `NUMBLENDTEXTURES >= 2` — before this, `evaluate_if_expr`
+    /// returned `None` for ANY relational operator (no tokens for
+    /// `<`/`<=`/`>`/`>=` existed), so `#if NUMBLENDTEXTURES >= 2`
+    /// (`effects/blend`, the standard day/night blend effect; 9 passes in
+    /// the Avatar report alone) always rejected the whole material via
+    /// `AmbiguousCondition`. An undefined identifier is 0, matching the
+    /// real GLSL preprocessor's rule (same as the equality tests above).
+    #[test]
+    fn relational_operators_evaluate_numblendtextures_guard() {
+        let mut combos = BTreeMap::new();
+        combos.insert("NUMBLENDTEXTURES".to_string(), 1);
+        assert_eq!(
+            evaluate_if_expr("NUMBLENDTEXTURES >= 2", &combos),
+            Some(false)
+        );
+        combos.insert("NUMBLENDTEXTURES".to_string(), 2);
+        assert_eq!(
+            evaluate_if_expr("NUMBLENDTEXTURES >= 2", &combos),
+            Some(true)
+        );
+        assert_eq!(
+            evaluate_if_expr("NUMBLENDTEXTURES >= 2", &BTreeMap::new()),
+            Some(false)
+        );
+    }
+
+    /// S7 (P3): the rest of the relational set, plus precedence: `<`/`<=`/
+    /// `>`/`>=` bind tighter than `==`/`!=` and looser than `!`/`defined`/
+    /// primary, matching standard C.
+    #[test]
+    fn relational_operators_full_set_and_precedence() {
+        let mut combos = BTreeMap::new();
+        combos.insert("A".to_string(), 2);
+        combos.insert("B".to_string(), 3);
+        // `A < 3 && B` -> (2 < 3) && (3 != 0) -> true && true.
+        assert_eq!(evaluate_if_expr("A < 3 && B", &combos), Some(true));
+        assert_eq!(evaluate_if_expr("A <= 2", &combos), Some(true));
+        assert_eq!(evaluate_if_expr("A > 2", &combos), Some(false));
+        assert_eq!(evaluate_if_expr("B >= 3", &combos), Some(true));
+        // `!(A >= 1)` -> !(2 >= 1) -> !true -> false.
+        assert_eq!(evaluate_if_expr("!(A >= 1)", &combos), Some(false));
+        // `A == 1 || B > 2` -> (2 == 1) || (3 > 2) -> false || true.
+        assert_eq!(evaluate_if_expr("A == 1 || B > 2", &combos), Some(true));
     }
 
     /// S4a review RECOMMENDED #4: `#if`/`#ifdef` combo-name matching is
