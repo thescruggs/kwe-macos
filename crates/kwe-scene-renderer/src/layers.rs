@@ -328,6 +328,13 @@ pub struct LayerDraw {
     pub tint: [f32; 4],
     /// What to draw: image (unit quad) or text (per-layer vertex buffer).
     pub kind: DrawKind,
+    /// S2: draw through the layer's compiled material pipeline
+    /// (vulkan.rs's `material_bindings[layer_index]`) instead of the S1
+    /// base-texture quad. Set only for `DrawKind::Image` layers whose
+    /// material shader preprocessed, compiled, and bound successfully;
+    /// text and particle draws are always `false` (materials are S2 scope
+    /// for model/image layers only).
+    pub material: bool,
 }
 
 /// The model transform for one 2D layer: R(θ)·S(scale)·diag(size), about
@@ -348,7 +355,18 @@ pub fn layer_model(
 /// layers, layers whose texture failed to load (texture_ok), and text
 /// layers with no vertex data yet (empty text, missing font, or not yet
 /// synced). Pure — unit-tested; the worker calls it once per render.
-pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> Vec<LayerDraw> {
+/// `material_ok` is index-aligned with `layers` like `texture_ok`: `true`
+/// for a layer whose material shader preprocessed, compiled, and bound a
+/// pipeline successfully (vulkan.rs `bind_material_layer`) — S2. Only
+/// `DrawKind::Image` layers can be `true` here in practice (text/particle
+/// layers never attempt material compilation); the check still applies
+/// uniformly since a `false`/out-of-range entry is the common case (an
+/// empty slice works for every caller that has no materials at all).
+pub fn frame_draws(
+    layers: &[Rc<RefCell<LayerState>>],
+    texture_ok: &[bool],
+    material_ok: &[bool],
+) -> Vec<LayerDraw> {
     layers
         .iter()
         .enumerate()
@@ -369,6 +387,7 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
                 Some(_) => return None,
                 None => (DrawKind::Image, state.tint),
             };
+            let material = kind == DrawKind::Image && material_ok.get(layer_index) == Some(&true);
             let (m, t) = layer_model(state.angles[2], state.scale, state.size, state.origin);
             Some(LayerDraw {
                 layer_index,
@@ -380,6 +399,7 @@ pub fn frame_draws(layers: &[Rc<RefCell<LayerState>>], texture_ok: &[bool]) -> V
                 brightness: state.brightness,
                 tint,
                 kind,
+                material,
             })
         })
         .collect()
@@ -598,12 +618,12 @@ mod tests {
             state("broken", true),
         ];
         let texture_ok = [true, true, false];
-        let draws = frame_draws(&layers, &texture_ok);
+        let draws = frame_draws(&layers, &texture_ok, &[]);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].layer_index, 0);
         // Order is scene.json order when several layers draw.
         let layers = vec![state("hidden", false), state("a", true), state("b", true)];
-        let draws = frame_draws(&layers, &[true, true, true]);
+        let draws = frame_draws(&layers, &[true, true, true], &[]);
         assert_eq!(
             draws
                 .iter()
@@ -628,7 +648,7 @@ mod tests {
             state.brightness = 2.0;
             state.tint = [0.5, 1.0, 0.25, 0.75];
         }
-        let draws = frame_draws(&[layer], &[true]);
+        let draws = frame_draws(&[layer], &[true], &[]);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].alpha, 0.25);
         assert_eq!(draws[0].t, [40.0, 8.0]);
@@ -665,6 +685,7 @@ mod tests {
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
             kind: DrawKind::Image,
+            material: false,
         };
         let particle = |scene_order| LayerDraw {
             layer_index: MAX_LAYERS + scene_order,
@@ -676,6 +697,7 @@ mod tests {
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
             kind: DrawKind::Particles { vertex_count: 6 },
+            material: false,
         };
         // File: [particle @0, image @1, particle @2, image @3] — an
         // invisible layer @4 and an untextured system @5 are absent from
@@ -713,7 +735,7 @@ mod tests {
             state.angles[2] = 90.0;
             state.alpha = 0.5;
         }
-        let draws = frame_draws(&[layer], &[true]);
+        let draws = frame_draws(&[layer], &[true], &[]);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].kind, DrawKind::Text { vertex_count: 12 });
         // The text color drives the tint slot (not the layer's tint).
@@ -737,7 +759,7 @@ mod tests {
             state("img", true),
             text_state("t1", "later", [1.0, 1.0, 1.0, 1.0], 0),
         ];
-        let draws = frame_draws(&layers, &[true, true, true]);
+        let draws = frame_draws(&layers, &[true, true, true], &[]);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].layer_index, 1);
         assert_eq!(draws[0].kind, DrawKind::Image);
@@ -773,6 +795,7 @@ mod tests {
             texture: None,
             text: Some(spec),
             video: None,
+            material: None,
         });
         assert_eq!(layer.size, [1.0, 1.0]);
         let text = layer.text.as_ref().unwrap();

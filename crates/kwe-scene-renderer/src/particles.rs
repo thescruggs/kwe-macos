@@ -503,6 +503,7 @@ pub fn particle_draws(
             kind: DrawKind::Particles {
                 vertex_count: system.vertex_count,
             },
+            material: false,
         });
     }
     draws

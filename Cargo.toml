@@ -36,4 +36,12 @@ rquickjs = "0.12.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+# S2: GLSL -> SPIR-V for the material-shader pipeline. Default features
+# (no "build-from-source") link the SYSTEM libshaderc via pkg-config
+# (verified against /usr/lib/pkgconfig/shaderc.pc, libshaderc_shared.so.1
+# on this host) instead of vendoring/building glslang+shaderc from source.
+# Packaging must add `shaderc` (runtime) and `shaderc` (pkg-config .pc +
+# headers live in the same package on Arch) as a build dependency; see
+# packaging/PKGBUILD.
+shaderc = "0.10.1"
 thiserror = "2.0"

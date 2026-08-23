@@ -36,8 +36,10 @@
 
 mod js;
 mod layers;
+mod materialshader;
 mod particles;
 mod scene;
+mod shaderpre;
 mod text;
 mod textures;
 mod texv;
@@ -420,6 +422,13 @@ struct SceneWorker {
     /// Per layer: whether its texture uploaded (or it has no image at all —
     /// a model/particle object). frame_draws skips false entries.
     texture_ok: Vec<bool>,
+    /// S2: per layer, whether its material shader preprocessed, compiled,
+    /// and bound a pipeline (vulkan.rs `bind_material_layer`) — draws
+    /// through the material pipeline instead of the S1 base-texture quad.
+    /// Index-aligned with `layers`/`texture_ok`; always `false` for a
+    /// layer with no model reference, and for any material that fell
+    /// back (see `compile_material_layers`).
+    material_ok: Vec<bool>,
     /// M3f: the script-visible particle-system states, index-aligned with
     /// the scene's `objects` array (particle entries) and with
     /// `particle_texture_ok`. Simulated every frame (particles.rs) with
@@ -506,7 +515,7 @@ impl SceneWorker {
         // image interleave exactly as the file says (an image listed after
         // a particle system draws on top of it).
         let draws = merged_draws(
-            frame_draws(&self.layers, &self.texture_ok),
+            frame_draws(&self.layers, &self.texture_ok, &self.material_ok),
             particle_draws(&self.particles, &self.particle_texture_ok),
         );
         let initial = match self.renderer.render(self.engine.clear_color(), &draws) {
@@ -568,7 +577,7 @@ impl SceneWorker {
                     self.sync_particles(dt);
                     self.sync_videos();
                     let draws = merged_draws(
-                        frame_draws(&self.layers, &self.texture_ok),
+                        frame_draws(&self.layers, &self.texture_ok, &self.material_ok),
                         particle_draws(&self.particles, &self.particle_texture_ok),
                     );
                     match self.renderer.render(color, &draws) {
@@ -915,6 +924,19 @@ fn main() -> Result<()> {
     let mut texture_ok = upload_layer_textures(&mut renderer, &config.layers, &layers);
     upload_video_first_frames(&mut renderer, &config.layers, &mut videos, &mut texture_ok);
 
+    // 5a. S2: for every model layer with resolved material data, attempt
+    //     to preprocess + compile + bind its material shader; on any
+    //     failure the layer keeps drawing through the S1 base-texture
+    //     quad above (texture_ok already covers it) — this step only ever
+    //     ADDS the material pipeline on top, never removes drawability.
+    let material_ok = compile_material_layers(
+        &mut config.layers,
+        &mut renderer,
+        world_w,
+        world_h,
+        arguments.assets_dir.as_deref(),
+    );
+
     // 5b. M3f: particle-system textures (slot MAX_LAYERS + system_index).
     let particles = engine.particles();
     let particle_texture_ok =
@@ -986,6 +1008,7 @@ fn main() -> Result<()> {
         text,
         layers,
         texture_ok,
+        material_ok,
         particles,
         particle_texture_ok,
         videos,
@@ -1414,12 +1437,429 @@ fn load_model_textures(
             layer.size = [texture.width as f32, texture.height as f32];
         }
         layer.texture = Some(texture);
+        // S2: keep the material data `resolve_model` already walked so
+        // `compile_material_layers` (run after every layer's base texture
+        // is known) can attempt a material-pipeline draw without
+        // re-parsing model.json/material.json. `constant_shader_values`
+        // keeps serde_json's insertion order (not sorted) so
+        // `shaderpre`'s slot assignment is deterministic per-material
+        // without this module needing to know the ordering rule.
+        layer.material = Some(scene::MaterialSpec {
+            shader: resolved_model.shader.clone(),
+            blending: resolved_model.blending.clone(),
+            combos: resolved_model
+                .combos
+                .iter()
+                .filter_map(|(name, value)| Some((name.clone(), value.as_i64()?)))
+                .collect(),
+            constant_shader_values: resolved_model
+                .constant_shader_values
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+            texture_slots: resolved_model
+                .texture_slots
+                .iter()
+                .map(|slot| slot.as_ref().map(|slot| slot.bytes.clone()))
+                .collect(),
+        });
         resolved += 1;
     }
     if skipped > 0 {
         eprintln!("event=renderer.scene.model_texture_skip count={skipped}");
     }
     resolved
+}
+
+/// Cap on one shader source file (`.vert`/`.frag`/`.h` include), read
+/// through `kwe_core::confined_read`. Generous over any real
+/// corpus shader (the largest is under 32 KiB) while bounding a crafted
+/// assets tree; matches `materialshader::MAX_SHADER_TEXT_BYTES`, the
+/// separate cap on the fully PREPROCESSED text `shaderc` receives.
+const MAX_SHADER_SOURCE_BYTES: u64 = 256 * 1024;
+
+/// The `AssetLocator::shader` resolution rule (`AssetLocator.cpp:9-35`):
+/// a `workshop/<id>/<file>` reference tries the compat redirect
+/// `zcompat/scene/shaders/<id>/<file>` first, falling back to the plain
+/// `shaders/<reference>` path either way `reference` did not start with
+/// `workshop/`, or the redirect did not resolve. `reference` already
+/// carries its extension (`.vert`/`.frag` for a shader, `.h` as `#include`
+/// names already do).
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Assets/AssetLocator.cpp:9-35 (`AssetLocator::shader`)
+/// @ b016d7d1 — adapted (confined_read against the assets root replaces
+/// the upstream virtual filesystem's `readString`).
+fn resolve_shader_reference(assets_root: &Path, reference: &str) -> Option<Vec<u8>> {
+    let path = Path::new(reference);
+    if let Ok(stripped) = path.strip_prefix("workshop") {
+        let mut components = stripped.components();
+        if let Some(id) = components.next() {
+            let rest: PathBuf = components.collect();
+            if let (Some(id), Some(rest)) = (id.as_os_str().to_str(), rest.to_str()) {
+                let redirect = format!("zcompat/scene/shaders/{id}/{rest}");
+                if let Some(bytes) =
+                    kwe_core::confined_read(assets_root, &redirect, MAX_SHADER_SOURCE_BYTES)
+                {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    kwe_core::confined_read(
+        assets_root,
+        &format!("shaders/{reference}"),
+        MAX_SHADER_SOURCE_BYTES,
+    )
+}
+
+/// Read one shader stage's top-level source (`shaders/<shader_name>.vert`
+/// or `.frag`, through the workshop redirect above) as UTF-8. `None` on
+/// any read/decode failure — the caller treats it as one more material
+/// fallback reason.
+fn read_shader_stage(assets_root: &Path, shader_name: &str, extension: &str) -> Option<String> {
+    let mut path = PathBuf::from(shader_name);
+    path.set_extension(extension);
+    let reference = path.to_str()?;
+    let bytes = resolve_shader_reference(assets_root, reference)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// S2 scope: the material pipeline draws exactly one vertex format — a
+/// quad with `a_Position` (vec2 or vec3, z implicitly 0) then `a_TexCoord`
+/// (vec2), the attribute list every `genericimage*`-family vertex shader
+/// declares with default combos (mesh/puppet geometry, which needs more
+/// attributes — bone indices/weights, tangents, per-vertex color — stays
+/// out this slice). Anything else falls back to the S1 quad.
+///
+/// Checks only the first two declared attributes, not the full count:
+/// `shaderpre::preprocess` scrapes `attribute` lines by simple textual
+/// scan, with no `#if`/`#ifdef` evaluation (that happens later, inside
+/// `shaderc`'s real GLSL preprocessor, once this text reaches
+/// `compile_stage`) — a shader like `genericimage2.vert`, whose
+/// `SKINNING`-gated `a_BlendIndices`/`a_BlendWeights` never actually
+/// reach the compiled SPIR-V because `SKINNING` is never `#define`d
+/// (undefined macros in `#if` evaluate to 0, verified against `glslc`),
+/// would otherwise show 4 scraped attributes and always fall back — for
+/// the corpus's most common material shader, that would defeat this
+/// slice's point. A rare shader whose extra attributes ARE genuinely
+/// live (its gating combo defaults on) still degrades safely: pipeline
+/// creation validates the vertex shader's actual input interface against
+/// `MATERIAL_UNIT_QUAD`'s fixed 2-attribute layout and fails cleanly if
+/// they do not match, which the caller already treats as one more
+/// fallback reason (`pipeline_creation_failed`) — never a crash.
+fn material_vertex_format_supported(attributes: &[shaderpre::AttributeDecl]) -> bool {
+    attributes.len() >= 2
+        && matches!(attributes[0].glsl_type.as_str(), "vec2" | "vec3")
+        && attributes[0].name == "a_Position"
+        && attributes[1].glsl_type == "vec2"
+        && attributes[1].name == "a_TexCoord"
+}
+
+/// `blending` (`normal`/`translucent`/`additive` in the corpus) onto the
+/// existing implemented `BlendMode` set: `additive` maps to `Add`;
+/// everything else (including `normal`, which some WE materials use to
+/// mean "no extra blending beyond the standard alpha composite" rather
+/// than literally opaque) maps to `Normal` — the same alpha-blended
+/// src-over every other layer already renders with, since the material
+/// pipeline draws through the identical blend-attachment table
+/// (`blend_attachment_for`) the S1 quad pipeline uses.
+fn material_blend_mode(blending: Option<&str>) -> layers::BlendMode {
+    match blending {
+        Some("additive") => layers::BlendMode::Add,
+        _ => layers::BlendMode::Normal,
+    }
+}
+
+/// Lenient parse of a `constantshadervalues` entry into up to 4 float
+/// components — a WE vector field can be a JSON number, a space-separated
+/// string (`"1 0.5 0"`), or a JSON array; components beyond 4 are dropped,
+/// missing components stay 0.0. `None` only when the value's shape is
+/// unrecognized (an object, a bool, unparseable tokens) — the caller
+/// leaves that constant at its shader-side zero default rather than
+/// failing the whole material.
+fn parse_constant_components(value: &serde_json::Value) -> Option<[f32; 4]> {
+    let mut out = [0.0f32; 4];
+    if let Some(text) = value.as_str() {
+        for (slot, token) in out.iter_mut().zip(text.split_whitespace()) {
+            *slot = token.parse::<f32>().ok()?;
+        }
+        Some(out)
+    } else if let Some(number) = value.as_f64() {
+        out[0] = number as f32;
+        Some(out)
+    } else if let Some(array) = value.as_array() {
+        for (slot, entry) in out.iter_mut().zip(array.iter()) {
+            *slot = entry.as_f64()? as f32;
+        }
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// S2: for every model layer with resolved material data (`load_model_
+/// textures` already populated `layer.material`), attempt to preprocess,
+/// compile, and bind its material shader pass. This step only ever ADDS
+/// the material-pipeline draw on top of the S1 base-texture quad — a
+/// layer whose material falls back for any reason keeps drawing through
+/// `texture_ok`/the base texture exactly as S1 left it; nothing here can
+/// make a previously-drawable layer stop drawing.
+///
+/// Bounded: `materialshader::MAX_PIPELINES_PER_SCENE` distinct pipelines
+/// per scene (two model layers with the same shader/combos/blend share
+/// one pipeline and do not count twice — the cap is checked against
+/// compiled pipelines, not attempts); every shader-text/include read goes
+/// through `resolve_shader_reference`'s `confined_read` cap; every
+/// preprocess call is bounded by `shaderpre`'s own include-depth/size
+/// caps; every compile is bounded by `materialshader::MAX_SHADER_TEXT_
+/// BYTES`.
+///
+/// Emits one bounded diagnostic per distinct fallback reason
+/// (`event=renderer.scene.shader_fallback reason=... count=N`) and one
+/// summary line after every layer has been attempted
+/// (`event=renderer.scene.shaders compiled=N fallback=M`) — never one
+/// line per layer, matching every other load-time diagnostic in this
+/// file.
+fn compile_material_layers(
+    layers: &mut [scene::LayerSpec],
+    renderer: &mut LayerRenderer,
+    world_width: f32,
+    world_height: f32,
+    assets_dir: Option<&Path>,
+) -> Vec<bool> {
+    let mut material_ok = vec![false; layers.len()];
+    let Some(assets_root) = assets_dir.and_then(|dir| dir.canonicalize().ok()) else {
+        return material_ok; // no assets dir (or it does not exist): shader source cannot resolve at all
+    };
+
+    let mut compiled = 0usize;
+    let mut compiled_pipelines: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut fallback_reasons: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    // Every uniform name `fold_declarations` could not map to a WE
+    // standard slot or a material constant (zero-defaulted instead) —
+    // deduplicated across every layer attempted, reported once at the
+    // end rather than per layer.
+    let mut unsupported_uniform_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    for (index, layer) in layers.iter_mut().enumerate() {
+        let Some(material) = layer.material.clone() else {
+            continue; // not a model layer, or its base texture never resolved (load_model_textures)
+        };
+        let Some(shader_name) = material.shader.as_deref() else {
+            *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
+            continue;
+        };
+
+        let Some(vertex_source) = read_shader_stage(&assets_root, shader_name, "vert") else {
+            *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
+            continue;
+        };
+        let Some(fragment_source) = read_shader_stage(&assets_root, shader_name, "frag") else {
+            *fallback_reasons.entry("shader_source_missing").or_insert(0) += 1;
+            continue;
+        };
+
+        let constant_names: Vec<String> = material
+            .constant_shader_values
+            .iter()
+            .map(|(name, _)| name.clone())
+            .take(shaderpre::MAX_MATERIAL_CONSTANTS)
+            .collect();
+        let mut varying_locations = std::collections::BTreeMap::new();
+        let root_for_includes = assets_root.clone();
+        let mut include: Box<shaderpre::IncludeLookup<'_>> =
+            Box::new(move |name: &str| resolve_shader_reference(&root_for_includes, name));
+
+        let vertex_label = format!("{shader_name}.vert");
+        let vertex_pre = match shaderpre::preprocess(
+            shaderpre::Stage::Vertex,
+            &vertex_label,
+            &vertex_source,
+            &material.combos,
+            &constant_names,
+            &mut varying_locations,
+            &mut include,
+        ) {
+            Ok(output) => output,
+            Err(_) => {
+                *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+                continue;
+            }
+        };
+        if !material_vertex_format_supported(&vertex_pre.attributes) {
+            *fallback_reasons
+                .entry("unsupported_vertex_format")
+                .or_insert(0) += 1;
+            continue;
+        }
+
+        let fragment_label = format!("{shader_name}.frag");
+        let fragment_pre = match shaderpre::preprocess(
+            shaderpre::Stage::Fragment,
+            &fragment_label,
+            &fragment_source,
+            &material.combos,
+            &constant_names,
+            &mut varying_locations,
+            &mut include,
+        ) {
+            Ok(output) => output,
+            Err(_) => {
+                *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+                continue;
+            }
+        };
+
+        unsupported_uniform_names.extend(vertex_pre.unsupported_uniforms.iter().cloned());
+        unsupported_uniform_names.extend(fragment_pre.unsupported_uniforms.iter().cloned());
+
+        // The precise, live-preprocessed check (materialshader.rs doc
+        // comment): the static `references_render_target` flag on either
+        // stage is a fast conservative pre-filter (skips a shaderc call
+        // for a shader with no `_rt_` mention anywhere), the live check is
+        // the actual gate.
+        if (vertex_pre.references_render_target
+            && materialshader::references_live_render_target(
+                &vertex_pre.source,
+                materialshader::Stage::Vertex,
+                &vertex_label,
+            ))
+            || (fragment_pre.references_render_target
+                && materialshader::references_live_render_target(
+                    &fragment_pre.source,
+                    materialshader::Stage::Fragment,
+                    &fragment_label,
+                ))
+        {
+            *fallback_reasons
+                .entry("render_target_reference")
+                .or_insert(0) += 1;
+            continue;
+        }
+
+        let blend_mode = material_blend_mode(material.blending.as_deref());
+        let key = materialshader::MaterialKey::compute(
+            shader_name,
+            &fragment_pre.combos,
+            blend_mode.variant_index(),
+        );
+        if !compiled_pipelines.contains(&key.0)
+            && compiled_pipelines.len() >= materialshader::MAX_PIPELINES_PER_SCENE
+        {
+            *fallback_reasons.entry("pipeline_cap").or_insert(0) += 1;
+            continue;
+        }
+
+        let vertex_spirv = match materialshader::compile_stage(
+            &vertex_pre.source,
+            materialshader::Stage::Vertex,
+            &vertex_label,
+        ) {
+            Ok(spirv) => spirv,
+            Err(_) => {
+                *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+                continue;
+            }
+        };
+        let fragment_spirv = match materialshader::compile_stage(
+            &fragment_pre.source,
+            materialshader::Stage::Fragment,
+            &fragment_label,
+        ) {
+            Ok(spirv) => spirv,
+            Err(_) => {
+                *fallback_reasons.entry("compile_failed").or_insert(0) += 1;
+                continue;
+            }
+        };
+
+        if renderer
+            .register_material_pipeline(key.clone(), &vertex_spirv, &fragment_spirv, blend_mode)
+            .is_err()
+        {
+            *fallback_reasons
+                .entry("pipeline_creation_failed")
+                .or_insert(0) += 1;
+            continue;
+        }
+        compiled_pipelines.insert(key.0);
+
+        let mut textures: Vec<Option<(Vec<u8>, u32, u32)>> =
+            Vec::with_capacity(shaderpre::MAX_MATERIAL_TEXTURES);
+        let mut uniforms = materialshader::MaterialUniforms::default();
+        for slot_bytes in material
+            .texture_slots
+            .iter()
+            .take(shaderpre::MAX_MATERIAL_TEXTURES)
+        {
+            let decoded = slot_bytes
+                .as_ref()
+                .and_then(|bytes| texv::decode_model_texture(bytes));
+            match decoded {
+                Some(texture) => {
+                    let slot = textures.len();
+                    uniforms.texture_resolution[slot] = [
+                        texture.width as f32,
+                        texture.height as f32,
+                        1.0 / (texture.width as f32).max(1.0),
+                        1.0 / (texture.height as f32).max(1.0),
+                    ];
+                    textures.push(Some((texture.rgba, texture.width, texture.height)));
+                }
+                None => textures.push(None),
+            }
+        }
+        while textures.len() < shaderpre::MAX_MATERIAL_TEXTURES {
+            textures.push(None);
+        }
+        for (slot, (_, value)) in material
+            .constant_shader_values
+            .iter()
+            .enumerate()
+            .take(shaderpre::MAX_MATERIAL_CONSTANTS)
+        {
+            if let Some(components) = parse_constant_components(value) {
+                uniforms.material_constants[slot] = components;
+            }
+        }
+        uniforms.mvp = materialshader::build_orthographic_mvp(
+            [[1.0, 0.0], [0.0, 1.0]],
+            [0.0, 0.0],
+            world_width,
+            world_height,
+        );
+
+        match renderer.bind_material_layer(index, key, &textures, uniforms) {
+            Ok(()) => {
+                material_ok[index] = true;
+                compiled += 1;
+            }
+            Err(_) => {
+                *fallback_reasons.entry("bind_failed").or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (reason, count) in &fallback_reasons {
+        eprintln!("event=renderer.scene.shader_fallback reason={reason} count={count}");
+    }
+    if !unsupported_uniform_names.is_empty() {
+        eprintln!(
+            "event=renderer.scene.shader_unsupported_uniform count={} names={}",
+            unsupported_uniform_names.len(),
+            unsupported_uniform_names
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    let fallback_total: usize = fallback_reasons.values().sum();
+    eprintln!("event=renderer.scene.shaders compiled={compiled} fallback={fallback_total}");
+    material_ok
 }
 
 /// Upload the decoded layer textures into the compositor. Index-aligned
@@ -2262,6 +2702,7 @@ mod tests {
             texture: None,
             text: None,
             video: None,
+            material: None,
         }
     }
 

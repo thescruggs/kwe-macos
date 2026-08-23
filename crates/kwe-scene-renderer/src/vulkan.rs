@@ -67,7 +67,12 @@ use ash::vk;
 use ash::{Device, Entry, Instance};
 
 use crate::layers::{BlendMode, DrawKind, LayerDraw, MAX_LAYERS};
+use crate::materialshader::{
+    MATERIAL_UNIFORMS_SIZE, MaterialKey, MaterialUniforms, build_orthographic_mvp,
+};
 use crate::particles::MAX_PARTICLE_SYSTEMS;
+use crate::shaderpre::MAX_MATERIAL_TEXTURES;
+use std::collections::HashMap;
 
 /// Fence wait bound per frame; a GPU stuck longer than this is treated as a
 /// backend failure by the caller.
@@ -188,6 +193,26 @@ struct LayerTexture {
     height: u32,
 }
 
+/// S2: one layer's bound material — everything `render`'s draw loop needs
+/// to issue the draw, plus the resources `bind_material_layer`/`Drop` must
+/// tear down. `textures` holds ONLY the slots this layer uploaded its own
+/// image for (index = `g_Texture<N>`'s N); any other index sampled the
+/// shared `dummy_texture` and owns nothing here.
+struct MaterialBinding {
+    pipeline: vk::Pipeline,
+    descriptor_set: vk::DescriptorSet,
+    textures: Vec<(u32, LayerTexture)>,
+    ubo_buffer: vk::Buffer,
+    ubo_memory: vk::DeviceMemory,
+    ubo_mapped: *mut u8,
+    /// The CPU-side mirror of what is currently in `ubo_mapped` — `render`
+    /// mutates `mvp`/`time_alpha_brightness` here each draw and re-copies
+    /// the whole struct, rather than computing byte offsets into the
+    /// mapped buffer by hand (fragile if `MaterialUniforms`'s field order
+    /// ever changes).
+    uniforms: MaterialUniforms,
+}
+
 /// A persistent host-visible staging buffer (M3g). `upload_layer` creates
 /// and destroys its staging per call, which is right for a handful of
 /// startup uploads and wrong for a video layer re-uploading at 30 fps:
@@ -291,6 +316,48 @@ pub struct LayerRenderer {
     world_height: f32,
     device_name: String,
     device_kind: String,
+    /// S2: shared across every material pipeline — the descriptor set
+    /// layout (8 combined-image-samplers at bindings 0..7, one uniform
+    /// buffer at binding 8) and the pipeline layout built from it (no
+    /// push constants: the whole per-instance transform lives in the
+    /// per-layer `MaterialUniforms` UBO instead — see
+    /// `materialshader::build_orthographic_mvp`).
+    material_descriptor_set_layout: vk::DescriptorSetLayout,
+    material_pipeline_layout: vk::PipelineLayout,
+    /// Bounded pool: `MAX_LAYERS` sets, each `MAX_MATERIAL_TEXTURES`
+    /// combined-image-samplers + 1 uniform buffer (materials apply to
+    /// layers only, not particle systems, in S2 scope).
+    material_descriptor_pool: vk::DescriptorPool,
+    /// One compiled pipeline per distinct `MaterialKey` (shader + resolved
+    /// combos + blend variant) — `register_material_pipeline` compiles
+    /// once and every layer sharing that key reuses it. Bounded by the
+    /// caller (`materialshader::MAX_PIPELINES_PER_SCENE`).
+    material_pipelines: HashMap<u64, vk::Pipeline>,
+    /// The one vertex format the material pipeline draws — a unit quad
+    /// with `a_Position` (vec3, z=0) + `a_TexCoord` (vec2), matching every
+    /// `genericimage*`-family vertex shader's attribute list with default
+    /// combos (S2 scope: mesh/puppet geometry stays a quad). Mirrors
+    /// `UNIT_QUAD`'s uv convention exactly.
+    material_vertex_buffer: vk::Buffer,
+    material_vertex_buffer_memory: vk::DeviceMemory,
+    /// 1x1 transparent-black image bound to every material texture slot a
+    /// layer's material does not fill — Vulkan requires every descriptor
+    /// a pipeline's shader statically references to be valid, and a
+    /// material's descriptor set always declares all 8 sampler bindings
+    /// regardless of which ones that particular shader actually samples.
+    dummy_texture: LayerTexture,
+    /// Per layer, `Some` once `bind_material_layer` succeeds for it —
+    /// None means the layer either is not a model layer, or its material
+    /// fell back to the S1 quad path.
+    material_bindings: Vec<Option<MaterialBinding>>,
+    /// S2's `g_Time`: not real elapsed time (`render` takes no time
+    /// parameter — this slice keeps existing `render`/test call sites
+    /// unchanged) but a monotonic frame counter divided by an assumed 60
+    /// fps, which is exact for the steady-state case and only drifts
+    /// under sustained frame-time pressure. Good enough for a uniform
+    /// almost no default-combo `genericimage*` shader reads; documented
+    /// as a known simplification (see `AI-Skills/BETA_PLAN.md`).
+    material_frame_counter: u64,
     // Kept alive for the whole renderer lifetime: ash 0.38's Entry owns the
     // dlopen guard on libvulkan.so.1, and the loader's own trampoline
     // function pointers (vkDestroyDevice among them) dangle once the entry
@@ -766,6 +833,97 @@ impl LayerRenderer {
 
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
 
+        // S2: material pipeline shared state — descriptor set layout (8
+        // combined-image-samplers + 1 UBO), its pipeline layout, a bounded
+        // descriptor pool (MAX_LAYERS sets: materials apply to layers
+        // only), the one vertex format the material path draws
+        // (`MATERIAL_UNIT_QUAD`), and a 1x1 transparent-black dummy
+        // texture for the sampler slots a given material does not fill
+        // (Vulkan requires every statically-referenced descriptor to be
+        // valid, and the descriptor set always declares all 8 bindings).
+        let mut material_bindings_layout =
+            [vk::DescriptorSetLayoutBinding::default(); MAX_MATERIAL_TEXTURES + 1];
+        for (index, binding) in material_bindings_layout
+            .iter_mut()
+            .take(MAX_MATERIAL_TEXTURES)
+            .enumerate()
+        {
+            *binding = vk::DescriptorSetLayoutBinding::default()
+                .binding(index as u32)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        }
+        material_bindings_layout[MAX_MATERIAL_TEXTURES] = vk::DescriptorSetLayoutBinding::default()
+            .binding(MAX_MATERIAL_TEXTURES as u32)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
+        let material_set_layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&material_bindings_layout);
+        let material_descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&material_set_layout_info, None) }?;
+        let material_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&material_descriptor_set_layout));
+        let material_pipeline_layout =
+            unsafe { device.create_pipeline_layout(&material_layout_info, None) }?;
+        let material_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count((MAX_LAYERS * MAX_MATERIAL_TEXTURES) as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(MAX_LAYERS as u32),
+        ];
+        let material_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(MAX_LAYERS as u32)
+            .pool_sizes(&material_pool_sizes);
+        let material_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&material_pool_info, None) }?;
+
+        let material_vertex_bytes =
+            (MATERIAL_UNIT_QUAD.len() * std::mem::size_of::<f32>()) as vk::DeviceSize;
+        let material_vertex_info = vk::BufferCreateInfo::default()
+            .size(material_vertex_bytes)
+            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let material_vertex_buffer = unsafe { device.create_buffer(&material_vertex_info, None) }?;
+        let material_vertex_requirements =
+            unsafe { device.get_buffer_memory_requirements(material_vertex_buffer) };
+        let material_vertex_buffer_memory =
+            allocate_host_visible(&instance, &device, physical, &material_vertex_requirements)?;
+        unsafe {
+            device.bind_buffer_memory(material_vertex_buffer, material_vertex_buffer_memory, 0)
+        }?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                MATERIAL_UNIT_QUAD.as_ptr(),
+                device
+                    .map_memory(
+                        material_vertex_buffer_memory,
+                        0,
+                        material_vertex_bytes,
+                        vk::MemoryMapFlags::empty(),
+                    )?
+                    .cast::<f32>(),
+                MATERIAL_UNIT_QUAD.len(),
+            );
+            device.unmap_memory(material_vertex_buffer_memory);
+        }
+
+        let dummy_texture = upload_image_now(
+            &instance,
+            &device,
+            physical,
+            queue,
+            upload_buffer,
+            fence,
+            &[0, 0, 0, 0],
+            1,
+            1,
+        )?;
+
         Ok(Self {
             instance,
             device,
@@ -809,6 +967,15 @@ impl LayerRenderer {
             world_height: height as f32,
             device_name,
             device_kind,
+            material_descriptor_set_layout,
+            material_pipeline_layout,
+            material_descriptor_pool,
+            material_pipelines: HashMap::new(),
+            material_vertex_buffer,
+            material_vertex_buffer_memory,
+            dummy_texture,
+            material_bindings: Vec::new(),
+            material_frame_counter: 0,
             _entry: entry,
         })
     }
@@ -1139,6 +1306,337 @@ impl LayerRenderer {
         });
         self.descriptor_sets[index] = set;
         self.live_uploads += 1;
+        Ok(())
+    }
+
+    /// S2: compile (if not already cached under `key`) one material
+    /// pipeline — vertex + fragment SPIR-V, the fixed material vertex
+    /// format (`MATERIAL_UNIT_QUAD`), and the given blend variant, sharing
+    /// `material_pipeline_layout`/`material_descriptor_set_layout` and the
+    /// render pass every other pipeline in this renderer uses. A no-op
+    /// (`Ok`) if `key` is already registered — two layers with the same
+    /// material and resolved combos share one pipeline.
+    pub fn register_material_pipeline(
+        &mut self,
+        key: MaterialKey,
+        vertex_spirv: &[u32],
+        fragment_spirv: &[u32],
+        blend_mode: BlendMode,
+    ) -> Result<(), RenderError> {
+        if self.material_pipelines.contains_key(&key.0) {
+            return Ok(());
+        }
+        let vertex_module = shader_module(&self.device, vertex_spirv)?;
+        let fragment_module = match shader_module(&self.device, fragment_spirv) {
+            Ok(module) => module,
+            Err(error) => {
+                unsafe { self.device.destroy_shader_module(vertex_module, None) };
+                return Err(error);
+            }
+        };
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex_module)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment_module)
+                .name(c"main"),
+        ];
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(20)
+            .input_rate(vk::VertexInputRate::VERTEX);
+        let attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(12),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding))
+            .vertex_attribute_descriptions(&attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport = vk::Viewport::default()
+            .x(0.0)
+            .y(0.0)
+            .width(self.width as f32)
+            .height(self.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        let scissor = vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(vk::Extent2D {
+                width: self.width,
+                height: self.height,
+            });
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(std::slice::from_ref(&viewport))
+            .scissors(std::slice::from_ref(&scissor));
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+        let blend_attachment = blend_attachment_for(blend_mode);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&blend_attachment));
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .layout(self.material_pipeline_layout)
+            .render_pass(self.render_pass)
+            .subpass(0)
+            .depth_stencil_state(&depth_stencil);
+        let result = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        };
+        // A shader module is only referenced during pipeline creation
+        // (the Vulkan spec does not require it to outlive the pipeline),
+        // so it is destroyed immediately either way — no per-pipeline
+        // module bookkeeping needed.
+        unsafe {
+            self.device.destroy_shader_module(fragment_module, None);
+            self.device.destroy_shader_module(vertex_module, None);
+        }
+        let pipeline = match result {
+            Ok(pipelines) => pipelines[0],
+            Err((_, result)) => return Err(result.into()),
+        };
+        self.material_pipelines.insert(key.0, pipeline);
+        Ok(())
+    }
+
+    /// S2: bind one layer's material — upload up to `MAX_MATERIAL_TEXTURES`
+    /// already-decoded RGBA8 textures (a `None` slot samples the shared
+    /// 1x1 `dummy_texture`), allocate a UBO seeded with `uniforms`, and
+    /// write both into a fresh descriptor set bound to `key`'s pipeline
+    /// (which must already be registered via `register_material_pipeline`).
+    /// Replaces any previous material binding at `layer_index` in place
+    /// (tearing down its textures/UBO/descriptor set first) — a re-bind
+    /// never leaks or exhausts the bounded descriptor pool.
+    ///
+    /// On any texture-upload failure this cleans up everything it had
+    /// already uploaded for THIS call and returns `Err` without touching
+    /// the layer's previous binding (if any) — the caller (main.rs) drops
+    /// the whole material attempt on `Err`, so the layer keeps whatever it
+    /// had (typically nothing yet, since binding happens once at load).
+    pub fn bind_material_layer(
+        &mut self,
+        layer_index: usize,
+        key: MaterialKey,
+        textures: &[Option<(Vec<u8>, u32, u32)>],
+        mut uniforms: MaterialUniforms,
+    ) -> Result<(), RenderError> {
+        if layer_index >= MAX_LAYERS {
+            return Err(RenderError::Vulkan(format!(
+                "layer index {layer_index} beyond the {MAX_LAYERS}-layer cap for materials"
+            )));
+        }
+        let Some(&pipeline) = self.material_pipelines.get(&key.0) else {
+            return Err(RenderError::Vulkan(
+                "bind_material_layer: pipeline not registered".to_string(),
+            ));
+        };
+
+        let mut owned_textures: Vec<(u32, LayerTexture)> = Vec::new();
+        let mut image_infos = [vk::DescriptorImageInfo::default(); MAX_MATERIAL_TEXTURES];
+        for (slot, image_info) in image_infos.iter_mut().enumerate() {
+            let view = match textures.get(slot).and_then(|entry| entry.as_ref()) {
+                Some((rgba, width, height)) => {
+                    match upload_image_now(
+                        &self.instance,
+                        &self.device,
+                        self.physical,
+                        self.queue,
+                        self.upload_buffer,
+                        self.fence,
+                        rgba,
+                        *width,
+                        *height,
+                    ) {
+                        Ok(texture) => {
+                            let view = texture.view;
+                            owned_textures.push((slot as u32, texture));
+                            view
+                        }
+                        Err(error) => {
+                            if is_fence_timeout(&error) {
+                                return Err(error);
+                            }
+                            for (_, texture) in owned_textures {
+                                unsafe {
+                                    self.device.destroy_image_view(texture.view, None);
+                                    self.device.destroy_image(texture.image, None);
+                                    self.device.free_memory(texture.memory, None);
+                                }
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                None => self.dummy_texture.view,
+            };
+            *image_info = vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        }
+
+        let ubo_info = vk::BufferCreateInfo::default()
+            .size(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let ubo_buffer = match unsafe { self.device.create_buffer(&ubo_info, None) } {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                for (_, texture) in owned_textures {
+                    unsafe {
+                        self.device.destroy_image_view(texture.view, None);
+                        self.device.destroy_image(texture.image, None);
+                        self.device.free_memory(texture.memory, None);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        let ubo_requirements = unsafe { self.device.get_buffer_memory_requirements(ubo_buffer) };
+        let ubo_memory = match allocate_host_visible(
+            &self.instance,
+            &self.device,
+            self.physical,
+            &ubo_requirements,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(ubo_buffer, None) };
+                for (_, texture) in owned_textures {
+                    unsafe {
+                        self.device.destroy_image_view(texture.view, None);
+                        self.device.destroy_image(texture.image, None);
+                        self.device.free_memory(texture.memory, None);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        unsafe { self.device.bind_buffer_memory(ubo_buffer, ubo_memory, 0) }?;
+        let ubo_mapped = unsafe {
+            self.device.map_memory(
+                ubo_memory,
+                0,
+                MATERIAL_UNIFORMS_SIZE as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?
+        }
+        .cast::<u8>();
+        // g_ModelViewProjectionMatrix is overwritten every draw (`render`);
+        // the caller's initial value only matters if this layer is bound
+        // but never drawn (e.g. starts invisible) — identity is harmless.
+        uniforms.mvp = build_orthographic_mvp([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 1.0, 1.0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&uniforms).cast::<u8>(),
+                ubo_mapped,
+                MATERIAL_UNIFORMS_SIZE,
+            );
+        }
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.material_descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.material_descriptor_set_layout));
+        let descriptor_set = match unsafe { self.device.allocate_descriptor_sets(&alloc_info) } {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                unsafe {
+                    self.device.unmap_memory(ubo_memory);
+                    self.device.destroy_buffer(ubo_buffer, None);
+                    self.device.free_memory(ubo_memory, None);
+                }
+                for (_, texture) in owned_textures {
+                    unsafe {
+                        self.device.destroy_image_view(texture.view, None);
+                        self.device.destroy_image(texture.image, None);
+                        self.device.free_memory(texture.memory, None);
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(MAX_MATERIAL_TEXTURES + 1);
+        for (slot, image_info) in image_infos.iter().enumerate() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(slot as u32)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(image_info)),
+            );
+        }
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(ubo_buffer)
+            .offset(0)
+            .range(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize);
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(MAX_MATERIAL_TEXTURES as u32)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info)),
+        );
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        while self.material_bindings.len() <= layer_index {
+            self.material_bindings.push(None);
+        }
+        if let Some(old) = self.material_bindings[layer_index].take() {
+            unsafe {
+                self.device.unmap_memory(old.ubo_memory);
+                self.device.destroy_buffer(old.ubo_buffer, None);
+                self.device.free_memory(old.ubo_memory, None);
+                self.device
+                    .free_descriptor_sets(
+                        self.material_descriptor_pool,
+                        std::slice::from_ref(&old.descriptor_set),
+                    )
+                    .expect("free_descriptor_sets: the material pool has FREE_DESCRIPTOR_SET");
+                for (_, texture) in old.textures {
+                    self.device.destroy_image_view(texture.view, None);
+                    self.device.destroy_image(texture.image, None);
+                    self.device.free_memory(texture.memory, None);
+                }
+            }
+        }
+        self.material_bindings[layer_index] = Some(MaterialBinding {
+            pipeline,
+            descriptor_set,
+            textures: owned_textures,
+            ubo_buffer,
+            ubo_memory,
+            ubo_mapped,
+            uniforms,
+        });
         Ok(())
     }
 
@@ -1515,6 +2013,64 @@ impl LayerRenderer {
             );
         }
         for draw in draws {
+            // S2: a material draw goes through its own compiled pipeline
+            // and 8-sampler+UBO descriptor set instead of the S1
+            // single-sampler path below — `frame_draws` only ever sets
+            // `material: true` after `bind_material_layer` succeeded, so
+            // the `else` here (no binding) is a defense, not a normal
+            // path.
+            if draw.material {
+                self.material_frame_counter += 1;
+                let time = self.material_frame_counter as f32 / 60.0;
+                let world_width = self.world_width;
+                let world_height = self.world_height;
+                let Some(binding) = self
+                    .material_bindings
+                    .get_mut(draw.layer_index)
+                    .and_then(|slot| slot.as_mut())
+                else {
+                    continue;
+                };
+                // Per-instance dynamic uniforms: the model transform
+                // (`materialshader::build_orthographic_mvp` — the same
+                // world-extent math the S1 push-constant path applies, so
+                // a material draw and the S1 quad draw of the same layer
+                // land on identical pixels) plus g_Time/g_UserAlpha/
+                // g_Brightness. Everything else in the UBO (textures,
+                // material constants, points/parallax/pointer defaults)
+                // was set once at `bind_material_layer` time.
+                binding.uniforms.mvp =
+                    build_orthographic_mvp(draw.m, draw.t, world_width, world_height);
+                binding.uniforms.time_alpha_brightness = [time, draw.alpha, draw.brightness, 0.0];
+                let uniforms_ptr = std::ptr::from_ref(&binding.uniforms).cast::<u8>();
+                let ubo_mapped = binding.ubo_mapped;
+                let pipeline = binding.pipeline;
+                let descriptor_set = binding.descriptor_set;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(uniforms_ptr, ubo_mapped, MATERIAL_UNIFORMS_SIZE);
+                    self.device.cmd_bind_pipeline(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline,
+                    );
+                    self.device.cmd_bind_descriptor_sets(
+                        self.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.material_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&descriptor_set),
+                        &[],
+                    );
+                    self.device.cmd_bind_vertex_buffers(
+                        self.command_buffer,
+                        0,
+                        std::slice::from_ref(&self.material_vertex_buffer),
+                        &[0],
+                    );
+                    self.device.cmd_draw(self.command_buffer, 6, 1, 0, 0);
+                }
+                continue;
+            }
             // A draw whose texture never uploaded (skipped at load) is
             // silently dropped here — the draw list builder already skips
             // it, so this is only a defense.
@@ -1837,6 +2393,39 @@ impl Drop for LayerRenderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // S2: every material binding's textures/UBO, then the shared
+            // material pipelines/layouts/pool/vertex buffer/dummy texture.
+            // Descriptor sets are freed implicitly by
+            // `destroy_descriptor_pool` below (no `FREE_DESCRIPTOR_SET`
+            // per-set free needed at teardown).
+            for binding in self.material_bindings.iter().flatten() {
+                self.device.unmap_memory(binding.ubo_memory);
+                self.device.destroy_buffer(binding.ubo_buffer, None);
+                self.device.free_memory(binding.ubo_memory, None);
+                for (_, texture) in &binding.textures {
+                    self.device.destroy_image_view(texture.view, None);
+                    self.device.destroy_image(texture.image, None);
+                    self.device.free_memory(texture.memory, None);
+                }
+            }
+            for pipeline in self.material_pipelines.values() {
+                self.device.destroy_pipeline(*pipeline, None);
+            }
+            self.device
+                .destroy_pipeline_layout(self.material_pipeline_layout, None);
+            self.device
+                .destroy_descriptor_pool(self.material_descriptor_pool, None);
+            self.device
+                .destroy_descriptor_set_layout(self.material_descriptor_set_layout, None);
+            self.device
+                .destroy_buffer(self.material_vertex_buffer, None);
+            self.device
+                .free_memory(self.material_vertex_buffer_memory, None);
+            self.device
+                .destroy_image_view(self.dummy_texture.view, None);
+            self.device.destroy_image(self.dummy_texture.image, None);
+            self.device.free_memory(self.dummy_texture.memory, None);
+
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             for pipeline in &self.pipelines {
@@ -2035,6 +2624,250 @@ fn allocate_host_visible(
 fn shader_module(device: &Device, code: &[u32]) -> Result<vk::ShaderModule, RenderError> {
     let info = vk::ShaderModuleCreateInfo::default().code(code);
     unsafe { device.create_shader_module(&info, None) }.map_err(Into::into)
+}
+
+/// S2: upload one RGBA8 image to a device-local sampled image and wait for
+/// it, returning the raw `(image, memory, view)` triple with no descriptor
+/// set — the caller owns binding it into whatever descriptor set makes
+/// sense (a material's 8-sampler set, unlike `upload_layer`'s one-sampler
+/// set). A free function (not a method) so `LayerRenderer::new_with` can
+/// call it before `Self` exists (for the shared dummy texture) and
+/// `bind_material_layer` can call it once `self` exists, from the same
+/// code path either way.
+///
+/// Mirrors `upload_layer`'s image-create/stage/copy/barrier/view sequence;
+/// duplicated rather than factored out of `upload_layer` to avoid
+/// reworking that function's already-reviewed error/cleanup paths for a
+/// second, structurally different caller (material texture bytes are
+/// already decoded RGBA8 the same as layer textures, so the upload
+/// mechanics are identical — only what happens to the result differs).
+#[allow(clippy::too_many_arguments)]
+fn upload_image_now(
+    instance: &Instance,
+    device: &Device,
+    physical: vk::PhysicalDevice,
+    queue: vk::Queue,
+    upload_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<LayerTexture, RenderError> {
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() != expected {
+        return Err(RenderError::Vulkan(format!(
+            "texture byte count {} does not match {width}x{height} RGBA8",
+            rgba.len()
+        )));
+    }
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::R8G8B8A8_UNORM)
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { device.create_image(&image_info, None) }?;
+    let mut memory: Option<vk::DeviceMemory> = None;
+    let mut staging: Option<vk::Buffer> = None;
+    let mut staging_memory: Option<vk::DeviceMemory> = None;
+    let mut staging_mapped = false;
+    let outcome = (|| -> Result<vk::ImageView, RenderError> {
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocated = allocate(
+            instance,
+            device,
+            physical,
+            &requirements,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        memory = Some(allocated);
+        unsafe { device.bind_image_memory(image, allocated, 0) }?;
+
+        let staging_info = vk::BufferCreateInfo::default()
+            .size(rgba.len() as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let created_staging = unsafe { device.create_buffer(&staging_info, None) }?;
+        staging = Some(created_staging);
+        let staging_requirements =
+            unsafe { device.get_buffer_memory_requirements(created_staging) };
+        let created_staging_memory =
+            allocate_host_visible(instance, device, physical, &staging_requirements)?;
+        staging_memory = Some(created_staging_memory);
+        unsafe { device.bind_buffer_memory(created_staging, created_staging_memory, 0) }?;
+        let mapped = unsafe {
+            device.map_memory(
+                created_staging_memory,
+                0,
+                rgba.len() as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )?
+        }
+        .cast::<u8>();
+        staging_mapped = true;
+        unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), mapped, rgba.len()) };
+        let staging = created_staging;
+        let staging_memory = created_staging_memory;
+
+        unsafe { device.reset_fences(&[fence]) }?;
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe { device.begin_command_buffer(upload_buffer, &begin_info) }?;
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier(
+                upload_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_transfer),
+            );
+        }
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        unsafe {
+            device.cmd_copy_buffer_to_image(
+                upload_buffer,
+                staging,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region),
+            );
+        }
+        let to_shader = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        unsafe {
+            device.cmd_pipeline_barrier(
+                upload_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_shader),
+            );
+        }
+        unsafe { device.end_command_buffer(upload_buffer) }?;
+        let submit =
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&upload_buffer));
+        unsafe { device.queue_submit(queue, &[submit], fence) }?;
+        match unsafe { device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS) } {
+            Ok(()) => {}
+            Err(_) => return Err(RenderError::FenceTimeout),
+        }
+        unsafe {
+            device.unmap_memory(staging_memory);
+            device.destroy_buffer(staging, None);
+            device.free_memory(staging_memory, None);
+        }
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        Ok(unsafe { device.create_image_view(&view_info, None) }?)
+    })();
+    match outcome {
+        Ok(view) => Ok(LayerTexture {
+            image,
+            // `bind_image_memory` above already succeeded, so `memory` is
+            // always `Some` on this path — the allocation is the first
+            // fallible step in the closure and every step after it either
+            // returns `Err` (leaving `outcome` an `Err`, not reaching
+            // here) or continues with `memory` already set.
+            memory: memory.expect("memory bound before Ok(view)"),
+            view,
+            width,
+            height,
+        }),
+        Err(error) => {
+            if is_fence_timeout(&error) {
+                // The queue submit may still be reading the staging
+                // buffer/destination image — see `upload_layer`'s
+                // identical note. Leak the handles to process teardown;
+                // the caller (LayerRenderer::render's fence-timeout path)
+                // terminates the process immediately.
+                return Err(error);
+            }
+            if staging_mapped && let Some(memory) = staging_memory {
+                unsafe { device.unmap_memory(memory) };
+            }
+            if let Some(buffer) = staging {
+                unsafe { device.destroy_buffer(buffer, None) };
+            }
+            if let Some(memory) = staging_memory {
+                unsafe { device.free_memory(memory, None) };
+            }
+            if let Some(memory) = memory {
+                unsafe { device.free_memory(memory, None) };
+            }
+            unsafe { device.destroy_image(image, None) };
+            Err(error)
+        }
+    }
 }
 
 /// The M3f particle vertex shader: pos + uv + color + size per vertex,
@@ -2339,6 +3172,20 @@ const UNIT_QUAD: [f32; 24] = [
     -0.5, -0.5, 0.0, 0.0,
 ];
 
+/// S2's material pipeline vertex format: `a_Position` (vec3, z always 0)
+/// plus `a_TexCoord` (vec2) — the attribute list every
+/// `genericimage*`-family vertex shader declares with default combos.
+/// Same 6-vertex layout and uv convention as `UNIT_QUAD`, just with the
+/// extra `z = 0.0` component WE's own vertex shaders expect.
+const MATERIAL_UNIT_QUAD: [f32; 30] = [
+    -0.5, -0.5, 0.0, 0.0, 0.0, //
+    0.5, -0.5, 0.0, 1.0, 0.0, //
+    0.5, 0.5, 0.0, 1.0, 1.0, //
+    0.5, 0.5, 0.0, 1.0, 1.0, //
+    -0.5, 0.5, 0.0, 0.0, 1.0, //
+    -0.5, -0.5, 0.0, 0.0, 0.0,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2394,6 +3241,108 @@ mod tests {
         assert_eq!(bgra_premultiplied(&input, false).len(), input.len());
     }
 
+    /// S2 end-to-end: a synthetic material shader (no texture sampling —
+    /// a fixed solid-color fragment shader, the same shape smoke-scene.sh's
+    /// new case uses) preprocessed, compiled, registered, and bound to a
+    /// layer, drawn fullscreen and read back. Confirms the whole material
+    /// path — shaderpre -> shaderc -> the 8-sampler+UBO descriptor set ->
+    /// the draw loop's per-frame UBO patch — produces the exact color the
+    /// fragment shader hard-codes, independent of any texture. Skip-by-
+    /// default like `isolated_draw`.
+    #[test]
+    fn material_pipeline_draws_a_synthetic_solid_color() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "material_pipeline_draws_a_synthetic_solid_color: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(0.2, 0.6, 0.8, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);\n}\n";
+        let mut locations = std::collections::BTreeMap::new();
+        let mut include: Box<crate::shaderpre::IncludeLookup<'static>> = Box::new(|_: &str| None);
+        let vertex_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Vertex,
+            "synthetic.vert",
+            vertex_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("vertex preprocesses");
+        let fragment_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Fragment,
+            "synthetic.frag",
+            fragment_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("fragment preprocesses");
+        let vertex_spirv = crate::materialshader::compile_stage(
+            &vertex_pre.source,
+            crate::materialshader::Stage::Vertex,
+            "synthetic.vert",
+        )
+        .expect("vertex compiles");
+        let fragment_spirv = crate::materialshader::compile_stage(
+            &fragment_pre.source,
+            crate::materialshader::Stage::Fragment,
+            "synthetic.frag",
+        )
+        .expect("fragment compiles");
+
+        let key = MaterialKey::compute(
+            "synthetic",
+            &fragment_pre.combos,
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                BlendMode::Normal,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 1.0], &draws)
+            .expect("render once");
+        assert_eq!(pixels.len(), 64 * 48 * 4);
+        // B8G8R8A8 readback: B=0.8*255≈204, G=0.6*255≈153, R=0.2*255≈51.
+        for pixel in pixels.chunks_exact(4) {
+            assert!((203..=205).contains(&pixel[0]), "B={}", pixel[0]);
+            assert!((152..=154).contains(&pixel[1]), "G={}", pixel[1]);
+            assert!((50..=52).contains(&pixel[2]), "R={}", pixel[2]);
+            assert_eq!(pixel[3], 255);
+        }
+    }
+
     /// One full offscreen render through the real pipeline and readback: the
     /// worker machinery (QuickJS, mmap) is not involved, so this catches
     /// pipeline/command-regression faults (a device-lost draw and a teardown
@@ -2423,6 +3372,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.1, 0.2, 0.3, 1.0], &draws)
@@ -2481,6 +3431,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 1.0], &draws)
@@ -2587,6 +3538,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 0.0], &draws)
@@ -2647,6 +3599,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.0, 0.0, 0.0, 0.0], &draws)
@@ -2829,6 +3782,7 @@ mod tests {
                 blend_mode: mode,
                 brightness: 1.0,
                 tint: [1.0, 1.0, 1.0, 1.0],
+                material: false,
             }];
             let pixels = renderer
                 .render([0.4, 0.25, 0.1, 1.0], &draws)
@@ -2866,6 +3820,7 @@ mod tests {
             blend_mode: BlendMode::Normal,
             brightness: 2.0,
             tint: [1.0, 0.25, 0.5, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.4, 0.25, 0.1, 1.0], &draws)
@@ -2913,6 +3868,7 @@ mod tests {
             blend_mode: BlendMode::Multiply,
             brightness: 1.0,
             tint: [1.0, 1.0, 1.0, 1.0],
+            material: false,
         }];
         let pixels = renderer
             .render([0.4, 0.25, 0.1, 0.5], &draws)

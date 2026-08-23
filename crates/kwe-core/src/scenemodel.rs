@@ -72,6 +72,21 @@ pub struct ResolvedModel {
     /// (index 0's name is `texture_name` above), unresolved and unread —
     /// recorded so the next slice does not have to re-parse the material.
     pub extra_textures: Vec<String>,
+    /// S2: `passes[0].constantshadervalues` exactly as written (material
+    /// constant overrides for the shader's own `uniform` parameters, e.g.
+    /// `{"roughness": "0.2"}`) — the material pipeline maps these onto
+    /// `MaterialUniforms.g_MaterialConstants` slots by name.
+    pub constant_shader_values: serde_json::Map<String, Value>,
+    /// S2: every `g_Texture<N>` slot, POSITIONALLY (index == N, `None` for
+    /// an empty/null slot), resolved to bytes. Slot 0 duplicates
+    /// `texture_bytes` when slot 0 is non-null (kept for the S1 honesty
+    /// gate's "first non-null slot" contract, unaffected by this
+    /// addition); this field is what the S2 material pipeline actually
+    /// draws with. `Err` from `resolve_model` already means EVERY declared
+    /// non-null slot up to `MAX_MATERIAL_TEXTURES` resolved — a material
+    /// referencing a texture that does not exist fails resolution
+    /// entirely, the same honesty contract slot 0 already had.
+    pub texture_slots: Vec<Option<TextureSlot>>,
 }
 
 /// The texture-name-to-asset-path rule
@@ -96,6 +111,45 @@ fn bounded_json(bytes: Vec<u8>, what: &str) -> Result<Value, String> {
 /// (`TextureParser::parseTextureMap`, `TextureParser.cpp:125-154`): each
 /// entry is a string, an object with a `name` string, or null (an empty
 /// slot). Returns `(first_name, remaining_names)`.
+/// S2: every `g_Texture<N>` slot (`N` = 0..`MAX_MATERIAL_TEXTURES`) a
+/// material pass declares, in POSITIONAL order (unlike
+/// `first_texture_name`, a null entry at index 0 means slot 0 is empty —
+/// it does NOT get skipped/renumbered — because the material shader's
+/// `g_Texture0`/`g_Texture1`/... uniforms are bound by that same
+/// positional index, and getting it wrong would sample the wrong image
+/// into the wrong slot). Entries past `MAX_MATERIAL_TEXTURES` are
+/// ignored (the material pipeline's descriptor set only has that many
+/// bindings; a shader referencing a higher index already fails
+/// preprocessing in `kwe-scene-renderer::shaderpre` independently).
+pub const MAX_MATERIAL_TEXTURES: usize = 8;
+
+fn positional_texture_names(textures: &Value) -> Vec<Option<String>> {
+    let Some(array) = textures.as_array() else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .take(MAX_MATERIAL_TEXTURES)
+        .map(|entry| match entry {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Object(object) => object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One resolved `g_Texture<N>` slot (S2 material pipeline).
+#[derive(Debug, Clone)]
+pub struct TextureSlot {
+    pub name: String,
+    pub texture_ref: String,
+    pub bytes: Vec<u8>,
+}
+
 fn first_texture_name(textures: &Value) -> Option<(String, Vec<String>)> {
     let array = textures.as_array()?;
     let mut names = Vec::new();
@@ -190,6 +244,62 @@ pub fn resolve_model(
         }
     }
 
+    // S2: resolve every OTHER positional texture slot (1..MAX_MATERIAL_
+    // TEXTURES), best-effort. Unlike slot 0 above, a slot that fails to
+    // resolve or fails the same decode-ability header check does NOT fail
+    // model resolution — it stays `None`. Slot 0 keeps its original S1
+    // all-or-nothing contract (a model with an unresolvable primary
+    // texture was never drawable and still is not); the extra slots are
+    // additive material data the S1 quad path never needed, so requiring
+    // them here would regress scenes S1 already accepts (a broken mask/
+    // normal-map texture would newly refuse a model whose base texture is
+    // perfectly fine).
+    let positional_names = pass0
+        .get("textures")
+        .map(positional_texture_names)
+        .unwrap_or_default();
+    let mut texture_slots: Vec<Option<TextureSlot>> = Vec::with_capacity(MAX_MATERIAL_TEXTURES);
+    for (index, name) in positional_names.iter().enumerate() {
+        let Some(name) = name else {
+            texture_slots.push(None);
+            continue;
+        };
+        if index == 0 && *name == texture_name {
+            // Slot 0 already resolved above (and is the honesty gate) —
+            // reuse it rather than reading the same bytes twice.
+            texture_slots.push(Some(TextureSlot {
+                name: texture_name.clone(),
+                texture_ref: texture_ref.clone(),
+                bytes: texture_bytes.clone(),
+            }));
+            continue;
+        }
+        let slot_ref = texture_asset_path(name);
+        let slot = lookup(&slot_ref).and_then(|bytes| {
+            if crate::texvheader::is_texv(&bytes) {
+                let real_bytes = crate::texvheader::check_header(&bytes).ok()?;
+                if real_bytes > crate::texvheader::MAX_SINGLE_TEXTURE_BUDGET_BYTES {
+                    return None;
+                }
+            }
+            Some(TextureSlot {
+                name: name.clone(),
+                texture_ref: slot_ref,
+                bytes,
+            })
+        });
+        texture_slots.push(slot);
+    }
+    while texture_slots.len() < MAX_MATERIAL_TEXTURES {
+        texture_slots.push(None);
+    }
+
+    let constant_shader_values = pass0
+        .get("constantshadervalues")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
     let shader = pass0
         .get("shader")
         .and_then(Value::as_str)
@@ -224,6 +334,8 @@ pub fn resolve_model(
         depthtest,
         combos,
         extra_textures,
+        constant_shader_values,
+        texture_slots,
     })
 }
 
@@ -355,6 +467,54 @@ mod tests {
         let resolved = resolve_model("models/m.json", &mut lookup).expect("resolves");
         assert_eq!(resolved.texture_name, "mask");
         assert_eq!(resolved.extra_textures, vec!["phase".to_string()]);
+        // S2: texture_slots is positional, index 0 stays None (the null
+        // entry there was never renumbered away) even though texture_name
+        // (the S1 "first non-null" honesty signal) is "mask".
+        assert!(resolved.texture_slots[0].is_none());
+        assert_eq!(resolved.texture_slots[1].as_ref().unwrap().name, "mask");
+        // Slot 2 ("phase") has no resolvable bytes in this lookup — a
+        // missing extra slot degrades to None, it does not fail
+        // resolution (unlike slot 0).
+        assert!(resolved.texture_slots[2].is_none());
+    }
+
+    #[test]
+    fn positional_slots_resolve_up_to_the_cap_and_constants_are_recorded() {
+        let mut lookup = map_lookup(vec![
+            (
+                "models/m.json",
+                br#"{"material": "materials/m.json"}"#.to_vec(),
+            ),
+            (
+                "materials/m.json",
+                br#"{"passes": [{"shader": "genericimage2",
+                    "textures": ["albedo", "normal"],
+                    "constantshadervalues": {"roughness": "0.4"}}]}"#
+                    .to_vec(),
+            ),
+            ("materials/albedo.tex", b"albedo-bytes".to_vec()),
+            ("materials/normal.tex", b"normal-bytes".to_vec()),
+        ]);
+        let resolved = resolve_model("models/m.json", &mut lookup).expect("resolves");
+        assert_eq!(resolved.texture_slots.len(), MAX_MATERIAL_TEXTURES);
+        assert_eq!(
+            resolved.texture_slots[0].as_ref().unwrap().bytes,
+            b"albedo-bytes"
+        );
+        assert_eq!(
+            resolved.texture_slots[1].as_ref().unwrap().bytes,
+            b"normal-bytes"
+        );
+        for slot in &resolved.texture_slots[2..] {
+            assert!(slot.is_none());
+        }
+        assert_eq!(
+            resolved
+                .constant_shader_values
+                .get("roughness")
+                .and_then(Value::as_str),
+            Some("0.4")
+        );
     }
 
     #[test]

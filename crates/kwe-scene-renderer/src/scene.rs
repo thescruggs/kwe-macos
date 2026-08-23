@@ -228,6 +228,35 @@ pub struct LayerSpec {
     /// stays `None` for video layers — their pixels never come from the
     /// image decoder.
     pub video: Option<VideoSpec>,
+    /// S2: the resolved material data `load_model_textures` extracted
+    /// alongside the base texture — `Some` only for a model layer whose
+    /// `kwe_core::resolve_model` walk succeeded. `compile_material_layers`
+    /// (main.rs) consumes this to attempt a material-pipeline draw; a
+    /// layer with `material.is_none()` (not a model, or resolution
+    /// failed) always uses the S1 base-texture quad.
+    pub material: Option<MaterialSpec>,
+}
+
+/// S2: everything `compile_material_layers` needs from
+/// `kwe_core::scenemodel::ResolvedModel` to attempt compiling and binding
+/// a material pipeline for one layer. A thin, owned copy (rather than
+/// keeping the whole `ResolvedModel` around) so `scene.rs` does not need
+/// to depend on `kwe_core::scenemodel`'s full surface.
+#[derive(Debug, Clone, Default)]
+pub struct MaterialSpec {
+    pub shader: Option<String>,
+    pub blending: Option<String>,
+    pub combos: std::collections::BTreeMap<String, i64>,
+    /// Ordered `constantshadervalues` names -> their declared value, as
+    /// written (string or number in the JSON — `compile_material_layers`
+    /// parses to `f32`, skipping a value it cannot parse).
+    pub constant_shader_values: Vec<(String, serde_json::Value)>,
+    /// Positional `g_Texture<N>` RAW (undecoded) `.tex` bytes, `None` for
+    /// an empty/unresolved slot — mirrors
+    /// `kwe_core::scenemodel::ResolvedModel::texture_slots`. Decoded by
+    /// `compile_material_layers` the same way `load_model_textures`
+    /// already decodes slot 0.
+    pub texture_slots: Vec<Option<Vec<u8>>>,
 }
 
 /// One `objects` entry interpreted as a video layer (M3g). The
@@ -971,6 +1000,7 @@ fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> O
         texture: None,
         text: None,
         video: None,
+        material: None,
     })
 }
 
@@ -1014,6 +1044,7 @@ fn parse_image_layer(
         texture: None,
         text: None,
         video: None,
+        material: None,
     })
 }
 
@@ -1124,6 +1155,7 @@ fn parse_text_layer(
             has_size,
         }),
         video: None,
+        material: None,
     })
 }
 
@@ -1230,6 +1262,7 @@ fn parse_video_layer(
             rate,
             path: None,
         }),
+        material: None,
     })
 }
 

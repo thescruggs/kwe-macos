@@ -50,6 +50,11 @@ depends=(
     # apply fails with shell_unreachable.
     'kscreen'
     'qt6-tools'
+    # S2: kwe-scene-renderer dlopens libshaderc_shared.so.1 at runtime for
+    # the material-shader GLSL -> SPIR-V compile (crates/kwe-scene-renderer,
+    # the `shaderc` crate, default features — no vendored glslang build;
+    # see THIRD_PARTY.yml's rust-shaderc entry).
+    'shaderc'
 )
 makedepends=(
     'rust'
@@ -59,6 +64,10 @@ makedepends=(
     'qt6-base'
     'qt6-declarative'
     'kirigami'
+    # S2: pkg-config discovers the system libshaderc at build time
+    # (shaderc.pc); the same 'shaderc' package provides both that and the
+    # runtime .so, so it is listed in both arrays.
+    'shaderc'
 )
 
 build() {

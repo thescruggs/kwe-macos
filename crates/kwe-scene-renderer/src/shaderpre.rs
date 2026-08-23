@@ -1,0 +1,1190 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! S2 material-shader preprocessor: turns one Wallpaper Engine shader
+//! source (`assets/shaders/<name>.vert` / `.frag`) into GLSL that
+//! `shaderc` (materialshader.rs) can compile straight to SPIR-V for
+//! Vulkan 1.2.
+//!
+//! Two things happen here, kept in one pass over the source text:
+//!
+//! 1. The upstream-faithful part — HLSL-compat header shim, `#include`
+//!    resolution, `#require LightingV1` stub, `// [COMBO] {json}` combo
+//!    scraping, `uniform TYPE name; // {json}` parameter-metadata
+//!    scraping, `gl_FragColor` -> `out_FragColor`, combos as
+//!    `#define NAME value` — is a direct port of
+//!    `ShaderUnit::preprocess`/`compile` (see the `Borrowed-From` note on
+//!    each function below).
+//! 2. A Vulkan-target addition with no upstream equivalent — upstream
+//!    compiles this same preprocessed text through glslang -> SPIR-V ->
+//!    SPIRV-Cross back to *OpenGL 330*, where loose `uniform`s and
+//!    unnumbered `varying`s are legal. Compiling straight to Vulkan
+//!    SPIR-V is not: every non-opaque uniform must live in a block, every
+//!    sampler needs a `layout(binding=)`, every stage-interface variable
+//!    needs a `layout(location=)`. `fold_declarations` performs exactly
+//!    that rewrite, in place, for the declarations this slice's material
+//!    pipeline understands (the WE "standard" uniform set plus a
+//!    material's own `constantshadervalues`); anything it does not
+//!    recognize gets a zero-valued local so the shader still compiles
+//!    (`Unknown uniforms get zero defaults` in the task brief) rather
+//!    than failing preprocessing outright — a real compile failure from
+//!    shaderc is a value the caller already has to handle (unsupported
+//!    GLSL constructs, missing includes that were load-bearing, etc.), so
+//!    this module leans on that instead of trying to detect every way a
+//!    shader can fail to compile.
+//!
+//! Pure: every function takes text/closures in and returns values out — no
+//! filesystem or Vulkan access happens in this module.
+
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
+/// `ShaderUnit::preprocessIncludes` has no explicit recursion bound (it
+/// relies on the corpus never nesting includes deeply); this module
+/// enforces one so a crafted or cyclic `#include` chain cannot recurse
+/// unboundedly.
+pub const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// Total size of one stage's preprocessed source, after every include is
+/// inlined and every substitution applied. Generous over any real WE
+/// shader (the largest corpus fragment shader plus its includes is under
+/// 32 KiB) while still bounding a crafted `#include` cycle or a chain of
+/// large headers.
+pub const MAX_PREPROCESSED_BYTES: usize = 1024 * 1024;
+
+/// `g_Texture0..g_Texture7` — the descriptor set's sampled-image bindings
+/// (vulkan.rs). A material referencing `g_Texture8` or higher cannot be
+/// bound and preprocessing fails for that stage.
+pub const MAX_MATERIAL_TEXTURES: usize = 8;
+
+/// Slots in the `MaterialUniforms` UBO's `g_MaterialConstants` array
+/// (materialshader.rs) available to a material's `constantshadervalues`
+/// plus any other uniform name this module does not recognize as a WE
+/// standard. A material with more distinct such uniforms than this falls
+/// back past the cap (uses the zero-default path for the overflow, not a
+/// hard preprocessing failure — see `fold_declarations`).
+pub const MAX_MATERIAL_CONSTANTS: usize = 16;
+
+/// The upstream HLSL-compat shim, verbatim (the `mul`/`lerp`/`frac`/...
+/// macro block), plus two `#extension` pragmas with no upstream
+/// equivalent: `#version 330` alone rejects `layout(binding=...)`
+/// (`'binding' : not supported for this version or the enabled
+/// extensions`) and `GL_ARB_separate_shader_objects` is what makes a
+/// stage-local `layout(location=)` legal without a matching
+/// `#version 420`+. Verified empirically against `glslc
+/// --target-env=vulkan1.2` during development — dropping either
+/// extension reproduces the exact compile error named above.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:22-58 (the
+/// `SHADER_HEADER`/`FRAGMENT_SHADER_DEFINES`/`VERTEX_SHADER_DEFINES`
+/// macros) @ b016d7d1 — adapted (Rust string constants instead of C++
+/// preprocessor macros; the two `#extension` lines above are this
+/// module's own addition, not from upstream, which never needs them
+/// since it targets OpenGL 330 by way of a SPIRV-Cross round trip rather
+/// than compiling straight to Vulkan SPIR-V).
+const SHADER_HEADER: &str = "#version 330\n\
+#extension GL_ARB_shading_language_420pack : enable\n\
+#extension GL_ARB_separate_shader_objects : enable\n\
+precision highp float;\n\
+#define mul(x, y) ((y) * (x))\n\
+#define lerp mix\n\
+#define frac fract\n\
+#define CAST2(x) (vec2(x))\n\
+#define CAST3(x) (vec3(x))\n\
+#define CAST4(x) (vec4(x))\n\
+#define CAST3X3(x) (mat3(x))\n\
+#define float2 vec2\n\
+#define float3 vec3\n\
+#define float4 vec4\n\
+#define int2 ivec2\n\
+#define int3 ivec3\n\
+#define int4 ivec4\n\
+#define saturate(x) (clamp(x, 0.0, 1.0))\n\
+#define texSample2D texture\n\
+#define texSample2DLod textureLod\n\
+#define log10(x) (log2(x) * 0.301029995663981)\n\
+#define atan2 atan\n\
+#define fmod(x, y) ((x)-(y)*trunc((x)/(y)))\n\
+#define ddx dFdx\n\
+#define ddy(x) dFdy(-(x))\n\
+#define GLSL 1\n\n";
+
+/// `#define max` is deliberately dropped from the verbatim header: upstream
+/// argument-swaps it (`max(x, y) -> max(y, x)`) to paper over an HLSL/GLSL
+/// operand-order quirk that does not affect GLSL, which already defines
+/// `max` the same way in both languages — keeping it would just risk a
+/// macro-recursion diagnostic on some drivers for no behavioral gain.
+// `out_FragColor` needs an explicit `layout(location=0)` for the same
+// Vulkan reason every other stage-interface variable does (see
+// `SHADER_HEADER`'s doc comment) — there is exactly one color attachment
+// (vulkan.rs's single-attachment render pass), so location 0 is always
+// correct.
+const FRAGMENT_SHADER_DEFINES: &str =
+    "layout(location = 0) out vec4 out_FragColor;\n#define varying in\n";
+const VERTEX_SHADER_DEFINES: &str = "#define attribute in\n#define varying out\n";
+
+/// The `#require LightingV1` stub — lighting objects are not implemented,
+/// so the generated function always returns zero contribution.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:366-377
+/// (`ShaderUnit::generateLightingV1`) @ b016d7d1 — adapted.
+const LIGHTING_V1_STUB: &str = "// begin of generated module LightingV1\n\
+vec3 PerformLighting_V1(vec3 worldPos, vec3 albedo, vec3 normal, vec3 viewDir,\n\
+    vec3 specularTint, vec3 baseReflectance, float roughness, float metallic)\n\
+{\n\
+    return vec3(0.0);\n\
+}\n\
+// end of generated module LightingV1\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Vertex,
+    Fragment,
+}
+
+/// Given an include filename (already extension-normalized, e.g.
+/// `"common_pbr.h"` or, for a workshop-shader redirect,
+/// `"zcompat/scene/shaders/<id>/foo.h"`), return its bytes, or `None` if
+/// it does not exist. Callers implement the `shaders/<name>` root and the
+/// `workshop/<id>/<file>` -> `zcompat/scene/shaders/<id>/<file>` redirect
+/// (`AssetLocator::shader`) before calling `preprocess` — this module only
+/// resolves the bare `#include "file.h"` name it finds in shader text,
+/// which the redirect does not apply to (upstream's redirect is keyed on
+/// the *top-level* shader path, not each include).
+pub type IncludeLookup<'a> = dyn FnMut(&str) -> Option<Vec<u8>> + 'a;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreprocessError {
+    /// `#include` chain nested past `MAX_INCLUDE_DEPTH`.
+    IncludeDepthExceeded,
+    /// Preprocessed text exceeded `MAX_PREPROCESSED_BYTES`.
+    SizeExceeded { bytes: usize, limit: usize },
+    /// A `uniform sampler2D` names a texture index >= `MAX_MATERIAL_TEXTURES`.
+    TooManyTextures { name: String, index: u32 },
+}
+
+impl std::fmt::Display for PreprocessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IncludeDepthExceeded => {
+                write!(f, "include depth exceeded {MAX_INCLUDE_DEPTH}")
+            }
+            Self::SizeExceeded { bytes, limit } => {
+                write!(f, "preprocessed size {bytes} exceeds the {limit} byte cap")
+            }
+            Self::TooManyTextures { name, index } => write!(
+                f,
+                "texture slot {index} (from uniform \"{name}\") exceeds the {MAX_MATERIAL_TEXTURES}-texture cap"
+            ),
+        }
+    }
+}
+
+/// One `uniform TYPE name; // {json}` parameter declaration, exactly as
+/// upstream's `preprocessVariables` would have handed to
+/// `parseParameterConfiguration` — recorded for diagnostics/tests; the
+/// material pipeline does not currently act on the JSON metadata beyond
+/// what `fold_declarations` needs (type + name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniformMeta {
+    pub glsl_type: String,
+    pub name: String,
+    pub json: Option<Value>,
+}
+
+/// One `attribute TYPE name;` declaration, vertex stage only, in source
+/// order — the caller (vulkan.rs material-pipeline registration) checks
+/// this against the one vertex format the quad path supports (S2 scope:
+/// mesh/puppet geometry stays out) and falls back if it does not match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeDecl {
+    pub glsl_type: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PreprocessOutput {
+    /// The final GLSL text, ready for `shaderc`.
+    pub source: String,
+    /// Combos in effect for this stage: discovered defaults overridden by
+    /// the material's own combos map, keyed by the ORIGINAL (not
+    /// upper-cased) combo name — `#define`s in `source` are upper-cased,
+    /// matching upstream.
+    pub combos: BTreeMap<String, i64>,
+    /// Scraped `uniform TYPE name; // {json}` parameter metadata, in
+    /// source order — diagnostic/test surface (asserted by the
+    /// `uniform_metadata_scraped_with_json` unit test); the material
+    /// pipeline does not currently need the JSON payload beyond what
+    /// `fold_declarations` already used for slot assignment.
+    #[allow(dead_code)]
+    pub uniforms: Vec<UniformMeta>,
+    pub attributes: Vec<AttributeDecl>,
+    /// `g_Texture<N>` indices this stage's source actually declares —
+    /// diagnostic/test surface (`sampler_gets_binding_from_texture_index`);
+    /// `bind_material_layer` fills every slot regardless (a `None` texture
+    /// samples the shared dummy), so production code does not currently
+    /// need to know which indices a given shader actually references.
+    #[allow(dead_code)]
+    pub sampler_slots: Vec<u32>,
+    /// True if any `_rt_`-prefixed name (a runtime FBO render target —
+    /// out of scope this slice, effects/FBO chains are S3) appears
+    /// anywhere in the preprocessed text, including in scraped uniform
+    /// JSON metadata (a `"default":"_rt_FullFrameBuffer"` sampler default
+    /// is exactly how upstream shaders reference one). Conservative by
+    /// design: some `_rt_` mentions may be behind a combo this material
+    /// never enables, but treating every mention as disqualifying is the
+    /// honest-degrade choice the task calls for over trying to prove
+    /// reachability.
+    pub references_render_target: bool,
+    /// Uniform names this module could not map to either a WE-standard
+    /// slot or a material-constant slot — each got a local zero-valued
+    /// declaration instead. Diagnostic only.
+    pub unsupported_uniforms: Vec<String>,
+}
+
+/// Resolve every `#include "file"` in `source`, recursively (bounded by
+/// `MAX_INCLUDE_DEPTH`), inlining the included text where the directive
+/// appeared. A missing include is not an error — matches upstream, which
+/// leaves a "tried including... but was not found" comment rather than
+/// failing (some includes in the corpus are behind combos that are never
+/// enabled, so their filename may not resolve without that being a real
+/// problem).
+///
+/// Deviates from upstream's placement strategy
+/// (`ShaderUnit::preprocessIncludes`, which collects every include's text
+/// separately and splices it in just before `main()`, walking an `#if`
+/// stack to avoid landing inside a false branch): every `#include` in the
+/// corpus sits at file scope above any function definition, so inlining
+/// in place is equivalent and does not need upstream's placement search.
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-171 (the
+/// `#include` extraction loop and its not-found fallback) @ b016d7d1 —
+/// adapted (recursive bounded resolution replaces the two-pass,
+/// one-level-of-nesting scheme; in-place splice replaces the
+/// before-`main()` placement search).
+fn resolve_includes(
+    source: &str,
+    include: &mut IncludeLookup<'_>,
+    depth: usize,
+    total_len: &mut usize,
+) -> Result<String, PreprocessError> {
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(PreprocessError::IncludeDepthExceeded);
+    }
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("#include")
+            && let Some(name) = extract_quoted(rest)
+        {
+            out.push_str("// begin of include from file ");
+            out.push_str(&name);
+            out.push('\n');
+            match include(&name) {
+                Some(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let resolved = resolve_includes(&text, include, depth + 1, total_len)?;
+                    out.push_str(&resolved);
+                    if !resolved.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                None => {
+                    out.push_str("// tried including file ");
+                    out.push_str(&name);
+                    out.push_str(" but was not found\n");
+                }
+            }
+            out.push_str("// end of included from file ");
+            out.push_str(&name);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+    }
+    *total_len += out.len();
+    if *total_len > MAX_PREPROCESSED_BYTES {
+        return Err(PreprocessError::SizeExceeded {
+            bytes: *total_len,
+            limit: MAX_PREPROCESSED_BYTES,
+        });
+    }
+    Ok(out)
+}
+
+fn extract_quoted(rest: &str) -> Option<String> {
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    Some(rest[start..end].to_string())
+}
+
+/// Scrape `// [COMBO] {json}` (combo declaration + default) and
+/// `uniform TYPE name; // {json}` (parameter metadata) lines. Returns
+/// discovered combo defaults (only for combos not already in
+/// `material_combos` — matches upstream: a material-specified combo value
+/// always wins over the shader's own default) and the uniform metadata
+/// list, in source order.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:96-134
+/// (`ShaderUnit::preprocessVariables`) @ b016d7d1 — adapted (only the
+/// `[COMBO]`/commented-`uniform` detection and default-value extraction;
+/// the sampler-combo-requirement resolution in
+/// `parseParameterConfiguration` — `requireany`/texture-slot-driven combo
+/// activation — is out of scope: GLSL treats an undefined macro in `#if`
+/// as 0 (verified against `glslc`), so an un-scraped combo used only by a
+/// `#if COMBO_NAME` guard still compiles, just always taking the
+/// combo-off branch unless the material's own `combos` map sets it).
+fn scrape(
+    source: &str,
+    material_combos: &BTreeMap<String, i64>,
+) -> (BTreeMap<String, i64>, Vec<UniformMeta>) {
+    let mut discovered = BTreeMap::new();
+    let mut uniforms = Vec::new();
+    for line in source.lines() {
+        if let Some(json_text) = line.find("// [COMBO] ").map(|at| &line[at + 11..]) {
+            if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(json_text) {
+                let Some(combo) = object.get("combo").and_then(Value::as_str) else {
+                    continue;
+                };
+                if material_combos.contains_key(combo) || discovered.contains_key(combo) {
+                    continue;
+                }
+                let default = match object.get("default") {
+                    Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                discovered.insert(combo.to_string(), default);
+            }
+            continue;
+        }
+        let Some(semicolon) = line.find(';') else {
+            continue;
+        };
+        let Some(comment) = line.find("// ") else {
+            continue;
+        };
+        if !(line.contains("uniform ") && semicolon < comment) {
+            continue;
+        }
+        let Some(last_space) = line[..semicolon].rfind(' ') else {
+            continue;
+        };
+        let Some(previous_space) = line[..last_space].rfind(' ') else {
+            continue;
+        };
+        let glsl_type = line[previous_space + 1..last_space].trim().to_string();
+        let name = line[last_space + 1..semicolon].trim().to_string();
+        if glsl_type.is_empty() || name.is_empty() || name.contains('[') {
+            continue;
+        }
+        let json = serde_json::from_str::<Value>(&line[comment + 3..]).ok();
+        uniforms.push(UniformMeta {
+            glsl_type,
+            name,
+            json,
+        });
+    }
+    (discovered, uniforms)
+}
+
+/// Replace every `#require ModuleName` line: `LightingV1` gets the stub
+/// function inlined in place (the corpus's only implemented module,
+/// mirroring `ShaderUnit::resolveRequireModule`); anything else is
+/// commented out (unimplemented, not a hard failure — matches upstream's
+/// `sLog.error` + continue behavior).
+fn resolve_requires(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("#require") {
+            let module = rest.trim();
+            if module == "LightingV1" {
+                out.push_str(LIGHTING_V1_STUB);
+            } else {
+                out.push_str("// unresolved #require ");
+                out.push_str(module);
+                out.push('\n');
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// The WE "standard" uniform set this material pipeline provides via the
+/// `MaterialUniforms` UBO (materialshader.rs) — name -> GLSL expression
+/// reaching the matching UBO field. `g_Texture<N>Resolution` doubles as
+/// texel size (`.zw`), matching WE's own convention (a resolution uniform
+/// that is `vec4(width, height, 1/width, 1/height)`); `g_TexelSize` (no
+/// number) aliases texture slot 0's, the common single-texture case.
+fn standard_uniform_expr(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("g_Texture")
+        && let Some(index_str) = rest.strip_suffix("Resolution")
+        && let Ok(index) = index_str.parse::<u32>()
+        && index < MAX_MATERIAL_TEXTURES as u32
+    {
+        return Some(format!("u_Std.g_TextureResolution_[{index}]"));
+    }
+    if let Some(rest) = name.strip_prefix("g_Point")
+        && let Ok(index) = rest.parse::<u32>()
+        && index < 8
+    {
+        return Some(format!("u_Std.g_Point_[{index}]"));
+    }
+    Some(
+        match name {
+            "g_ModelViewProjectionMatrix" => "u_Std.g_ModelViewProjectionMatrix_",
+            "g_EffectTextureProjectionMatrix" => "u_Std.g_EffectTextureProjectionMatrix_",
+            "g_Color" => "u_Std.g_Color_",
+            "g_ParallaxPosition" => "u_Std.g_ParallaxPointer_.xy",
+            "g_PointerPosition" => "u_Std.g_ParallaxPointer_.zw",
+            "g_TexelSize" => "u_Std.g_TextureResolution_[0].zw",
+            "g_Time" => "u_Std.g_TimeAlphaBrightness_.x",
+            "g_UserAlpha" => "u_Std.g_TimeAlphaBrightness_.y",
+            "g_Brightness" => "u_Std.g_TimeAlphaBrightness_.z",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// The fixed UBO block every material shader stage declares, always at
+/// `set=0, binding=8`. `materialshader::MaterialUniforms` is the Rust
+/// mirror — the two must stay byte-for-byte in sync (see that module's
+/// doc comment and its `std140 layout` unit test).
+const MATERIAL_UBO_BLOCK: &str = "layout(set = 0, binding = 8, std140) uniform MaterialUniforms {\n\
+    mat4 g_ModelViewProjectionMatrix_;\n\
+    mat4 g_EffectTextureProjectionMatrix_;\n\
+    vec4 g_TextureResolution_[8];\n\
+    vec4 g_Point_[8];\n\
+    vec4 g_Color_;\n\
+    vec4 g_ParallaxPointer_;\n\
+    vec4 g_TimeAlphaBrightness_;\n\
+    vec4 g_MaterialConstants_[16];\n\
+} u_Std;\n";
+
+fn zero_literal(glsl_type: &str) -> Option<&'static str> {
+    Some(match glsl_type {
+        "float" => "float(0.0)",
+        "int" => "int(0)",
+        "bool" => "bool(false)",
+        "vec2" => "vec2(0.0)",
+        "vec3" => "vec3(0.0)",
+        "vec4" => "vec4(0.0)",
+        "mat3" => "mat3(0.0)",
+        "mat4" => "mat4(0.0)",
+        _ => return None,
+    })
+}
+
+fn material_constant_swizzle(glsl_type: &str) -> Option<&'static str> {
+    match glsl_type {
+        "float" => Some(".x"),
+        "vec2" => Some(".xy"),
+        "vec3" => Some(".xyz"),
+        "vec4" => Some(""),
+        _ => None,
+    }
+}
+
+/// Rewrite every `attribute`/`varying`/non-sampler-`uniform` declaration
+/// this module recognizes so the result is legal Vulkan GLSL (see the
+/// module doc's point 2). Declarations this function does not recognize
+/// (arrays, unsupported types, anything not matching the simple
+/// `QUALIFIER TYPE name;` shape) are left untouched — if the shader
+/// actually needs them to compile, `shaderc` reports the failure and the
+/// caller falls back; this module does not try to predict every way that
+/// can happen.
+///
+/// `varying_locations` is shared across the vertex and fragment calls for
+/// one material (the caller preprocesses vertex first) so a varying with
+/// the same name gets the SAME `layout(location=)` in both stages — the
+/// two stages are linked purely by matching locations in a Vulkan
+/// pipeline, there is no by-name linking step the way there is in the
+/// upstream/OpenGL target.
+#[allow(clippy::too_many_lines)]
+/// `(folded source, scraped attributes, referenced sampler slots, uniform
+/// names that got a zero-default fallback)` — `fold_declarations`'s
+/// return shape, named to satisfy `clippy::type_complexity`.
+type FoldedDeclarations = (String, Vec<AttributeDecl>, Vec<u32>, Vec<String>);
+
+fn fold_declarations(
+    source: &str,
+    material_constants: &[String],
+    varying_locations: &mut BTreeMap<String, u32>,
+) -> Result<FoldedDeclarations, PreprocessError> {
+    let mut out = String::with_capacity(source.len());
+    let mut attributes = Vec::new();
+    let mut sampler_slots = Vec::new();
+    let mut unsupported = Vec::new();
+    let mut next_attribute_location = 0u32;
+    let mut next_sampler_slot = 0u32;
+    let mut used_sampler_slots: [bool; MAX_MATERIAL_TEXTURES] = [false; MAX_MATERIAL_TEXTURES];
+
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+
+        if let Some(rest) = trimmed.strip_prefix("attribute ") {
+            if let Some((glsl_type, name)) = parse_decl(rest) {
+                let location = next_attribute_location;
+                next_attribute_location += 1;
+                attributes.push(AttributeDecl {
+                    glsl_type: glsl_type.clone(),
+                    name: name.clone(),
+                });
+                out.push_str(indent);
+                out.push_str(&format!(
+                    "layout(location = {location}) attribute {glsl_type} {name};{newline}"
+                ));
+                continue;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("varying ") {
+            if let Some((glsl_type, name)) = parse_decl(rest) {
+                let next = varying_locations.len() as u32;
+                let location = *varying_locations.entry(name.clone()).or_insert(next);
+                out.push_str(indent);
+                out.push_str(&format!(
+                    "layout(location = {location}) varying {glsl_type} {name};{newline}"
+                ));
+                continue;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("uniform ")
+            && let Some((glsl_type, name)) = parse_decl(rest)
+        {
+            if glsl_type == "sampler2D" {
+                let index = if let Some(n) = name
+                    .strip_prefix("g_Texture")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    n
+                } else {
+                    while (next_sampler_slot as usize) < MAX_MATERIAL_TEXTURES
+                        && used_sampler_slots[next_sampler_slot as usize]
+                    {
+                        next_sampler_slot += 1;
+                    }
+                    next_sampler_slot
+                };
+                if index as usize >= MAX_MATERIAL_TEXTURES {
+                    return Err(PreprocessError::TooManyTextures { name, index });
+                }
+                used_sampler_slots[index as usize] = true;
+                sampler_slots.push(index);
+                out.push_str(indent);
+                out.push_str(&format!(
+                    "layout(set = 0, binding = {index}) uniform sampler2D {name};{newline}"
+                ));
+                continue;
+            }
+            if !glsl_type.contains('[') && !name.contains('[') {
+                if let Some(expr) = standard_uniform_expr(&name) {
+                    out.push_str(indent);
+                    out.push_str(&format!("#define {name} {expr}{newline}"));
+                    continue;
+                }
+                if let Some(slot) = material_constants.iter().position(|n| n == &name)
+                    && slot < MAX_MATERIAL_CONSTANTS
+                    && let Some(swizzle) = material_constant_swizzle(&glsl_type)
+                {
+                    out.push_str(indent);
+                    out.push_str(&format!(
+                        "#define {name} u_Std.g_MaterialConstants_[{slot}]{swizzle}{newline}"
+                    ));
+                    continue;
+                }
+                if let Some(zero) = zero_literal(&glsl_type) {
+                    unsupported.push(name.clone());
+                    out.push_str(indent);
+                    out.push_str(&format!("const {glsl_type} {name} = {zero};{newline}"));
+                    continue;
+                }
+            }
+            unsupported.push(name.clone());
+        }
+        out.push_str(line);
+    }
+    Ok((out, attributes, sampler_slots, unsupported))
+}
+
+/// Parse `TYPE NAME` (or `TYPE NAME[N]`) up to the first `;`, tolerating a
+/// trailing `// comment`. Returns `None` for anything that does not match
+/// (arrays are returned WITH the brackets still in `name`/`glsl_type`, so
+/// callers can detect and skip them explicitly rather than silently
+/// mis-parsing).
+fn parse_decl(rest: &str) -> Option<(String, String)> {
+    let semicolon = rest.find(';')?;
+    let body = rest[..semicolon].trim();
+    let last_space = body.rfind(' ')?;
+    let glsl_type = body[..last_space].trim().to_string();
+    let name = body[last_space + 1..].trim().to_string();
+    if glsl_type.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((glsl_type, name))
+}
+
+/// Preprocess one shader stage. `material_combos` is the material's own
+/// combo overrides (`ResolvedModel::combos`, already parsed by
+/// `kwe_core::scenemodel`); `material_constants` is the ordered list of
+/// non-standard uniform names this material provides a constant for
+/// (built by the caller from `ResolvedModel::constant_shader_values`,
+/// deterministically ordered, capped at `MAX_MATERIAL_CONSTANTS`).
+/// `varying_locations` must be the SAME map across the vertex and
+/// fragment calls for one material (see `fold_declarations`).
+pub fn preprocess(
+    stage: Stage,
+    file_label: &str,
+    source: &str,
+    material_combos: &BTreeMap<String, i64>,
+    material_constants: &[String],
+    varying_locations: &mut BTreeMap<String, u32>,
+    include: &mut IncludeLookup<'_>,
+) -> Result<PreprocessOutput, PreprocessError> {
+    let mut total_len = 0usize;
+    let included = resolve_includes(source, include, 0, &mut total_len)?;
+    let required = resolve_requires(&included);
+    let (discovered_combos, uniforms) = scrape(&required, material_combos);
+
+    let mut combos: BTreeMap<String, i64> = BTreeMap::new();
+    for (name, value) in material_combos {
+        combos.insert(name.clone(), *value);
+    }
+    for (name, value) in &discovered_combos {
+        combos.entry(name.clone()).or_insert(*value);
+    }
+
+    let (folded, attributes, sampler_slots, unsupported_uniforms) =
+        fold_declarations(&required, material_constants, varying_locations)?;
+
+    let mut source_out = String::new();
+    source_out.push_str(&format!(
+        "// ======================================================\n// Processed shader {file_label}\n// ======================================================\n"
+    ));
+    source_out.push_str(SHADER_HEADER);
+    source_out.push_str(match stage {
+        Stage::Fragment => FRAGMENT_SHADER_DEFINES,
+        Stage::Vertex => VERTEX_SHADER_DEFINES,
+    });
+    source_out.push_str(MATERIAL_UBO_BLOCK);
+    for (name, value) in &combos {
+        source_out.push_str(&format!("#define {} {}\n", name.to_uppercase(), value));
+    }
+    source_out.push('\n');
+    source_out.push_str(&folded.replace("gl_FragColor", "out_FragColor"));
+
+    if source_out.len() > MAX_PREPROCESSED_BYTES {
+        return Err(PreprocessError::SizeExceeded {
+            bytes: source_out.len(),
+            limit: MAX_PREPROCESSED_BYTES,
+        });
+    }
+
+    // Checked against `required` (post-include, pre-fold) rather than the
+    // final `source_out`: `fold_declarations` rewrites a matched sampler
+    // or uniform line and drops its trailing `// {json}` comment — which
+    // is exactly where a `"default":"_rt_FullFrameBuffer"` reference
+    // lives — so checking the folded text would miss it.
+    let references_render_target = required.contains("_rt_");
+
+    Ok(PreprocessOutput {
+        source: source_out,
+        combos,
+        uniforms,
+        attributes,
+        sampler_slots,
+        references_render_target,
+        unsupported_uniforms,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_includes() -> Box<IncludeLookup<'static>> {
+        Box::new(|_: &str| None)
+    }
+
+    #[test]
+    fn header_shim_and_frag_color_rewrite_present() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "void main() { gl_FragColor = vec4(1.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("#version 330"));
+        assert!(out.source.contains("#define lerp mix"));
+        assert!(out.source.contains("out vec4 out_FragColor;"));
+        assert!(out.source.contains("out_FragColor = vec4(1.0);"));
+        assert!(!out.source.contains("gl_FragColor"));
+    }
+
+    #[test]
+    fn combo_scraped_with_default_and_emitted_as_define() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let source = "// [COMBO] {\"combo\":\"LIGHTING\",\"default\":0}\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(out.combos.get("LIGHTING"), Some(&0));
+        assert!(out.source.contains("#define LIGHTING 0"));
+    }
+
+    #[test]
+    fn material_combo_override_wins_over_shader_default() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut material_combos = BTreeMap::new();
+        material_combos.insert("LIGHTING".to_string(), 1);
+        let source = "// [COMBO] {\"combo\":\"LIGHTING\",\"default\":0}\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &material_combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(out.combos.get("LIGHTING"), Some(&1));
+        assert!(out.source.contains("#define LIGHTING 1"));
+    }
+
+    #[test]
+    fn combo_disabled_marker_is_not_scraped() {
+        // Real corpus files carry a `[COMBO_DISABLED]` variant that must
+        // NOT match the `[COMBO] ` scrape (upstream's exact-substring
+        // `"// [COMBO] "` check does not match it either).
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let source = "// [COMBO_DISABLED] {\"combo\":\"DOUBLESIDEDLIGHTING\",\"default\":0}\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(!out.combos.contains_key("DOUBLESIDEDLIGHTING"));
+    }
+
+    #[test]
+    fn uniform_metadata_scraped_with_json() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let source =
+            "uniform float g_UserAlpha; // {\"material\":\"Alpha\",\"default\":1}\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(out.uniforms.len(), 1);
+        assert_eq!(out.uniforms[0].name, "g_UserAlpha");
+        assert_eq!(out.uniforms[0].glsl_type, "float");
+        assert!(out.uniforms[0].json.is_some());
+    }
+
+    #[test]
+    fn uncommented_plain_uniform_is_not_scraped_as_metadata() {
+        // Matches upstream: only `uniform TYPE name; // json` (semicolon
+        // before the comment) is a scraped "parameter" — a plain
+        // `uniform mat4 g_ModelViewProjectionMatrix;` with no trailing
+        // comment is not (it still gets folded into the UBO by
+        // `fold_declarations`, just not recorded as metadata).
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let source = "uniform mat4 g_ModelViewProjectionMatrix;\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.uniforms.is_empty());
+        assert!(
+            out.source
+                .contains("#define g_ModelViewProjectionMatrix u_Std.g_ModelViewProjectionMatrix_")
+        );
+    }
+
+    #[test]
+    fn include_resolves_and_inlines() {
+        let mut include: Box<IncludeLookup<'static>> = Box::new(|name: &str| {
+            if name == "common.h" {
+                Some(b"vec3 helper() { return vec3(1.0); }\n".to_vec())
+            } else {
+                None
+            }
+        });
+        let mut locs = BTreeMap::new();
+        let source = "#include \"common.h\"\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("vec3 helper()"));
+    }
+
+    #[test]
+    fn nested_include_resolves_two_levels() {
+        let mut include: Box<IncludeLookup<'static>> = Box::new(|name: &str| match name {
+            "a.h" => Some(b"#include \"b.h\"\n".to_vec()),
+            "b.h" => Some(b"const float X = 1.0;\n".to_vec()),
+            _ => None,
+        });
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#include \"a.h\"\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("const float X = 1.0;"));
+    }
+
+    #[test]
+    fn missing_include_is_not_an_error() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#include \"missing.h\"\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("but was not found"));
+    }
+
+    #[test]
+    fn include_depth_bounded() {
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"#include \"self.h\"\n".to_vec()));
+        let mut locs = BTreeMap::new();
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#include \"self.h\"\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert_eq!(error, PreprocessError::IncludeDepthExceeded);
+    }
+
+    #[test]
+    fn oversized_preprocessed_text_is_refused() {
+        let big = "a".repeat(MAX_PREPROCESSED_BYTES + 1);
+        let mut include: Box<IncludeLookup<'static>> = {
+            let big = big.clone();
+            Box::new(move |_: &str| Some(big.clone().into_bytes()))
+        };
+        let mut locs = BTreeMap::new();
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#include \"huge.h\"\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreprocessError::SizeExceeded { .. }));
+    }
+
+    #[test]
+    fn require_lighting_v1_stub_inserted() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#require LightingV1\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("PerformLighting_V1"));
+    }
+
+    #[test]
+    fn unknown_require_is_commented_not_fatal() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "#require SomethingElse\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("unresolved #require SomethingElse"));
+    }
+
+    #[test]
+    fn sampler_gets_binding_from_texture_index() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform sampler2D g_Texture0; // {}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("layout(set = 0, binding = 0) uniform sampler2D g_Texture0;")
+        );
+        assert_eq!(out.sampler_slots, vec![0]);
+    }
+
+    #[test]
+    fn texture_index_past_cap_is_an_error() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform sampler2D g_Texture9; // {}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreprocessError::TooManyTextures { .. }));
+    }
+
+    #[test]
+    fn varying_shares_location_between_vertex_and_fragment() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let vert = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "varying vec2 v_TexCoord;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        let frag = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "varying vec2 v_TexCoord;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            vert.source
+                .contains("layout(location = 0) varying vec2 v_TexCoord;")
+        );
+        assert!(
+            frag.source
+                .contains("layout(location = 0) varying vec2 v_TexCoord;")
+        );
+    }
+
+    #[test]
+    fn attribute_locations_assigned_in_order() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert_eq!(
+            out.attributes,
+            vec![
+                AttributeDecl {
+                    glsl_type: "vec3".into(),
+                    name: "a_Position".into()
+                },
+                AttributeDecl {
+                    glsl_type: "vec2".into(),
+                    name: "a_TexCoord".into()
+                },
+            ]
+        );
+        assert!(
+            out.source
+                .contains("layout(location = 0) attribute vec3 a_Position;")
+        );
+        assert!(
+            out.source
+                .contains("layout(location = 1) attribute vec2 a_TexCoord;")
+        );
+    }
+
+    #[test]
+    fn material_constant_folds_into_ubo_slot() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let constants = vec!["g_Roughness".to_string()];
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform float g_Roughness; // {\"material\":\"roughness\",\"default\":0.5}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &constants,
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("#define g_Roughness u_Std.g_MaterialConstants_[0].x")
+        );
+        assert!(out.unsupported_uniforms.is_empty());
+    }
+
+    #[test]
+    fn unknown_uniform_gets_zero_default_and_diagnostic() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform vec3 g_SomeUnknownThing;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("const vec3 g_SomeUnknownThing = vec3(0.0);")
+        );
+        assert_eq!(
+            out.unsupported_uniforms,
+            vec!["g_SomeUnknownThing".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_target_reference_is_flagged() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform sampler2D g_Texture4; // {\"default\":\"_rt_FullFrameBuffer\"}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.references_render_target);
+    }
+
+    #[test]
+    fn no_render_target_reference_when_absent() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform sampler2D g_Texture0; // {\"label\":\"albedo\"}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(!out.references_render_target);
+    }
+
+    #[test]
+    fn standard_matrix_uniform_folds_and_disappears_as_a_declaration() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "uniform mat4 g_ModelViewProjectionMatrix;\nvoid main(){ gl_Position = g_ModelViewProjectionMatrix * vec4(1.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        // No loose `uniform mat4 g_ModelViewProjectionMatrix;` line
+        // remains (Vulkan would reject it outside a block) — the name now
+        // resolves via the #define.
+        assert!(
+            !out.source
+                .contains("uniform mat4 g_ModelViewProjectionMatrix;")
+        );
+    }
+}
