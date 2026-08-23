@@ -737,15 +737,20 @@ the same per-draw brightness/alpha as `g_Brightness`/`g_UserAlpha`,
 packed into one vec4 — the `VERSION`-combo-gated replacement for that
 pair in every `genericimage*` fragment shader), `g_ParallaxPosition`,
 `g_Point0..7`, `g_PointerPosition`, `g_TexelSize`,
-`g_EffectTextureProjectionMatrix`) plus up to 16 of the material's own
-`constantshadervalues`, by name. Any other uniform gets a local
-zero-valued declaration and a one-time diagnostic
+`g_EffectTextureProjectionMatrix`, and (S4a) `g_ModelMatrix`/
+`g_ViewProjectionMatrix`/`g_NormalModelMatrix` plus their `Alt` siblings
+— folded to `mat4(1.0)`/`mat3(1.0)` identity, not zero, since these feed
+vertex POSITION (see "Vertex attribute shapes (S4)" below) — plus up to
+16 of the material's own `constantshadervalues`, by name. Any other
+uniform gets a local zero-valued declaration and a one-time diagnostic
 (`event=renderer.scene.shader_unsupported_uniform`) — the shader still
-compiles, that one value is just inert (this includes lighting/
-reflection-only uniforms such as `g_EyePosition`/`g_ModelMatrix`/
-`g_ViewProjectionMatrix`, matching `#require LightingV1`'s existing
-"always zero contribution" scope limit — a material that genuinely
-NEEDS real lighting math still draws, just without lighting).
+compiles, that one value is just inert. This still includes genuinely
+lighting-only uniforms such as `g_EyePosition`/`g_LightsPosition`,
+matching `#require LightingV1`'s existing "always zero contribution"
+scope limit — a material that genuinely needs real LIGHT/SHADING math
+still draws, just without lighting; that is now a materially narrower
+gap than before S4a, which also zero-defaulted the matrices feeding the
+object's own screen POSITION.
 
 **S4**: `fold_declarations`' scraping is now conditional-compilation-
 AWARE — a bounded `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`
@@ -1050,13 +1055,39 @@ and confirmed against the real corpus scene that surfaced them (Workshop
 3100709479, a `genericimage3` material): after both fixes, its render
 output is byte-identical to the pre-S4 baseline's own (already-correct)
 S1 fallback, while now drawing through the REAL material pipeline
-instead of a flat textured quad. Neither fix is lighting/reflection
-support (that stays out of scope, unchanged from S1–S3:
-`#require LightingV1` still resolves to a zero-contribution stub, and a
-material whose LIVE combo state genuinely needs `g_EyePosition`/
-`g_ModelMatrix`/`g_ViewProjectionMatrix` for real (non-zero) shading
-still draws with those zero-defaulted — a documented, pre-existing gap
-this slice did not attempt to close).
+instead of a flat textured quad.
+
+**S4a adversarial review, MUST-FIX #3**: a third, related "zero should be
+identity" gap survived the original S4 pass and the 60-scene sweep —
+`g_ModelMatrix`/`g_ViewProjectionMatrix`/`g_NormalModelMatrix` (+ `Alt`
+siblings) also fell through to the generic zero-default. Unlike
+`g_EyePosition`/lighting math (genuinely out of scope — `#require
+LightingV1` still resolves to a zero-contribution stub), these three feed
+vertex **POSITION**, not just shading: `genericimage3.vert:163`'s
+`worldPos = mul(vec4(localPos, 1.0), g_ModelMatrix)` runs
+UNCONDITIONALLY on every draw of this shader family, and once a material
+sets `LIGHTING=1` (a legitimate combo override on the very same
+`a_Normal`/`a_Color` attribute family S4 widened acceptance to),
+`gl_Position` itself is computed from `worldPos * g_ViewProjectionMatrix`
+— two zero matrices collapsing the object's on-screen geometry to a
+single degenerate point, not "missing lighting." None of the 60 local
+corpus scenes happen to set `LIGHTING`/`REFLECTION`/`VERTEXCOLOR` on a
+`genericimage2/3/4`-family material, so the sweep could not have caught
+this the way it caught the two fixes above — found by adversarial review
+instead. Fixed the same way: `g_ModelMatrix`/`g_AltModelMatrix`/
+`g_ViewProjectionMatrix`/`g_AltViewProjectionMatrix` fold to `mat4(1.0)`;
+`g_NormalModelMatrix`/`g_AltNormalModelMatrix` fold to `mat3(1.0)` —
+pinned by `shaderpre::tests::model_and_view_projection_matrices_fold_to_identity_not_zero`.
+This is still not real lighting/reflection support (a material whose live
+combo state needs `g_EyePosition` for real, non-zero shading still draws
+without it, unchanged), and two more unconditional-declaration `mat4`
+uniforms were found by the same grep but left unfixed as out of this
+finding's specific scope (`g_EffectModelMatrix`, read unconditionally in
+`volumetricsfront.frag`'s raymarch; `g_EffectModelViewProjectionMatrix`,
+read unconditionally in `effectcomposebackground.vert`'s screen-coord
+compute — both single-shader-file, effect-pass-only names, not the
+widely-used image-object family this review targeted) — recorded here as
+a known residual gap, not silently dropped.
 
 **Residual sweep findings, not further chased this slice**: after both
 fixes, the 60-scene sweep's flagged count is higher than the 8 found

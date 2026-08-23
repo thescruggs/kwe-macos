@@ -186,6 +186,17 @@ pub enum PreprocessError {
     /// visible as one more fallback reason instead of silently
     /// compiling a material with a combo quietly missing.
     InvalidComboName(String),
+    /// S4a review MUST-FIX #2: an `#if`/`#elif` condition
+    /// `evaluate_if_expr` could not fully evaluate (an unrecognized
+    /// expression shape, or the depth/token bound in MUST-FIX #1 was
+    /// hit) WHILE its parent scope is live -- rather than guess "always
+    /// live" (which can silently SUPPRESS a genuinely-live sibling
+    /// `#else`/`#elif` branch and under-scrape its declarations, see the
+    /// finding), the whole material is rejected the same way any other
+    /// preprocess failure already is. Carries the raw (bounded, char-
+    /// count-capped) condition text for a future diagnostic; not
+    /// currently logged (`main.rs` discards the `Err` payload today).
+    AmbiguousCondition(String),
 }
 
 impl std::fmt::Display for PreprocessError {
@@ -206,6 +217,9 @@ impl std::fmt::Display for PreprocessError {
             ),
             Self::InvalidComboName(name) => {
                 write!(f, "combo name {name:?} is not a valid GLSL identifier")
+            }
+            Self::AmbiguousCondition(expr) => {
+                write!(f, "could not evaluate #if/#elif condition {expr:?}")
             }
         }
     }
@@ -537,6 +551,30 @@ fn standard_uniform_expr(name: &str) -> Option<String> {
     // zero-default path: `vec2(0.0, 0.0)` IS the correct identity
     // translation for the same formula, so no special case is needed
     // there.
+    //
+    // S4a review RECOMMENDED #5: this identity default is a reasonable
+    // ENGINEERING CHOICE, not literally upstream's own default — traced
+    // against `CPass.cpp`/`CPass.h` in linux-wallpaperengine,
+    // `TextureAnimationState::rotation`'s real raw default is `{0,0,0,0}`
+    // (upstream only ever WRITES a non-zero rotation for a genuinely
+    // GIF-animated texture). Every corpus occurrence of this formula
+    // (`genericimage.vert:30`/`genericimage2.vert:102`/
+    // `genericimage3.vert:153`/`genericimage4.vert:177`) only READS
+    // `g_Texture<N>Rotation` inside `#if SPRITESHEET` (its `v_TexCoord`
+    // assignment sits in the `#if SPRITESHEET ... #else v_TexCoord.xy =
+    // a_TexCoord; #endif` branch) — with `SPRITESHEET` off (the common
+    // case), this uniform's value is DECLARED (unconditionally) but
+    // never actually READ, so the identity default below is inert there
+    // either way. It only matters once a material sets `SPRITESHEET=1`,
+    // which this renderer does not decode real per-frame spritesheet/GIF
+    // atlas data for at all (a separate, documented gap) — identity is
+    // still a strictly better approximation than the old zero-default
+    // for that unimplemented case (matches this same file's
+    // `g_ModelMatrix`/`g_ViewProjectionMatrix` reasoning), but it would
+    // still be visually WRONG for a real multi-frame spritesheet material
+    // (stretches the whole atlas across one quad instead of windowing a
+    // single frame) if one is ever encountered — not validated against a
+    // genuinely SPRITESHEET-live corpus case.
     if let Some(rest) = name.strip_prefix("g_Texture")
         && let Some(index_str) = rest.strip_suffix("Rotation")
         && let Ok(index) = index_str.parse::<u32>()
@@ -554,6 +592,45 @@ fn standard_uniform_expr(name: &str) -> Option<String> {
         match name {
             "g_ModelViewProjectionMatrix" => "u_Std.g_ModelViewProjectionMatrix_",
             "g_EffectTextureProjectionMatrix" => "u_Std.g_EffectTextureProjectionMatrix_",
+            // S4a review MUST-FIX #3: `g_ModelMatrix`/`g_ViewProjectionMatrix`/
+            // `g_NormalModelMatrix` (+ their `Alt` siblings) previously fell
+            // through to the generic `mat4(0.0)`/`mat3(0.0)` zero-default —
+            // the SAME "zero should be identity" bug class already fixed
+            // above for `g_Texture<N>Rotation`/`g_Color4`, just for
+            // matrices that feed vertex POSITION, not only lighting.
+            // Traced in the local WE asset corpus
+            // (`genericimage3.vert:56,58,163`): `worldPos = mul(vec4(localPos,
+            // 1.0), M_MDL)` (`M_MDL` = `g_ModelMatrix` outside
+            // `PRELIGHTING`) runs UNCONDITIONALLY on every draw of this
+            // shader family, and once a material sets `LIGHTING=1`
+            // (legitimate — a sibling gate on this exact `a_Normal`/
+            // `a_Color` attribute family this slice widened acceptance
+            // to, e.g. `materials/util/flatalphavertexcolor.json`),
+            // `gl_Position` itself is computed from `worldPos *
+            // g_ViewProjectionMatrix` — two zero matrices multiplied
+            // through collapse the object's on-screen GEOMETRY to a
+            // single degenerate point, not merely "missing lighting."
+            // None of the 60 local corpus scenes happen to set
+            // `LIGHTING`/`REFLECTION`/`VERTEXCOLOR` on a
+            // `genericimage2/3/4`-family material, so the 60-scene sweep
+            // could not have caught this the way it caught the
+            // `g_Texture<N>Rotation`/`g_Color4` regressions — found by
+            // adversarial review instead. Identity (`mat4(1.0)`/
+            // `mat3(1.0)`) is the correct "no real transform implemented"
+            // default, matching this slice's own `g_Texture0Rotation`
+            // reasoning (a zero matrix is essentially never the
+            // intentionally-correct default for an UNIMPLEMENTED
+            // transform). This does not implement real per-object model
+            // transforms, alt-camera matrices, or normal-matrix lighting
+            // math (`#require LightingV1` still resolves to a
+            // zero-contribution stub) — it only stops an identity-adjacent
+            // computation from silently zeroing out the object's own
+            // screen position.
+            "g_ModelMatrix"
+            | "g_AltModelMatrix"
+            | "g_ViewProjectionMatrix"
+            | "g_AltViewProjectionMatrix" => "mat4(1.0)",
+            "g_NormalModelMatrix" | "g_AltNormalModelMatrix" => "mat3(1.0)",
             "g_Color" => "u_Std.g_Color_",
             "g_ParallaxPosition" => "u_Std.g_ParallaxPointer_.xy",
             "g_PointerPosition" => "u_Std.g_ParallaxPointer_.zw",
@@ -640,19 +717,45 @@ struct CondFrame {
     active_here: bool,
 }
 
+/// Recursion-depth bound for `evaluate_if_expr`'s parser (nested parens
+/// or a chained `!` run) — S4a review MUST-FIX #1: with no bound, a
+/// single `#if` line comfortably under `MAX_PREPROCESSED_BYTES` (e.g.
+/// `"#if "` + `"("` x 400,000 + `"1"` + `")"` x 400,000) drove the
+/// recursive-descent parser several hundred thousand stack frames deep —
+/// a native stack overflow (`SIGSEGV`/uncatchable), not a panic, killing
+/// the whole worker process, not just the one material. 32 is generous
+/// over any real WE `#if` expression (all one-line boolean combinations
+/// per the local corpus survey) while nowhere near stack-exhausting.
+/// Mirrors `MAX_INCLUDE_DEPTH`'s existing pattern in this same file.
+const MAX_IF_EXPR_DEPTH: usize = 32;
+/// Token-count bound for one `#if`/`#elif` expression, independent of
+/// the depth bound above (a long CHAIN like `a && b && c && ...` has
+/// depth 1 but unbounded token count) — checked during tokenization so a
+/// pathological line cannot even build a huge `Token` vector first.
+const MAX_IF_EXPR_TOKENS: usize = 256;
+
 /// Evaluate a `#if`/`#elif` boolean/integer expression against known
 /// combo values, for `fold_declarations`'s live-branch tracking. Combo
-/// names are matched case-insensitively (the shader text always
-/// references them upper-cased; `combos_upper`'s keys already are).
-/// Supports `||`, `&&`, `==`, `!=`, unary `!`, parentheses, decimal
-/// integer literals, bare identifiers (truthy iff nonzero — an unknown
-/// identifier is `0`, matching the real GLSL preprocessor's "undefined
-/// macro in `#if` is 0" rule, already relied on by `scrape`'s doc
-/// comment), and `defined(NAME)` / `defined NAME`. Returns `None` for
-/// any expression shape this minimal recursive-descent parser does not
-/// fully consume — the caller then falls back to "always live", the
-/// pre-S4 behavior, rather than risk silently dropping a real attribute
-/// behind an expression it misjudged.
+/// names are matched CASE-SENSITIVELY against `combos_upper`'s
+/// already-upper-cased keys (S4a review RECOMMENDED #4): `#define`s are
+/// always emitted upper-cased (`preprocess`'s `#define {}
+/// {}",name.to_uppercase()`), and `shaderc`'s real preprocessor matches
+/// macro names case-sensitively too, so a shader must write the combo
+/// name in the SAME upper-cased form to ever really match — folding case
+/// on the identifier side here (as an earlier version of this function
+/// did) would accept e.g. `#if skinning` as if it were `#if SKINNING`,
+/// which `shaderc` would not. Supports `||`, `&&`, `==`, `!=`, unary `!`,
+/// parentheses, decimal integer literals, bare identifiers (truthy iff
+/// nonzero — an unknown identifier is `0`, matching the real GLSL
+/// preprocessor's "undefined macro in `#if` is 0" rule, already relied
+/// on by `scrape`'s doc comment), and `defined(NAME)` / `defined NAME`.
+/// Returns `None` for any expression shape this minimal recursive-descent
+/// parser does not fully consume, OR once `MAX_IF_EXPR_DEPTH`/
+/// `MAX_IF_EXPR_TOKENS` is exceeded — `fold_declarations` (S4a review
+/// MUST-FIX #2) treats `None` as "cannot safely judge this branch" and
+/// rejects the whole material via `PreprocessError::AmbiguousCondition`
+/// rather than guessing a truth value that could suppress a genuinely-
+/// live sibling `#else`/`#elif` branch.
 fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<bool> {
     #[derive(Debug, Clone, PartialEq)]
     enum Token {
@@ -675,6 +778,9 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
             if c.is_whitespace() {
                 i += 1;
                 continue;
+            }
+            if tokens.len() >= MAX_IF_EXPR_TOKENS {
+                return None;
             }
             match c {
                 '(' => {
@@ -727,19 +833,42 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
         }
         Some(tokens)
     }
+    // S4a review RECOMMENDED #4: exact-case lookup — `combos_upper`'s
+    // keys are already upper-cased (built once in `fold_declarations`
+    // from the material's resolved combos), and matching a bare
+    // identifier by ITS OWN case (not folded) mirrors `shaderc`'s real,
+    // case-sensitive macro lookup against the always-upper-cased
+    // `#define` this module emits.
     fn lookup(name: &str, combos_upper: &BTreeMap<String, i64>) -> i64 {
-        combos_upper.get(&name.to_uppercase()).copied().unwrap_or(0)
+        combos_upper.get(name).copied().unwrap_or(0)
     }
     struct Parser<'a> {
         tokens: &'a [Token],
         pos: usize,
         combos_upper: &'a BTreeMap<String, i64>,
+        /// S4a review MUST-FIX #1: monotonically increasing (never
+        /// decremented) count of `or_expr`/`unary_expr` recursive
+        /// entries during THIS parse — a fresh `Parser` (and so a fresh
+        /// `depth = 0`) is built once per `evaluate_if_expr` call, i.e.
+        /// once per `#if`/`#elif` LINE, so this bounds total recursive
+        /// descent for one expression without needing careful
+        /// increment/decrement bookkeeping on every return path (a
+        /// stricter, always-safe superset of true nesting depth).
+        depth: usize,
     }
     impl<'a> Parser<'a> {
         fn peek(&self) -> Option<&Token> {
             self.tokens.get(self.pos)
         }
+        fn enter(&mut self) -> Option<()> {
+            self.depth += 1;
+            if self.depth > MAX_IF_EXPR_DEPTH {
+                return None;
+            }
+            Some(())
+        }
         fn or_expr(&mut self) -> Option<i64> {
+            self.enter()?;
             let mut lhs = self.and_expr()?;
             while self.peek() == Some(&Token::Or) {
                 self.pos += 1;
@@ -778,6 +907,7 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
         }
         fn unary_expr(&mut self) -> Option<i64> {
             if self.peek() == Some(&Token::Not) {
+                self.enter()?;
                 self.pos += 1;
                 let v = self.unary_expr()?;
                 return Some(i64::from(v == 0));
@@ -807,9 +937,7 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
                             }
                             self.pos += 1;
                         }
-                        return Some(i64::from(
-                            self.combos_upper.contains_key(&target.to_uppercase()),
-                        ));
+                        return Some(i64::from(self.combos_upper.contains_key(&target)));
                     }
                     Some(lookup(&name, self.combos_upper))
                 }
@@ -831,6 +959,7 @@ fn evaluate_if_expr(expr: &str, combos_upper: &BTreeMap<String, i64>) -> Option<
         tokens: &tokens,
         pos: 0,
         combos_upper,
+        depth: 0,
     };
     let value = parser.or_expr()?;
     if parser.pos != tokens.len() {
@@ -894,8 +1023,10 @@ fn fold_declarations(
         let newline = if line.ends_with('\n') { "\n" } else { "" };
 
         if let Some(rest) = trimmed.strip_prefix("#ifdef ") {
+            // S4a review RECOMMENDED #4: exact-case match — see
+            // `evaluate_if_expr::lookup`'s doc comment.
             let parent_live = is_live(&cond_stack);
-            let taken = parent_live && combos_upper.contains_key(&rest.trim().to_uppercase());
+            let taken = parent_live && combos_upper.contains_key(rest.trim());
             cond_stack.push(CondFrame {
                 branch_taken: taken,
                 active_here: taken,
@@ -904,7 +1035,7 @@ fn fold_declarations(
             continue;
         } else if let Some(rest) = trimmed.strip_prefix("#ifndef ") {
             let parent_live = is_live(&cond_stack);
-            let taken = parent_live && !combos_upper.contains_key(&rest.trim().to_uppercase());
+            let taken = parent_live && !combos_upper.contains_key(rest.trim());
             cond_stack.push(CondFrame {
                 branch_taken: taken,
                 active_here: taken,
@@ -913,7 +1044,28 @@ fn fold_declarations(
             continue;
         } else if let Some(rest) = trimmed.strip_prefix("#if ") {
             let parent_live = is_live(&cond_stack);
-            let taken = parent_live && evaluate_if_expr(rest.trim(), &combos_upper).unwrap_or(true);
+            // S4a review MUST-FIX #2: only ASK `evaluate_if_expr` when
+            // the parent scope is actually live (`&&` short-circuits, so
+            // a dead parent never even evaluates the child condition --
+            // its truth value cannot matter, matching the existing
+            // "don't scrape inside a dead branch" contract). When the
+            // parent IS live and the condition cannot be judged, reject
+            // the whole material (`AmbiguousCondition`) instead of
+            // guessing `true` -- guessing can silently suppress a
+            // genuinely-live sibling `#else`/`#elif` branch's
+            // declarations (see the finding).
+            let taken = if parent_live {
+                match evaluate_if_expr(rest.trim(), &combos_upper) {
+                    Some(value) => value,
+                    None => {
+                        return Err(PreprocessError::AmbiguousCondition(
+                            rest.trim().chars().take(200).collect(),
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
             cond_stack.push(CondFrame {
                 branch_taken: taken,
                 active_here: taken,
@@ -929,11 +1081,19 @@ fn fold_declarations(
             if let Some(frame) = cond_stack.last_mut() {
                 if frame.branch_taken {
                     frame.active_here = false;
-                } else {
-                    let taken =
-                        parent_live && evaluate_if_expr(rest.trim(), &combos_upper).unwrap_or(true);
+                } else if parent_live {
+                    let taken = match evaluate_if_expr(rest.trim(), &combos_upper) {
+                        Some(value) => value,
+                        None => {
+                            return Err(PreprocessError::AmbiguousCondition(
+                                rest.trim().chars().take(200).collect(),
+                            ));
+                        }
+                    };
                     frame.branch_taken = taken;
                     frame.active_here = taken;
+                } else {
+                    frame.active_here = false;
                 }
             }
             out.push_str(line);
@@ -1852,16 +2012,113 @@ mod tests {
         );
     }
 
-    /// An unparseable `#if` expression must fall back to "always live" —
-    /// the pre-S4 behavior — rather than silently dropping a real
-    /// attribute behind an expression this minimal evaluator cannot
-    /// judge.
+    /// S4a review MUST-FIX #1: a single `#if` line with deeply nested
+    /// parens (10k) must return quickly (bounded recursion depth, no
+    /// stack overflow) rather than crash the process. Also covers the
+    /// same shape for a long chained `!` run.
     #[test]
-    fn unparseable_if_expression_falls_back_to_live() {
-        assert_eq!(evaluate_if_expr("SOME_FUNC(X)", &BTreeMap::new()), None);
+    fn evaluate_if_expr_bounds_deeply_nested_parens_and_not_chains() {
+        let nested = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
+        assert_eq!(evaluate_if_expr(&nested, &BTreeMap::new()), None);
+        let not_chain = format!("{}1", "!".repeat(10_000));
+        assert_eq!(evaluate_if_expr(&not_chain, &BTreeMap::new()), None);
+    }
+
+    /// S4a review RECOMMENDED #4: `#if`/`#ifdef` combo-name matching is
+    /// case-SENSITIVE, matching `shaderc`'s real preprocessor against the
+    /// always-upper-cased `#define` this module emits — a shader that
+    /// spells a live combo in any case OTHER than upper-case must NOT
+    /// match, even though the combo genuinely exists.
+    #[test]
+    fn if_and_ifdef_are_case_sensitive() {
+        let mut combos = BTreeMap::new();
+        combos.insert("SKINNING".to_string(), 1);
+        let combos_upper: BTreeMap<String, i64> =
+            combos.iter().map(|(k, v)| (k.to_uppercase(), *v)).collect();
+        assert_eq!(evaluate_if_expr("SKINNING", &combos_upper), Some(true));
+        assert_eq!(evaluate_if_expr("skinning", &combos_upper), Some(false));
+
         let mut include = no_includes();
         let mut locs = BTreeMap::new();
         let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
+             #ifdef skinning\nattribute vec3 a_Normal;\n#endif\nvoid main(){}\n",
+            &combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        // Lower-case `#ifdef skinning` does NOT match the upper-cased
+        // `#define SKINNING 1` this module emits, so a_Normal stays dead
+        // -- exactly what `shaderc`'s real preprocessor would do too.
+        assert_eq!(out.attributes.len(), 2);
+    }
+
+    /// NIT #6: `AttributeDecl::location`'s doc comment promises callers
+    /// must use the field itself, not `Vec` position -- exercise a case
+    /// where a LIVE `#ifdef`-gated attribute sits BETWEEN two others,
+    /// shifting nothing (all three are live and in source order here,
+    /// which is the common case), but pinned together with a dead
+    /// preceding branch so the assigned locations are NOT simply
+    /// `0, 1, 2` by accident of this test's own structure lining up with
+    /// Vec order.
+    #[test]
+    fn location_field_is_correct_even_when_an_earlier_branch_is_dead() {
+        let mut combos = BTreeMap::new();
+        combos.insert("VERTEXCOLOR".to_string(), 1);
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\n\
+             #if MORPHING\nattribute vec4 a_PositionVec4;\n#endif\n\
+             #if VERTEXCOLOR\nattribute vec4 a_Color;\n#endif\n\
+             attribute vec2 a_TexCoord;\nvoid main(){}\n",
+            &combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        // MORPHING (dead) contributes nothing; VERTEXCOLOR (live) sits
+        // between a_Position and a_TexCoord in SOURCE order, so
+        // a_TexCoord's `location` (2) does NOT equal its Vec index if it
+        // were computed from position alone in a differently-ordered
+        // scrape -- this test exists to keep that field, not Vec index,
+        // as the thing every caller reads.
+        assert_eq!(out.attributes.len(), 3);
+        assert_eq!(out.attributes[0].name, "a_Position");
+        assert_eq!(out.attributes[0].location, 0);
+        assert_eq!(out.attributes[1].name, "a_Color");
+        assert_eq!(out.attributes[1].location, 1);
+        assert_eq!(out.attributes[2].name, "a_TexCoord");
+        assert_eq!(out.attributes[2].location, 2);
+    }
+
+    /// An unparseable `#if` expression, when its parent scope is live,
+    /// must reject the whole material (`PreprocessError::AmbiguousCondition`)
+    /// rather than guess a truth value — S4a review MUST-FIX #2
+    /// corrected this slice's original "fall back to always live"
+    /// behavior, which could silently suppress a genuinely-live sibling
+    /// `#else` branch (see
+    /// `unparseable_if_expression_with_a_live_else_sibling_is_rejected_not_guessed`).
+    #[test]
+    fn unparseable_if_expression_falls_back_to_live() {
+        assert_eq!(evaluate_if_expr("SOME_FUNC(X)", &BTreeMap::new()), None);
+        // S4a review MUST-FIX #2: an unparseable `#if` whose parent scope
+        // IS live must reject the whole material (`AmbiguousCondition`),
+        // not guess "always live" -- guessing can silently suppress a
+        // genuinely-live sibling `#else` branch's declarations (a
+        // DIFFERENT, worse failure than refusing this one material; see
+        // `unparseable_if_expression_with_a_live_else_sibling_is_rejected_not_guessed`
+        // below for the exact shape that motivated this).
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let error = preprocess(
             Stage::Vertex,
             "t.vert",
             "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
@@ -1871,9 +2128,55 @@ mod tests {
             &mut locs,
             &mut include,
         )
+        .unwrap_err();
+        assert!(matches!(error, PreprocessError::AmbiguousCondition(_)));
+    }
+
+    /// The exact regression MUST-FIX #2 describes: an unparseable `#if`
+    /// condition that is really FALSE (upstream/`shaderc` would take the
+    /// `#else` branch) must not let the OLD "guess true" fallback scrape
+    /// the `#if` branch's attributes while silently never touching the
+    /// `#else` branch's real, different attributes. Before the fix this
+    /// scraped `{a_PositionVec4}` only; after the fix it rejects the
+    /// whole material instead.
+    #[test]
+    fn unparseable_if_expression_with_a_live_else_sibling_is_rejected_not_guessed() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let error = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "#if SOME_FUNC(X)\nattribute vec4 a_PositionVec4;\n#else\n             attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n#endif\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreprocessError::AmbiguousCondition(_)));
+    }
+
+    /// An unparseable condition BEHIND an already-dead parent branch must
+    /// NOT be rejected -- its truth value cannot matter (nothing inside
+    /// would be scraped either way), matching the existing "don't even
+    /// look inside a dead branch" contract and avoiding refusing a
+    /// material over an expression that is genuinely irrelevant to it.
+    #[test]
+    fn unparseable_if_expression_behind_a_dead_parent_is_not_an_error() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\n\
+             #if 0\n#if SOME_FUNC(X)\nattribute vec3 a_Normal;\n#endif\n#endif\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
         .unwrap();
-        assert_eq!(out.attributes.len(), 3);
-        assert_eq!(out.attributes[2].name, "a_Normal");
+        assert_eq!(out.attributes.len(), 2);
     }
 
     /// Regression: `attribute mediump vec2 a_TexCoord;` (the real corpus
@@ -2122,5 +2425,66 @@ mod tests {
             "#define g_Color4 vec4(u_Std.g_TimeAlphaBrightness_.zzz, u_Std.g_TimeAlphaBrightness_.y)"
         ));
         assert!(!out.unsupported_uniforms.contains(&"g_Color4".to_string()));
+    }
+
+    /// S4a review MUST-FIX #3: `g_ModelMatrix`/`g_ViewProjectionMatrix`/
+    /// `g_NormalModelMatrix` (+ `Alt` siblings) must fold to identity, not
+    /// the generic zero-default -- a zero `g_ModelMatrix`/
+    /// `g_ViewProjectionMatrix` collapses a `genericimage*`-family
+    /// object's on-screen geometry to a single point once a material
+    /// sets `LIGHTING=1` (`worldPos = mul(localPos, g_ModelMatrix)`,
+    /// unconditional; `gl_Position = mul(worldPos, g_ViewProjectionMatrix)`
+    /// under `LIGHTING`).
+    #[test]
+    fn model_and_view_projection_matrices_fold_to_identity_not_zero() {
+        for name in [
+            "g_ModelMatrix",
+            "g_AltModelMatrix",
+            "g_ViewProjectionMatrix",
+            "g_AltViewProjectionMatrix",
+        ] {
+            let mut include = no_includes();
+            let mut locs = BTreeMap::new();
+            let out = preprocess(
+                Stage::Vertex,
+                "t.vert",
+                &format!(
+                    "uniform mat4 {name};\nvoid main(){{ gl_Position = {name} * vec4(1.0); }}\n"
+                ),
+                &BTreeMap::new(),
+                &[],
+                &mut locs,
+                &mut include,
+            )
+            .unwrap();
+            assert!(
+                out.source.contains(&format!("#define {name} mat4(1.0)")),
+                "{name}: {}",
+                out.source
+            );
+            assert!(!out.unsupported_uniforms.contains(&name.to_string()));
+        }
+        for name in ["g_NormalModelMatrix", "g_AltNormalModelMatrix"] {
+            let mut include = no_includes();
+            let mut locs = BTreeMap::new();
+            let out = preprocess(
+                Stage::Vertex,
+                "t.vert",
+                &format!(
+                    "uniform mat3 {name};\nvoid main(){{ gl_Position = vec4({name} * vec3(1.0), 1.0); }}\n"
+                ),
+                &BTreeMap::new(),
+                &[],
+                &mut locs,
+                &mut include,
+            )
+            .unwrap();
+            assert!(
+                out.source.contains(&format!("#define {name} mat3(1.0)")),
+                "{name}: {}",
+                out.source
+            );
+            assert!(!out.unsupported_uniforms.contains(&name.to_string()));
+        }
     }
 }
