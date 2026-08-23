@@ -455,37 +455,185 @@ fn collect_includes(
     Ok(out)
 }
 
-/// Byte index of the start of the line holding the file's `main(`
-/// function definition — a bare `main` token (not part of a longer
-/// identifier like `mainColor`) followed, after optional spaces/tabs, by
-/// `(`. `None` if no such token exists (defensive; a well-formed shader
-/// stage always has exactly one). The search is a single linear pass
-/// (`search_from` strictly advances every iteration), so it cannot loop
-/// unboundedly even over a hostile/malformed source within the existing
-/// `MAX_PREPROCESSED_BYTES` cap.
-fn find_main_insertion_point(body: &str) -> Option<usize> {
+/// Byte index of the file's `main(` token itself (not the start of its
+/// line — callers needing that use `line_start(body, find_main_token(body)?)`)
+/// — a bare `main` token (not part of a longer identifier like
+/// `mainColor`) followed,
+/// after optional spaces/tabs, by `(`. `None` if no such token exists
+/// (defensive; a well-formed shader stage always has exactly one).
+///
+/// S5 review RECOMMENDED #1: comment-aware. A `main` occurrence inside a
+/// `//` line comment or a `/* */` block comment (e.g. `// see main()
+/// above` or a commented-out old entry point) must never be mistaken for
+/// the real definition — the pre-fix scan matched the bare token
+/// anywhere in the text, so a shader with such a comment ABOVE its real
+/// `main(` would splice included text into the comment's line instead of
+/// before the actual function, landing it after any declaration the
+/// comment happened to follow textually. The scan tracks comment state
+/// as it goes (a single linear pass — `i` strictly advances every
+/// iteration, so it cannot loop unboundedly even over a hostile/
+/// malformed source within the existing `MAX_PREPROCESSED_BYTES` cap);
+/// unterminated block comments run to end-of-file, matching how a real
+/// GLSL compiler would treat the same malformed input (nothing after an
+/// unterminated `/*` can be real code either).
+fn find_main_token(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
     let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut search_from = 0usize;
-    while let Some(relative) = body[search_from..].find("main") {
-        let start = search_from + relative;
-        let end = start + "main".len();
-        let before_is_boundary = start == 0 || !is_ident_byte(body.as_bytes()[start - 1]);
-        let after = &body[end..];
-        let after_is_boundary = after.as_bytes().first().is_none_or(|&b| !is_ident_byte(b));
-        if before_is_boundary && after_is_boundary {
-            let rest = after.trim_start_matches([' ', '\t']);
-            if rest.starts_with('(') {
-                let line_start = body[..start].rfind('\n').map_or(0, |pos| pos + 1);
-                return Some(line_start);
+    let mut i = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    while i < bytes.len() {
+        if in_line_comment {
+            if bytes[i] == b'\n' {
+                in_line_comment = false;
             }
+            i += 1;
+            continue;
         }
-        search_from = end;
+        if in_block_comment {
+            if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i..].starts_with(b"main") {
+            let start = i;
+            let end = start + 4;
+            let before_is_boundary = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let after_is_boundary = bytes.get(end).is_none_or(|&b| !is_ident_byte(b));
+            if before_is_boundary && after_is_boundary {
+                let mut after = end;
+                while matches!(bytes.get(after), Some(b' ') | Some(b'\t')) {
+                    after += 1;
+                }
+                if bytes.get(after) == Some(&b'(') {
+                    return Some(start);
+                }
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
     }
     None
 }
 
+/// Byte index of the start of the line containing byte offset `pos`.
+fn line_start(body: &str, pos: usize) -> usize {
+    body[..pos].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+/// Walk every `#if`/`#ifdef`/`#ifndef` ... `#endif` region in `body`
+/// (bounded: `search_from` strictly advances every iteration) and,
+/// whenever `point` sits strictly inside one when its `#endif` is
+/// reached, move `point` back to the start of that region's own `#if`
+/// line — so spliced include text can never land inside a combo-gated
+/// dead branch (a shader whose `#if` disables the branch would silently
+/// compile the includes away for every branch that does NOT define that
+/// combo).
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:270-296 (the
+/// `#if`/`#endif` stack walk in `preprocessIncludes`) @ b016d7d1 —
+/// adapted: a plain substring scan replaces upstream's `std::regex`
+/// walk (equivalent for this token shape: `#ifdef`/`#ifndef` both start
+/// with the literal `#if`, matching upstream's own non-anchored
+/// `(#if|#endif)` pattern), and the stack holds byte offsets directly
+/// instead of upstream's separately-tracked `current`/`stackStart`.
+fn move_point_outside_conditionals(body: &str, mut point: usize) -> usize {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut search_from = 0usize;
+    while search_from < body.len() {
+        let next_if = body[search_from..].find("#if").map(|rel| search_from + rel);
+        let next_endif = body[search_from..]
+            .find("#endif")
+            .map(|rel| search_from + rel);
+        let (pos, is_endif) = match (next_if, next_endif) {
+            (None, None) => break,
+            (Some(i), None) => (i, false),
+            (None, Some(e)) => (e, true),
+            (Some(i), Some(e)) => {
+                if i <= e {
+                    (i, false)
+                } else {
+                    (e, true)
+                }
+            }
+        };
+        if is_endif {
+            if let Some(start) = stack.pop()
+                && point > start
+                && point <= pos
+            {
+                point = line_start(body, start);
+            }
+            search_from = pos + "#endif".len();
+        } else {
+            stack.push(pos);
+            search_from = pos + "#if".len();
+        }
+    }
+    point
+}
+
+/// Where to splice the collected `#include` text: matches upstream's real
+/// placement rule, not "right before `main`" alone — immediately after
+/// the LAST top-level `attribute`/`varying`/`uniform` declaration before
+/// `main` (many WE shader headers, e.g. `common_blur.h`, assume their
+/// functions run after every such declaration the including file makes
+/// is already visible, wherever in the file it sits), walked back outside
+/// any `#if`/`#ifdef`/`#ifndef` ... `#endif` region it would otherwise
+/// land inside (`move_point_outside_conditionals`). Falls back to right
+/// before `main`'s own line when no such declaration precedes it. `None`
+/// if `main(` itself cannot be found (caller appends at the end instead).
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-312
+/// (`ShaderUnit::preprocessIncludes`'s full insertion-point search: the
+/// attribute/varying/uniform `rfind` and the `#if`-stack walk together)
+/// @ b016d7d1 — adapted: Rust byte offsets and `str::rfind` in place of
+/// upstream's `std::string::rfind`/regex walk; behavior is otherwise a
+/// direct port, including the final `min()` against the plain
+/// before-`main` fallback.
+///
+/// S5 review RECOMMENDED #2: this is the real upstream placement rule.
+/// The prior implementation spliced unconditionally right before `main`
+/// regardless of where the including file's own declarations sat,
+/// documented at the time as "equivalent for every shader this renderer
+/// has been measured against" only because none of the then-covered
+/// corpus shaders needed the `#if`-aware search — this closes that gap.
+fn find_include_insertion_point(body: &str) -> Option<usize> {
+    let main_pos = find_main_token(body)?;
+    let main_line_start = line_start(body, main_pos);
+    let declared_line_end = ["attribute", "varying", "uniform"]
+        .iter()
+        .filter_map(|keyword| body[..main_pos].rfind(keyword))
+        .max()
+        .map(|pos| {
+            body[pos..]
+                .find('\n')
+                .map_or(body.len(), |rel| pos + rel + 1)
+        });
+    let point = declared_line_end.unwrap_or(main_line_start);
+    let point = move_point_outside_conditionals(body, point);
+    Some(point.min(main_line_start))
+}
+
 /// Resolve every `#include` in `source`, then splice ALL of their
-/// resolved text in just before the file's `main(` definition — matching
+/// resolved text in at [`find_include_insertion_point`] — matching
 /// upstream's real placement strategy, not a naive in-place text
 /// substitution.
 ///
@@ -508,17 +656,19 @@ fn find_main_insertion_point(body: &str) -> Option<usize> {
 /// these three real corpus shaders).
 ///
 /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
-/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-171
-/// (`preprocessIncludes` collects every include's text separately and
-/// splices it in just before `main()`) @ b016d7d1 — adapted: upstream
-/// additionally walks an `#if`/`#endif` stack while searching for the
-/// insertion point so it cannot land inside a dead branch; every `main(`
-/// in the local corpus is unconditional (not itself behind an `#if`), so
-/// a plain first-occurrence search is equivalent for every shader this
-/// renderer has been measured against — a shader with a combo-gated
-/// `main(` would need that upstream `#if`-aware search, not implemented
-/// here (falls back to appending at the very end if `main(` is not
-/// found, rather than losing the included text).
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-312
+/// (`ShaderUnit::preprocessIncludes`, the full method: include
+/// extraction/not-found fallback, the attribute/varying/uniform-based
+/// insertion point, and the `#if`/`#endif` stack walk) @ b016d7d1 —
+/// adapted (recursive bounded include resolution in place of upstream's
+/// two-pass scheme; see [`find_include_insertion_point`] and
+/// [`move_point_outside_conditionals`] for the placement-rule port).
+/// S5 review RECOMMENDED #2 closed the prior gap here: earlier revisions
+/// of this function spliced unconditionally right before `main`, which
+/// this doc comment used to justify as "equivalent for every shader this
+/// renderer has been measured against" — true only because none of the
+/// then-covered corpus shaders needed the declaration-aware/`#if`-aware
+/// search upstream actually does.
 fn resolve_includes(
     source: &str,
     include: &mut IncludeLookup<'_>,
@@ -539,7 +689,7 @@ fn resolve_includes(
         return Ok(body);
     }
     let mut spliced = String::with_capacity(body.len() + accumulated.len());
-    match find_main_insertion_point(&body) {
+    match find_include_insertion_point(&body) {
         Some(index) => {
             spliced.push_str(&body[..index]);
             spliced.push_str(&accumulated);
@@ -1980,6 +2130,108 @@ mod tests {
         assert!(x_pos < main_pos);
     }
 
+    /// S5 review RECOMMENDED #1: a `main` mention inside a `//` line
+    /// comment or a `/* */` block comment must never be mistaken for the
+    /// real definition.
+    #[test]
+    fn find_main_token_skips_line_and_block_comments() {
+        let source = "// see main() above for the old entry point\n/* another main( here */\nvoid main(){}\n";
+        let pos = find_main_token(source).expect("the real main() must still be found");
+        assert_eq!(&source[pos..pos + 4], "main");
+        assert!(
+            source[..pos].ends_with("void "),
+            "landed on a commented-out main instead of the real one: {source}"
+        );
+    }
+
+    /// When `main` only ever appears inside comments, there is no real
+    /// definition to find — this must not false-positive on either
+    /// comment style.
+    #[test]
+    fn find_main_token_returns_none_when_main_only_appears_in_comments() {
+        let source = "// main() was removed\n/* void main(){} -- old */\n";
+        assert!(find_main_token(source).is_none());
+    }
+
+    /// An unterminated block comment runs to end-of-file (matching how a
+    /// real GLSL compiler would treat the same malformed input) rather
+    /// than looping or panicking.
+    #[test]
+    fn find_main_token_handles_an_unterminated_block_comment() {
+        let source = "/* unterminated\nvoid main(){}\n";
+        assert!(find_main_token(source).is_none());
+    }
+
+    /// S5 review RECOMMENDED #2: the splice point sits after the LAST
+    /// top-level `attribute`/`varying`/`uniform` declaration before
+    /// `main`, not merely after the first one — pins upstream's
+    /// `rfind`-based "latest" selection among all three keywords.
+    #[test]
+    fn include_splices_after_the_last_top_level_declaration_before_main() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> = Box::new(|name: &str| {
+            if name == "helper.h" {
+                Some(b"vec3 useAll() { return g_A + vec3(g_B) + vec3(g_C); }\n".to_vec())
+            } else {
+                None
+            }
+        });
+        let source = "#include \"helper.h\"\nattribute vec3 g_A;\nvarying vec3 g_B;\nuniform vec3 g_C;\nvoid main(){}\n";
+        let out =
+            resolve_includes(source, &mut include, 0, &mut total_len, &mut include_count).unwrap();
+        let uniform_pos = out.find("uniform vec3 g_C;").unwrap();
+        let use_pos = out.find("useAll()").unwrap();
+        let main_pos = out.find("void main(").unwrap();
+        assert!(
+            uniform_pos < use_pos,
+            "must land after the LAST declaration (uniform), not the first: {out}"
+        );
+        assert!(use_pos < main_pos);
+    }
+
+    /// A `#if`/`#endif` region that would otherwise straddle the computed
+    /// insertion point pushes the splice point back before the `#if`
+    /// itself, so the included text is never itself conditionally
+    /// compiled away.
+    #[test]
+    fn include_splice_point_is_moved_outside_an_enclosing_if_block() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"const float X = 1.0;\n".to_vec()));
+        let source =
+            "#include \"a.h\"\n#if FEATURE\nuniform vec3 g_Inside;\n#endif\nvoid main(){}\n";
+        let out =
+            resolve_includes(source, &mut include, 0, &mut total_len, &mut include_count).unwrap();
+        let if_pos = out.find("#if FEATURE").unwrap();
+        let x_pos = out.find("const float X = 1.0;").unwrap();
+        assert!(
+            x_pos < if_pos,
+            "must land before the #if, not inside it: {out}"
+        );
+    }
+
+    /// The same `#if`-stack walk handles nesting: the splice point walks
+    /// back past every enclosing level, landing before the OUTERMOST
+    /// `#if`, not just the innermost one.
+    #[test]
+    fn include_splice_point_handles_nested_if_blocks() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"const float X = 1.0;\n".to_vec()));
+        let source = "#include \"a.h\"\n#if OUTER\n#if INNER\nuniform vec3 g_Inside;\n#endif\n#endif\nvoid main(){}\n";
+        let out =
+            resolve_includes(source, &mut include, 0, &mut total_len, &mut include_count).unwrap();
+        let outer_pos = out.find("#if OUTER").unwrap();
+        let x_pos = out.find("const float X = 1.0;").unwrap();
+        assert!(
+            x_pos < outer_pos,
+            "must land before the OUTERMOST #if: {out}"
+        );
+    }
+
     #[test]
     fn missing_include_is_not_an_error() {
         let mut include = no_includes();
@@ -2968,6 +3220,78 @@ mod tests {
                 out.source
             );
             assert!(!out.unsupported_uniforms.contains(&name.to_string()));
+        }
+    }
+
+    /// S5 review RECOMMENDED #2's own regression guard: the three real
+    /// S4b `compile_failed` fix targets — `shine_gaussian.frag` (a bare
+    /// `#include "common_blur.h"` as line 1), `godrays_gaussian.frag`
+    /// (one `uniform` before the include), and `blur_precise_gaussian.frag`
+    /// (a `// [COMBO]` line before the include, PLUS a `varying` behind
+    /// its own `#if MASK` block AFTER the last unconditional `uniform` —
+    /// the one real-corpus shape that would silently break under a
+    /// last-declaration rule with no `#if`-awareness: splicing
+    /// `common_blur.h`'s `blur13a`/`blur7a`/`blur3a` INSIDE `#if MASK`
+    /// would undefine them for every material with MASK off) — must
+    /// still preprocess and compile to SPIR-V after this module's
+    /// placement-rule rewrite. Skipped, not failed, when the local WE
+    /// assets tree is not mounted (this is a local-verification test
+    /// over real, un-committed Workshop-adjacent assets, never a
+    /// synthetic fixture).
+    #[test]
+    fn s4b_fix_target_shaders_still_compile_after_the_placement_rewrite() {
+        let assets_root =
+            std::path::Path::new("/media/crushinator/steamapps/common/wallpaper_engine/assets");
+        if !assets_root.is_dir() {
+            eprintln!("skipping: local WE assets tree not mounted");
+            return;
+        }
+        let cases = [
+            (
+                "effects/shine/shaders/effects/shine_gaussian",
+                "shine_gaussian.frag",
+            ),
+            (
+                "effects/godrays/shaders/effects/godrays_gaussian",
+                "godrays_gaussian.frag",
+            ),
+            (
+                "effects/blurprecise/shaders/effects/blur_precise_gaussian",
+                "blur_precise_gaussian.frag",
+            ),
+        ];
+        for (shader_name, label) in cases {
+            let path = assets_root.join(format!("{shader_name}.frag"));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let assets_root = assets_root.to_path_buf();
+            let mut include: Box<IncludeLookup<'static>> = Box::new(move |name: &str| {
+                std::fs::read(assets_root.join("shaders").join(name)).ok()
+            });
+            let mut locs = BTreeMap::new();
+            let out = preprocess(
+                Stage::Fragment,
+                label,
+                &source,
+                &BTreeMap::new(),
+                &[],
+                &mut locs,
+                &mut include,
+            )
+            .unwrap_or_else(|error| panic!("{label}: preprocess failed: {error:?}"));
+            assert!(
+                out.source.contains("blur13a") || out.source.contains("blur7a"),
+                "{label}: common_blur.h was not spliced in: {}",
+                out.source
+            );
+            crate::materialshader::compile_stage(
+                &out.source,
+                crate::materialshader::Stage::Fragment,
+                label,
+            )
+            .unwrap_or_else(|error| {
+                panic!("{label}: compile failed: {error:?}\n---\n{}", out.source)
+            });
         }
     }
 }
