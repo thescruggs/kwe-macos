@@ -200,7 +200,11 @@ pub struct DecodedTexv {
 /// treating a plain animated GIF (`frameWidth == textureWidth`, `cols == 1`
 /// but `rows` would have to equal `frame_count`, easy to get by chance on
 /// a tall single-column strip) as a spritesheet when it isn't a grid.
-fn infer_spritesheet_grid(frames: &[Frame], width: u32, height: u32) -> Option<textures::SpritesheetGrid> {
+fn infer_spritesheet_grid(
+    frames: &[Frame],
+    width: u32,
+    height: u32,
+) -> Option<textures::SpritesheetGrid> {
     let first = frames.first()?;
     if width == 0 || height == 0 || first.width1 <= 0.0 || first.height1 <= 0.0 {
         return None;

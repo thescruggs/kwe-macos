@@ -3570,8 +3570,8 @@ mod tests {
     /// `instance_*` field stays the 1.0 identity, never a scene reject.
     #[test]
     fn instanceoverride_absent_or_malformed_defaults_to_identity() {
-        let particles = parse_particles_of(r#"{"objects": [{"name": "dust", "particle": {}}]}"#)
-            .unwrap();
+        let particles =
+            parse_particles_of(r#"{"objects": [{"name": "dust", "particle": {}}]}"#).unwrap();
         assert_eq!(particles[0].instance_count, 1.0);
         assert_eq!(particles[0].instance_colorn, 1.0);
 
@@ -3598,7 +3598,10 @@ mod tests {
             }]}"#,
         )
         .unwrap();
-        assert_eq!(particles[0].file_ref.as_deref(), Some("particles/stars.json"));
+        assert_eq!(
+            particles[0].file_ref.as_deref(),
+            Some("particles/stars.json")
+        );
         assert_eq!(particles[0].instance_count, 0.0);
         assert_eq!(particles[0].scale, [4.0, 0.8]);
     }

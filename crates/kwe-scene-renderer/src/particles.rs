@@ -716,7 +716,10 @@ impl ParticleSystemState {
             emitter_accumulators,
             turbulence_runtime,
             sim_time: 0.0,
-            spritesheet: spec.texture.as_ref().and_then(|texture| texture.spritesheet),
+            spritesheet: spec
+                .texture
+                .as_ref()
+                .and_then(|texture| texture.spritesheet),
             scale: spec.scale,
             texture_ratio: texture_ratio_for(spec.texture.as_ref()),
         }
@@ -2035,8 +2038,16 @@ mod tests {
         state.build_vertex_bytes(&mut scratch);
         let (x0, y0) = vertex_pos(&scratch, 0);
         let (x1, y1) = vertex_pos(&scratch, 2); // br corner
-        assert_eq!((x0, x1), (-5.0, 5.0), "x-extent unaffected by texture_ratio");
-        assert_eq!((y0, y1), (-2.5, 2.5), "y-extent halved by texture_ratio 0.5");
+        assert_eq!(
+            (x0, x1),
+            (-5.0, 5.0),
+            "x-extent unaffected by texture_ratio"
+        );
+        assert_eq!(
+            (y0, y1),
+            (-2.5, 2.5),
+            "y-extent halved by texture_ratio 0.5"
+        );
     }
 
     /// S7 (P7): a negative scale component mirrors that axis — the

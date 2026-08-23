@@ -1569,7 +1569,10 @@ fn load_particle_file_definitions(
             );
         }
         for name in &stats.unsupported_operator_names {
-            particlefile::record_unsupported_name(&mut unsupported.unsupported_operator_names, name);
+            particlefile::record_unsupported_name(
+                &mut unsupported.unsupported_operator_names,
+                name,
+            );
         }
         // S7 (P6): the scene's `instanceoverride.count` scales the file's
         // own `maxcount` BEFORE the cap clamps it — WE's day/night star
@@ -4106,7 +4109,8 @@ mod tests {
         overbright: &str,
     ) -> impl FnMut(&str) -> Option<Vec<u8>> {
         let png = tiny_png();
-        move |reference: &str| match reference {
+        move |reference: &str| {
+            match reference {
             "particles/p.json" => {
                 Some(br#"{"material": "materials/p.json", "maxcount": 100}"#.to_vec())
             }
@@ -4119,6 +4123,7 @@ mod tests {
             ),
             "materials/p.tex" => Some(png.clone()),
             _ => None,
+        }
         }
     }
 

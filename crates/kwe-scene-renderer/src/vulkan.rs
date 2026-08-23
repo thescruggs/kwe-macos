@@ -1799,7 +1799,8 @@ impl LayerRenderer {
                 Some(MaterialTextureBind::RenderTarget(name)) => {
                     match self.effect_targets.get(name.as_str()) {
                         Some(fbo) => {
-                            uniforms.texture_resolution[slot] = resolution_vec4(fbo.width, fbo.height);
+                            uniforms.texture_resolution[slot] =
+                                resolution_vec4(fbo.width, fbo.height);
                             fbo.view
                         }
                         None => {
@@ -2826,13 +2827,14 @@ impl LayerRenderer {
             Err((_, result)) => return Err(result.into()),
         };
 
-        let (image_infos, owned_textures) = match self.resolve_texture_slots(textures, &mut uniforms) {
-            Ok(result) => result,
-            Err(error) => {
-                unsafe { self.device.destroy_pipeline(pipeline, None) };
-                return Err(error);
-            }
-        };
+        let (image_infos, owned_textures) =
+            match self.resolve_texture_slots(textures, &mut uniforms) {
+                Ok(result) => result,
+                Err(error) => {
+                    unsafe { self.device.destroy_pipeline(pipeline, None) };
+                    return Err(error);
+                }
+            };
 
         uniforms.mvp = build_orthographic_mvp([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 1.0, 1.0);
         let ubo_info = vk::BufferCreateInfo::default()
@@ -6031,7 +6033,10 @@ mod tests {
     /// without a divide-by-zero for a degenerate 0-sized dimension.
     #[test]
     fn resolution_vec4_is_pixels_then_texel_size() {
-        assert_eq!(resolution_vec4(1920, 1080), [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]);
+        assert_eq!(
+            resolution_vec4(1920, 1080),
+            [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]
+        );
         assert_eq!(resolution_vec4(0, 0), [0.0, 0.0, 1.0, 1.0]);
     }
 
@@ -6076,10 +6081,7 @@ mod tests {
         let (_, owned) = renderer
             .resolve_texture_slots(&textures, &mut uniforms)
             .expect("resolve texture slots");
-        assert!(
-            owned.is_empty(),
-            "a render-target slot uploads nothing new"
-        );
+        assert!(owned.is_empty(), "a render-target slot uploads nothing new");
         assert_eq!(uniforms.texture_resolution[0], resolution_vec4(8, 4));
 
         // A name with no live entry (not yet registered / dummy view)

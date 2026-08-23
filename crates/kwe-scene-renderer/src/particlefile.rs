@@ -100,7 +100,10 @@ pub fn parse_component_model(root: &Map<String, Value>) -> (ComponentModel, Comp
                 Some(emitter) => emitters.push(emitter),
                 None => {
                     stats.unsupported_emitters += 1;
-                    record_unsupported_name(&mut stats.unsupported_emitter_names, entry_name(object));
+                    record_unsupported_name(
+                        &mut stats.unsupported_emitter_names,
+                        entry_name(object),
+                    );
                 }
             }
         }
@@ -135,7 +138,10 @@ pub fn parse_component_model(root: &Map<String, Value>) -> (ComponentModel, Comp
                 Some(operator) => operators.push(operator),
                 None => {
                     stats.unsupported_operators += 1;
-                    record_unsupported_name(&mut stats.unsupported_operator_names, entry_name(object));
+                    record_unsupported_name(
+                        &mut stats.unsupported_operator_names,
+                        entry_name(object),
+                    );
                 }
             }
         }
@@ -428,7 +434,11 @@ mod tests {
         // S7 (P9): the actual unrecognized `name` strings are recorded too,
         // not just the count.
         assert!(stats.unsupported_emitter_names.contains("wobblerandom"));
-        assert!(stats.unsupported_initializer_names.contains("rotationrandom"));
+        assert!(
+            stats
+                .unsupported_initializer_names
+                .contains("rotationrandom")
+        );
         assert!(stats.unsupported_operator_names.contains("vortex"));
     }
 
@@ -446,8 +456,7 @@ mod tests {
             emitters.push_str(&format!(r#"{{"name": "unknown{i}"}},"#));
         }
         emitters.pop();
-        let (_, stats) =
-            parse_component_model(&root(&format!(r#"{{"emitter": [{emitters}]}}"#)));
+        let (_, stats) = parse_component_model(&root(&format!(r#"{{"emitter": [{emitters}]}}"#)));
         assert_eq!(stats.unsupported_emitters, particles::MAX_COMPONENT_ITEMS);
         assert_eq!(stats.unsupported_emitter_names.len(), MAX_UNSUPPORTED_NAMES);
     }
