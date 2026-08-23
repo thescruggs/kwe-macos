@@ -5444,6 +5444,143 @@ mod tests {
         }
     }
 
+    /// S6 end-to-end, device-gated: a material fragment shader that
+    /// writes a NON-BLACK colour into a fully-transparent (alpha=0)
+    /// region must leave the clear colour visible there, not stamp its
+    /// own colour over it — the exact real-corpus shape that exposed the
+    /// bug (`materials/Sin título-2.tex`, Workshop 1725674512's water-
+    /// reflection layer, fills its transparent surround with opaque
+    /// white rather than black). The pipeline's blend state
+    /// (`blend_attachment_for`) uses premultiplied-alpha src-over
+    /// factors (`ONE`, `ONE_MINUS_SRC_ALPHA` for colour); a shader that
+    /// writes STRAIGHT (non-premultiplied) colour — `gl_FragColor =
+    /// vec4(1,1,1,0)`, exactly this shader's left half — blends as
+    /// `dst*1 + white*1 = white`, stamping opaque white over the clear
+    /// colour regardless of alpha, UNLESS `shaderpre::preprocess`
+    /// premultiplies the shader's real output before the blend hardware
+    /// sees it (see `preprocess`'s doc comment on the `main`-wrapping
+    /// fix). The right half (opaque, alpha=1) is unaffected by
+    /// premultiplication (`rgb*1 == rgb`) and pins that the fix does not
+    /// silently darken ordinary opaque content.
+    #[test]
+    fn material_fragment_shader_with_transparent_nonblack_pixels_does_not_paint_over_the_clear_color()
+     {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "material_fragment_shader_with_transparent_nonblack_pixels_does_not_paint_over_the_clear_color: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        // Left half (v_TexCoord.x < 0.5): opaque white RGB but alpha=0 --
+        // the exact "transparent regions filled with a non-black colour"
+        // export shape. Right half: an ordinary opaque colour, to pin
+        // that premultiplication is a no-op there.
+        let fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    if (v_TexCoord.x < 0.5) {\n        gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0);\n    } else {\n        gl_FragColor = vec4(0.2, 0.6, 0.8, 1.0);\n    }\n}\n";
+        let mut locations = std::collections::BTreeMap::new();
+        let mut include: Box<crate::shaderpre::IncludeLookup<'static>> = Box::new(|_: &str| None);
+        let vertex_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Vertex,
+            "synthetic_alpha.vert",
+            vertex_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("vertex preprocesses");
+        let fragment_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Fragment,
+            "synthetic_alpha.frag",
+            fragment_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("fragment preprocesses");
+        let vertex_spirv = crate::materialshader::compile_stage(
+            &vertex_pre.source,
+            crate::materialshader::Stage::Vertex,
+            "synthetic_alpha.vert",
+        )
+        .expect("vertex compiles");
+        let fragment_spirv = crate::materialshader::compile_stage(
+            &fragment_pre.source,
+            crate::materialshader::Stage::Fragment,
+            "synthetic_alpha.frag",
+        )
+        .expect("fragment compiles");
+
+        let key = MaterialKey::compute(
+            "synthetic_alpha",
+            &fragment_pre.combos,
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                BlendMode::Normal,
+                &vertex_pre.attributes,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[64.0, 0.0], [0.0, 48.0]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        // A clear colour distinguishable from both white (the bug's
+        // wrong answer) and the right half's real colour.
+        let pixels = renderer
+            .render([1.0, 0.0, 0.0, 1.0], &draws, &[])
+            .expect("render once");
+        assert_eq!(pixels.len(), 64 * 48 * 4);
+        // B8G8R8A8 readback of the clear colour (1,0,0,1): B=0,G=0,R=255.
+        for x in 0..16u32 {
+            for y in 0..48u32 {
+                let offset = ((y * 64 + x) * 4) as usize;
+                let pixel = &pixels[offset..offset + 4];
+                assert_eq!(
+                    pixel,
+                    &[0, 0, 255, 255],
+                    "left half (alpha=0, white RGB) at ({x},{y}) must leave the clear colour untouched, not paint white: {pixel:?}"
+                );
+            }
+        }
+        // Right half: unaffected by premultiplication (alpha=1).
+        // B8G8R8A8: B=0.8*255≈204, G=0.6*255≈153, R=0.2*255≈51.
+        for x in 48..64u32 {
+            for y in 0..48u32 {
+                let offset = ((y * 64 + x) * 4) as usize;
+                let pixel = &pixels[offset..offset + 4];
+                assert!((203..=205).contains(&pixel[0]), "B={}", pixel[0]);
+                assert!((152..=154).contains(&pixel[1]), "G={}", pixel[1]);
+                assert!((50..=52).contains(&pixel[2]), "R={}", pixel[2]);
+                assert_eq!(pixel[3], 255);
+            }
+        }
+    }
+
     /// S4 end-to-end: a vertex shader declaring `a_Normal` AND `a_Color`
     /// (the corpus's `genericimage3`/`genericimage4`-family shape, S4's
     /// deliverable 1) actually receives real per-vertex data from the

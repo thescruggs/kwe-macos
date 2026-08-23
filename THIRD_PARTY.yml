@@ -285,9 +285,11 @@ entries:
       no upstream equivalent — upstream's own `find(" main")` has the
       same weakness this closes, an original robustness fix, not a port.
       S6 (bug-fix slice: layer-centering NDC math, the material-constant
-      "material" key vs. GLSL uniform name mismatch, and the Wallpaper
-      Engine assets-root library-folder discovery gap) adapted file,
-      carrying a Borrowed-From comment at the adapted function:
+      "material" key vs. GLSL uniform name mismatch, the Wallpaper
+      Engine assets-root library-folder discovery gap, and the material
+      pipeline's straight-vs-premultiplied alpha blend mismatch) adapted
+      files, each carrying a Borrowed-From comment at the adapted
+      function:
       src/WallpaperEngine/Render/Objects/CImage.cpp:259-262
       (`updateScenePosition`'s `this->m_pos.x -= scene_width / 2` etc. —
       recentering an object's absolute-origin quad corners onto the
@@ -297,7 +299,27 @@ entries:
       upstream also flips y there to match OpenGL's y-up NDC; this
       renderer targets Vulkan's native y-down NDC and already documents
       "no y-flip" (shaders/quad.vert), so only the centre subtraction is
-      ported, not the flip). The material-constant name-mapping fix
+      ported, not the flip);
+      src/WallpaperEngine/Render/Objects/Effects/CPass.cpp:128-140
+      (`CPass::setupPass`'s blend-func switch: `BlendingMode_Translucent`
+      -> `glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, ...)`,
+      i.e. upstream's fixed-function blend hardware — not the shader —
+      scales a STRAIGHT-alpha fragment's colour by its own alpha before
+      compositing) -> crates/kwe-scene-renderer/src/shaderpre.rs
+      (`preprocess`'s fragment-stage `main`-wrapping fix — adapted, not a
+      code port: this renderer's own material blend state
+      (`vulkan::blend_attachment_for`) uses PREMULTIPLIED-alpha factors
+      (`ONE`, `ONE_MINUS_SRC_ALPHA`) instead of upstream's straight-alpha
+      ones (`GL_SRC_ALPHA`, `GL_ONE_MINUS_SRC_ALPHA`), a renderer-specific
+      choice this slice did not revisit — so instead of matching
+      upstream's blend func, every material fragment shader's real `main`
+      is renamed and wrapped to premultiply its own output once, making
+      its result match what this renderer's EXISTING blend factors
+      require; the citation is upstream's semantics — a straight-alpha
+      shader, alpha-scaled once before compositing — not upstream's
+      mechanism, since GLSL has no equivalent of overriding another
+      function's blend factors at the source level).
+      The material-constant name-mapping fix
       (crates/kwe-scene-renderer/src/shaderpre.rs, fold_declarations'
       `uniform_material_keys` lookup) and the Steam library-folder
       discovery fix (crates/kwe-core/src/scan.rs,

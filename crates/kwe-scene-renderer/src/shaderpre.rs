@@ -1745,12 +1745,52 @@ pub fn preprocess(
         Stage::Fragment => FRAGMENT_SHADER_DEFINES,
         Stage::Vertex => VERTEX_SHADER_DEFINES,
     });
+    // S6: the material pipeline's Vulkan blend state (`vulkan::
+    // blend_attachment_for`) uses PREMULTIPLIED-alpha src-over factors
+    // (`ONE`, `ONE_MINUS_SRC_ALPHA` for color) — correct only when the
+    // fragment shader's own output is already premultiplied (`out_rgb =
+    // trueRGB * trueAlpha`). A real WE material fragment shader never
+    // does this itself (upstream's own blend funcs, `CPass.cpp:128-140`,
+    // use `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` for Translucent — i.e.
+    // upstream's hardware does the alpha scaling, not the shader — so no
+    // real WE shader has ever needed to premultiply), and this
+    // renderer's own material shaders are a straight `gl_FragColor =
+    // texSample2D(...)` passthrough of whatever alpha the source texture
+    // declares. A texture whose fully-transparent regions are filled
+    // with a non-black color — an ordinary, common export convention
+    // (`materials/Sin título-2.tex`, Workshop 1725674512's water-
+    // reflection layer, exports its transparent surround as opaque
+    // white) — then blends as `out_rgb = srcRGB·1 + dst·(1−0) = srcRGB +
+    // dst`, adding the full, un-scaled RGB onto whatever is underneath
+    // regardless of its (correctly zero) alpha: an opaque white
+    // rectangle stamped over the destination instead of leaving it
+    // untouched. Wrapping every material fragment shader's real `main`
+    // and premultiplying its OWN output once, right before the blend
+    // hardware sees it, makes the shader's actual output match what the
+    // existing (unchanged, since the S1 quad/particle pipelines' own
+    // hand-written shaders and their exact-byte pixel oracles are out of
+    // this fix's scope) blend factors require — a no-op whenever alpha
+    // is 1 (every existing opaque-material device test), and the
+    // correct fix whenever it is not.
+    if stage == Stage::Fragment {
+        source_out.push_str("#define main kwe_material_main\n");
+    }
     source_out.push_str(MATERIAL_UBO_BLOCK);
     for (name, value) in &combos {
         source_out.push_str(&format!("#define {} {}\n", name.to_uppercase(), value));
     }
     source_out.push('\n');
     source_out.push_str(&folded.replace("gl_FragColor", "out_FragColor"));
+    if stage == Stage::Fragment {
+        // #undef first: `#define main kwe_material_main` above has no
+        // scope limit in GLSL's preprocessor, so without this the wrapper's
+        // OWN `void main()` below would itself be renamed to
+        // `kwe_material_main` too — a second definition of the same
+        // function, `'kwe_material_main' : function already has a body`.
+        source_out.push_str(
+            "\n#undef main\nvoid main() {\n    kwe_material_main();\n    out_FragColor.rgb *= out_FragColor.a;\n}\n",
+        );
+    }
 
     if source_out.len() > MAX_PREPROCESSED_BYTES {
         return Err(PreprocessError::SizeExceeded {
@@ -1932,6 +1972,60 @@ mod tests {
         assert!(out.source.contains("out vec4 out_FragColor;"));
         assert!(out.source.contains("out_FragColor = vec4(1.0);"));
         assert!(!out.source.contains("gl_FragColor"));
+    }
+
+    /// S6: every material FRAGMENT shader's real `main` is renamed and
+    /// wrapped so its output gets premultiplied before the material
+    /// pipeline's premultiplied-alpha blend state
+    /// (`vulkan::blend_attachment_for`) sees it — see `preprocess`'s doc
+    /// comment on why (a straight-alpha shader whose transparent pixels
+    /// are non-black, e.g. `materials/Sin título-2.tex`, Workshop
+    /// 1725674512, otherwise paints its own colour over whatever is
+    /// underneath regardless of alpha). The original body (still
+    /// containing the literal statement text) is untouched; only the
+    /// enclosing function name and the trailing wrapper are new.
+    #[test]
+    fn material_fragment_shader_output_is_wrapped_to_premultiply_alpha() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "void main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 0.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("#define main kwe_material_main"));
+        assert!(out.source.contains("#undef main"));
+        assert!(
+            out.source
+                .contains("out_FragColor = vec4(1.0, 1.0, 1.0, 0.0);")
+        );
+        assert!(out.source.contains("kwe_material_main();"));
+        assert!(out.source.contains("out_FragColor.rgb *= out_FragColor.a;"));
+    }
+
+    /// The vertex stage must NOT get the fragment-only premultiply
+    /// wrapper (`out_FragColor` does not even exist in a vertex shader).
+    #[test]
+    fn vertex_shader_is_not_wrapped_for_premultiplication() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "void main() { gl_Position = vec4(0.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(!out.source.contains("kwe_material_main"));
+        assert!(!out.source.contains("#define main"));
     }
 
     #[test]
