@@ -119,13 +119,38 @@ precision highp float;\n\
 #define fmod(x, y) ((x)-(y)*trunc((x)/(y)))\n\
 #define ddx dFdx\n\
 #define ddy(x) dFdy(-(x))\n\
+#define max(x, y) max(y, x)\n\
 #define GLSL 1\n\n";
 
-/// `#define max` is deliberately dropped from the verbatim header: upstream
-/// argument-swaps it (`max(x, y) -> max(y, x)`) to paper over an HLSL/GLSL
-/// operand-order quirk that does not affect GLSL, which already defines
-/// `max` the same way in both languages — keeping it would just risk a
-/// macro-recursion diagnostic on some drivers for no behavioral gain.
+/// S4b fix: `#define max(x, y) max(y, x)` was previously dropped from the
+/// verbatim header on the theory that GLSL already defines `max` the same
+/// way HLSL does, so the swap was assumed to be a no-op kept only for
+/// upstream fidelity. That theory was wrong for exactly the shape the WE
+/// shader corpus actually writes: HLSL's `max(scalar, vecN)` implicitly
+/// broadcasts the scalar regardless of argument position, but GLSL's
+/// overload set only has `genType max(genType x, float y)` — the scalar
+/// MUST be the second argument, and even then only as a `float` (an
+/// integer literal like the bare `0` in `max(0, albedo.rgb)` needs GLSL's
+/// int -> float implicit conversion on the SECOND-position argument to
+/// resolve at all). A WE shader written as `max(0, someVec3)` (the real
+/// corpus shape — `workshop/2423477561/effects/nitro.frag` and
+/// `workshop/2988515046/effects/nitro.frag`, both pkg-bundled) has no
+/// matching GLSL overload in EITHER position — `shaderc` reports `'max' :
+/// no matching overloaded function found` for the un-swapped call. This
+/// macro is what upstream itself ships (`ShaderUnit.cpp`'s own
+/// `SHADER_HEADER`) to paper over exactly this: swapping unconditionally
+/// is safe because a well-typed `max(a, b)` call is mathematically
+/// commutative — a currently-compiling call written the OTHER way around
+/// (vector first, scalar second) is unaffected in VALUE, and only breaks
+/// if the corpus also authored `max()` in that order somewhere, which the
+/// 60-scene local corpus byte-identity sweep (before/after this fix)
+/// found no case of.
+///
+/// (The C preprocessor's blue-paint rule — a macro name is never
+/// re-expanded inside its own substitution while that expansion is in
+/// progress — is what makes `#define max(x,y) max(y,x)` terminate rather
+/// than recurse infinitely; this is a standard, safe idiom, confirmed
+/// against `shaderc`'s real preprocessor, not just a textual assumption.)
 // `out_FragColor` needs an explicit `layout(location=0)` for the same
 // Vulkan reason every other stage-interface variable does (see
 // `SHADER_HEADER`'s doc comment) — there is exactly one color attachment
@@ -334,24 +359,26 @@ pub struct PreprocessOutput {
 /// enabled, so their filename may not resolve without that being a real
 /// problem).
 ///
-/// Deviates from upstream's placement strategy
-/// (`ShaderUnit::preprocessIncludes`, which collects every include's text
-/// separately and splices it in just before `main()`, walking an `#if`
-/// stack to avoid landing inside a false branch): every `#include` in the
-/// corpus sits at file scope above any function definition, so inlining
-/// in place is equivalent and does not need upstream's placement search.
+/// S4b fix: every `#include`'s resolved text is collected into one shared
+/// accumulator (in encounter order, flattened across nesting) instead of
+/// being inlined at its exact source position, and [`resolve_includes`]
+/// splices that accumulator in just before `main(` — matching upstream's
+/// real placement strategy (see that function's doc). This function does
+/// the recursive walk/collection; it never returns text with `#include`
+/// lines still in it.
+///
 /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
 /// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-171 (the
 /// `#include` extraction loop and its not-found fallback) @ b016d7d1 —
 /// adapted (recursive bounded resolution replaces the two-pass,
-/// one-level-of-nesting scheme; in-place splice replaces the
-/// before-`main()` placement search).
-fn resolve_includes(
+/// one-level-of-nesting scheme).
+fn collect_includes(
     source: &str,
     include: &mut IncludeLookup<'_>,
     depth: usize,
     total_len: &mut usize,
     include_count: &mut usize,
+    accumulated: &mut String,
 ) -> Result<String, PreprocessError> {
     if depth > MAX_INCLUDE_DEPTH {
         return Err(PreprocessError::IncludeDepthExceeded);
@@ -366,29 +393,55 @@ fn resolve_includes(
             if *include_count > MAX_INCLUDE_COUNT {
                 return Err(PreprocessError::TooManyIncludes);
             }
-            out.push_str("// begin of include from file ");
-            out.push_str(&name);
-            out.push('\n');
+            // `total_len` tracks a DELTA against `accumulated`'s length
+            // (not its absolute size) so a shader with several sibling
+            // includes is not double- or triple-counted — every push
+            // below adds real bytes to the one shared accumulator, and
+            // only the growth since this include started is new.
+            let accumulated_before = accumulated.len();
+            accumulated.push_str("// begin of include from file ");
+            accumulated.push_str(&name);
+            accumulated.push('\n');
             match include(&name) {
                 Some(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
-                    let resolved =
-                        resolve_includes(&text, include, depth + 1, total_len, include_count)?;
-                    out.push_str(&resolved);
+                    // Nested includes flatten into the SAME accumulator,
+                    // in the order encountered — matches upstream
+                    // collecting every include's text into one list
+                    // regardless of nesting depth. The nested call's own
+                    // `out` (its non-#include lines) is pushed here; its
+                    // OWN nested includes already pushed themselves into
+                    // `accumulated` directly and bounded their own delta.
+                    let resolved = collect_includes(
+                        &text,
+                        include,
+                        depth + 1,
+                        total_len,
+                        include_count,
+                        accumulated,
+                    )?;
+                    accumulated.push_str(&resolved);
                     if !resolved.ends_with('\n') {
-                        out.push('\n');
+                        accumulated.push('\n');
                     }
                 }
                 None => {
-                    out.push_str("// tried including file ");
-                    out.push_str(&name);
-                    out.push_str(" but was not found\n");
+                    accumulated.push_str("// tried including file ");
+                    accumulated.push_str(&name);
+                    accumulated.push_str(" but was not found\n");
                 }
             }
-            out.push_str("// end of included from file ");
-            out.push_str(&name);
-            out.push('\n');
-            continue;
+            accumulated.push_str("// end of included from file ");
+            accumulated.push_str(&name);
+            accumulated.push('\n');
+            *total_len += accumulated.len() - accumulated_before;
+            if *total_len > MAX_PREPROCESSED_BYTES {
+                return Err(PreprocessError::SizeExceeded {
+                    bytes: *total_len,
+                    limit: MAX_PREPROCESSED_BYTES,
+                });
+            }
+            continue; // the #include line itself is NOT copied into `out`
         }
         out.push_str(line);
     }
@@ -400,6 +453,104 @@ fn resolve_includes(
         });
     }
     Ok(out)
+}
+
+/// Byte index of the start of the line holding the file's `main(`
+/// function definition — a bare `main` token (not part of a longer
+/// identifier like `mainColor`) followed, after optional spaces/tabs, by
+/// `(`. `None` if no such token exists (defensive; a well-formed shader
+/// stage always has exactly one). The search is a single linear pass
+/// (`search_from` strictly advances every iteration), so it cannot loop
+/// unboundedly even over a hostile/malformed source within the existing
+/// `MAX_PREPROCESSED_BYTES` cap.
+fn find_main_insertion_point(body: &str) -> Option<usize> {
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut search_from = 0usize;
+    while let Some(relative) = body[search_from..].find("main") {
+        let start = search_from + relative;
+        let end = start + "main".len();
+        let before_is_boundary = start == 0 || !is_ident_byte(body.as_bytes()[start - 1]);
+        let after = &body[end..];
+        let after_is_boundary = after.as_bytes().first().is_none_or(|&b| !is_ident_byte(b));
+        if before_is_boundary && after_is_boundary {
+            let rest = after.trim_start_matches([' ', '\t']);
+            if rest.starts_with('(') {
+                let line_start = body[..start].rfind('\n').map_or(0, |pos| pos + 1);
+                return Some(line_start);
+            }
+        }
+        search_from = end;
+    }
+    None
+}
+
+/// Resolve every `#include` in `source`, then splice ALL of their
+/// resolved text in just before the file's `main(` definition — matching
+/// upstream's real placement strategy, not a naive in-place text
+/// substitution.
+///
+/// This matters: many WE shader headers (e.g. `common_blur.h`'s
+/// `blur13`/`blur7`/`blur3`, which read a bare `g_Texture0`) are written
+/// assuming the file that includes them has ALREADY declared the globals
+/// those functions use, wherever in the file that declaration sits — a
+/// pattern only sound if the included text lands after every top-level
+/// declaration, which "insert at the `#include` line's own position"
+/// cannot guarantee when (as in the local WE asset corpus's
+/// `shine_gaussian.frag`/`godrays_gaussian.frag`/
+/// `blur_precise_gaussian.frag`) the `#include` line is the FIRST line of
+/// the file, before the `uniform sampler2D g_Texture0;` it depends on.
+/// In-place inlining put the header's function bodies (which reference
+/// `g_Texture0`) textually BEFORE that declaration, so `shaderc` reported
+/// `'g_Texture0' : undeclared identifier` — this was a real, previously
+/// undiagnosed bug in this module's OWN documented deviation from
+/// upstream (the old doc comment's "every `#include` in the corpus sits
+/// at file scope above any function definition" premise was false for
+/// these three real corpus shaders).
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-171
+/// (`preprocessIncludes` collects every include's text separately and
+/// splices it in just before `main()`) @ b016d7d1 — adapted: upstream
+/// additionally walks an `#if`/`#endif` stack while searching for the
+/// insertion point so it cannot land inside a dead branch; every `main(`
+/// in the local corpus is unconditional (not itself behind an `#if`), so
+/// a plain first-occurrence search is equivalent for every shader this
+/// renderer has been measured against — a shader with a combo-gated
+/// `main(` would need that upstream `#if`-aware search, not implemented
+/// here (falls back to appending at the very end if `main(` is not
+/// found, rather than losing the included text).
+fn resolve_includes(
+    source: &str,
+    include: &mut IncludeLookup<'_>,
+    depth: usize,
+    total_len: &mut usize,
+    include_count: &mut usize,
+) -> Result<String, PreprocessError> {
+    let mut accumulated = String::new();
+    let body = collect_includes(
+        source,
+        include,
+        depth,
+        total_len,
+        include_count,
+        &mut accumulated,
+    )?;
+    if accumulated.is_empty() {
+        return Ok(body);
+    }
+    let mut spliced = String::with_capacity(body.len() + accumulated.len());
+    match find_main_insertion_point(&body) {
+        Some(index) => {
+            spliced.push_str(&body[..index]);
+            spliced.push_str(&accumulated);
+            spliced.push_str(&body[index..]);
+        }
+        None => {
+            spliced.push_str(&body);
+            spliced.push_str(&accumulated);
+        }
+    }
+    Ok(spliced)
 }
 
 fn extract_quoted(rest: &str) -> Option<String> {
@@ -516,13 +667,43 @@ fn resolve_requires(source: &str) -> String {
     out
 }
 
+/// The trailing swizzle that narrows a `vec4` UBO slot down to the
+/// shader's OWN declared type for a folded standard uniform — S4b fix
+/// (found via the local WE asset corpus's `common_perspective.h`
+/// `squareToQuad`/`inverse` chain, see `standard_uniform_expr`'s
+/// `g_Point<N>` case): several standard uniforms are backed by a `vec4`
+/// UBO field regardless of what any ONE shader declares locally (e.g.
+/// `effects/perspective.vert` declares `uniform vec2 g_Point0;` while the
+/// shared `u_Std.g_Point_[8]` UBO field is `vec4`), and folding to the
+/// bare vec4 expression silently changes the call-site TYPE the rest of
+/// the shader sees — `squareToQuad(vec2, vec2, vec2, vec2)` called with
+/// four `vec4` arguments is not the same overload, so `shaderc` reports
+/// "no matching overloaded function found" for a function that outright
+/// EXISTS, and any assignment expecting the narrower type then also
+/// mismatches ("cannot convert from const float to 3x3 matrix" was the
+/// SAME root cause's second symptom on the very same corpus shader,
+/// cascading from `squareToQuad`'s own broken call). `glsl_type` is the
+/// EXACT type token this shader's own declaration used, straight from
+/// `parse_decl` — narrowing only ever DROPS trailing components (`.xy`/
+/// `.xyz`), never invents data, so a `vec4`-declaring shader (the common
+/// case) is untouched (empty swizzle).
+fn narrowing_swizzle(glsl_type: &str) -> &'static str {
+    match glsl_type {
+        "vec2" => ".xy",
+        "vec3" => ".xyz",
+        _ => "",
+    }
+}
+
 /// The WE "standard" uniform set this material pipeline provides via the
 /// `MaterialUniforms` UBO (materialshader.rs) — name -> GLSL expression
 /// reaching the matching UBO field. `g_Texture<N>Resolution` doubles as
 /// texel size (`.zw`), matching WE's own convention (a resolution uniform
 /// that is `vec4(width, height, 1/width, 1/height)`); `g_TexelSize` (no
 /// number) aliases texture slot 0's, the common single-texture case.
-fn standard_uniform_expr(name: &str) -> Option<String> {
+/// `glsl_type` is the shader's OWN declared type for this uniform
+/// (`parse_decl`'s scraped type token) — see `narrowing_swizzle`.
+fn standard_uniform_expr(name: &str, glsl_type: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("g_Texture")
         && let Some(index_str) = rest.strip_suffix("Resolution")
         && let Ok(index) = index_str.parse::<u32>()
@@ -586,7 +767,10 @@ fn standard_uniform_expr(name: &str) -> Option<String> {
         && let Ok(index) = rest.parse::<u32>()
         && index < 8
     {
-        return Some(format!("u_Std.g_Point_[{index}]"));
+        return Some(format!(
+            "u_Std.g_Point_[{index}]{}",
+            narrowing_swizzle(glsl_type)
+        ));
     }
     Some(
         match name {
@@ -676,6 +860,39 @@ const MATERIAL_UBO_BLOCK: &str = "layout(set = 0, binding = 8, std140) uniform M
     vec4 g_TimeAlphaBrightness_;\n\
     vec4 g_MaterialConstants_[16];\n\
 } u_Std;\n";
+
+/// Cap on how many elements a zero-filled array uniform's replacement
+/// initializer will enumerate (S4b fix — see `fold_declarations`'s array
+/// branch). Generous over any real corpus array (the audio-spectrum
+/// uniforms this fixes top out at 64 elements: `g_AudioSpectrum64Left/
+/// Right`); a hostile/malformed declaration past this bound is left on
+/// the pre-existing "unsupported, line passes through unmodified" path
+/// rather than building an unbounded initializer-list string.
+const MAX_ZERO_ARRAY_LEN: u32 = 1024;
+
+/// Split an array declarator's `name` field (`parse_decl` leaves the
+/// brackets attached here, e.g. `"g_AudioSpectrum16Left[16]"`) into the
+/// bare name and element count. `None` for anything not shaped exactly
+/// `IDENT[DIGITS]` (a multi-dimensional array, a non-numeric size
+/// expression, or a missing/malformed bracket) — the caller's existing
+/// unsupported/pass-through fallback handles those the same as before
+/// this fix.
+fn parse_array_declarator(name: &str) -> Option<(&str, u32)> {
+    let open = name.find('[')?;
+    if !name.ends_with(']') {
+        return None;
+    }
+    let base = &name[..open];
+    let size_str = &name[open + 1..name.len() - 1];
+    if base.is_empty() || size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let size: u32 = size_str.parse().ok()?;
+    if size == 0 || size > MAX_ZERO_ARRAY_LEN {
+        return None;
+    }
+    Some((base, size))
+}
 
 fn zero_literal(glsl_type: &str) -> Option<&'static str> {
     Some(match glsl_type {
@@ -1174,7 +1391,7 @@ fn fold_declarations(
                 continue;
             }
             if !glsl_type.contains('[') && !name.contains('[') {
-                if let Some(expr) = standard_uniform_expr(&name) {
+                if let Some(expr) = standard_uniform_expr(&name, &glsl_type) {
                     out.push_str(indent);
                     out.push_str(&format!("#define {name} {expr}{newline}"));
                     continue;
@@ -1195,6 +1412,41 @@ fn fold_declarations(
                     out.push_str(&format!("const {glsl_type} {name} = {zero};{newline}"));
                     continue;
                 }
+            } else if !glsl_type.contains('[')
+                && let Some((base, size)) = parse_array_declarator(&name)
+                && let Some(zero) = zero_literal(&glsl_type)
+            {
+                // S4b fix: an ARRAY uniform (e.g. `uniform float
+                // g_AudioSpectrum16Left[16];`, the real corpus shape that
+                // surfaced this — an audio-visualizer material declaring
+                // spectrum-band arrays this renderer does not feed real
+                // audio data into) previously fell all the way through to
+                // the generic per-line pass-through below, leaving the
+                // ORIGINAL loose `uniform ... [N];` line in the compiled
+                // output — Vulkan's GLSL profile requires every
+                // non-opaque uniform to live inside a named block, so
+                // `shaderc` reported `'non-opaque uniforms outside a
+                // block' : not allowed when using GLSL for Vulkan`. Same
+                // "still compiles, just inert" contract as the scalar/
+                // vector zero-default just above: a NON-const array
+                // (GLSL's `const` array initializer rules are stricter
+                // than a plain global's) zero-initialized with an
+                // explicit `TYPE[N](...)` constructor — GLSL has no
+                // `TYPE[N] = TYPE(0.0)` broadcast shorthand, every element
+                // must be listed.
+                unsupported.push(name.clone());
+                out.push_str(indent);
+                out.push_str(&format!(
+                    "{glsl_type} {base}[{size}] = {glsl_type}[{size}](",
+                ));
+                for i in 0..size {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(zero);
+                }
+                out.push_str(&format!(");{newline}"));
+                continue;
             }
             unsupported.push(name.clone());
         }
@@ -1642,6 +1894,90 @@ mod tests {
         )
         .unwrap();
         assert!(out.source.contains("const float X = 1.0;"));
+    }
+
+    /// The S4b fix: `common_blur.h`'s real shape (`blur13`/`blur7`/`blur3`
+    /// reading a bare `g_Texture0`) assumes the INCLUDING file's own
+    /// declarations are visible, wherever in the file they sit — real
+    /// corpus shaders (`shine_gaussian.frag`, `godrays_gaussian.frag`,
+    /// `blur_precise_gaussian.frag`) `#include` it as the FIRST line,
+    /// before their own `uniform sampler2D g_Texture0;`. In-place inlining
+    /// (the pre-fix behavior) would put the header's function ahead of
+    /// that declaration — `shaderc` reports `'g_Texture0' : undeclared
+    /// identifier`. Tests `resolve_includes` directly (not the full
+    /// `preprocess` pipeline, which would fold the sampler declaration
+    /// away) so the plain text ordering is pinned precisely.
+    #[test]
+    fn include_content_lands_before_main_not_at_its_own_line_position() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> = Box::new(|name: &str| {
+            if name == "common_blur.h" {
+                Some(b"vec3 helper() { return texture(g_Texture0, vec2(0.0)).rgb; }\n".to_vec())
+            } else {
+                None
+            }
+        });
+        let source =
+            "#include \"common_blur.h\"\n\nuniform sampler2D g_Texture0;\n\nvoid main(){}\n";
+        let out =
+            resolve_includes(source, &mut include, 0, &mut total_len, &mut include_count).unwrap();
+        let decl_pos = out
+            .find("uniform sampler2D g_Texture0;")
+            .expect("declaration present");
+        let use_pos = out.find("helper()").expect("included function present");
+        let main_pos = out.find("void main(").expect("main present");
+        assert!(
+            decl_pos < use_pos,
+            "the declaration must precede the included function that reads it: {out}"
+        );
+        assert!(
+            use_pos < main_pos,
+            "included text must land before main(), not after: {out}"
+        );
+        // The #include line itself is gone from its original position —
+        // it is not left behind as dead text once its content moved.
+        assert!(!out.contains("#include \"common_blur.h\""));
+    }
+
+    /// A source with no `main(` at all (malformed input, defensive-only —
+    /// every real shader stage has exactly one) must not silently drop
+    /// the included text; it appends at the end instead.
+    #[test]
+    fn include_with_no_main_appends_at_the_end_instead_of_dropping() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"const float X = 1.0;\n".to_vec()));
+        let out = resolve_includes(
+            "#include \"a.h\"\nsome_other_content();\n",
+            &mut include,
+            0,
+            &mut total_len,
+            &mut include_count,
+        )
+        .unwrap();
+        assert!(out.contains("const float X = 1.0;"));
+        assert!(out.contains("some_other_content();"));
+    }
+
+    /// `main` used as part of a longer identifier (`mainColor`) must not
+    /// be mistaken for the function definition — the splice point search
+    /// is word-boundary-aware in both directions.
+    #[test]
+    fn main_like_identifiers_do_not_confuse_the_insertion_point_search() {
+        let mut total_len = 0usize;
+        let mut include_count = 0usize;
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"const float X = 1.0;\n".to_vec()));
+        let source = "vec3 mainColor() { return vec3(0.0); }\n#include \"a.h\"\nvoid main(){}\n";
+        let out =
+            resolve_includes(source, &mut include, 0, &mut total_len, &mut include_count).unwrap();
+        let color_pos = out.find("mainColor").unwrap();
+        let x_pos = out.find("const float X = 1.0;").unwrap();
+        let main_pos = out.find("void main(").unwrap();
+        assert!(color_pos < x_pos, "did not stop at mainColor: {out}");
+        assert!(x_pos < main_pos);
     }
 
     #[test]
@@ -2374,6 +2710,153 @@ mod tests {
             unsupported.extend(out.unsupported_uniforms.iter().cloned());
         }
         assert!(unsupported.is_empty(), "{unsupported:?}");
+    }
+
+    /// S4b fix: `g_Point<N>` folds to the shared `vec4` UBO slot, but a
+    /// shader that declares it as `vec2` (the real corpus shape —
+    /// `effects/perspective.vert`) must get a `.xy`-narrowed expression,
+    /// not the bare vec4 — passing a vec4 where a function expects vec2
+    /// arguments (`squareToQuad(vec2, vec2, vec2, vec2)`) is a genuine
+    /// type mismatch, not a cosmetic one (`shaderc` reports "no matching
+    /// overloaded function found" for a function that DOES exist).
+    #[test]
+    fn point_uniform_narrows_to_the_shaders_own_declared_type() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "uniform vec2 g_Point0;\nvoid main(){ gl_Position = vec4(g_Point0, 0.0, 1.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source.contains("#define g_Point0 u_Std.g_Point_[0].xy"),
+            "{}",
+            out.source
+        );
+        assert!(out.unsupported_uniforms.is_empty());
+    }
+
+    /// A `vec4`-declaring shader (the common case, no local corpus example
+    /// needing narrowing) gets the bare slot expression — no swizzle
+    /// appended, byte-identical to the pre-fix output.
+    #[test]
+    fn point_uniform_declared_as_vec4_is_unswizzled() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Vertex,
+            "t.vert",
+            "uniform vec4 g_Point3;\nvoid main(){ gl_Position = g_Point3; }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source.contains("#define g_Point3 u_Std.g_Point_[3]\n"),
+            "{}",
+            out.source
+        );
+    }
+
+    /// S4b fix: an ARRAY uniform (`uniform float g_AudioSpectrum16Left
+    /// [16];`, the real corpus shape — an audio-visualizer material this
+    /// renderer does not feed live spectrum data into) previously fell
+    /// through to the generic per-line pass-through, leaving a loose
+    /// (non-block) `uniform` declaration in the compiled text — Vulkan's
+    /// GLSL profile rejects any non-opaque uniform outside a block. It
+    /// must now become a zero-initialized, non-uniform array the rest of
+    /// the shader can still read by the same name.
+    #[test]
+    fn array_uniform_zero_fills_instead_of_leaving_a_loose_declaration() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform float g_AudioSpectrum16Left[16];\nvoid main(){ gl_FragColor = vec4(g_AudioSpectrum16Left[0]); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            !out.source.contains("uniform float g_AudioSpectrum16Left"),
+            "the loose uniform declaration must not survive: {}",
+            out.source
+        );
+        assert!(
+            out.source
+                .contains("float g_AudioSpectrum16Left[16] = float[16](float(0.0), float(0.0)"),
+            "{}",
+            out.source
+        );
+        assert!(
+            out.unsupported_uniforms
+                .contains(&"g_AudioSpectrum16Left[16]".to_string())
+        );
+    }
+
+    /// A hostile/absurd array size (past `MAX_ZERO_ARRAY_LEN`) is left on
+    /// the pre-existing pass-through path (still "unsupported", never a
+    /// panic or an unbounded initializer-list string) rather than
+    /// generating a huge constructor.
+    #[test]
+    fn array_uniform_past_the_zero_fill_bound_is_left_unsupported_not_expanded() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let huge = MAX_ZERO_ARRAY_LEN + 1;
+        let source = format!(
+            "uniform float g_Huge[{huge}];\nvoid main(){{ gl_FragColor = vec4(g_Huge[0]); }}\n"
+        );
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            &source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        // Left exactly as written -- not expanded into a huge literal list.
+        assert!(
+            out.source
+                .contains(&format!("uniform float g_Huge[{huge}];"))
+        );
+    }
+
+    /// S4b fix: `#define max(x, y) max(y, x)` (upstream's own header,
+    /// previously dropped) is what makes `max(0, someVec3)` — the real
+    /// corpus shape (`workshop/2423477561/effects/nitro.frag`) — resolve:
+    /// the swap puts the scalar in GLSL's required SECOND position, where
+    /// its int -> float implicit conversion against `max(genType, float)`
+    /// applies. Pinned as a textual assertion on the header (the actual
+    /// overload-resolution behavior is exercised end-to-end by
+    /// `materialshader`'s device-gated compile tests and the corpus
+    /// verification recorded in the S4b change-log).
+    #[test]
+    fn max_macro_swaps_arguments_matching_upstreams_header() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "void main(){ gl_FragColor = vec4(1.0); }\n",
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(out.source.contains("#define max(x, y) max(y, x)"));
     }
 
     /// `g_Texture<N>Translation` needs no special case: the generic
