@@ -69,6 +69,14 @@ QHash<int, QByteArray> CatalogModel::roleNames() const {
 }
 
 void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
+    // B3 (docs/bugs/GALLERY_AUTO_REFRESH_SHIFT.md): skip the full model reset
+    // when the catalog payload did not change since the last apply. The
+    // auto-refresh keeps polling, but the grid only rebuilds on a real change.
+    const QJsonArray incoming = catalog.value(QStringLiteral("items")).toArray();
+    if (m_hasItems && incoming == m_lastItems)
+        return;
+    m_lastItems = incoming;
+    m_hasItems = true;
     QList<WallpaperItem> replacement;
     int scene = 0;
     int video = 0;

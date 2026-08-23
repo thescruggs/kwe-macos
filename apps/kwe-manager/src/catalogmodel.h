@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QAbstractListModel>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QSortFilterProxyModel>
 #include <QUrl>
@@ -79,6 +80,12 @@ signals:
 
 private:
     QList<WallpaperItem> m_items;
+    // B3: the items array of the last catalog applied. The client refreshes
+    // the catalog every few seconds; an unchanged payload must not reset the
+    // model (a reset invalidates every delegate and makes the grid re-settle
+    // under the pointer). Only a changed payload reaches beginResetModel.
+    QJsonArray m_lastItems;
+    bool m_hasItems = false;
     int m_sceneCount = 0;
     int m_videoCount = 0;
     int m_webCount = 0;

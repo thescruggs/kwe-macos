@@ -6,9 +6,13 @@
 - **Severity:** Medium user-facing — nothing breaks, but the selection grid
   is visibly unstable: cards move under the pointer, which makes clicking
   the wallpaper you meant to click a matter of timing.
-- **Status:** TRIAGED, not yet reproduced under instrumentation. The
-  suspect below is from reading the code, not from a measurement — confirm
-  it before changing anything.
+- **Status:** FIXED 2026-08-23 (smallest fix from the list below):
+  `CatalogModel::replaceFromCatalog` keeps the last applied `items` array and
+  returns before `beginResetModel` when the refreshed payload is identical,
+  so the 5 s auto-refresh no longer rebuilds the grid unless the catalog
+  actually changed. Confirmed by the maintainer's report ("every couple of
+  seconds it refreshes") matching the 5 s cadence; the targeted-signal diff
+  and the cadence revisit remain optional follow-ups.
 
 ## Suspected cause (to confirm)
 
