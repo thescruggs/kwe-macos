@@ -117,6 +117,20 @@ pub fn web_renderer_command(
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-extensions".into(),
+        // BETA B6 (docs/bugs/WEB_FILE_ACCESS_BLACK_CANVAS.md): a file://
+        // page's origin is opaque, so WITHOUT this flag its own images are
+        // cross-origin for WebGL (texImage2D throws SecurityError) and
+        // same-directory XHR/fetch is blocked — real Workshop wallpapers
+        // render black. The flag makes every file: URL the page can name
+        // readable, which inside this namespace means the content root and
+        // the read-only system binds (/usr /etc /lib …); nothing from the
+        // user's home is reachable and the network still needs the grant.
+        // Narrowing the /etc bind is the follow-up recorded with B6.
+        "--allow-file-access-from-files".into(),
+        // Chromium 151 deprecates the silent software-WebGL fallback behind
+        // --disable-gpu; this keeps WebGL (SwiftShader) available when the
+        // fallback is removed. There is no GPU in the sandbox either way.
+        "--enable-unsafe-swiftshader".into(),
         "--remote-debugging-pipe".into(),
         format!("--window-size={width},{height}"),
         "--user-data-dir=/tmp/kwe-profile".into(),
@@ -211,6 +225,11 @@ pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxComm
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-extensions".into(),
+        // BETA B6: same file-access and software-WebGL flags as the renderer
+        // so the preview shows what the wallpaper will show. A file://
+        // page's own images are otherwise cross-origin for WebGL.
+        "--allow-file-access-from-files".into(),
+        "--enable-unsafe-swiftshader".into(),
         "--user-data-dir=/tmp/kwe-preview-profile".into(),
         "file:///wallpaper/index.html".into(),
     ]);
@@ -268,6 +287,8 @@ mod tests {
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
+            "--allow-file-access-from-files",
+            "--enable-unsafe-swiftshader",
             "--user-data-dir=/tmp/kwe-profile",
             "file:///wallpaper/index.html",
         ] {
@@ -317,6 +338,8 @@ mod tests {
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-extensions",
+            "--allow-file-access-from-files",
+            "--enable-unsafe-swiftshader",
             "--user-data-dir=/tmp/kwe-preview-profile",
             "file:///wallpaper/index.html",
         ] {

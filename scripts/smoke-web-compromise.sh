@@ -4,9 +4,13 @@
 # page attempts four sandbox escapes in order — (1) a network fetch to a
 # host STALL listener (a scratch loopback port whose listener accepts every
 # connection and never answers: deterministic on any machine, unlike an
-# external address), (2) a cors-mode fetch of file:///etc/passwd plus a
-# traversal XHR to file:///wallpaper/../../../../etc/passwd, (3) a no-cors
-# fetch of file:///wallpaper/index.html proving the content root is
+# external address), (2) a cors-mode fetch of a HOST canary file that is
+# not bound into the namespace plus a traversal XHR to the same file through
+# /wallpaper/../.. (BETA B6: the renderer runs chromium with
+# --allow-file-access-from-files, so file: reads are no longer blocked by
+# the browser — the BOUND set is the boundary), (3) a cors-mode fetch of
+# file:///wallpaper/index.html proving the content root is readable (the
+# control for attempt 2: reads work, so its rejections are isolation) and
 # reachable, (4) localStorage and userAgent reads — and paints one
 # color-coded result box per attempt. The suite runs the fixture through the
 # daemon pipeline twice (Scenario A: default grants, network off; Scenario
@@ -185,6 +189,10 @@ PY
 
 make_fixture() {
     mkdir -p "$fixture"
+    # The host canary for attempt 2: a real, readable file on the host that
+    # is NOT bound into the sandbox. A resolution from inside is a genuine
+    # host-file read through a hole in the namespace.
+    echo "kwe-host-canary $$" >"$smoke_root/host-canary.txt"
     cat >"$fixture/index.html" <<HTML
 <!doctype html><html><head><meta charset="utf-8"><style>
 html,body{margin:0;padding:0;overflow:hidden;background:#101214}
@@ -227,34 +235,38 @@ fetch('http://127.0.0.1:$STALL_PORT/', {signal: AbortSignal.timeout(1500)}).then
     settle(0, ((e.name === 'TimeoutError' || e.name === 'AbortError')
       && performance.now() - netStart >= 1000) ? ORANGE : GREEN);
   });
-// Attempt 2 (host-file reads): cors-mode fetch of /etc/passwd and a
-// traversal XHR. Both must FAIL. Chromium 151 blocks fetch/XHR to file:
-// URLs from a file:// page (measured — the page's own URL is blocked too),
-// and the traversal normalizes to file:///etc/passwd, which EXISTS inside
-// the sandbox (/etc is ro-bound): a resolution would be a real read of the
-// host file and paints red.
+// Attempt 2 (host-file reads): cors-mode fetch of a host canary file that
+// exists on the host ($smoke_root/host-canary.txt) but is NOT bound into
+// the namespace, and a traversal XHR to the same file through
+// /wallpaper/../.. (normalizes to the host path). Both must FAIL. Since
+// BETA B6 chromium runs with --allow-file-access-from-files — file: reads
+// are NOT blocked by the browser any more (attempt 3 proves it) — so a
+// resolution here is a real read of a host file through the namespace:
+// red. (/etc/passwd is deliberately not the target: /etc is ro-bound and
+// IS readable by wallpaper JS under B6; narrowing that bind is the
+// recorded follow-up.)
 var fsDone = 0;
 function fsSettle(color) {
   if (++fsDone >= 2) settle(1, color);
 }
-fetch('file:///etc/passwd').then(
-  function () { settle(1, RED); },
+fetch('file://$smoke_root/host-canary.txt').then(
+  function (r) { if (r.ok) { settle(1, RED); } else { fsSettle(GREEN); } },
   function () { fsSettle(GREEN); });
 try {
   var xhr = new XMLHttpRequest();
-  xhr.open('GET', 'file:///wallpaper/../../../../etc/passwd', true);
-  xhr.onload = function () { settle(1, RED); };
+  xhr.open('GET', 'file:///wallpaper/../..$smoke_root/host-canary.txt', true);
+  xhr.onload = function () { if (xhr.status === 200 && xhr.responseText.indexOf('kwe-host-canary') === 0) { settle(1, RED); } else { fsSettle(GREEN); } };
   xhr.onerror = function () { fsSettle(GREEN); };
   xhr.send();
 } catch (e) { fsSettle(GREEN); }
-// Attempt 3 (content-root reachability): a no-cors fetch of the page's own
-// file resolves with an opaque response exactly when the file exists (a
-// missing mount rejects — measured). Plain cors-mode fetch cannot be used:
-// it is blocked for every file: URL, the page's own included (see attempt
-// 2), so this is the probe that proves the attempt-2 failures are
-// isolation, not a broken content mount.
-fetch('file:///wallpaper/index.html', {mode: 'no-cors'}).then(
-  function () { settle(2, GREEN); },
+// Attempt 3 (content-root reachability, the attempt-2 control): a
+// cors-mode fetch of the page's own file must RESOLVE with its bytes —
+// B6 made same-directory reads legal, and this is exactly what WebGL
+// textures and XHR-loaded assets in real wallpapers need. A rejection here
+// means the flag is missing (and attempt 2's greens would be meaningless).
+fetch('file:///wallpaper/index.html').then(
+  function (r) { return r.text(); }).then(
+  function (t) { settle(2, t.indexOf('kwe-compromise') >= 0 ? GREEN : RED); },
   function () { settle(2, RED); });
 // Attempt 4 (allowed reads): localStorage (per-profile, inside the tmpfs)
 // and the user agent string must keep working.

@@ -630,25 +630,29 @@ echo "web smoke passed: missing content root rejected with invalid_params"
 
 # Case 7: the busy-loop page passes the static preflight but the worker
 # rejects the backend (exit 73, CDP bootstrap deadlock); the active base
-# worker stays live and rolled_back names exit_code_73.
+# worker stays live and rolled_back names exit_code_73. Since BETA B4 a
+# candidate's exit 73 is a REFUSAL (last_failure "refused"): it is reported
+# with its detail but never restarted and never counted toward quarantine
+# (docs/bugs/APPLY_REJECTED_QUARANTINED.md).
 base_pid="$(jq -r '.result.pid' <<<"$(call_daemon renderer.status)")"
 busy_params='{"wallpaper_id":"web-busy","content_hash":"hash-web-busy","width":160,"height":90,"fps":30,"kind":"web","content":"'"$fixture_busy"'"}'
 call_daemon renderer.start "$busy_params" >/dev/null
 rollback_status="$(wait_phase rolled_back)"
 [[ "$(jq -r '.result.pid' <<<"$rollback_status")" == "$base_pid" ]]
-[[ "$(jq -r '.result.last_failure' <<<"$rollback_status")" == "process_exit" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$rollback_status")" == "refused" ]]
 [[ "$(jq -r '.result.last_failure_detail' <<<"$rollback_status")" == *"exit_code_73"* ]]
+[[ "$(jq -r '.result.failures' <<<"$rollback_status")" == "0" ]]
+[[ "$(jq -r '.result.quarantined' <<<"$rollback_status")" == "false" ]]
 kill -0 "$base_pid"
-echo "web smoke passed: busy-loop content -> worker exit 73 -> rolled_back with exit_code_73"
+echo "web smoke passed: busy-loop content -> worker exit 73 -> rolled_back as a refusal (no strike)"
 
 # Case 8: repeated kill -9s with no intervening success hit the three-failure
 # budget -> quarantined, and renderer.start for the same identity is refused
 # with the quarantine phase (mirrors smoke-video case 6).
-# Start a fresh worker first: case 7's busy-loop identity is quarantined
-# (the status "failures" field reads the *requested* identity's record, and
-# after the rollback the requested identity is still the busy one, so its
-# leftover 3 failures would short-circuit the loop). A fresh promotion
-# clears the animated identity's record, so the budget starts at 0.
+# Start a fresh worker first so the requested identity is the animated one
+# (the status "failures" field reads the *requested* identity's record; after
+# case 7's rollback the requested identity is still the busy one). A fresh
+# promotion clears the animated identity's record, so the budget starts at 0.
 call_daemon renderer.start "$animated_params" >/dev/null
 fresh_status="$(wait_phase live)"
 [[ "$(jq -r '.result.failures' <<<"$fresh_status")" == "0" ]]

@@ -157,6 +157,7 @@ Page.startScreencast {format:"jpeg",quality:80,
 ```text
 flags:  --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage
         --disable-extensions --no-first-run --no-default-browser-check
+        --allow-file-access-from-files --enable-unsafe-swiftshader   (BETA B6)
         --remote-debugging-pipe --user-data-dir=<fresh tmp> <file://fixture>
 wire:   fds 3/4, ASCIIZ (JSON + NUL) framing, 4 MiB per-message bound
 setup:  Target.getTargets -> Target.attachToTarget{flatten:true}
@@ -229,7 +230,12 @@ empty, and nothing would bind the browser's system paths in). The sandbox:
   (M1a default OFF; grants land in M2c);
 - `--die-with-parent --new-session`, then `chromium --headless=new
   --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run
-  --no-default-browser-check --disable-extensions --remote-debugging-pipe
+  --no-default-browser-check --disable-extensions
+  --allow-file-access-from-files --enable-unsafe-swiftshader (BETA B6:
+  without the first, a file:// page's own images are cross-origin for WebGL
+  and same-directory XHR is blocked — Workshop wallpapers render black;
+  the second keeps software WebGL when chromium removes the deprecated
+  silent fallback) --remote-debugging-pipe
   --window-size=<spec> --user-data-dir=/tmp/kwe-profile
   file:///wallpaper/index.html`.
 
@@ -543,22 +549,27 @@ comes (1.5 s abort).
 | Attempt | Escape | Scenario A (default, no grant) | Scenario B (network grant) |
 | --- | --- | --- | --- |
 | 1 | network fetch to `http://127.0.0.1:<scratch>/` (host stall listener), 1.5 s abort bound | no loopback in the isolated netns: connect fails fast (~10 ms TypeError) → **green**; actual: green | connects to the host listener, hangs, aborts at the 1.5 s bound → **orange** (positive control); actual: **orange (255,139,0)** |
-| 2 | cors-mode fetch of `file:///etc/passwd` + traversal XHR `file:///wallpaper/../../../../etc/passwd` | both fail → **green**; actual: green | same → **green**; actual: green |
-| 3 | content-root reachability: `file:///wallpaper/index.html` | succeeds → **green**; actual: green | same → **green**; actual: green |
+| 2 | (B6 form) cors-mode fetch of a HOST canary `file://<smoke_root>/host-canary.txt` that exists on the host but is not bound + traversal XHR to it through `file:///wallpaper/../..<smoke_root>/…` | both fail → **green** | same → **green** |
+| 3 | content-root reachability, the attempt-2 control: cors-mode fetch of `file:///wallpaper/index.html` RESOLVES with its bytes (B6) | succeeds → **green** | same → **green** |
 | 4 | allowed reads: localStorage + `navigator.userAgent` | succeed → **green**; actual: green | same → **green**; actual: green |
 
-Honest reading of row 2: the boundary under test is the BROWSER's
-file-scheme/CORS isolation — chromium 151 blocks cors-mode fetch/XHR to
-every `file:` URL from a `file://` page (the page's own URL included), so
-the traversal cannot distinguish a bound path from a non-bound one through
-this attempt alone. The sandbox's non-bound-path contribution (only the
-system paths and the content root are reachable — there IS no traversal
-target) is asserted by the command-builder unit tests
-(`webpreviewtest.cpp::isolationByDefault`, the kwe-core builder tests),
-not by this case. The row's RED condition still holds: a resolution would
-be a genuine host-file read by the browser's own code (the traversal
-normalizes to `file:///etc/passwd`, which EXISTS inside the sandbox because
-/etc is ro-bound).
+Honest reading of row 2, **as revised by BETA B6 (2026-08-22)**: the
+renderer now runs chromium with `--allow-file-access-from-files`, so the
+browser's file-scheme/CORS isolation that the M2d form of this row relied
+on is GONE by design — a `file://` page can read any `file:` URL it can
+name. The boundary under test is therefore the NAMESPACE: only the content
+root and the read-only system binds (`/usr` `/etc` `/lib` `/lib64` `/bin`
+`/sbin`) exist inside it, so the canary on the host (`<smoke_root>`, under
+`/tmp` which is shadowed by the sandbox's own tmpfs) is unreachable and the
+traversal has no target. Row 3 is the control that proves reads work
+(the page's own file resolves with its bytes), so row 2's rejections are
+isolation and not a blocked scheme. What B6 gives up, stated plainly:
+wallpaper JS can read the ro-bound system files (`/etc/passwd`,
+`/etc/hostname`, fontconfig, the throwaway profile under `/tmp`); nothing
+under the user's home is bound, and leaving the sandbox with anything
+still needs the per-wallpaper network grant. Narrowing the `/etc` bind to
+what chromium needs is the follow-up recorded in
+`docs/bugs/WEB_FILE_ACCESS_BLACK_CANVAS.md`.
 
 The fixture colors are GREEN `#00c000` (sandbox held), ORANGE `#ff8c00`
 (attempt left the sandbox — only the positive control may paint it), RED
@@ -595,9 +606,9 @@ until the abort — the namespace's network stack is genuinely the host's.
    in M2d). A no-cors fetch resolves opaque exactly when the file exists, so
    it is the probe that proves attempt 2's failures are isolation (see the
    honest reading of row 2 in §7.2), not a broken content mount.
-3. **`/etc/passwd` exists inside the sandbox** (a no-cors probe of it
-   resolves): attempt 2's RED would be a genuine host-file read, not a
-   missing-file artifact.
+3. **(Superseded by B6.)** The M2d form used `/etc/passwd` as the target
+   because it exists inside the sandbox; under B6 it is readable by design,
+   so attempt 2 targets a host canary outside the binds instead (§7.2).
 4. **Attempt 1's positive control is the 1.5 s abort, not a resolved
    response**: the stall listener never answers, so the fetch cannot
    resolve; the observable that proves the fetch LEFT the sandbox is the
