@@ -730,27 +730,43 @@ and `layout(set=0, binding=N)` on each `uniform sampler2D g_Texture<N>`.
 Non-sampler uniforms fold into one fixed `MaterialUniforms` UBO
 (`set=0, binding=8`) via `#define`: the WE standard set
 (`g_ModelViewProjectionMatrix`, `g_Time`, `g_Texture<N>Resolution` —
-doubling as texel size in `.zw` — `g_UserAlpha`, `g_Brightness`,
-`g_Color`, `g_ParallaxPosition`, `g_Point0..7`, `g_PointerPosition`,
-`g_TexelSize`, `g_EffectTextureProjectionMatrix`) plus up to 16 of the
-material's own `constantshadervalues`, by name. Any other uniform gets a
-local zero-valued declaration and a one-time diagnostic
+doubling as texel size in `.zw` — `g_Texture<N>Rotation` (S4: identity
+`vec4(1.0, 0.0, 0.0, 1.0)`, not zero — see "Vertex attribute shapes
+(S4)" below), `g_UserAlpha`, `g_Brightness`, `g_Color`, `g_Color4` (S4:
+the same per-draw brightness/alpha as `g_Brightness`/`g_UserAlpha`,
+packed into one vec4 — the `VERSION`-combo-gated replacement for that
+pair in every `genericimage*` fragment shader), `g_ParallaxPosition`,
+`g_Point0..7`, `g_PointerPosition`, `g_TexelSize`,
+`g_EffectTextureProjectionMatrix`) plus up to 16 of the material's own
+`constantshadervalues`, by name. Any other uniform gets a local
+zero-valued declaration and a one-time diagnostic
 (`event=renderer.scene.shader_unsupported_uniform`) — the shader still
-compiles, that one value is just inert. This module's scraping is
-textual, not conditional-compilation-aware (`#if`/`#ifdef` evaluation
-happens later, inside `shaderc`'s real GLSL preprocessor); a shader whose
-combo-gated declarations (e.g. `genericimage2.vert`'s
-`SKINNING`-guarded bone attributes) never actually reach the compiled
-SPIR-V under default combos is still accepted — the vertex-format check
-only requires the first two declared attributes to match, and a pipeline
-whose ACTUAL compiled shader interface does not match
-`MATERIAL_UNIT_QUAD` (`a_Position` vec3 + `a_TexCoord` vec2) fails
-pipeline creation cleanly (one more fallback reason), never a crash. The
-`_rt_` render-target check similarly asks `shaderc`'s own preprocessor
-for the LIVE (post-`#if`) text before deciding — the textual scrape alone
-would flag `genericimage2` (the corpus's most common material shader)
-100% of the time, since its `_rt_`-tagged texture default sits behind a
-combo that is off unless a material explicitly turns it on.
+compiles, that one value is just inert (this includes lighting/
+reflection-only uniforms such as `g_EyePosition`/`g_ModelMatrix`/
+`g_ViewProjectionMatrix`, matching `#require LightingV1`'s existing
+"always zero contribution" scope limit — a material that genuinely
+NEEDS real lighting math still draws, just without lighting).
+
+**S4**: `fold_declarations`' scraping is now conditional-compilation-
+AWARE — a bounded `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`
+tracker (`shaderpre::evaluate_if_expr`, supporting `||`/`&&`/`==`/`!=`/
+`!`/parens/`defined()`/bare identifiers, with an unparseable expression
+falling back to "always live" rather than risk dropping a real
+declaration) only scrapes/folds a declaration while every enclosing
+`#if` branch is the one actually taken for the material's resolved
+combos — matching what `shaderc`'s real GLSL preprocessor sees. Before
+S4, the scraper picked up EVERY branch's declarations unconditionally
+(dead and live alike), which both mis-shaped `AttributeDecl.location`
+assignment (a dead branch's attribute could "steal" location 0, pushing
+a live `a_TexCoord` to a location the compiled SPIR-V never actually
+uses there) and made the vertex-format check see attribute NAMES from
+the wrong branch entirely (`genericimage3.vert`'s `#if MORPHING
+{ a_PositionVec4 } #else { a_Position }` scraped as attributes[0]=
+`a_PositionVec4`, attributes[1]=`a_Position` even with `MORPHING`
+off, since `a_TexCoord` landed at index 2). The `_rt_` render-target
+check already asked `shaderc`'s own preprocessor for the LIVE text
+before deciding (unaffected by this fix); `fold_declarations`'
+attribute/varying/uniform scraping now gets the same treatment.
 
 **Compilation** (`crates/kwe-scene-renderer/src/materialshader.rs`): the
 `shaderc` crate against the SYSTEM `libshaderc` (default features — no
@@ -979,54 +995,102 @@ difference. A separate `event=renderer.scene.effect_asset_budget_exceeded
 bytes=... cap=...` line (RECOMMENDED #4) fires once if the aggregate
 effect-asset read budget is hit during scene load.
 
-## Mesh/puppet vertex formats (S3, partial)
+## Vertex attribute shapes (S4) / mesh/puppet vertex formats
 
-**Implemented**: the precision-qualifier scraping bug fixed this slice
-(`shaderpre::parse_decl` previously left a leading `lowp`/`mediump`/
-`highp` glued onto the scraped GLSL type, e.g. `"mediump vec2"` instead
-of `"vec2"`, so `main.rs::material_vertex_format_supported`'s bare
-string-equality check against `"vec2"` always failed for a shader whose
-second attribute carried ANY precision qualifier — a real corpus shader,
-`puppettexturechannels.vert`, does exactly this), pinned by a direct
-unit test (`shaderpre::tests::precision_qualifier_is_stripped_from_the_scraped_type`).
-Its net effect on the corpus-wide `unsupported_vertex_format` count is
-NOT cleanly isolable from this slice's other changes (the pkg-bundled-
-shader lookup fix and the effect-safety restriction below both change
-which materials are even attempted) — the local 60-scene sweep's final
-`unsupported_vertex_format` count is 55 (vs 53 in the S2 baseline),
-essentially unchanged in aggregate once every other S3 change is
-accounted for, which says most of the corpus's "mesh/puppet" fallbacks
-were never about THIS scraping bug specifically — they are the
-genuinely different attribute shapes surveyed below. The qualifier fix
-is still real and correct (confirmed by the unit test and by manual
-inspection of `puppettexturechannels.vert`'s own shape), just not the
-large aggregate win an earlier, less-safety-restricted build of this
-slice appeared to show.
+**Implemented (S4)**: the material pipeline's shared quad buffer
+(`vulkan::MATERIAL_UNIT_QUAD`) now carries constant per-vertex data for
+SIX attribute names instead of two — `a_Position`(vec2/vec3) and
+`a_TexCoord`(vec2) as before, plus `a_Normal`(vec3, always `+Z` — the
+quad is flat), `a_Color`(vec4, always opaque white), `a_PositionVec4`
+(vec4, mirrors `a_Position` with z=0/w=1), and `a_TexCoordVec4`(vec4,
+mirrors `a_TexCoord` with z=0/w=1) — see `vulkan::material_attribute_layout`.
+`main.rs::material_vertex_format_supported` accepts any subset of these
+six names (each with its matching declared GLSL type, no duplicates)
+that includes at least one position-like and one texcoord-like
+attribute; `vulkan::material_vertex_attributes` builds each pipeline's
+`VertexInputAttributeDescription` list dynamically from the material's
+OWN scraped, live-only attribute set (see the S4 conditional-compilation
+scraping fix above) instead of a hardcoded 2-attribute array. This is
+squarely the `genericimage3`/`genericimage4`-family shape upstream's
+`CImage`/`CPass` feed a flat 2D image object — mesh/puppet geometry
+(bone indices/weights, tangents, the multi-UV-channel `C1`/`C2`/...
+variants used only by rope/mesh particle shaders) stays out of this
+slice, per the survey below.
+
+**A second, load-bearing S4 fix**: two WE "standard" uniforms this
+pipeline previously zero-defaulted turned out to be genuinely LIVE (not
+dead behind an off-by-default combo) for a `VERSION`-tagged
+`genericimage*` material, and a zero default for either one visibly
+BREAKS the draw — found via the 60-scene corpus byte-identity sweep
+(`scripts/scene-corpus-byte-identity-sweep.sh`), which flagged 8
+real regressions the first time this slice widened the vertex-format
+acceptance without also fixing these:
+- `g_Texture<N>Rotation` (vec4): the UV transform every
+  `genericimage*.vert` applies unconditionally
+  (`v_TexCoord.xy = g_Texture<N>Translation + a_TexCoord.x *
+  g_Texture<N>Rotation.xy + a_TexCoord.y * g_Texture<N>Rotation.zw`) —
+  a zero ROTATION matrix collapses every sampled UV to one point. Fixed
+  to the identity `vec4(1.0, 0.0, 0.0, 1.0)`. (`g_Texture<N>Translation`
+  needed no change: `vec2(0.0)` already IS the correct identity
+  translation for the same formula.)
+- `g_Color4` (vec4): the `VERSION`-combo-gated replacement for the
+  `g_Brightness`/`g_UserAlpha` pair every `genericimage*.frag` otherwise
+  uses (`#ifndef VERSION { ...g_Brightness/g_UserAlpha... } #else {
+  uniform vec4 g_Color4; ... color *= g_Color4; }`) — a zero `g_Color4`
+  multiplies the sampled colour to fully transparent black for every
+  `VERSION`-tagged material. Fixed to fold to the SAME per-draw
+  brightness/alpha values already threaded through
+  `u_Std.g_TimeAlphaBrightness_` (`vec4(...zzz, ...y)`), matching what
+  the `g_Brightness`/`g_UserAlpha` branch already does.
+
+Both are pinned by direct unit tests
+(`shaderpre::tests::texture_rotation_uniform_folds_to_identity_not_zero`,
+`shaderpre::tests::color4_uniform_folds_to_brightness_alpha_not_zero`)
+and confirmed against the real corpus scene that surfaced them (Workshop
+3100709479, a `genericimage3` material): after both fixes, its render
+output is byte-identical to the pre-S4 baseline's own (already-correct)
+S1 fallback, while now drawing through the REAL material pipeline
+instead of a flat textured quad. Neither fix is lighting/reflection
+support (that stays out of scope, unchanged from S1–S3:
+`#require LightingV1` still resolves to a zero-contribution stub, and a
+material whose LIVE combo state genuinely needs `g_EyePosition`/
+`g_ModelMatrix`/`g_ViewProjectionMatrix` for real (non-zero) shading
+still draws with those zero-defaulted — a documented, pre-existing gap
+this slice did not attempt to close).
+
+**Residual sweep findings, not further chased this slice**: after both
+fixes, the 60-scene sweep's flagged count is higher than the 8 found
+before the fix (most scenes newly draw REAL content where they
+previously drew nothing at all — `unsupported_vertex_format` no longer
+refuses them — which the pixel-stat sweep reports as "flagged" even
+though it is the intended, desired effect of this deliverable, not a
+regression; every scene that already drew a real photo through its
+material pre-S4 remains byte-identical post-S4). One scene (Workshop
+3765081478, a heavily custom "cloud"-style shader with 59 distinct
+non-standard `u_`-prefixed uniform names, only 46 of 53 materials
+compiling even after this fix) draws visibly different, near-uniform-
+white content post-S4 and is flagged here as a known, out-of-scope
+residual gap for a future slice to look at with real screenshots, not
+silently accepted as correct.
 
 **Deliberately left out** (documented, not silently dropped): a survey
-of the WE asset shader corpus (`assets/shaders/*.vert`, not just this
-machine's Workshop content) found the FIRST-TWO-ATTRIBUTE shapes this
-renderer does NOT implement, in descending frequency: `a_Position(vec3)
-+ a_Normal(vec3)` (7 shaders — lighting-only positions, no UV; these
-need `#require LightingV1`'s real implementation, out of scope), `a_
-PositionVec4(vec4) + ...` (7 — a different position type entirely,
-observed on foliage/billboard-family shaders), `a_Position(vec3) + a_
-Color(vec4)` (3 — vertex-painted/particle-style materials), `a_
-Position(vec3) + a_TexCoordVec4(vec4)` (3, including
-`puppettexturechannels.vert` — MULTI-CHANNEL texture blending for
-puppet-style character coloring; this is the one shape whose name
-literally says "puppet"), `a_Position(vec3) + a_BlendIndices` alone with
-no texcoord (1 — a shadow/depth-only pass shader, never a material's
-PRIMARY pass in the corpus). None of these were observed attributable to
-an ACCEPTED local scene's actual visible material in this pass's
-11-remaining-fallback count — the residual 11 are a mix of these shapes
-and genuinely broken/unusual shader text. Adding support for any of
-these is a real, scoped follow-up (extending
-`material_vertex_format_supported`'s matcher AND the Vulkan pipeline's
-vertex-input state to a second/third supported layout, plus building the
-extra per-vertex data for a flat quad) — not attempted this slice given
-the low remaining fallback count and the risk of a broader Vulkan
-pipeline change this late in the slice.
+of the WE asset shader corpus (`assets/shaders/*.vert`) found the
+attribute shapes this renderer still does NOT implement, all involving
+at least one attribute outside the six-name known set: `a_Position(vec3)
++ a_Normal(vec3)` alone, no UV (7 shaders — lighting-only positions;
+these need `#require LightingV1`'s real implementation, out of scope),
+bone/skinning attributes (`a_BlendIndices`/`a_BlendWeights`, live only
+when a material explicitly sets `SKINNING=1`, not observed in the local
+corpus), tangents (`a_Tangent4`, live with `NORMALMAP`/`REFLECTION`),
+and the rope/mesh-particle multi-UV-channel variants
+(`a_TexCoordVec4C1`/`C2`/`C3`, `a_TexCoordVec3C2`, `a_PositionC1`,
+`a_TexCoordC2`/`C3`/`C4` — `genericropeparticle.vert`,
+`puppettexturechannels.vert`'s remaining non-standard channels). Adding
+support for any of these is a real, scoped follow-up (extending
+`vulkan::KNOWN_MATERIAL_ATTRIBUTES`/`material_attribute_layout` and
+`main.rs::material_vertex_format_supported`'s matcher to a wider known
+set, plus deciding what constant per-vertex data — if any — a flat quad
+can meaningfully supply for a bone-weighted or multi-channel attribute).
 
 **Puppet MESH geometry (custom triangle lists, not just attribute
 shape)**: upstream's only mesh-beyond-the-quad path is a `model.json`
