@@ -2060,10 +2060,9 @@ fn parse_orthogonal_projection(general: &serde_json::Map<String, Value>) -> Opti
         let value = projection.get(name)?;
         let number = if let Some(number) = value.as_f64() {
             number
-        } else if let Some(text) = value.as_str() {
-            text.parse::<f64>().ok()?
         } else {
-            return None;
+            let text = value.as_str()?;
+            text.parse::<f64>().ok()?
         };
         if !number.is_finite() {
             return None;
