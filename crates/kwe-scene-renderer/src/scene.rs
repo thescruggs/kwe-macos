@@ -302,6 +302,21 @@ pub struct MaterialSpec {
     /// `load_model_textures` already decodes slot 0; a `RenderTarget`
     /// name is resolved by the renderer at bind/draw time (S3).
     pub texture_slots: Vec<Option<MaterialTextureSource>>,
+    /// C2: mirrors `kwe_core::scenemodel::ResolvedModel::passthrough`
+    /// (default `false`) — the layer's BASE material's model.json
+    /// declared `"passthrough": true`. Used by `main.rs`'s material
+    /// planning to skip binding/drawing this layer's own material when it
+    /// has no resolved effect chain (upstream never draws a passthrough
+    /// model bare — `CImage.cpp:605-606`).
+    pub passthrough: bool,
+    /// C2: mirrors `kwe_core::scenemodel::ResolvedModel::fullscreen`
+    /// (default `false`, `true` for `"fullscreen"` OR `"projectlayer"`).
+    /// Used together with `passthrough` and the scene's declared
+    /// resolution to decide whether a passthrough layer with a chain is
+    /// scene-covering (chain runs) or a sub-region composition layer
+    /// (chain and draw both skipped — see `main.rs`'s
+    /// `passthrough_region_unsupported` diag).
+    pub fullscreen: bool,
 }
 
 /// One `objects` entry interpreted as a video layer (M3g). The

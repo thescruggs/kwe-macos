@@ -93,7 +93,31 @@ pub struct ResolvedModel {
     /// knows to size the layer to the scene's world extent when it has
     /// no static base texture to size from (its only texture slot is
     /// typically a `_rt_` runtime target).
+    ///
+    /// C2: also `true` when the model.json declares `"projectlayer":
+    /// true` (e.g. `models/util/projectlayer.json`) even if it has no
+    /// `"fullscreen"` key of its own — a documented deviation from
+    /// upstream, which never reads `projectlayer` at all
+    /// (`ModelParser.cpp:26-27` only reads `fullscreen`/`passthrough`);
+    /// we fold it in here because our composition-layer handling
+    /// (`main.rs`) needs a single "does this object cover the scene"
+    /// signal, and a project layer is upstream's other screen-covering
+    /// passthrough case (`CImage.cpp:323-341`: `model->fullscreen` gates
+    /// `realX/realY/realWidth/realHeight` to the full `-1..1` NDC quad).
     pub fullscreen: bool,
+    /// C2: `model.json`'s own top-level `"passthrough"` boolean (default
+    /// `false`) — set by every composition/post-process model in the
+    /// corpus (`composelayer.json`, `fullscreenlayer.json`,
+    /// `projectlayer.json`). Upstream never draws a passthrough model
+    /// bare (`CImage.cpp:605-606`, "passthrough images without effects
+    /// are bad, do not draw them"); `main.rs`'s material planning uses
+    /// this to skip binding/drawing a passthrough layer that has no
+    /// resolved effect chain, rather than paint it as an ordinary
+    /// fullscreen-reprojected quad.
+    ///
+    /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    /// src/WallpaperEngine/Data/Parsers/ModelParser.cpp:26-27 @ b016d7d1.
+    pub passthrough: bool,
 }
 
 /// The texture-name-to-asset-path rule
@@ -411,8 +435,19 @@ pub fn resolve_model(
         .and_then(Value::as_str)
         .ok_or_else(|| "model.json has no string \"material\" field".to_string())?
         .to_string();
-    let fullscreen = model_object
+    let declared_fullscreen = model_object
         .get("fullscreen")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let projectlayer = model_object
+        .get("projectlayer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // C2: projectlayer implies fullscreen for our purposes — see
+    // `ResolvedModel::fullscreen`'s doc comment.
+    let fullscreen = declared_fullscreen || projectlayer;
+    let passthrough = model_object
+        .get("passthrough")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
@@ -433,6 +468,7 @@ pub fn resolve_model(
         constant_shader_values: material.constant_shader_values,
         texture_slots: material.texture_slots,
         fullscreen,
+        passthrough,
     })
 }
 

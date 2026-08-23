@@ -1003,6 +1003,7 @@ fn main() -> Result<()> {
         spec.height,
         &content,
         arguments.assets_dir.as_deref(),
+        config.resolution,
     );
 
     // 5b. M3f: particle-system textures (slot MAX_LAYERS + system_index).
@@ -1805,6 +1806,8 @@ fn load_model_textures(
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             texture_slots: material_texture_slots(&resolved_model),
+            passthrough: resolved_model.passthrough,
+            fullscreen: resolved_model.fullscreen,
         });
         // S3: resolve this object's effects[] through the same lookup
         // chain (pkg entries -> scene dir -> assets root) that just
@@ -2743,6 +2746,67 @@ fn effect_target_requests(
 /// (`event=renderer.scene.shader_fallback reason=... count=N`), the S2
 /// summary line, and (S3, only when at least one layer has a resolved
 /// effect) `event=renderer.scene.effects objects=N passes=M fallback=K`.
+/// C2: whether `compile_material_layers` should proceed to bind/draw a
+/// layer's own material this frame, given its BASE material's
+/// `passthrough`/`fullscreen` flags, whether a resolved effect chain
+/// produced a final material for it, the layer's declared size, and the
+/// scene's declared resolution (`scene.rs::parse_resolution`, P1). A
+/// non-passthrough base material (the overwhelming majority of layers)
+/// always returns `Ok(())` — this only changes behaviour for the
+/// composelayer/fullscreenlayer/projectlayer model family.
+///
+/// Upstream never draws a passthrough model bare (its `gl_Position` comes
+/// from `a_TexCoord` and it samples `_rt_FullFrameBuffer` at
+/// `MVP·a_Position`, so drawing it as an ordinary frame-pass quad paints a
+/// fullscreen re-projection of the compositor instead of the object) —
+/// `Err("passthrough_without_effects")` when there is no chain to draw
+/// instead.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Objects/CImage.cpp:605-606 @ b016d7d1
+/// ("passthrough images without effects are bad, do not draw them").
+///
+/// With a chain, upstream extracts the screen region UNDER the object and
+/// runs the chain on that copy (`CImage.cpp` texcoordCopy/
+/// copySpacePosition) — this renderer's chain seed is a full-frame
+/// snapshot (`_rt_FullFrameBuffer`) instead, which only paints the right
+/// content when the object covers the whole scene (a `fullscreen`/
+/// `projectlayer` model, or a layer whose declared size is at least the
+/// scene's declared resolution on both axes — when the scene has no
+/// declared resolution at all, treat every layer as covering, matching
+/// `world_extent`'s own "no declared resolution" fallback). Running the
+/// full-frame seed for a smaller SUB-REGION composition layer (e.g.
+/// Avatar's 768x768 "Adjustable Composition Layer") paints wrong-region
+/// garbage — a documented deviation from upstream; the honest degrade is
+/// `Err("passthrough_region_unsupported")`, skipping the chain and the
+/// draw entirely rather than showing it. Real per-object screen-region
+/// extraction is a future slice.
+fn passthrough_draw_decision(
+    material: Option<&scene::MaterialSpec>,
+    has_chain_material: bool,
+    layer_size: [f32; 2],
+    scene_resolution: Option<(u32, u32)>,
+) -> Result<(), &'static str> {
+    let Some(material) = material else {
+        return Ok(()); // not a model layer, or its base texture never resolved
+    };
+    if !material.passthrough {
+        return Ok(());
+    }
+    if !has_chain_material {
+        return Err("passthrough_without_effects");
+    }
+    let covering = material.fullscreen
+        || scene_resolution.is_none_or(|(scene_width, scene_height)| {
+            layer_size[0] >= scene_width as f32 && layer_size[1] >= scene_height as f32
+        });
+    if covering {
+        Ok(())
+    } else {
+        Err("passthrough_region_unsupported")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_material_layers(
     layers: &mut [scene::LayerSpec],
@@ -2753,6 +2817,10 @@ fn compile_material_layers(
     canvas_height: u32,
     content: &Path,
     assets_dir: Option<&Path>,
+    // C2: the scene's declared resolution (P1's `config.resolution`) —
+    // used to decide whether a passthrough layer with a resolved effect
+    // chain is scene-covering (see the `base_passthrough` block below).
+    scene_resolution: Option<(u32, u32)>,
 ) -> (Vec<bool>, Vec<usize>) {
     let mut material_ok = vec![false; layers.len()];
     // S5: layer indices whose final bound material samples
@@ -2865,6 +2933,16 @@ fn compile_material_layers(
 
     for (index, layer) in layers.iter_mut().enumerate() {
         let plan = plans[index].as_ref();
+        let has_chain_material = plan.and_then(|p| p.final_material.as_ref()).is_some();
+        if let Err(reason) = passthrough_draw_decision(
+            layer.material.as_ref(),
+            has_chain_material,
+            layer.size,
+            scene_resolution,
+        ) {
+            *fallback_reasons.entry(reason).or_insert(0) += 1;
+            continue;
+        }
         // S5: the effect chain's own final untargeted pass (if any) now
         // ALWAYS becomes the layer's own bound material, regardless of
         // whether the base material had a real texture of its own to
@@ -4176,6 +4254,96 @@ mod tests {
             (systems[0].brightness - 0.25).abs() < 1e-6,
             "brightness={}",
             systems[0].brightness
+        );
+    }
+
+    /// C2: a passthrough base material with NO resolved effect chain must
+    /// never draw — upstream never draws a passthrough model bare
+    /// (CImage.cpp:605-606).
+    #[test]
+    fn passthrough_draw_decision_without_a_chain_is_refused() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), false, [768.0, 768.0], Some((3840, 2160))),
+            Err("passthrough_without_effects")
+        );
+    }
+
+    /// C2: a passthrough base material declared `fullscreen` (or
+    /// `projectlayer`, which `resolve_model` folds into `fullscreen`) with
+    /// a resolved chain still resolves — the object covers the whole
+    /// scene, so the full-frame-buffer seed paints the right content.
+    #[test]
+    fn passthrough_draw_decision_fullscreen_with_a_chain_resolves() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            fullscreen: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), true, [64.0, 64.0], Some((3840, 2160))),
+            Ok(())
+        );
+    }
+
+    /// C2: a passthrough base material whose declared size covers the
+    /// scene on both axes (even without the `fullscreen` flag) also
+    /// resolves.
+    #[test]
+    fn passthrough_draw_decision_size_covering_the_scene_resolves() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), true, [3840.0, 2160.0], Some((3840, 2160))),
+            Ok(())
+        );
+    }
+
+    /// C2 root cause case: a SUB-REGION passthrough composition layer
+    /// (e.g. Avatar's 768x768 "Adjustable Composition Layer" against a
+    /// 3840x2160 scene) with a resolved chain must skip both the chain and
+    /// the draw — this renderer's full-frame-buffer chain seed would paint
+    /// wrong-region garbage for anything smaller than the whole scene.
+    #[test]
+    fn passthrough_draw_decision_sub_region_with_a_chain_is_refused() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), true, [768.0, 768.0], Some((3840, 2160))),
+            Err("passthrough_region_unsupported")
+        );
+    }
+
+    /// C2: no declared scene resolution (`general.resolution`/
+    /// `orthogonalprojection` absent) treats every layer as covering,
+    /// matching `world_extent`'s own "no declared resolution" fallback.
+    #[test]
+    fn passthrough_draw_decision_no_scene_resolution_treats_every_layer_as_covering() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), true, [1.0, 1.0], None),
+            Ok(())
+        );
+    }
+
+    /// C2: a non-passthrough material is never affected by any of the
+    /// above, chain or no chain.
+    #[test]
+    fn passthrough_draw_decision_non_passthrough_always_resolves() {
+        let material = scene::MaterialSpec::default();
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), false, [1.0, 1.0], Some((3840, 2160))),
+            Ok(())
         );
     }
 
