@@ -88,9 +88,9 @@ with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
   "general": {"clearcolor": [0, 0, 0, 1], "resolution": [160, 90], "fps": 30},
   "objects": [
     {"name": "bg", "image": "textures/red.png",
-     "origin": [0, 0], "size": [160, 90], "alpha": 1.0, "visible": true},
+     "origin": [80, 45], "size": [160, 90], "alpha": 1.0, "visible": true},
     {"name": "mark", "image": "textures/blue.png",
-     "origin": [60, 34], "size": [40, 22]}
+     "origin": [140, 79], "size": [40, 22]}
   ]
 }
 ```
@@ -99,7 +99,7 @@ with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
 |---|---|---|---|
 | `name` | string, **required** | — | the layer's name for `Scene.getLayer(name)`; a missing or non-string name rejects the layer entry |
 | `image` | string | none | the image reference (see "Image sources" below); a non-string value makes the object inert (skipped, not rejected) |
-| `origin` | `[x, y]` (2 or 3 entries) | `[0, 0]` | the layer's **center** in scene units (WE alignment "center", the default); scene (0,0) is the frame center, +y down; z is unused by 2D rendering |
+| `origin` | `[x, y]` (2 or 3 entries) | `[0, 0]` | the layer's **center**, in ABSOLUTE scene-pixel units, top-left origin, +y down — matching upstream's own convention (`CImage.cpp`'s `origin.x - scaledSize.x/2` etc. builds a layer's corners directly from this absolute value; a full-screen layer's `origin` is `[declared resolution / 2, declared resolution / 2]`, e.g. `[80, 45]` above for a 160x90 scene, NOT `[0, 0]`). The compositor recenters this absolute value onto the visible rectangle's own centre before the NDC divide (S6 fix, `vulkan::LayerRenderer::set_world_extent`/`recenter`, `crates/kwe-scene-renderer/src/vulkan.rs`); the default `[0, 0]` therefore places an object at the scene's own TOP-LEFT corner when its `origin` is omitted, not at the frame centre. z is unused by 2D rendering |
 | `angles` | `[rx, ry, rz]` (2 or 3 entries) | `[0, 0, 0]` | **radians in the file**, converted to degrees at parse (the script API speaks degrees); corpus-verified: exact π, none at 90/180 |
 | `scale` | `[sx, sy]` (2 or 3 entries) | `[1, 1]` | relative scale about the origin; negative values mirror |
 | `size` | `[w, h]` (exactly 2 entries) | `[0, 0]` | the size in scene units the texture is drawn at; `[0, 0]` (absent) takes the decoded texture's own dimensions at load |
@@ -130,7 +130,13 @@ byte-identical to the M3c layout, so the vertex shader reads the same
 offsets; `world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)`, and the fragment
 shader multiplies the texture's alpha by m1.w (the layer alpha folded with
 the tint alpha host-side) and the sampled RGB by the effects vector,
-**before** blending.
+**before** blending. `(m0.z, m1.z)` is NOT `origin` verbatim: it is
+`origin` minus the scene's own centre (S6 fix, `vulkan::recenter`), so
+that this `world` space's `(0,0)` lands on the visible rectangle's centre
+— matching `viewport`, which is the F1 visible world extent
+(`world_extent`, `crates/kwe-scene-renderer/src/main.rs`), not the raw
+canvas size, whenever the declared `resolution` and canvas aspect ratio
+differ.
 
 Blending is src-over by default (the Normal variant): color
 ONE / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA — the fragment

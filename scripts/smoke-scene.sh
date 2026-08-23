@@ -696,11 +696,31 @@ open(blue, "wb").write(png_solid(0, 0, 255))
 open(blend, "wb").write(png_solid(64, 103, 142))
 
 
+# S6: every fixture here writes "origin" relative to the 160x90 canvas's
+# OWN centre (matching this file's long-standing comments below, e.g.
+# "frame x 81..140" for a particle system's origin x in [1,60]) -- but WE's
+# real convention (docs/SCENE_FORMAT_V1.md; confirmed against upstream
+# CImage.cpp and a real Workshop scene by the S6 fix) is an ABSOLUTE
+# top-left scene-pixel position, e.g. a full-screen layer's origin is
+# [resolution/2, resolution/2], not [0, 0]. `scene()` shifts every
+# object's origin by half the declared 160x90 resolution once, here,
+# rather than rewrite every literal origin value below.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects, clear=(0.0, 0.0, 0.0, 1.0), script=None):
     general = {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30}
     if script is not None:
         general["script"] = script
-    return {"general": general, "objects": objects}
+    return {"general": general, "objects": _recenter(objects)}
 
 
 bg = {"name": "bg", "image": "m3c-red.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 1.0, "visible": True}
@@ -736,11 +756,14 @@ json.dump(
     ),
     open(sys.argv[9], "w"),
 )
+# S6: origin.x/y set here are absolute scene-pixel coordinates now (WE's
+# real convention) -- 140,79 is the same on-screen spot the pre-fix value
+# 60,34 meant relative to the canvas centre (+80,+45).
 open(sys.argv[10], "w").write(
     "function init() {\n"
     "  var mark = Scene.getLayer(\"mark\");\n"
     "  if (mark === null) throw new Error(\"layer not registered\");\n"
-    "  mark.origin.x = 60; mark.origin.y = 34;\n"
+    "  mark.origin.x = 140; mark.origin.y = 79;\n"
     "  mark.size.x = 40; mark.size.y = 22;\n"
     "}\n"
 )
@@ -809,11 +832,26 @@ def png_solid(r, g, b, a=255):
 open(sys.argv[1], "wb").write(png_solid(64, 103, 142))
 
 
+# S6: see the M3c fixture block's `_recenter` doc comment above (this is a
+# separate `python3` heredoc, so it needs its own copy) — origin is
+# written relative to the canvas centre here; `scene()` shifts it to WE's
+# real absolute-origin convention.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects, clear=(0.4, 0.25, 0.1, 1.0), script=None):
     general = {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30}
     if script is not None:
         general["script"] = script
-    return {"general": general, "objects": objects}
+    return {"general": general, "objects": _recenter(objects)}
 
 
 layer = {"name": "layer", "image": "m3d-texel.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 1.0, "visible": True}
@@ -883,11 +921,26 @@ import struct
 import sys
 
 
+# S6: see the M3c fixture block's `_recenter` doc comment (this is a
+# separate `python3` heredoc, so it needs its own copy) — origin is
+# written relative to the canvas centre here; `scene()` shifts it to WE's
+# real absolute-origin convention.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects, script=None):
     general = {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30}
     if script is not None:
         general["script"] = script
-    return {"general": general, "objects": objects}
+    return {"general": general, "objects": _recenter(objects)}
 
 
 bg = {"name": "bg", "image": "m3c-blue.png", "origin": [0.0, 0.0], "size": [160.0, 90.0], "alpha": 1.0, "visible": True}
@@ -1005,11 +1058,27 @@ open(gray, "wb").write(png_solid(76, 76, 76))
 open(red, "wb").write(png_solid(255, 0, 0))
 
 
+# S6: see the M3c fixture block's `_recenter` doc comment (this is a
+# separate `python3` heredoc, so it needs its own copy) — origin is
+# written relative to the canvas centre here (including every particle
+# system's `origin=` below, via `system()`'s own top-level "origin" key);
+# `scene()` shifts it to WE's real absolute-origin convention.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects, clear=(0.0, 0.0, 0.0, 1.0), script=None):
     general = {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30}
     if script is not None:
         general["script"] = script
-    return {"general": general, "objects": objects}
+    return {"general": general, "objects": _recenter(objects)}
 
 
 def system(name, material, origin=(0.0, 0.0), **particle):
@@ -1281,10 +1350,27 @@ import struct
 import sys
 
 
+# S6: see the M3c fixture block's `_recenter` doc comment (this is a
+# separate `python3` heredoc, so it needs its own copy) — origin is
+# written relative to the canvas centre here (including every video
+# layer's `origin=[0.0, 0.0]` below, via `video()`'s own top-level
+# "origin" key); `scene()` shifts it to WE's real absolute-origin
+# convention.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects, clear=(0.0, 0.0, 0.0, 1.0)):
     return {
         "general": {"clearcolor": list(clear), "resolution": [160, 90], "fps": 30},
-        "objects": objects,
+        "objects": _recenter(objects),
     }
 
 
@@ -2579,10 +2665,25 @@ import json
 import sys
 
 
+# S6: see the M3c fixture block's `_recenter` doc comment (this is a
+# separate `python3` heredoc, so it needs its own copy) — origin is
+# written relative to the canvas centre here; `scene()` shifts it to WE's
+# real absolute-origin convention.
+def _recenter(objects):
+    shifted = []
+    for obj in objects:
+        obj = dict(obj)
+        if "origin" in obj:
+            ox, oy = obj["origin"]
+            obj["origin"] = [ox + 80.0, oy + 45.0]
+        shifted.append(obj)
+    return shifted
+
+
 def scene(objects):
     return {
         "general": {"clearcolor": [0.7, 0.7, 0.7, 1.0], "resolution": [160, 90], "fps": 30},
-        "objects": objects,
+        "objects": _recenter(objects),
     }
 
 
@@ -2696,7 +2797,7 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.1, 0.1, 0.1, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": [{"name": "solid", "image": "models/solid.json",'
-    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+    b' "origin": [80.0, 45.0], "size": [160.0, 90.0]}]}'
 )
 model_json = b'{"material": "materials/solid.json"}'
 material_json = b'{"passes": [{"shader": "genericimage2", "textures": ["solid"]}]}'
@@ -2718,12 +2819,16 @@ open(sys.argv[1], "wb").write(
 # field's materials/spark.json, and materials/spark.tex are all pkg
 # entries, mirroring the S1 model case's all-pkg layout above). The
 # particle file declares a boxrandom emitter with zero distance (spawns
-# exactly at the system's own origin -- scene (0,0) = frame (80,45), the
-# M3c convention) and a lifetimerandom long enough that the population is
-# stable well before the poll below times out.
+# exactly at the system's own origin) and a lifetimerandom long enough
+# that the population is stable well before the poll below times out.
+# S6: the object's own "origin" is explicit (80,45) -- WE's real absolute
+# scene-pixel convention (a scene-declared resolution of 160x90 puts its
+# own centre, and therefore frame centre, at (80,45); an omitted "origin"
+# genuinely defaults to (0,0), the scene's top-left corner, not centre).
 s4b_scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
-    b' "objects": [{"name": "spark", "image": null, "particle": "particles/spark.json"}]}'
+    b' "objects": [{"name": "spark", "image": null, "particle": "particles/spark.json",'
+    b' "origin": [80.0, 45.0]}]}'
 )
 s4b_particle_json = (
     b'{"material": "materials/spark.json", "maxcount": 64,'
@@ -2849,6 +2954,26 @@ for _attempt in {1..400}; do
     sleep 0.05
 done
 head -c 8 "$standalone" | grep -q KWEFRM1
+# S6: KWEFRM1 does NOT imply the device line is in the log yet --
+# `SharedFrameWriter::create` (kwe-frame-protocol) writes the magic header
+# the instant the frame mapping file is created, which happens BEFORE
+# `LayerRenderer::new` even picks a Vulkan device (main.rs creates the
+# writer, then the renderer) -- so the poll loop above can observe
+# KWEFRM1 well before this process's `event=renderer.scene.device` line
+# is written. Usually too small a gap to see, but under load (a
+# concurrent discrete-GPU renderer plus the desktop compositor
+# contending for CPU on this machine measurably widened it) a one-shot
+# grep immediately after the KWEFRM1 poll went flaky; retry the same
+# short way every other poll loop in this file already does.
+for _attempt in {1..100}; do
+    grep -q "event=renderer.scene.device name=.*llvmpipe" "$smoke_root/standalone.log" && break
+    kill -0 "$standalone_pid" 2>/dev/null || {
+        echo "standalone renderer exited before logging its device" >&2
+        sed -n '1,120p' "$smoke_root/standalone.log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
 grep -q "event=renderer.scene.device name=.*llvmpipe" "$smoke_root/standalone.log"
 scene_oracle "$standalone" 1.5
 stop_standalone "$standalone_pid" "$smoke_root/standalone.log" "standalone renderer"
@@ -3386,7 +3511,7 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": [{"name": "solid", "image": "models/solid.json",'
-    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+    b' "origin": [80.0, 45.0], "size": [160.0, 90.0]}]}'
 )
 model_json = b'{"material": "materials/solid.json"}'
 material_json = b'{"passes": [{"shader": "smoketest", "textures": ["solid"]}]}'
@@ -3533,7 +3658,7 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": [{"name": "fx", "image": "models/fx.json",'
-    b' "origin": [0.0, 0.0], "size": [160.0, 90.0],'
+    b' "origin": [80.0, 45.0], "size": [160.0, 90.0],'
     b' "effects": [{"file": "effects/test.json", "visible": true, "passes": [{}]}]}]}'
 )
 model_json = b'{"material": "materials/fx.json", "fullscreen": true}'
@@ -3691,7 +3816,7 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": [{"name": "solid", "image": "models/solid.json",'
-    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+    b' "origin": [80.0, 45.0], "size": [160.0, 90.0]}]}'
 )
 model_json = b'{"material": "materials/solid.json"}'
 material_json = b'{"passes": [{"shader": "smoketest4", "textures": ["solid"]}]}'
@@ -3837,7 +3962,7 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": [{"name": "photo", "image": "models/photo.json",'
-    b' "origin": [0.0, 0.0], "size": [160.0, 90.0],'
+    b' "origin": [80.0, 45.0], "size": [160.0, 90.0],'
     b' "effects": ['
     b'  {"file": "effects/s5eff_a.json", "visible": true, "passes": [{}]},'
     b'  {"file": "effects/s5eff_b.json", "visible": true, "passes": [{}]}'
@@ -3921,6 +4046,13 @@ void main() {
 	v_TexCoord = a_TexCoord;
 }
 VERT
+# S6: this fixture's "below" material references shader "s5bbelow"
+# (shaders/s5bbelow.vert + .frag) but pre-S6 only ever wrote the .frag —
+# the missing .vert made `read_shader_stage` return `None` for the
+# vertex stage (`shader_source_missing`), which the standalone `--assets-
+# dir` reproduction below now surfaces (S5's own smoke-scene.sh/check.sh
+# gates were never re-run before this slice, per this task's brief).
+cp "$s5b_assets_dir/shaders/s5bbase.vert" "$s5b_assets_dir/shaders/s5bbelow.vert"
 cat >"$s5b_assets_dir/shaders/s5bbelow.frag" <<'FRAG'
 uniform sampler2D g_Texture0;
 varying vec2 v_TexCoord;
@@ -3988,8 +4120,8 @@ def texv_argb8888(width, height, rgba):
 scene_json = (
     b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
     b' "objects": ['
-    b'  {"name": "below", "image": "models/below.json", "origin": [0.0, 0.0], "size": [160.0, 90.0]},'
-    b'  {"name": "above", "image": "models/above.json", "origin": [0.0, 0.0], "size": [160.0, 90.0]}'
+    b'  {"name": "below", "image": "models/below.json", "origin": [80.0, 45.0], "size": [160.0, 90.0]},'
+    b'  {"name": "above", "image": "models/above.json", "origin": [80.0, 45.0], "size": [160.0, 90.0]}'
     b' ]}'
 )
 below_model_json = b'{"material": "materials/below.json", "fullscreen": true}'

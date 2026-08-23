@@ -284,6 +284,27 @@ entries:
       scan itself (find_main_token, skipping `//`/`/* */` comments) has
       no upstream equivalent — upstream's own `find(" main")` has the
       same weakness this closes, an original robustness fix, not a port.
+      S6 (bug-fix slice: layer-centering NDC math, the material-constant
+      "material" key vs. GLSL uniform name mismatch, and the Wallpaper
+      Engine assets-root library-folder discovery gap) adapted file,
+      carrying a Borrowed-From comment at the adapted function:
+      src/WallpaperEngine/Render/Objects/CImage.cpp:259-262
+      (`updateScenePosition`'s `this->m_pos.x -= scene_width / 2` etc. —
+      recentering an object's absolute-origin quad corners onto the
+      scene's own centre before the camera's `glm::ortho(-width/2,
+      width/2, ...)` projection) -> crates/kwe-scene-renderer/src/
+      vulkan.rs (LayerRenderer::set_world_extent/recenter — adapted:
+      upstream also flips y there to match OpenGL's y-up NDC; this
+      renderer targets Vulkan's native y-down NDC and already documents
+      "no y-flip" (shaders/quad.vert), so only the centre subtraction is
+      ported, not the flip). The material-constant name-mapping fix
+      (crates/kwe-scene-renderer/src/shaderpre.rs, fold_declarations'
+      `uniform_material_keys` lookup) and the Steam library-folder
+      discovery fix (crates/kwe-core/src/scan.rs,
+      default_wallpaper_engine_assets_dir routing through
+      discover_libraries) are original bug fixes with no upstream
+      citation — both close gaps in this renderer's OWN prior S2/S1
+      ports, not new adaptations of upstream code.
       Verified cross-checked against real Workshop payloads under
       /media/crushinator/steamapps/workshop/content/431960/*/ and the real
       Wallpaper Engine asset shaders under
