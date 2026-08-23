@@ -2773,11 +2773,12 @@ fn effect_target_requests(
 /// content when the object covers the whole scene (a `fullscreen`/
 /// `projectlayer` model, or a layer whose declared size is at least the
 /// scene's declared resolution on both axes — when the scene has no
-/// declared resolution at all, treat every layer as covering, matching
-/// `world_extent`'s own "no declared resolution" fallback). Running the
-/// full-frame seed for a smaller SUB-REGION composition layer (e.g.
-/// Avatar's 768x768 "Adjustable Composition Layer") paints wrong-region
-/// garbage — a documented deviation from upstream; the honest degrade is
+/// declared resolution at all, scene units are canvas pixels, so the layer
+/// size is compared against the canvas, matching `world_extent`'s own
+/// "scene units are canvas pixels" rule). Running the full-frame seed for
+/// a smaller SUB-REGION composition layer (e.g. Avatar's 768x768
+/// "Adjustable Composition Layer") paints wrong-region garbage — a
+/// documented deviation from upstream; the honest degrade is
 /// `Err("passthrough_region_unsupported")`, skipping the chain and the
 /// draw entirely rather than showing it. Real per-object screen-region
 /// extraction is a future slice.
@@ -2786,6 +2787,7 @@ fn passthrough_draw_decision(
     has_chain_material: bool,
     layer_size: [f32; 2],
     scene_resolution: Option<(u32, u32)>,
+    canvas: (u32, u32),
 ) -> Result<(), &'static str> {
     let Some(material) = material else {
         return Ok(()); // not a model layer, or its base texture never resolved
@@ -2797,9 +2799,13 @@ fn passthrough_draw_decision(
         return Err("passthrough_without_effects");
     }
     let covering = material.fullscreen
-        || scene_resolution.is_none_or(|(scene_width, scene_height)| {
+        || if let Some((scene_width, scene_height)) = scene_resolution {
             layer_size[0] >= scene_width as f32 && layer_size[1] >= scene_height as f32
-        });
+        } else {
+            // No declared scene resolution: scene units are canvas pixels.
+            // Compare layer size against the canvas.
+            layer_size[0] >= canvas.0 as f32 && layer_size[1] >= canvas.1 as f32
+        };
     if covering {
         Ok(())
     } else {
@@ -2939,6 +2945,7 @@ fn compile_material_layers(
             has_chain_material,
             layer.size,
             scene_resolution,
+            (canvas_width, canvas_height),
         ) {
             *fallback_reasons.entry(reason).or_insert(0) += 1;
             continue;
@@ -4267,7 +4274,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            passthrough_draw_decision(Some(&material), false, [768.0, 768.0], Some((3840, 2160))),
+            passthrough_draw_decision(
+                Some(&material),
+                false,
+                [768.0, 768.0],
+                Some((3840, 2160)),
+                (960, 540)
+            ),
             Err("passthrough_without_effects")
         );
     }
@@ -4284,7 +4297,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            passthrough_draw_decision(Some(&material), true, [64.0, 64.0], Some((3840, 2160))),
+            passthrough_draw_decision(
+                Some(&material),
+                true,
+                [64.0, 64.0],
+                Some((3840, 2160)),
+                (960, 540)
+            ),
             Ok(())
         );
     }
@@ -4299,7 +4318,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            passthrough_draw_decision(Some(&material), true, [3840.0, 2160.0], Some((3840, 2160))),
+            passthrough_draw_decision(
+                Some(&material),
+                true,
+                [3840.0, 2160.0],
+                Some((3840, 2160)),
+                (960, 540)
+            ),
             Ok(())
         );
     }
@@ -4316,23 +4341,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            passthrough_draw_decision(Some(&material), true, [768.0, 768.0], Some((3840, 2160))),
+            passthrough_draw_decision(
+                Some(&material),
+                true,
+                [768.0, 768.0],
+                Some((3840, 2160)),
+                (960, 540)
+            ),
             Err("passthrough_region_unsupported")
         );
     }
 
     /// C2: no declared scene resolution (`general.resolution`/
-    /// `orthogonalprojection` absent) treats every layer as covering,
-    /// matching `world_extent`'s own "no declared resolution" fallback.
+    /// `orthogonalprojection` absent) compares the layer size against the
+    /// canvas (scene units are canvas pixels), matching `world_extent`'s own
+    /// "scene units are canvas pixels" rule. A layer whose size covers the
+    /// canvas on both axes draws.
     #[test]
-    fn passthrough_draw_decision_no_scene_resolution_treats_every_layer_as_covering() {
+    fn passthrough_draw_decision_no_scene_resolution_layer_size_covers_canvas_resolves() {
         let material = scene::MaterialSpec {
             passthrough: true,
             ..Default::default()
         };
         assert_eq!(
-            passthrough_draw_decision(Some(&material), true, [1.0, 1.0], None),
+            passthrough_draw_decision(Some(&material), true, [960.0, 540.0], None, (960, 540)),
             Ok(())
+        );
+    }
+
+    /// C2: no declared scene resolution with a layer whose size does not
+    /// cover the canvas is refused, avoiding wrong-region garbage.
+    #[test]
+    fn passthrough_draw_decision_no_scene_resolution_layer_size_smaller_than_canvas_is_refused() {
+        let material = scene::MaterialSpec {
+            passthrough: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            passthrough_draw_decision(Some(&material), true, [1.0, 1.0], None, (960, 540)),
+            Err("passthrough_region_unsupported")
         );
     }
 
@@ -4342,7 +4389,13 @@ mod tests {
     fn passthrough_draw_decision_non_passthrough_always_resolves() {
         let material = scene::MaterialSpec::default();
         assert_eq!(
-            passthrough_draw_decision(Some(&material), false, [1.0, 1.0], Some((3840, 2160))),
+            passthrough_draw_decision(
+                Some(&material),
+                false,
+                [1.0, 1.0],
+                Some((3840, 2160)),
+                (960, 540)
+            ),
             Ok(())
         );
     }
