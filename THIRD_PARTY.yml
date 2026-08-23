@@ -217,6 +217,29 @@ entries:
       blob heuristic scan) was researched but NOT ported this slice — zero
       local corpus usage found; see docs/SCENE_FORMAT_V1.md "Mesh/puppet
       vertex formats" for the citation and the decision record.
+      S4b (external particle definition files) adapted files, each
+      carrying a Borrowed-From comment at the adapted function/struct:
+      src/WallpaperEngine/Render/Objects/CParticle.cpp (the file's
+      top-level `material` field read, matching a model's `material` field
+      walk) -> crates/kwe-core/src/particlefile.rs (resolution only; no
+      simulation logic);
+      src/WallpaperEngine/Render/Objects/CParticle.cpp
+      (createBoxEmitter/createSphereEmitter's random-position rules,
+      the *RandomInitializer family, and createMovementOperator/
+      createAlphaFadeOperator/createSizeChangeOperator/
+      createColorChangeOperator/createOscillateAlphaOperator/
+      createOscillateSizeOperator/createControlPointAttractOperator/
+      createTurbulenceOperator) -> crates/kwe-scene-renderer/src/particles.rs
+      and crates/kwe-scene-renderer/src/particlefile.rs (adapted, not
+      ported verbatim — every emitter/initializer/operator kind is
+      2D-only, `controlpointattract` anchors at a static system-origin
+      offset rather than a live mouse-linked control point, and
+      `turbulence` is a bounded deterministic sine/cosine approximation,
+      NOT upstream's Perlin curl-noise algorithm; `rotationrandom`/
+      `angularvelocityrandom`/`angularmovement`/`oscillateposition`/
+      `vortex`/`mapsequencearoundcontrolpoint`/the `spritetrail` renderer
+      are not ported — see docs/SCENE_FORMAT_V1.md "External particle
+      definition files (S4b)" for the full documented-scope-cut list).
       Verified cross-checked against real Workshop payloads under
       /media/crushinator/steamapps/workshop/content/431960/*/ and the real
       Wallpaper Engine asset shaders under

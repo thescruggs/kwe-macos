@@ -543,6 +543,104 @@ is contained the same way.
 | vertex buffer | 4096 × 6 verts × 40 B ≈ 983 KiB per system | one host-visible buffer, create-or-grow; contents rebuilt + re-uploaded every frame a fixed step ran |
 | texture slots | `MAX_LAYERS` (256) + 16 particle slots = 272 | the M3c texture budget still applies per upload |
 
+### External particle definition files (S4b)
+
+**Implemented (S4b)**, replacing M3f's "the definition is never read" gap:
+a `particle` object whose value is a STRING (a `.json` particle file
+reference — pkg entry, scene directory, or `<assets>/particles/`) is now
+resolved and parsed into a **component model** (emitter/initializer/
+operator arrays, the real WE particle format), instead of always
+registering with the flat model's all-default fixture.
+
+**Resolution** (`crates/kwe-core/src/particlefile.rs`, shared by preflight
+and the worker, mirroring the S1 model-resolution split): the file itself
+(bounded 1 MiB JSON) → its own `material` field (a `.json` material path,
+resolved exactly like a model layer's `material` via
+`crates/kwe-core/src/scenemodel.rs`'s `resolve_material`) → `passes[0]` →
+the first texture slot → `materials/<name>.tex`. The B2 honesty gate
+(`SceneObjectSummary::particle_files_resolved`) counts a particle-file
+system as drawable only when this whole chain resolves a real texture —
+the same split S1 established for models; a reference that fails at any
+step (missing file, invalid JSON, no `material` field, unresolvable
+material/texture) keeps the M3f flat-model defaults, the pre-S4b honest
+fallback, never a scene rejection.
+
+**Component-model parse** (`crates/kwe-scene-renderer/src/particlefile.rs`,
+worker-only — preflight never needs the simulation detail): every field is
+read tolerantly (missing/malformed/out-of-range → a documented default or
+clamp; an unrecognized emitter/initializer/operator `name` is skipped and
+counted, never fatal, matching upstream's own "Unknown ... type" +
+continue behavior). Implemented kinds (Borrowed-From:
+`Almamu/linux-wallpaperengine`'s `Render/Objects/CParticle.cpp`,
+GPL-3.0-or-later, adapted — see THIRD_PARTY.yml):
+
+- **Emitters**: `boxrandom` (a per-axis random offset in
+  `[distancemin, distancemax]`, sign randomized, scaled by `directions`,
+  from `origin`) and `sphererandom` (a uniform-by-area point in the 2D
+  annulus between `distancemin`/`distancemax`, scaled by `directions`; a
+  declared `speedmin`/`speedmax` launches radially outward, otherwise an
+  initializer sets velocity).
+- **Initializers**: `lifetimerandom`, `sizerandom` (with `exponent` bias),
+  `alpharandom`, `velocityrandom` (adds to the emitter's velocity),
+  `colorrandom` (WE's 0..=255 range normalized to 0..=1).
+- **Operators**: `movement` (gravity + drag, upstream's exact
+  position-then-velocity order), `alphafade`, `sizechange`, `colorchange`
+  (life-fraction-gated linear ramps against the particle's spawn-time
+  values), `oscillatealpha`/`oscillatesize` (a per-particle cosine wave,
+  frequency/phase drawn once at spawn), `controlpointattract` (a
+  constant-force pull toward an anchor within a threshold radius), and
+  `turbulence` (see the scope cut below).
+- **Renderer**: the file's top-level `material` (not a per-renderer
+  field) supplies the texture, drawn through the EXISTING M3f particle
+  vertex/texture pipeline — no separate material-shader pipeline for
+  particles.
+
+**Documented scope cuts** (`crates/kwe-scene-renderer/src/particles.rs`'s
+module doc has the full reasoning):
+
+- **2D only**: every vector field's z component is parsed (bounds-checked)
+  and dropped — matches every other scene2d object in this renderer; the
+  sphere emitter always takes upstream's 2D-disk branch, never the 3D
+  spherical-shell one.
+- **No live control-point tracking**: `controlpointattract` anchors at the
+  system's own spawn origin plus the operator's own `origin` offset,
+  never a live mouse/audio-reactive control point (the `controlpoint`/
+  `children`/audio-processing fields are tolerated, not read).
+- **`turbulence` is a bounded deterministic APPROXIMATION** — a
+  sine/cosine directional field sampled at each particle's own position
+  plus a time term, NOT upstream's Perlin curl-noise algorithm. The
+  per-operator `phase`/`speed` are still drawn once from the system's
+  seeded PRNG (matching upstream's "once per operator instance" contract)
+  so the approximation stays deterministic across identical runs.
+- **Unimplemented, tolerated as unknown**: `rotationrandom`,
+  `angularvelocityrandom`, `angularmovement` (this renderer's particle
+  quads are always axis-aligned — no rotation attribute exists to drive),
+  `oscillateposition`, `vortex`, `mapsequencearoundcontrolpoint`, and the
+  `spritetrail` renderer (drawn as a plain sprite, not a trail).
+- **`sizerandom`'s scale convention deliberately differs from upstream**:
+  upstream halves the authored min/max before storing `p.size` because
+  ITS renderer consumes that field as a half-extent directly; this
+  renderer's single shared `build_vertex_bytes` already halves once
+  (`half = size * 0.5`, the SAME convention the flat model's
+  `sizeStart`/`sizeEnd` use), so `sizerandom` here feeds the authored
+  value straight through — replicating upstream's extra `/2` would halve
+  twice and render every authored size at a quarter scale.
+
+**Bounds**: `MAX_PARTICLE_FILE_BYTES` (1 MiB, kwe-core); up to
+`particles::MAX_COMPONENT_ITEMS` (16) emitters/initializers/operators each
+(excess entries are dropped, not an error); every numeric field clamps to
+a documented finite range at parse time (an emitter `rate` up to
+100,000/s is allowed through uncapped — the actual per-frame spawn work
+stays bounded by the existing `MAX_SPAWN_ACCUMULATOR`/`MAX_PARTICLES`
+caps regardless); the system's own `max_count` and per-emitter `rate`
+reuse the SAME `MAX_PARTICLES`/spawn-accumulator bounds the flat model
+already enforces — a component-model system can never exceed the
+existing per-system particle cap or do unbounded per-frame work, even
+under a hostile/malformed file. `event=renderer.scene.particle_file_skip`
+(one bounded line per scene load) reports how many file references failed
+to resolve/decode; `event=renderer.scene.particle_file_unsupported_items`
+reports unrecognized emitter/initializer/operator kinds seen.
+
 ## Image sources (M3c)
 
 - **File scenes**: the reference is resolved against the canonicalized
