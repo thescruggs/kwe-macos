@@ -51,6 +51,18 @@ pub const MAX_INCLUDE_DEPTH: usize = 8;
 /// large headers.
 pub const MAX_PREPROCESSED_BYTES: usize = 1024 * 1024;
 
+/// S2 review #5: `MAX_INCLUDE_DEPTH`/`MAX_PREPROCESSED_BYTES` bound
+/// nesting and total bytes, but not the NUMBER of sibling `#include`
+/// lines a single unit can carry — each one (found or not) round-trips
+/// through the caller's `confined_read` (two `canonicalize()` calls plus
+/// a stat), so a shader with many short, unresolvable includes could
+/// otherwise force on the order of `MAX_PREPROCESSED_BYTES` / (shortest
+/// include line) stat-heavy lookups before the byte budget ever kicks
+/// in. Mirrors `MAX_INCLUDE_DEPTH`'s spirit: a low, generous-over-any-real-
+/// shader cap on the total `#include` directives resolved per top-level
+/// `preprocess` call (across every nesting level).
+pub const MAX_INCLUDE_COUNT: usize = 64;
+
 /// `g_Texture0..g_Texture7` — the descriptor set's sampled-image bindings
 /// (vulkan.rs). A material referencing `g_Texture8` or higher cannot be
 /// bound and preprocessing fails for that stage.
@@ -158,10 +170,22 @@ pub type IncludeLookup<'a> = dyn FnMut(&str) -> Option<Vec<u8>> + 'a;
 pub enum PreprocessError {
     /// `#include` chain nested past `MAX_INCLUDE_DEPTH`.
     IncludeDepthExceeded,
+    /// More than `MAX_INCLUDE_COUNT` `#include` directives resolved
+    /// (across every nesting level) in one `preprocess` call.
+    TooManyIncludes,
     /// Preprocessed text exceeded `MAX_PREPROCESSED_BYTES`.
     SizeExceeded { bytes: usize, limit: usize },
     /// A `uniform sampler2D` names a texture index >= `MAX_MATERIAL_TEXTURES`.
     TooManyTextures { name: String, index: u32 },
+    /// S2 review #1: a combo name (from either `material_combos` — i.e.
+    /// `material.json`'s own `combos` map — or a shader's `// [COMBO]`
+    /// scrape) is not a strict GLSL identifier. Both sources are
+    /// untrusted metadata that reaches a `#define NAME VALUE` line
+    /// verbatim; rejecting the whole material here (rather than
+    /// dropping just the bad entry) keeps the failure honest and
+    /// visible as one more fallback reason instead of silently
+    /// compiling a material with a combo quietly missing.
+    InvalidComboName(String),
 }
 
 impl std::fmt::Display for PreprocessError {
@@ -170,6 +194,9 @@ impl std::fmt::Display for PreprocessError {
             Self::IncludeDepthExceeded => {
                 write!(f, "include depth exceeded {MAX_INCLUDE_DEPTH}")
             }
+            Self::TooManyIncludes => {
+                write!(f, "more than {MAX_INCLUDE_COUNT} #include directives")
+            }
             Self::SizeExceeded { bytes, limit } => {
                 write!(f, "preprocessed size {bytes} exceeds the {limit} byte cap")
             }
@@ -177,8 +204,34 @@ impl std::fmt::Display for PreprocessError {
                 f,
                 "texture slot {index} (from uniform \"{name}\") exceeds the {MAX_MATERIAL_TEXTURES}-texture cap"
             ),
+            Self::InvalidComboName(name) => {
+                write!(f, "combo name {name:?} is not a valid GLSL identifier")
+            }
         }
     }
+}
+
+/// S2 review #1: strict GLSL-identifier check for a combo name before it
+/// can reach a `#define NAME VALUE` line — `^[A-Za-z_][A-Za-z0-9_]{0,63}$`.
+/// Both combo sources this module accepts (`material_combos`, built by
+/// the caller from `material.json`'s `combos` map, and the `// [COMBO]`
+/// scrape below) are untrusted metadata: a JSON string value can encode
+/// an embedded newline (`"FOO\nBAR"` decodes to an actual LF byte even
+/// though the JSON sat on one physical line), which would otherwise let
+/// a crafted name break out of the `#define` line and inject arbitrary
+/// additional shader text. The 64-character length cap matches this
+/// module's other small-identifier bounds (`MAX_MATERIAL_CONSTANTS`-style
+/// sizing) and is generous over any real WE combo name (the longest
+/// scraped from the real asset corpus is well under 32 characters).
+fn is_valid_combo_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    name.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// One `uniform TYPE name; // {json}` parameter declaration, exactly as
@@ -268,6 +321,7 @@ fn resolve_includes(
     include: &mut IncludeLookup<'_>,
     depth: usize,
     total_len: &mut usize,
+    include_count: &mut usize,
 ) -> Result<String, PreprocessError> {
     if depth > MAX_INCLUDE_DEPTH {
         return Err(PreprocessError::IncludeDepthExceeded);
@@ -278,13 +332,18 @@ fn resolve_includes(
         if let Some(rest) = trimmed.strip_prefix("#include")
             && let Some(name) = extract_quoted(rest)
         {
+            *include_count += 1;
+            if *include_count > MAX_INCLUDE_COUNT {
+                return Err(PreprocessError::TooManyIncludes);
+            }
             out.push_str("// begin of include from file ");
             out.push_str(&name);
             out.push('\n');
             match include(&name) {
                 Some(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
-                    let resolved = resolve_includes(&text, include, depth + 1, total_len)?;
+                    let resolved =
+                        resolve_includes(&text, include, depth + 1, total_len, include_count)?;
                     out.push_str(&resolved);
                     if !resolved.ends_with('\n') {
                         out.push('\n');
@@ -348,6 +407,19 @@ fn scrape(
                 let Some(combo) = object.get("combo").and_then(Value::as_str) else {
                     continue;
                 };
+                // S2 review #1: a shader's own `// [COMBO]` scrape is
+                // metadata too (parsed from the corpus asset file, not
+                // hand-written GLSL) — reject a malformed name the same
+                // way material.json's `combos` map is rejected below,
+                // just by dropping the one entry rather than failing the
+                // whole material (this data cannot smuggle text past a
+                // `#define` line issued for a DIFFERENT combo the way an
+                // external material.json entry could, since it is only
+                // ever inserted here, never taken verbatim from the
+                // caller).
+                if !is_valid_combo_name(combo) {
+                    continue;
+                }
                 if material_combos.contains_key(combo) || discovered.contains_key(combo) {
                     continue;
                 }
@@ -645,8 +717,27 @@ pub fn preprocess(
     varying_locations: &mut BTreeMap<String, u32>,
     include: &mut IncludeLookup<'_>,
 ) -> Result<PreprocessOutput, PreprocessError> {
+    // S2 review #1: `material_combos` is built by the caller straight
+    // from `material.json`'s own `combos` map — external, untrusted
+    // metadata that (unlike the shader text itself) a hostile Workshop
+    // package can control WITHOUT also owning the `.vert`/`.frag`
+    // source, by pointing `shader` at any trusted corpus shader. Reject
+    // the whole material (the caller's existing fallback path) rather
+    // than silently dropping or truncating a bad entry — a JSON string
+    // value can carry an escaped `\n` that `serde_json` decodes into a
+    // real LF byte even though the JSON sat on one physical line, which
+    // would otherwise let a crafted name break out of its own `#define`
+    // line and inject arbitrary further GLSL/preprocessor text into a
+    // vetted shader.
+    for name in material_combos.keys() {
+        if !is_valid_combo_name(name) {
+            return Err(PreprocessError::InvalidComboName(name.clone()));
+        }
+    }
+
     let mut total_len = 0usize;
-    let included = resolve_includes(source, include, 0, &mut total_len)?;
+    let mut include_count = 0usize;
+    let included = resolve_includes(source, include, 0, &mut total_len, &mut include_count)?;
     let required = resolve_requires(&included);
     let (discovered_combos, uniforms) = scrape(&required, material_combos);
 
@@ -708,6 +799,134 @@ mod tests {
 
     fn no_includes() -> Box<IncludeLookup<'static>> {
         Box::new(|_: &str| None)
+    }
+
+    // S2 review #1 (MUST-FIX): a material.json `combos` key can carry a
+    // JSON-escaped `\n` that decodes to a real LF byte even though the
+    // JSON sat on one physical line -- proving this cannot break out of
+    // the emitted `#define` line and inject further shader text is the
+    // whole point of the strict-identifier check.
+    #[test]
+    fn combo_name_with_embedded_newline_is_rejected_not_injected() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut material_combos = BTreeMap::new();
+        // Exactly the JSON-decoded shape the finding describes:
+        // `"combo": "FOO\nBAR"` decodes to this literal Rust string.
+        material_combos.insert("FOO\nBAR".to_string(), 0);
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "void main(){}\n",
+            &material_combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PreprocessError::InvalidComboName("FOO\nBAR".to_string())
+        );
+        // Never reaches a point where this string is formatted into the
+        // output at all -- there is no `source` to inspect on the `Err`
+        // path, which is itself the proof: an injected `#define`/
+        // `#extension`/arbitrary-GLSL line can only reach `source_out`
+        // by way of the `combos` loop this check runs before.
+    }
+
+    #[test]
+    fn combo_name_with_invalid_characters_is_rejected() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let mut material_combos = BTreeMap::new();
+        material_combos.insert("FOO BAR".to_string(), 1);
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "void main(){}\n",
+            &material_combos,
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PreprocessError::InvalidComboName("FOO BAR".to_string())
+        );
+    }
+
+    #[test]
+    fn valid_combo_name_shapes() {
+        for name in ["LIGHTING", "_underscore", "combo1", "A", "a_b_C_9"] {
+            assert!(is_valid_combo_name(name), "expected valid: {name}");
+        }
+        for name in [
+            "",
+            "1leading",
+            "has space",
+            "has\ttab",
+            "has\nnewline",
+            "has-dash",
+        ] {
+            assert!(!is_valid_combo_name(name), "expected invalid: {name}");
+        }
+        assert!(is_valid_combo_name(&"a".repeat(64)));
+        assert!(!is_valid_combo_name(&"a".repeat(65)));
+    }
+
+    /// A shader's own `// [COMBO]` scrape is metadata too -- a malformed
+    /// name there is dropped (not a hard preprocess failure, since it
+    /// cannot smuggle text past a DIFFERENT combo's `#define` line the
+    /// way an external material.json entry could).
+    #[test]
+    fn discovered_combo_with_invalid_name_is_dropped_not_defined() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let source = "// [COMBO] {\"combo\":\"BAD NAME\",\"default\":1}\nvoid main(){}\n";
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(!out.combos.contains_key("BAD NAME"));
+        // The offending line stays in the output as an inert comment
+        // (scrape only decides whether to DEFINE a combo, it never edits
+        // the source text) -- what must never appear is a #define line for
+        // it.
+        assert!(!out.source.contains("#define BAD NAME"));
+    }
+
+    #[test]
+    fn include_count_bounded_independent_of_depth_or_size() {
+        // MAX_INCLUDE_COUNT (64) sibling includes, each a tiny found file
+        // well under the byte/depth caps individually -- only the count
+        // cap should trip.
+        let mut include: Box<IncludeLookup<'static>> =
+            Box::new(|_: &str| Some(b"const float X = 1.0;\n".to_vec()));
+        let mut locs = BTreeMap::new();
+        let mut source = String::new();
+        for i in 0..(MAX_INCLUDE_COUNT + 1) {
+            source.push_str(&format!("#include \"h{i}.h\"\n"));
+        }
+        source.push_str("void main(){}\n");
+        let error = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            &source,
+            &BTreeMap::new(),
+            &[],
+            &mut locs,
+            &mut include,
+        )
+        .unwrap_err();
+        assert_eq!(error, PreprocessError::TooManyIncludes);
     }
 
     #[test]

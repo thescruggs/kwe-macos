@@ -1621,6 +1621,24 @@ fn parse_constant_components(value: &serde_json::Value) -> Option<[f32; 4]> {
 /// (`event=renderer.scene.shaders compiled=N fallback=M`) — never one
 /// line per layer, matching every other load-time diagnostic in this
 /// file.
+///
+/// S2 review #2: whether a `bind_material_layer` error should terminate
+/// the process instead of being treated as an ordinary material
+/// fallback -- a `FenceTimeout` means the queue submit backing whatever
+/// `bind_material_layer` had already uploaded for this call may still be
+/// executing on the GPU, exactly the hazard every other fence-touching
+/// call site in this file (`upload_layer_textures`, particle vertex/
+/// texture upload, video refresh/texture, text upload, `render()`
+/// itself) guards against by calling `reject_render` instead of letting
+/// a later `reset_fences`/`queue_submit` reuse the same fence/command
+/// buffer out from under a not-yet-complete submission. Pure and
+/// unit-tested (`material_bind_fence_timeout_is_fatal_other_errors_are_not`)
+/// so a future refactor of the match arm below cannot silently drop this
+/// check the way it was originally missing.
+fn material_bind_error_is_fatal(error: &RenderError) -> bool {
+    is_fence_timeout(error)
+}
+
 fn compile_material_layers(
     layers: &mut [scene::LayerSpec],
     renderer: &mut LayerRenderer,
@@ -1837,7 +1855,24 @@ fn compile_material_layers(
                 material_ok[index] = true;
                 compiled += 1;
             }
-            Err(_) => {
+            Err(error) => {
+                // S2 review #2 (MUST-FIX): every other fence-touching
+                // call site in this file (upload_layer_textures,
+                // particle vertex/texture upload, video refresh/
+                // texture, text upload, render() itself) checks
+                // is_fence_timeout and calls reject_render instead of
+                // treating the error as an ordinary skip -- a
+                // FenceTimeout means the queue submit may still be
+                // reading the staging buffer/destination image
+                // bind_material_layer already uploaded for this call
+                // (vulkan.rs's own doc comment on the identical pattern
+                // explains why), so the process must exit immediately
+                // rather than let the next render() reset/reuse the
+                // same fence and command buffer out from under a
+                // possibly still-executing submission.
+                if material_bind_error_is_fatal(&error) {
+                    reject_render(&error, "fence timeout during material texture upload");
+                }
                 *fallback_reasons.entry("bind_failed").or_insert(0) += 1;
             }
         }
@@ -2549,6 +2584,25 @@ fn reject_scene(error: &SceneError) -> ! {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// S2 review #2 (MUST-FIX): the guard `compile_material_layers` runs
+    /// before deciding whether a `bind_material_layer` failure is an
+    /// ordinary fallback or a process-terminating fence timeout. A real
+    /// `FenceTimeout` cannot be produced without a live Vulkan device
+    /// mid-submission (a mock is impractical here, per the review's own
+    /// note), so this pins the pure decision function directly: it must
+    /// stay `true` for `FenceTimeout` and `false` for every other
+    /// `RenderError`, matching every other fence-touching call site in
+    /// this file.
+    #[test]
+    fn material_bind_fence_timeout_is_fatal_other_errors_are_not() {
+        assert!(material_bind_error_is_fatal(
+            &vulkan::RenderError::FenceTimeout
+        ));
+        assert!(!material_bind_error_is_fatal(&vulkan::RenderError::Vulkan(
+            "out of memory".to_string()
+        )));
+    }
 
     #[test]
     fn media_state_maps_to_latest_wins_commands() {

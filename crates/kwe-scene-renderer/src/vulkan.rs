@@ -353,8 +353,11 @@ pub struct LayerRenderer {
     /// S2's `g_Time`: not real elapsed time (`render` takes no time
     /// parameter — this slice keeps existing `render`/test call sites
     /// unchanged) but a monotonic frame counter divided by an assumed 60
-    /// fps, which is exact for the steady-state case and only drifts
-    /// under sustained frame-time pressure. Good enough for a uniform
+    /// fps. This is exact only when the renderer's actual frame rate IS
+    /// 60 — it drifts systematically and permanently under any other
+    /// steady-state target/achieved rate (a user- or scene-configured fps
+    /// cap, F2's fps limiter, a slower device), not just transiently
+    /// "under sustained frame-time pressure". Good enough for a uniform
     /// almost no default-combo `genericimage*` shader reads; documented
     /// as a known simplification (see `AI-Skills/BETA_PLAN.md`).
     material_frame_counter: u64,
@@ -1560,6 +1563,23 @@ impl LayerRenderer {
                 MATERIAL_UNIFORMS_SIZE,
             );
         }
+        // S2 review #4 (RECOMMENDED): `allocate_host_visible` prefers
+        // `HOST_COHERENT` but falls back to plain `HOST_VISIBLE` if
+        // unavailable (an uncommon but real Vulkan portability case,
+        // e.g. some Mesa RADV/ANV memory-type layouts) — on that
+        // fallback, an explicit flush is the only thing that makes this
+        // write visible to the device. Mirrors `refresh_layer`'s
+        // identical flush (vulkan.rs, same rationale). WHOLE_SIZE at
+        // offset 0 always satisfies the nonCoherentAtomSize alignment
+        // rule.
+        let ubo_flush_range = vk::MappedMemoryRange::default()
+            .memory(ubo_memory)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        unsafe {
+            self.device
+                .flush_mapped_memory_ranges(std::slice::from_ref(&ubo_flush_range))
+        }?;
 
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.material_descriptor_pool)
@@ -2044,10 +2064,26 @@ impl LayerRenderer {
                 binding.uniforms.time_alpha_brightness = [time, draw.alpha, draw.brightness, 0.0];
                 let uniforms_ptr = std::ptr::from_ref(&binding.uniforms).cast::<u8>();
                 let ubo_mapped = binding.ubo_mapped;
+                let ubo_memory = binding.ubo_memory;
                 let pipeline = binding.pipeline;
                 let descriptor_set = binding.descriptor_set;
                 unsafe {
                     std::ptr::copy_nonoverlapping(uniforms_ptr, ubo_mapped, MATERIAL_UNIFORMS_SIZE);
+                }
+                // S2 review #4 (RECOMMENDED): same non-coherent-fallback
+                // hazard as the initial write in `bind_material_layer` —
+                // every per-draw uniform update needs its own flush, not
+                // just the first one, since a non-coherent memory type
+                // gives no implicit visibility guarantee across writes.
+                let ubo_flush_range = vk::MappedMemoryRange::default()
+                    .memory(ubo_memory)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                unsafe {
+                    self.device
+                        .flush_mapped_memory_ranges(std::slice::from_ref(&ubo_flush_range))
+                }?;
+                unsafe {
                     self.device.cmd_bind_pipeline(
                         self.command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,

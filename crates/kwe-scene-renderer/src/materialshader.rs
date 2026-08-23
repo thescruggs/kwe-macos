@@ -55,6 +55,14 @@ impl Default for MaterialUniforms {
     fn default() -> Self {
         Self {
             mvp: IDENTITY_MAT4,
+            // g_EffectTextureProjectionMatrix: unlike `mvp` (overwritten
+            // by `bind_material_layer` and every `render()` draw) and
+            // `parallax_pointer`/`points` (explicitly documented below as
+            // "unmodeled input defaults to inert"), this field is never
+            // written anywhere after `Default` -- effect passes are S3
+            // scope, so there is no scene input to thread into it yet.
+            // Stays a fixed identity for the same "unmodeled input
+            // defaults to inert" reason, just not previously called out.
             effect_texture_projection: IDENTITY_MAT4,
             texture_resolution: [[0.0; 4]; 8],
             points: [[0.0; 4]; 8],
@@ -134,6 +142,40 @@ fn compiler() -> Option<&'static shaderc::Compiler> {
         .as_ref()
 }
 
+/// S2 review #3 (RECOMMENDED): the shader text handed to `compile_stage`/
+/// `references_live_render_target` is fully attacker-controlled (a
+/// Workshop `.vert`/`.frag`), and neither `shaderc::Compiler::
+/// compile_into_spirv` nor `preprocess` carries an internal timeout.
+/// Running the call on a helper thread and bounding how long THIS
+/// function waits for it turns "the worker's scene-load path blocks
+/// indefinitely on a pathological shader" into "one material falls back
+/// after `MATERIAL_COMPILE_TIMEOUT`" — a hard, sound bound on the calling
+/// code path regardless of what glslang/SPIRV-Tools do internally
+/// (unlike `OptimizationLevel::Zero` alone — used below too, since this
+/// pipeline's shaders are already small and simple so optimization buys
+/// little — which only reduces EXPECTED compile time, not a guarantee).
+/// The daemon's own `--renderer-scene-startup-timeout-ms`/frame-timeout
+/// supervisor remains an external backstop, but is not relied on here: a
+/// supervisor kill would count as a `ProcessExit`/timeout strike per S2
+/// material compiled, not the clean one-material-fallback this timeout
+/// gives instead. The spawned thread is not joined on timeout (`shaderc`
+/// has no cancellation API) — it is left to finish or be reaped at
+/// process exit; this leaks at most one thread per timed-out compile,
+/// bounded by `MAX_PIPELINES_PER_SCENE` compile attempts per scene.
+const MATERIAL_COMPILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn with_timeout<T, F>(f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(MATERIAL_COMPILE_TIMEOUT).ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Vertex,
@@ -142,7 +184,9 @@ pub enum Stage {
 
 /// Compile one preprocessed GLSL stage to SPIR-V for Vulkan 1.2. Bounded:
 /// refuses text over `MAX_SHADER_TEXT_BYTES` before calling into
-/// `shaderc`; a `shaderc` failure (bad GLSL, unsupported construct) comes
+/// `shaderc`; runs the actual compile on a helper thread with a
+/// `MATERIAL_COMPILE_TIMEOUT` bound (see `with_timeout`'s doc comment); a
+/// `shaderc` failure (bad GLSL, unsupported construct) or a timeout comes
 /// back as `CompileError::Failed`, a value the caller (main.rs) treats
 /// exactly like any other material fallback trigger — never a panic.
 pub fn compile_stage(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>, CompileError> {
@@ -152,21 +196,36 @@ pub fn compile_stage(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>
             limit: MAX_SHADER_TEXT_BYTES,
         });
     }
-    let compiler = compiler().ok_or(CompileError::Unavailable)?;
-    let mut options = shaderc::CompileOptions::new().map_err(|_| CompileError::Unavailable)?;
-    options.set_target_env(
-        shaderc::TargetEnv::Vulkan,
-        shaderc::EnvVersion::Vulkan1_2 as u32,
-    );
-    options.set_optimization_level(shaderc::OptimizationLevel::Performance);
-    let shader_kind = match stage {
-        Stage::Vertex => shaderc::ShaderKind::Vertex,
-        Stage::Fragment => shaderc::ShaderKind::Fragment,
-    };
-    let result = compiler
-        .compile_into_spirv(source, shader_kind, label, "main", Some(&options))
-        .map_err(|error| CompileError::Failed(error.to_string()))?;
-    Ok(result.as_binary().to_vec())
+    if compiler().is_none() {
+        return Err(CompileError::Unavailable);
+    }
+    let source = source.to_string();
+    let label = label.to_string();
+    let outcome = with_timeout(move || -> Result<Vec<u32>, String> {
+        let compiler = compiler().ok_or_else(|| "compiler unavailable".to_string())?;
+        let mut options = shaderc::CompileOptions::new()
+            .map_err(|_| "compiler options unavailable".to_string())?;
+        options.set_target_env(
+            shaderc::TargetEnv::Vulkan,
+            shaderc::EnvVersion::Vulkan1_2 as u32,
+        );
+        options.set_optimization_level(shaderc::OptimizationLevel::Zero);
+        let shader_kind = match stage {
+            Stage::Vertex => shaderc::ShaderKind::Vertex,
+            Stage::Fragment => shaderc::ShaderKind::Fragment,
+        };
+        compiler
+            .compile_into_spirv(&source, shader_kind, &label, "main", Some(&options))
+            .map(|artifact| artifact.as_binary().to_vec())
+            .map_err(|error| error.to_string())
+    });
+    match outcome {
+        Some(Ok(spirv)) => Ok(spirv),
+        Some(Err(detail)) => Err(CompileError::Failed(detail)),
+        None => Err(CompileError::Failed(format!(
+            "compile exceeded the {MATERIAL_COMPILE_TIMEOUT:?} bound"
+        ))),
+    }
 }
 
 /// `shaderpre::PreprocessOutput::references_render_target` is a
@@ -182,29 +241,39 @@ pub fn compile_stage(source: &str, stage: Stage, label: &str) -> Result<Vec<u32>
 /// `_rt_` survives into the LIVE text, which is the precise answer: a
 /// dead branch is stripped before this check ever sees it. Fails closed
 /// (returns `true`, i.e. "treat as referencing a render target" ->
-/// fallback) if the compiler is unavailable or the preprocess call itself
-/// errors — the same shader is about to be handed to `compile_stage`
-/// anyway, so a preprocess-only failure here just means the caller will
-/// see the same failure moments later via `CompileError::Failed`.
+/// fallback) if the compiler is unavailable, the preprocess call itself
+/// errors, or the `MATERIAL_COMPILE_TIMEOUT` bound (`with_timeout`,
+/// shared with `compile_stage`) elapses — the same shader is about to be
+/// handed to `compile_stage` anyway, so any failure here just means the
+/// caller will see the same failure moments later via
+/// `CompileError::Failed`.
 pub fn references_live_render_target(source: &str, stage: Stage, label: &str) -> bool {
-    let Some(compiler) = compiler() else {
+    if compiler().is_none() {
         return true;
-    };
-    let Ok(mut options) = shaderc::CompileOptions::new() else {
-        return true;
-    };
-    options.set_target_env(
-        shaderc::TargetEnv::Vulkan,
-        shaderc::EnvVersion::Vulkan1_2 as u32,
-    );
+    }
     // The stage argument only selects a default `#define` shaderc adds
     // internally for old-style `GL_es_profile` detection, irrelevant
     // here; kept for API symmetry with `compile_stage`.
     let _ = stage;
-    match compiler.preprocess(source, label, "main", Some(&options)) {
-        Ok(artifact) => artifact.as_text().contains("_rt_"),
-        Err(_) => true,
-    }
+    let source = source.to_string();
+    let label = label.to_string();
+    let outcome = with_timeout(move || -> bool {
+        let Some(compiler) = compiler() else {
+            return true;
+        };
+        let Ok(mut options) = shaderc::CompileOptions::new() else {
+            return true;
+        };
+        options.set_target_env(
+            shaderc::TargetEnv::Vulkan,
+            shaderc::EnvVersion::Vulkan1_2 as u32,
+        );
+        match compiler.preprocess(&source, &label, "main", Some(&options)) {
+            Ok(artifact) => artifact.as_text().contains("_rt_"),
+            Err(_) => true,
+        }
+    });
+    outcome.unwrap_or(true)
 }
 
 /// Identifies one cached material pipeline: the shader base name plus its
