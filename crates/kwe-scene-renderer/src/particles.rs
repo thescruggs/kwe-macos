@@ -318,18 +318,32 @@ pub(crate) enum Initializer {
         min: f32,
         max: f32,
     },
-    /// `size = uniform(min, max)`, fed directly into `build_vertex_bytes`'s
+    /// `size = uniform(min, max) / 2`, fed into `build_vertex_bytes`'s
     /// existing `half = size * 0.5` (the SAME convention the flat model's
-    /// `size_start`/`size_end` already use — authored size is the quad's
-    /// FULL width). Upstream's own `createSizeRandomInitializer` divides
-    /// by 2 here because ITS renderer consumes `p.size` as a half-extent
-    /// directly; this renderer's single shared vertex builder already
-    /// halves once, so replicating upstream's extra `/2` would halve twice
-    /// and render authored sizes at a quarter scale — deliberately NOT
-    /// ported verbatim (documented deviation). `exponent` biases the
-    /// random draw (1 = uniform, matching `CParticle::
+    /// `size_start`/`size_end` already use). S7b (B2, re-issue of P8 with
+    /// the corrected justification): the earlier doc here claimed upstream
+    /// consumes `p.size` as a half-extent directly, so porting its extra
+    /// `/2` would halve twice — that was wrong about upstream's shader
+    /// math. Upstream (`CParticle.cpp:738`) sets
+    /// `p.size = (min + t·(max−min)) · sizeOverride / 2`, and
+    /// `common_particles.h::ComputeParticlePosition` spans
+    /// `positionAndSize.w · (uv−0.5)` with `uv` in `[0,1]`, so the quad's
+    /// FULL width equals `p.size` — i.e. upstream's `/2` makes the
+    /// authored min/max value a DIAMETER, and the initializer's output is
+    /// already half that diameter before it ever reaches the vertex
+    /// builder. Without this halving our file-based sprites rendered
+    /// exactly 2× upstream's width (authored value used as the full
+    /// width directly, then halved again by `build_vertex_bytes`, netting
+    /// a single halve instead of the two upstream applies). `exponent`
+    /// biases the random draw (1 = uniform, matching `CParticle::
     /// createSizeRandomInitializer`), clamped to a safe range at parse
     /// time so `powf` never sees 0/negative/absurdly large exponents.
+    /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    /// src/WallpaperEngine/Render/Objects/CParticle.cpp:738 @ b016d7d1
+    /// (the `common_particles.h::ComputeParticlePosition` span math cited
+    /// above is a WE asset shader, not part of that repo — it is quoted
+    /// here only to justify why upstream's `/2` makes the authored value
+    /// a diameter, not to claim it as a ported source).
     SizeRandom {
         min: f32,
         max: f32,
@@ -1291,7 +1305,9 @@ fn apply_initializer(initializer: &Initializer, particle: &mut Particle, prng: &
         }
         Initializer::SizeRandom { min, max, exponent } => {
             let t = prng.next_f32().max(0.0).powf(*exponent);
-            let value = (min + t * (max - min)).clamp(0.0, MAX_PARTICLE_SIZE);
+            // S7b (B2): halved to match upstream's `p.size = (...) / 2.0f`
+            // (`CParticle.cpp:738`) — see the variant's doc comment.
+            let value = ((min + t * (max - min)) * 0.5).clamp(0.0, MAX_PARTICLE_SIZE);
             particle.size = value;
             particle.initial_size = value;
         }
@@ -2473,10 +2489,10 @@ mod tests {
         let p = &state.particles[0];
         assert_eq!(p.life, 4.0);
         assert_eq!(
-            p.size, 40.0,
-            "sizerandom feeds build_vertex_bytes's own half=size*0.5 directly, no extra halving"
+            p.size, 20.0,
+            "sizerandom halves the authored diameter (S7b/B2, CParticle.cpp:738 p.size = (...) / 2.0f) before feeding build_vertex_bytes's own half=size*0.5"
         );
-        assert_eq!(p.initial_size, 40.0);
+        assert_eq!(p.initial_size, 20.0);
         assert_eq!(p.alpha, 0.5);
         assert_eq!(p.initial_alpha, 0.5);
         assert_eq!(p.color, [0.2, 0.4, 0.6]);
