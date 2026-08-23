@@ -129,15 +129,39 @@ pub fn default_steam_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// The Wallpaper Engine assets root, if any configured Steam root has one
-/// installed: the first `<steam root>/steamapps/common/wallpaper_engine/assets`
-/// that exists, in `steam_roots` order (S1; the default the daemon and
-/// `kwe preflight` use when `--wallpaper-engine-assets`/`--assets-dir` is
-/// not given explicitly). `None` when no root has it — model layers then
-/// resolve only against the scene's own package/directory.
+/// The Wallpaper Engine assets root, if any Steam LIBRARY has one
+/// installed: the first `<library>/steamapps/common/wallpaper_engine/assets`
+/// that exists (S1; the default the daemon and `kwe preflight` use when
+/// `--wallpaper-engine-assets`/`--assets-dir` is not given explicitly).
+/// `None` when no library has it — model layers then resolve only against
+/// the scene's own package/directory, and every effect/material shader
+/// that is not fully self-contained inside a scene's own `scene.pkg`
+/// fails to resolve (`shader_source_missing`/a spliced `#include` that
+/// silently has no content — S6).
+///
+/// S6 root cause: this used to search `steam_roots` directly (the 3-4
+/// hardcoded candidate paths from `default_steam_roots` — `$STEAM_ROOT`,
+/// `~/.local/share/Steam`, `~/.steam/steam`, `~/.steam/root`), NOT the
+/// full set of Steam LIBRARY FOLDERS those roots' `libraryfolders.vdf`
+/// manifests register — exactly the expansion `discover_libraries`
+/// already performs for `scan_installed` (which is how the catalog finds
+/// Workshop items on an external library just fine while this function,
+/// called separately, missed the assets root on that same library). A
+/// common real-world Steam layout — Wallpaper Engine and its Workshop
+/// items installed on a SEPARATE library folder (a second drive/mount)
+/// from the primary Steam root — silently produced `None` here even
+/// though `scan_installed` on the exact same roots correctly finds the
+/// library and every scene on it. Fixed by routing through
+/// `discover_libraries` the same way `scan_installed` does. Search order
+/// is now the libraries' own (sorted, deduplicated) path order rather
+/// than `steam_roots` order — immaterial for the overwhelmingly common
+/// case of one library with Wallpaper Engine installed.
 pub fn default_wallpaper_engine_assets_dir(steam_roots: &[PathBuf]) -> Option<PathBuf> {
-    steam_roots.iter().find_map(|root| {
-        let candidate = root.join("steamapps/common/wallpaper_engine/assets");
+    let (libraries, _diagnostics) = discover_libraries(steam_roots);
+    libraries.into_iter().find_map(|library| {
+        let candidate = library
+            .path
+            .join("steamapps/common/wallpaper_engine/assets");
         candidate.is_dir().then_some(candidate)
     })
 }
@@ -716,6 +740,41 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&a);
         let _ = fs::remove_dir_all(&b);
+    }
+
+    /// S6: the real-world shape that produced `shader_source_missing`/a
+    /// silently-empty `#include "common.h"` for every scene run without
+    /// an explicit `--assets-dir` — Wallpaper Engine installed on a
+    /// SEPARATE Steam library folder (a second drive/mount registered in
+    /// the primary root's `libraryfolders.vdf`), not directly under any
+    /// of `default_steam_roots`'s hardcoded candidates. Before this fix,
+    /// `default_wallpaper_engine_assets_dir` searched only the raw
+    /// `steam_roots` list and returned `None` here even though
+    /// `scan_installed`/`discover_libraries` on the exact same roots
+    /// correctly find the library and every scene on it (proven by the
+    /// installed daemon on this machine: `scan_installed` lists Workshop
+    /// scenes fine, but `default_wallpaper_engine_assets_dir` came back
+    /// `None`, so every renderer launched without `--assets-dir`).
+    #[test]
+    fn default_wallpaper_engine_assets_dir_finds_an_external_library_folder() {
+        let root = temp_fixture("assets-external-library");
+        let external = root.join("external-library");
+        fs::create_dir_all(external.join("steamapps/common/wallpaper_engine/assets")).unwrap();
+        fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            format!(
+                r#""LibraryFolders" {{ "0" {{ "path" "{}" }} }}"#,
+                external.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        // The primary root itself has no assets dir -- only the
+        // externally-registered library does.
+        assert_eq!(
+            default_wallpaper_engine_assets_dir(std::slice::from_ref(&root)),
+            Some(external.join("steamapps/common/wallpaper_engine/assets"))
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

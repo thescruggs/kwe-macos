@@ -1361,6 +1361,7 @@ fn fold_declarations(
     material_constants: &[String],
     varying_locations: &mut BTreeMap<String, u32>,
     combos: &BTreeMap<String, i64>,
+    uniform_material_keys: &BTreeMap<String, String>,
 ) -> Result<FoldedDeclarations, PreprocessError> {
     let combos_upper: BTreeMap<String, i64> = combos
         .iter()
@@ -1546,7 +1547,32 @@ fn fold_declarations(
                     out.push_str(&format!("#define {name} {expr}{newline}"));
                     continue;
                 }
-                if let Some(slot) = material_constants.iter().position(|n| n == &name)
+                // S6: `material_constants` (the caller's `constant_names`,
+                // built from `ResolvedModel::constant_shader_values`'
+                // KEYS) is keyed by the Wallpaper Engine PROPERTY name a
+                // scene/material overrides — e.g. `"speed"` — not by the
+                // uniform's own GLSL declaration name (`g_FlowSpeed`).
+                // Upstream's own shader corpus makes the two differ
+                // routinely (`uniform float g_FlowSpeed; // {"material":
+                // "speed", ...}` — the trailing JSON comment IS the
+                // mapping, already scraped into `uniform_material_keys`
+                // by `scrape` before this function runs). Matching
+                // `material_constants` against the bare GLSL name instead
+                // of this scraped key silently treated every override
+                // whose property name differs from its uniform name as
+                // absent, folding it to `zero_literal`'s generic zero/
+                // identity default and reporting it as `unsupported` even
+                // though the scene provided a real value for it — no
+                // compile failure, just the wrong (default) number. Falls
+                // back to the bare name when the uniform has no `//
+                // {"material":...}` comment (or no `"material"` key in
+                // it), matching every synthetic test/fixture that already
+                // uses the GLSL name directly as its constant name.
+                let constant_key = uniform_material_keys
+                    .get(&name)
+                    .map(String::as_str)
+                    .unwrap_or(name.as_str());
+                if let Some(slot) = material_constants.iter().position(|n| n == constant_key)
                     && slot < MAX_MATERIAL_CONSTANTS
                     && let Some(swizzle) = material_constant_swizzle(&glsl_type)
                 {
@@ -1690,8 +1716,25 @@ pub fn preprocess(
         combos.entry(name.clone()).or_insert(*value);
     }
 
-    let (folded, attributes, sampler_slots, unsupported_uniforms) =
-        fold_declarations(&required, material_constants, varying_locations, &combos)?;
+    // S6: the GLSL-name -> WE-property-name mapping `fold_declarations`
+    // needs to match `material_constants` (see its doc comment on the
+    // lookup) — every scraped uniform whose trailing `// {json}` comment
+    // has a string `"material"` field.
+    let uniform_material_keys: BTreeMap<String, String> = uniforms
+        .iter()
+        .filter_map(|uniform| {
+            let key = uniform.json.as_ref()?.get("material")?.as_str()?;
+            Some((uniform.name.clone(), key.to_string()))
+        })
+        .collect();
+
+    let (folded, attributes, sampler_slots, unsupported_uniforms) = fold_declarations(
+        &required,
+        material_constants,
+        varying_locations,
+        &combos,
+        &uniform_material_keys,
+    )?;
 
     let mut source_out = String::new();
     source_out.push_str(&format!(
@@ -2824,7 +2867,16 @@ mod tests {
     fn material_constant_folds_into_ubo_slot() {
         let mut include = no_includes();
         let mut locs = BTreeMap::new();
-        let constants = vec!["g_Roughness".to_string()];
+        // S6: `constant_names` is keyed by the WE PROPERTY name (a real
+        // caller builds it from `ResolvedModel::constant_shader_values`'
+        // keys, i.e. a scene.json `constantshadervalues` object's own
+        // keys — `"roughness"`, never `"g_Roughness"`) — see
+        // `material_constant_with_a_different_glsl_name_still_folds`
+        // below for the shape that exposed the bug this comment used to
+        // mask (this test's `constants` list used to say `g_Roughness`,
+        // matching the shader's own GLSL name by coincidence, so it never
+        // exercised the real GLSL-name-vs-property-name distinction).
+        let constants = vec!["roughness".to_string()];
         let out = preprocess(
             Stage::Fragment,
             "t.frag",
@@ -2838,6 +2890,74 @@ mod tests {
         assert!(
             out.source
                 .contains("#define g_Roughness u_Std.g_MaterialConstants_[0].x")
+        );
+        assert!(out.unsupported_uniforms.is_empty());
+    }
+
+    /// S6 regression: a real Workshop shader's declared GLSL uniform name
+    /// routinely differs from its `"material"` (WE property) name —
+    /// `shaders/effects/waterflow.frag` (Workshop 1725674512 "Aurora
+    /// Borealis") declares `uniform float g_FlowSpeed; // {"material":
+    /// "speed", ...}`, and the scene overrides it via
+    /// `constantshadervalues: {"speed": 0.16}`. Matching
+    /// `material_constants` against the bare GLSL name (`g_FlowSpeed`)
+    /// instead of the scraped `"material"` key (`speed`) silently missed
+    /// EVERY such override — no compile failure, the uniform just folded
+    /// to its generic zero/identity default and was reported
+    /// `unsupported` even though the scene supplied a real value.
+    #[test]
+    fn material_constant_with_a_different_glsl_name_still_folds() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let constants = vec!["speed".to_string()];
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform float g_FlowSpeed; // {\"material\":\"speed\",\"default\":1,\"range\":[0.01,1]}\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &constants,
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("#define g_FlowSpeed u_Std.g_MaterialConstants_[0].x"),
+            "source={}",
+            out.source
+        );
+        assert!(
+            out.unsupported_uniforms.is_empty(),
+            "g_FlowSpeed must not be reported unsupported when the scene overrides its \
+             \"speed\" material key: {:?}",
+            out.unsupported_uniforms
+        );
+    }
+
+    /// The fallback half of the same fix: a uniform with NO `"material"`
+    /// metadata key (or no trailing comment at all) must still match
+    /// `material_constants` by its bare GLSL name — every existing
+    /// synthetic fixture in this module relies on that, and it is also
+    /// upstream's real behavior for a `constantshadervalues` override
+    /// keyed directly by a uniform's GLSL name.
+    #[test]
+    fn material_constant_without_a_material_key_falls_back_to_the_glsl_name() {
+        let mut include = no_includes();
+        let mut locs = BTreeMap::new();
+        let constants = vec!["g_PlainConstant".to_string()];
+        let out = preprocess(
+            Stage::Fragment,
+            "t.frag",
+            "uniform float g_PlainConstant;\nvoid main(){}\n",
+            &BTreeMap::new(),
+            &constants,
+            &mut locs,
+            &mut include,
+        )
+        .unwrap();
+        assert!(
+            out.source
+                .contains("#define g_PlainConstant u_Std.g_MaterialConstants_[0].x")
         );
         assert!(out.unsupported_uniforms.is_empty());
     }
