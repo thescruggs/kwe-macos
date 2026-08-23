@@ -514,6 +514,14 @@ pub struct LayerRenderer {
     /// `UNIT_QUAD`'s uv convention exactly.
     material_vertex_buffer: vk::Buffer,
     material_vertex_buffer_memory: vk::DeviceMemory,
+    /// C1: the effect-pass vertex buffer, uploaded from `EFFECT_UNIT_QUAD`
+    /// (`[-1,1]` corners, not `[-0.5,0.5]`) — bound by
+    /// `render_effect_pass_binding` instead of `material_vertex_buffer` so
+    /// an effect pass's own `gl_Position = vec4(a_Position, 1.0)`-style
+    /// vertex shader (no MVP applied) lands the same fullscreen quad
+    /// upstream draws. See `EFFECT_UNIT_QUAD`'s doc comment.
+    effect_vertex_buffer: vk::Buffer,
+    effect_vertex_buffer_memory: vk::DeviceMemory,
     /// 1x1 transparent-black image bound to every material texture slot a
     /// layer's material does not fill — Vulkan requires every descriptor
     /// a pipeline's shader statically references to be valid, and a
@@ -1192,6 +1200,37 @@ impl LayerRenderer {
             device.unmap_memory(material_vertex_buffer_memory);
         }
 
+        // C1: the effect-pass counterpart of the buffer just above — same
+        // size/stride/upload pattern, sourced from `EFFECT_UNIT_QUAD`
+        // instead of `MATERIAL_UNIT_QUAD`.
+        let effect_vertex_bytes =
+            (EFFECT_UNIT_QUAD.len() * std::mem::size_of::<f32>()) as vk::DeviceSize;
+        let effect_vertex_info = vk::BufferCreateInfo::default()
+            .size(effect_vertex_bytes)
+            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let effect_vertex_buffer = unsafe { device.create_buffer(&effect_vertex_info, None) }?;
+        let effect_vertex_requirements =
+            unsafe { device.get_buffer_memory_requirements(effect_vertex_buffer) };
+        let effect_vertex_buffer_memory =
+            allocate_host_visible(&instance, &device, physical, &effect_vertex_requirements)?;
+        unsafe { device.bind_buffer_memory(effect_vertex_buffer, effect_vertex_buffer_memory, 0) }?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                EFFECT_UNIT_QUAD.as_ptr(),
+                device
+                    .map_memory(
+                        effect_vertex_buffer_memory,
+                        0,
+                        effect_vertex_bytes,
+                        vk::MemoryMapFlags::empty(),
+                    )?
+                    .cast::<f32>(),
+                EFFECT_UNIT_QUAD.len(),
+            );
+            device.unmap_memory(effect_vertex_buffer_memory);
+        }
+
         let dummy_texture = upload_image_now(
             &instance,
             &device,
@@ -1261,6 +1300,8 @@ impl LayerRenderer {
             material_pipelines: HashMap::new(),
             material_vertex_buffer,
             material_vertex_buffer_memory,
+            effect_vertex_buffer,
+            effect_vertex_buffer_memory,
             dummy_texture,
             material_bindings: Vec::new(),
             material_frame_counter: 0,
@@ -2843,7 +2884,12 @@ impl LayerRenderer {
                 }
             };
 
-        uniforms.mvp = build_orthographic_mvp([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 1.0, 1.0);
+        // C1: paired with `EFFECT_UNIT_QUAD` (±1 corners) — `world_width =
+        // world_height = 2.0` gives `sx = sy = 1`, so the identity-scaled
+        // MVP path lands the SAME ±1 fullscreen quad a direct-`gl_Position`
+        // vertex shader lands by skipping the MVP entirely. See
+        // `EFFECT_UNIT_QUAD`'s doc comment (CImage.cpp:349-352,396).
+        uniforms.mvp = build_orthographic_mvp([[1.0, 0.0], [0.0, 1.0]], [0.0, 0.0], 2.0, 2.0);
         let ubo_info = vk::BufferCreateInfo::default()
             .size(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)
             .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -3030,10 +3076,12 @@ impl LayerRenderer {
                 std::slice::from_ref(&descriptor_set),
                 &[],
             );
+            // C1: the effect-pass buffer (±1 corners), not the material
+            // one (±0.5) — see `EFFECT_UNIT_QUAD`'s doc comment.
             self.device.cmd_bind_vertex_buffers(
                 self.command_buffer,
                 0,
-                std::slice::from_ref(&self.material_vertex_buffer),
+                std::slice::from_ref(&self.effect_vertex_buffer),
                 &[0],
             );
             self.device.cmd_draw(self.command_buffer, 6, 1, 0, 0);
@@ -4132,6 +4180,9 @@ impl Drop for LayerRenderer {
                 .destroy_buffer(self.material_vertex_buffer, None);
             self.device
                 .free_memory(self.material_vertex_buffer_memory, None);
+            self.device.destroy_buffer(self.effect_vertex_buffer, None);
+            self.device
+                .free_memory(self.effect_vertex_buffer_memory, None);
             self.device
                 .destroy_image_view(self.dummy_texture.view, None);
             self.device.destroy_image(self.dummy_texture.image, None);
@@ -4993,6 +5044,40 @@ const MATERIAL_UNIT_QUAD: [f32; 120] = [
     -0.5, 0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -0.5, 0.5, 0.0, 1.0, 0.0, 1.0,
     0.0, 1.0, //
     -0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -0.5, -0.5, 0.0, 1.0, 0.0, 0.0,
+    0.0, 1.0,
+];
+
+/// C1: the effect-pass counterpart of `MATERIAL_UNIT_QUAD` — identical
+/// attribute layout/stride/corner-uv association, but `a_Position`/
+/// `a_PositionVec4` cover `[-1,1]` instead of `[-0.5,0.5]`.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/CImage.cpp:349-352,396 @ b016d7d1 — upstream's
+/// effect passes draw `passSpacePosition = (±1, ±1)` with
+/// `m_viewProjectionMatrix = mat4(1.0)`, so a pass vertex shader may EITHER
+/// apply `g_ModelViewProjectionMatrix` (identity there) OR write
+/// `gl_Position = vec4(a_Position, 1.0)` directly (the `PRECISE`/gaussian
+/// pattern) and land on the same fullscreen quad either way. Drawing effect
+/// passes with `MATERIAL_UNIT_QUAD` (±0.5) breaks that parity: the MVP path
+/// still lands ±1 (`compile_effect_pass`'s fixed MVP scales ×2), but a
+/// direct-`gl_Position` shader lands only ±0.5 — the centre quarter of its
+/// target FBO — leaving the rest transparent black. `EFFECT_UNIT_QUAD` plus
+/// a matching identity-scale MVP (`build_orthographic_mvp(identity, [0,0],
+/// 2.0, 2.0)`, giving `sx=sy=1`) makes both paths land ±1 like upstream.
+/// Regular material draws in the frame pass are unaffected — they keep
+/// `MATERIAL_UNIT_QUAD` and their existing per-layer MVP math.
+const EFFECT_UNIT_QUAD: [f32; 120] = [
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 1.0, 0.0, 0.0,
+    0.0, 1.0, //
+    1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.0,
+    0.0, 1.0, //
+    1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+    1.0, //
+    1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0,
+    1.0, //
+    -1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+    0.0, 1.0, //
+    -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 1.0, 0.0, 0.0,
     0.0, 1.0,
 ];
 
@@ -5930,6 +6015,194 @@ mod tests {
         // B8G8R8A8 readback of opaque red: B=0, G=0, R=255, A=255.
         for pixel in pixels.chunks_exact(4) {
             assert_eq!(pixel, &[0, 0, 255, 255]);
+        }
+    }
+
+    /// C1 regression: an effect pass whose vertex shader writes
+    /// `gl_Position = vec4(a_Position, 1.0)` directly (the upstream
+    /// `PRECISE`/gaussian pattern — no `g_ModelViewProjectionMatrix`
+    /// applied at all) must still fill the WHOLE target FBO, corners
+    /// included. Before `EFFECT_UNIT_QUAD`, the pass drew
+    /// `MATERIAL_UNIT_QUAD` (±0.5 corners) with no MVP to expand it, so
+    /// only the CENTRE quarter of the target got written and every corner
+    /// stayed the clear colour (transparent black) — this is the Avatar
+    /// bokeh chain's banded/streaked `gaussian_precise_*` failure mode.
+    /// Same end-to-end shape as `effect_chain_renders_through_an_
+    /// intermediate_fbo` above, but (a) the pass vertex shader skips the
+    /// MVP and (b) the canvas is sized equal to the target FBO so a
+    /// fullscreen sampling draw reads back 1:1 texel-for-pixel, letting
+    /// the test check an exact CORNER pixel rather than every pixel.
+    #[test]
+    fn effect_pass_direct_gl_position_fills_the_whole_target_corners_included() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "effect_pass_direct_gl_position_fills_the_whole_target_corners_included: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let (w, h) = (8u32, 8u32);
+        let mut renderer = LayerRenderer::new(Some(&binding), w, h).expect("create renderer");
+
+        // No `g_ModelViewProjectionMatrix` applied — matches upstream's
+        // `PRECISE`/gaussian effect vertex shaders, which rely on the
+        // fixed ±1 `passSpacePosition` alone.
+        let direct_vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = vec4(a_Position, 1.0);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let mvp_vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let solid_fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);\n}\n";
+        let sample_fragment_source = "uniform sampler2D g_Texture0;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = texSample2D(g_Texture0, v_TexCoord);\n}\n";
+
+        let compile = |source_vert: &str, source_frag: &str, label: &str| {
+            let mut locations = std::collections::BTreeMap::new();
+            let mut include: Box<crate::shaderpre::IncludeLookup<'static>> =
+                Box::new(|_: &str| None);
+            let vertex_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Vertex,
+                &format!("{label}.vert"),
+                source_vert,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("vertex preprocesses");
+            let fragment_pre = crate::shaderpre::preprocess(
+                crate::shaderpre::Stage::Fragment,
+                &format!("{label}.frag"),
+                source_frag,
+                &std::collections::BTreeMap::new(),
+                &[],
+                &mut locations,
+                &mut include,
+            )
+            .expect("fragment preprocesses");
+            let vertex_spirv = crate::materialshader::compile_stage(
+                &vertex_pre.source,
+                crate::materialshader::Stage::Vertex,
+                &format!("{label}.vert"),
+            )
+            .expect("vertex compiles");
+            let fragment_spirv = crate::materialshader::compile_stage(
+                &fragment_pre.source,
+                crate::materialshader::Stage::Fragment,
+                &format!("{label}.frag"),
+            )
+            .expect("fragment compiles");
+            (vertex_spirv, fragment_spirv)
+        };
+        let standard_attributes = vec![
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec3".into(),
+                name: "a_Position".into(),
+                location: 0,
+            },
+            crate::shaderpre::AttributeDecl {
+                glsl_type: "vec2".into(),
+                name: "a_TexCoord".into(),
+                location: 1,
+            },
+        ];
+
+        // 1. Create the target FBO and compile+bind a pass whose vertex
+        //    shader writes gl_Position directly (no MVP) — the exact
+        //    upstream pattern C1 makes land the full ±1 quad.
+        renderer
+            .prepare_effect_targets(&[EffectTargetRequest {
+                name: "_rt_TestTarget".to_string(),
+                width: w,
+                height: h,
+            }])
+            .expect("prepare effect targets");
+        let (direct_vertex, solid_fragment) =
+            compile(direct_vertex_source, solid_fragment_source, "direct");
+        let binding_index = renderer
+            .compile_effect_pass(
+                &direct_vertex,
+                &solid_fragment,
+                BlendMode::Normal,
+                "_rt_TestTarget",
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+                &standard_attributes,
+            )
+            .expect("compile effect pass");
+        assert!(
+            renderer.queue_effect_render(binding_index),
+            "well under MAX_EFFECT_FRAME_ACTIONS"
+        );
+        renderer
+            .render_effect_chains()
+            .expect("render effect chains");
+
+        // 2. Sample "_rt_TestTarget" with an ordinary MVP-driven material
+        //    draw covering the whole (target-sized) canvas, so the
+        //    readback is 1:1 texel-for-pixel with the target FBO.
+        let (sample_vertex, sample_fragment) =
+            compile(mvp_vertex_source, sample_fragment_source, "sample");
+        let key = MaterialKey::compute(
+            "sample",
+            &std::collections::BTreeMap::new(),
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &sample_vertex,
+                &sample_fragment,
+                BlendMode::Normal,
+                &standard_attributes,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[
+                    Some(MaterialTextureBind::RenderTarget(
+                        "_rt_TestTarget".to_string(),
+                    )),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[w as f32, 0.0], [0.0, h as f32]],
+            t: [0.0, 0.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        let pixels = renderer
+            .render([0.0, 0.0, 0.0, 0.0], &draws, &[])
+            .expect("render once");
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        let stride = (w * 4) as usize;
+        let opaque_red = [0u8, 0, 255, 255]; // BGRA8 readback of opaque red.
+        let corners = [
+            (0usize, 0usize),
+            ((w - 1) as usize, 0usize),
+            (0usize, (h - 1) as usize),
+            ((w - 1) as usize, (h - 1) as usize),
+        ];
+        for (x, y) in corners {
+            let offset = y * stride + x * 4;
+            let pixel = &pixels[offset..offset + 4];
+            assert_eq!(
+                pixel, &opaque_red,
+                "corner ({x},{y}) must be opaque red — pre-C1 the direct-gl_Position \
+                 pass only filled the target's centre quarter"
+            );
         }
     }
 
