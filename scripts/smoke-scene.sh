@@ -3522,4 +3522,137 @@ grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s3_standalone_log
 stop_standalone "$s3_standalone_pid" "$s3_standalone_log" "standalone S3 effects renderer"
 echo "scene smoke passed (S3): pkg model layer with a resolved effect chain -> a targeted pass renders a deterministic colour into an FBO, a second (untargeted) pass samples it and becomes the layer's own material draw"
 
+# S4: a model layer whose material shader declares FOUR attributes —
+# `a_Position`, `a_TexCoord`, `a_Normal`, `a_Color` — the
+# `genericimage3`/`genericimage4`-family image-object shape S4 newly
+# supports (S1/S2/S3 only ever fed `a_Position`+`a_TexCoord` through the
+# widened `MATERIAL_UNIT_QUAD` buffer; `a_Normal` is always `+Z` and
+# `a_Color` is always opaque white on this flat quad — see
+# `docs/SCENE_FORMAT_V1.md`). The fragment shader multiplies `a_Color`
+# by `a_Normal` (`v_Color * vec4(v_Normal, 1.0)`), so a correct draw is
+# pure opaque blue ((1,1,1,1) * (0,0,1,1) = (0,0,1,1)); any misrouted
+# attribute (wrong offset, wrong format, an unmodified S1 base-texture
+# fallback) would draw the base texture's red instead.
+s4_assets_dir="$smoke_root/s4-assets"
+mkdir -p "$s4_assets_dir/shaders"
+cat >"$s4_assets_dir/shaders/smoketest4.vert" <<'VERT'
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+attribute vec3 a_Normal;
+attribute vec4 a_Color;
+uniform mat4 g_ModelViewProjectionMatrix;
+varying vec4 v_Color;
+varying vec3 v_Normal;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_Color = a_Color;
+	v_Normal = a_Normal;
+}
+VERT
+cat >"$s4_assets_dir/shaders/smoketest4.frag" <<'FRAG'
+varying vec4 v_Color;
+varying vec3 v_Normal;
+void main() {
+	gl_FragColor = v_Color * vec4(v_Normal, 1.0);
+}
+FRAG
+
+s4_material_pkg="$smoke_root/s4-material.pkg"
+python3 - "$s4_material_pkg" <<'S4PY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))  # uncompressedSize
+    out += struct.pack("<i", len(pixels))  # compressedSize
+    out += pixels
+    return bytes(out)
+
+
+# The texture colour (255, 0, 0, 255) is deliberately NOT the shader's
+# output colour, same reasoning as the S2 case above: the oracle only
+# matches the shader's real a_Color/a_Normal-derived blue, so a
+# regression that quietly fell back to the S1 base-texture quad (or that
+# fed a_Normal/a_Color garbage instead of the documented (0,0,1)/(1,1,1,1)
+# constants) would sample red or something other than pure blue, and the
+# oracle would catch it.
+scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "solid", "image": "models/solid.json",'
+    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+)
+model_json = b'{"material": "materials/solid.json"}'
+material_json = b'{"passes": [{"shader": "smoketest4", "textures": ["solid"]}]}'
+texture = texv_argb8888(4, 4, (255, 0, 0, 255))
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/solid.json", model_json),
+            ("materials/solid.json", material_json),
+            ("materials/solid.tex", texture),
+        ]
+    )
+)
+S4PY
+
+s4_standalone_log="$smoke_root/standalone-s4-material.log"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-s4-material.bin" --width 160 --height 90 --fps 30 \
+    --content "$s4_material_pkg" --assets-dir "$s4_assets_dir" --device llvmpipe \
+    >"$s4_standalone_log" 2>&1 &
+s4_standalone_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$smoke_root/standalone-s4-material.bin" ]] && head -c 8 "$smoke_root/standalone-s4-material.bin" | grep -q KWEFRM1 && break
+    kill -0 "$s4_standalone_pid" 2>/dev/null || {
+        echo "standalone S4 material renderer exited early" >&2
+        sed -n '1,120p' "$s4_standalone_log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$smoke_root/standalone-s4-material.bin" | grep -q KWEFRM1
+# B8G8R8A8 memory order, opaque pure blue: B=255, G=0, R=0, A=255.
+scene_pixel_wait "$smoke_root/standalone-s4-material.bin" 80 45 "255,0,0,255" 1 "$s4_standalone_log"
+grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s4_standalone_log"
+stop_standalone "$s4_standalone_pid" "$s4_standalone_log" "standalone S4 material renderer"
+echo "scene smoke passed (S4): pkg model layer with a_Normal/a_Color-declaring material shader -> compiles through the widened vertex-attribute pipeline and draws its real colour, not the S1 base texture"
+
 echo "all scene smoke cases passed"
