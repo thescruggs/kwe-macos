@@ -682,6 +682,107 @@ a degraded layer (skip-never-reject, like every other texture path) with
 a bounded one-time diagnostic:
 `event=renderer.scene.model_texture_skip count=N`.
 
+## Material shaders (S2)
+
+**Implemented (S2)**, replacing S1's "custom material shaders... are out
+of scope" note: a model/image layer whose material pass shader
+preprocesses, compiles, and binds draws through that MATERIAL PASS
+SHADER — the WE look (tint/alpha/uv transforms, per-material combos, up
+to 8 texture slots) — instead of S1's flat base-texture quad. Any
+failure at any step falls back honestly to the S1 quad; a layer never
+stops drawing because its material shader could not be used.
+
+**Scope**: image/model layers only, quad geometry only (mesh/puppet
+attribute layouts — bone weights, tangents, per-vertex color — are S1's
+existing quad-only scope, unchanged). Effect passes, FBO render-target
+chains (`_rt_*` textures), and lighting objects are **out of scope**
+(S3) — a material whose live (post-`#if`) shader text still references a
+render target keeps the S1 quad path.
+
+**Preprocessor** (`crates/kwe-scene-renderer/src/shaderpre.rs`, adapted
+from `ShaderUnit::preprocess`/`compile`, GPL-3.0-or-later — see
+THIRD_PARTY.yml): `#include` resolution against
+`<assets>/shaders/<name>.{vert,frag,h}`, with the `workshop/<id>/<file>`
+→ `zcompat/scene/shaders/<id>/<file>` compat redirect
+(`AssetLocator::shader`); the verbatim HLSL-compat header shim
+(`mul`/`lerp`/`frac`/`float2`/`saturate`/`texSample2D`/... macros) plus
+two Vulkan-only `#extension` pragmas upstream never needs (it targets
+OpenGL 330 via a SPIRV-Cross round trip, not Vulkan SPIR-V directly);
+`#require LightingV1` resolves to a stub (lighting objects are not
+implemented — always zero contribution); `// [COMBO] {json}` combo
+scraping and `uniform TYPE name; // {json}` parameter-metadata scraping;
+combos as `#define NAME value` (a material's own `combos` map always
+overrides a shader's scraped default). Bounded: include depth ≤ 8, total
+preprocessed text ≤ 1 MiB, includes confined to the assets root
+(`kwe_core::confined_read` — no traversal/symlink escape).
+
+A second, Vulkan-specific pass (`fold_declarations`, no upstream
+equivalent) rewrites every recognized `attribute`/`varying`/non-sampler-
+`uniform` declaration into what Vulkan GLSL requires: explicit
+`layout(location=)` on stage-interface variables (shared between the
+vertex and fragment stages of one material so the two link correctly)
+and `layout(set=0, binding=N)` on each `uniform sampler2D g_Texture<N>`.
+Non-sampler uniforms fold into one fixed `MaterialUniforms` UBO
+(`set=0, binding=8`) via `#define`: the WE standard set
+(`g_ModelViewProjectionMatrix`, `g_Time`, `g_Texture<N>Resolution` —
+doubling as texel size in `.zw` — `g_UserAlpha`, `g_Brightness`,
+`g_Color`, `g_ParallaxPosition`, `g_Point0..7`, `g_PointerPosition`,
+`g_TexelSize`, `g_EffectTextureProjectionMatrix`) plus up to 16 of the
+material's own `constantshadervalues`, by name. Any other uniform gets a
+local zero-valued declaration and a one-time diagnostic
+(`event=renderer.scene.shader_unsupported_uniform`) — the shader still
+compiles, that one value is just inert. This module's scraping is
+textual, not conditional-compilation-aware (`#if`/`#ifdef` evaluation
+happens later, inside `shaderc`'s real GLSL preprocessor); a shader whose
+combo-gated declarations (e.g. `genericimage2.vert`'s
+`SKINNING`-guarded bone attributes) never actually reach the compiled
+SPIR-V under default combos is still accepted — the vertex-format check
+only requires the first two declared attributes to match, and a pipeline
+whose ACTUAL compiled shader interface does not match
+`MATERIAL_UNIT_QUAD` (`a_Position` vec3 + `a_TexCoord` vec2) fails
+pipeline creation cleanly (one more fallback reason), never a crash. The
+`_rt_` render-target check similarly asks `shaderc`'s own preprocessor
+for the LIVE (post-`#if`) text before deciding — the textual scrape alone
+would flag `genericimage2` (the corpus's most common material shader)
+100% of the time, since its `_rt_`-tagged texture default sits behind a
+combo that is off unless a material explicitly turns it on.
+
+**Compilation** (`crates/kwe-scene-renderer/src/materialshader.rs`): the
+`shaderc` crate against the SYSTEM `libshaderc` (default features — no
+vendored glslang/spirv-tools build; `packaging/PKGBUILD` adds `shaderc`
+as a dependency), target `Vulkan1_2`. Bounded: preprocessed text ≤
+256 KiB, ≤ 64 distinct pipelines per scene (a scene with more distinct
+materials keeps the S1 quad for the overflow); a `shaderc` failure comes
+back as a value (`CompileError::Failed`), never a panic.
+
+**Vulkan** (`crates/kwe-scene-renderer/src/vulkan.rs`): one compiled
+`vk::Pipeline` per distinct `(shader, resolved combos, blend variant)`
+key, cached and shared across every layer using the same material. A
+material's descriptor set always declares 8 combined-image-samplers (an
+unfilled slot samples a shared 1x1 transparent dummy texture — Vulkan
+requires every statically-referenced descriptor to be valid) plus the
+`MaterialUniforms` UBO. `g_ModelViewProjectionMatrix` is built directly
+from the same 2D affine transform (`R(θ)·S(scale)·diag(size)`, world
+units → NDC against `world_width`/`world_height`) the S1 push-constant
+quad path already applies — a material draw and an S1 quad draw of the
+same untinted, unbrightened layer land on IDENTICAL pixels (bit-exact:
+`color.rgb *= g_Brightness` with the default 1.0 is an IEEE-754 no-op).
+`g_Time` is a monotonic frame counter over an assumed 60 fps (not real
+elapsed time — a documented simplification); `g_ParallaxPosition`/
+`g_PointerPosition`/`g_Point0..7` default to zero (not wired to live
+input this slice). `blending` maps onto the existing blend-attachment
+table: `additive` → Add, everything else (`normal`, `translucent`,
+unknown) → the same alpha-blended src-over every other layer uses.
+
+**Diagnostics**: `event=renderer.scene.shader_fallback reason=... count=N`
+once per distinct reason after load (`no_shader_name`,
+`shader_source_missing`, `preprocess_failed`, `unsupported_vertex_format`,
+`render_target_reference`, `pipeline_cap`, `compile_failed`,
+`pipeline_creation_failed`, `bind_failed`), then
+`event=renderer.scene.shaders compiled=N fallback=M` once. A material
+that falls back stays covered by S1's `texture_ok`/base-texture path —
+this step only ever ADDS a material draw on top, never removes one.
+
 ## scene.pkg
 
 **Implemented (M3b)** in `kwe-core` (`crates/kwe-core/src/pkg.rs`) and wired

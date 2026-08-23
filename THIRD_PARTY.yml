@@ -163,9 +163,29 @@ entries:
       shapes) -> crates/kwe-core/src/scenemodel.rs;
       src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::texture's
       "materials/<name>.tex" naming rule) -> crates/kwe-core/src/scenemodel.rs.
+      S2 (material shaders) adapted files, each carrying a Borrowed-From
+      comment at the adapted function:
+      src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp (SHADER_HEADER/
+      FRAGMENT_SHADER_DEFINES/VERTEX_SHADER_DEFINES HLSL-compat macro block,
+      #include resolution and gl_FragColor rewrite, #require LightingV1
+      stub, // [COMBO] and commented-uniform metadata scraping) ->
+      crates/kwe-scene-renderer/src/shaderpre.rs (adapted: recursive bounded
+      #include resolution replaces the two-pass one-level scheme; two
+      Vulkan-only #extension pragmas and the fold_declarations pass —
+      layout(location=)/layout(binding=)/MaterialUniforms UBO folding —
+      have no upstream equivalent, since upstream targets OpenGL 330 via a
+      SPIRV-Cross round trip rather than compiling straight to Vulkan
+      SPIR-V);
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::shader's
+      workshop/<id>/<file> -> zcompat/scene/shaders/<id>/<file> compat
+      redirect) -> crates/kwe-scene-renderer/src/main.rs
+      (resolve_shader_reference).
       Verified cross-checked against real Workshop payloads under
-      /media/crushinator/steamapps/workshop/content/431960/*/ (never
-      committed as fixtures; synthetic buffers only in tests).
+      /media/crushinator/steamapps/workshop/content/431960/*/ and the real
+      Wallpaper Engine asset shaders under
+      /media/crushinator/steamapps/common/wallpaper_engine/assets/shaders
+      (never committed as fixtures; synthetic buffers/shader text only in
+      tests).
 
   - id: rust-texture2ddecoder
     project: texture2ddecoder
@@ -182,6 +202,28 @@ entries:
       u32::from_le_bytes([b, g, r, a]) (BGRA in-memory byte order); texv.rs
       swaps R/B per pixel to produce this project's straight RGBA8
       convention before handing pixels to the compositor.
+
+  - id: rust-shaderc
+    project: shaderc (Rust bindings)
+    url: https://crates.io/crates/shaderc
+    revision: 0.10.1
+    license_observed: Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: >
+      GLSL -> SPIR-V compilation for the S2 material-shader pipeline
+      (crates/kwe-scene-renderer/src/materialshader.rs). Built with DEFAULT
+      crate features only (no "build-from-source") so the crate's build
+      script links the SYSTEM libshaderc dynamically via pkg-config
+      (verified against /usr/lib/pkgconfig/shaderc.pc and
+      /usr/lib/libshaderc_shared.so.1 on the development machine) rather
+      than vendoring/building glslang+spirv-tools from source. The system
+      libshaderc itself (Apache-2.0, upstream
+      https://github.com/google/shaderc, packaged as `shaderc` on Arch —
+      the same package provides both the runtime .so and the pkg-config
+      .pc/headers used at build time) is a separate, unbundled runtime
+      dependency; packaging/PKGBUILD adds it under `depends`. Used only by
+      the separate-process kwe-scene-renderer worker, never in plasmashell.
 
   - id: pipewire-tools
     project: PipeWire tools (pw-record, pw-dump)
