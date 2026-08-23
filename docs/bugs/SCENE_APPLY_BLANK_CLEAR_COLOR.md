@@ -200,3 +200,30 @@ all-zero slot.
   fix if it ever shows up.
 - This does not shrink when M3h lands — it shrinks the SET of scenes that
   trip it. The honesty ladder is the durable part.
+
+## S1 follow-up (2026-08-22): the set shrank
+
+The "does not shrink" line above predicted the fix would be a slice that
+implements the missing feature, not a smaller refusal set — that slice
+landed. S1 (TEXV texture decoder + model/material resolution,
+`crates/kwe-scene-renderer/src/texv.rs` + `crates/kwe-core/src/scenemodel.rs`,
+adapted from `Almamu/linux-wallpaperengine` now that the project is
+GPL-3.0-or-later) turns a model layer into a real drawable — a textured
+quad using the model's material's first texture — when its texture
+resolves through the pkg/scene-dir/Wallpaper-Engine-assets lookup chain.
+On the same local corpus, with `--assets-dir` pointed at the machine's
+Wallpaper Engine assets install, the reported "Aurora Borealis"
+(1725674512) and 58 other scenes now apply; **59 of 60 are accepted**
+(up from 14 of 60). The one still-refused scene (1652229298) is honest,
+not a gap this fix missed: its model layer references
+`materials/_rt_FullFrameBuffer.tex` — a runtime render-target name, not a
+static asset — because it is a full-screen post-process/copybackground
+effect layer, which is out of scope until the effects/shader slice lands.
+The refusal reason text also changed to be honest about what's actually
+missing now: "N model layer(s) whose material textures could not be
+resolved (missing Wallpaper Engine assets?)" replaces the old blanket
+"need scene3d" — a model with no assets root configured still refuses
+correctly, now for the right stated reason. See
+docs/FEATURE_COMPATIBILITY.md `content.scene2d`/`content.scene3d` and
+docs/SCENE_FORMAT_V1.md for the full S1 scope (still no mesh, shaders, or
+effects — a model draws as a flat quad).

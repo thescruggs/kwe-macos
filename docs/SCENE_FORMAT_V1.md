@@ -10,17 +10,29 @@ format is the foundation slice of the original SceneScript engine per ADR
 
 ## Provenance
 
-This is an original implementation. The scene format and script API are
-inspired by the behavior of open-wallpaper-engine and linux-wallpaperengine
-(and through them, the original wallpaper engine scene format), which are
-consulted **as behavior references only** — for the shape of `scene.json`
-and the script entry points `init` / `update` / `resized`. No code is
-copied from either project or from wallpaper engine itself: the schema
-parser, the QuickJS engine wrapper, and the Vulkan compositor are written
-for this crate (SPDX Apache-2.0 headers). The GPL-licensed reference
-projects contribute no code to this repository (see THIRD_PARTY.yml for the
-actual third-party components: rquickjs 0.12.2 + vendored quickjs-ng, both
-MIT).
+The scene.json parser, the QuickJS engine wrapper, and the Vulkan
+compositor are an original implementation: the scene format and script API
+are inspired by the behavior of open-wallpaper-engine and
+linux-wallpaperengine (and through them, the original wallpaper engine
+scene format), consulted **as behavior references only** — for the shape
+of `scene.json` and the script entry points `init` / `update` / `resized`
+— through M3g.
+
+**S1 changes this for the TEXV texture container and model/material
+resolution specifically.** The project relicensed to GPL-3.0-or-later
+(2026-08-22, docs/PROVENANCE.md) to permit adapting GPL-3.0 code from
+`Almamu/linux-wallpaperengine`, and the TEXV decoder
+(`crates/kwe-scene-renderer/src/texv.rs`) and model/material resolver
+(`crates/kwe-core/src/scenemodel.rs`) do exactly that: they are adapted
+from that project's `TextureParser.cpp`/`Texture.h`,
+`ModelParser.cpp`/`MaterialParser.cpp`/`Material.h`, and
+`AssetLocator.cpp`, each function carrying a `Borrowed-From:` comment with
+the upstream path, line range, and commit (`b016d7d1`) per
+docs/PROVENANCE.md. See THIRD_PARTY.yml for the linked upstream commit,
+the license review, and the `texture2ddecoder` crate this decode also
+depends on. Every other section of this document (scene.json, image
+layers, blend modes, text, particles, scene.pkg, script API) remains the
+original implementation described above.
 
 ## scene.json
 
@@ -556,6 +568,120 @@ textures are RGBA8, uploaded as R8G8B8A8_UNORM (identity channel order —
 the M3a readback lesson) with a shared linear clamp-to-edge sampler and a
 per-layer descriptor set (pool capped at 256 sets).
 
+## TEXV texture container (S1)
+
+**Implemented (S1)** in `crates/kwe-scene-renderer/src/texv.rs`. Wallpaper
+Engine ships raw textures (`.tex` files, always referenced under
+`materials/`) in a container format distinct from PNG/JPEG: the TEXV
+container. This decoder is adapted from linux-wallpaperengine's
+`TextureParser.cpp`/`Texture.h` (GPL-3.0-or-later, see
+docs/PROVENANCE.md and THIRD_PARTY.yml) and verified byte-for-byte against
+real Workshop `.tex` payloads.
+
+**Layout** (`TEXV0005` + `TEXI0001` header, then a `TEXB000{1..4}`
+sub-container):
+
+- Header: format enum, flags (`NoInterpolation`, `ClampUVs`, `IsGif`, ...),
+  in-memory (power-of-2) width/height, and the "real" (unpadded) width/
+  height.
+- Format enum: `ARGB8888`, `RGB888`, `RGB565`, `DXT5`, `DXT3`, `DXT1`,
+  `RG88`, `R8`, `RG1616f`, `R16f`, `BC7`, `RGBa1010102`, `RGBA16161616f`,
+  `RGB161616f`. This decoder implements pixel decode for `ARGB8888`, `R8`,
+  `RG88` (raw/expanded), `DXT1`/`DXT3`/`DXT5`/`BC7` (CPU block decode via
+  the `texture2ddecoder` crate, MIT/Apache-2.0 — see THIRD_PARTY.yml); the
+  others parse structurally but return an error on decode (not implemented,
+  not a panic).
+- **FIF-tagged payloads** (`TEXB0003`/`TEXB0004` with a `freeImageFormat`
+  other than `FIF_UNKNOWN`, e.g. `FIF_PNG`, `FIF_JPEG`): the mip-0 payload
+  is itself an encoded image file, decoded through the existing
+  `textures::decode_texture` (the `image` crate) rather than the raw/BC
+  path — no new decode logic needed for these, only the container
+  envelope.
+- Mipmap chain: per-image, per-mip width/height, an optional compression
+  flag (`TEXB0002`+), and a declared uncompressed size. `compression == 1`
+  means the payload is an **LZ4 block** (not a frame — `lz4_flex::block`
+  with the declared size), decompressed with the declared size as the
+  target buffer; only mip 0 of image 0 is decoded this slice.
+- Animated textures (`TEXS0001`/`0002`/`0003`, gated by the `IsGif` flag):
+  a per-frame timing/UV-rect table is parsed and kept
+  (`DecodedTexv::frames`) but frame 0 — the same static mip-0 pixels — is
+  what this slice draws.
+
+**Output**: RGBA8 pixels, cropped to the top-left "real" width×height
+region of the decoded mip (S1's simplification — no UV-scaling shader
+stage exists yet, so the padded/pow2 buffer is physically cropped instead
+of sampled with a UV offset). `ARGB8888`'s in-memory byte order is
+already R,G,B,A (verified against upstream `CTexture.cpp`, which uploads
+the raw bytes as `GL_RGBA`/`GL_UNSIGNED_BYTE` unchanged despite the
+format's name) — no channel swizzle needed; `R8`/`RG88` expand to
+grayscale/red-green RGBA with full alpha.
+
+**Bounds**: per-edge dimension ≤ 8192 (in-memory, real, and every mip's
+own declared size), mip count ≤ 16, image count ≤ 16, animation frame
+count ≤ 8192, a `TEXB0004` mip's embedded editor-JSON string ≤ 64 KiB, and
+— the decompression-bomb defense — a mip's declared uncompressed size
+must equal exactly what its format+dimensions require (or, for a
+BC-format mip, the block-count-derived size) before any LZ4 decompression
+or block-decode allocation runs; a lying declared size is refused, never
+trusted for allocation. Every failure path returns a value
+(`Result`/`Option`), never panics, including on truncated or garbage
+input (see `texv.rs`'s test module for the fuzz-ish truncation sweep).
+
+## Model layers and material resolution (S1)
+
+**Implemented (S1)** in `crates/kwe-core/src/scenemodel.rs`, shared by
+preflight and the worker. In scene.json, `image` most commonly references
+not a texture directly but a `.json` **model** file (620 of the 685
+corpus image references in the researched sample): Wallpaper Engine
+stores every visual, 2D included, as a model instance. Before S1 these
+were skipped outright ("scene3d, this build does not render yet" — 46 of
+60 local Workshop scenes were refused with no drawable content at all).
+
+**S1 scope**: a model is drawn as a textured quad through the existing
+image-layer pipeline — the same geometry fields (origin/angles/scale/
+size/alpha/visible/blend/brightness/tint) an image layer uses, with a
+resolved material texture as its pixel source. Mesh/puppet geometry,
+custom material shaders, effect passes, and combos are **out of scope**
+this slice; the resolver still parses and records them
+(`ResolvedModel::shader/combos/blending/cullmode/depthtest/extra_textures`)
+for the slice that implements them.
+
+**Resolution walk** (adapted from linux-wallpaperengine's
+`ModelParser.cpp`/`MaterialParser.cpp`/`Material.h` and
+`AssetLocator::texture`, GPL-3.0-or-later — see THIRD_PARTY.yml):
+`image` (a `.json` model path) → the model's `material` field (a `.json`
+material path) → the material's `passes[0]` → the first non-null entry in
+`passes[0].textures[]` → `materials/<name>.tex` (the texture-name-to-
+asset-path rule every material texture reference follows, whether or not
+the name itself carries subdirectories, e.g. `masks/foo` →
+`materials/masks/foo.tex`).
+
+**Lookup order** (caller-composed, `scenemodel::AssetLookup`): scene.pkg
+entries first (pkg scenes), then the scene's own directory, then the
+configured Wallpaper Engine assets root (`--assets-dir` on the worker,
+`--wallpaper-engine-assets` on the daemon, `--assets-dir` on `kwe
+preflight`; default: the first existing
+`<steam root>/steamapps/common/wallpaper_engine/assets` over the
+discovered Steam roots). Both `model.json` and `material.json` are bounded
+to 1 MiB each and rejected as invalid JSON, not merely oversized-but-
+parsed, past that cap; the resolver performs no file I/O itself — every
+read goes through the caller's closure, so it never leaves kwe-core's
+dependency-free boundary (the decoder that turns the resolved `.tex`
+bytes into pixels, `texv.rs`, lives in kwe-scene-renderer, since
+preflight only needs to know a texture's bytes exist, never decode them).
+
+**Honesty (B2 contract)**: a model layer counts as **drawable** only when
+its texture actually resolves through the lookup chain — unlike a direct
+image reference, which counts as drawable statically even before its
+bytes are known to decode, a model has no rendering pipeline at all
+without a resolved texture. An unresolvable model's reason text is `N
+model layer(s) whose material textures could not be resolved (missing
+Wallpaper Engine assets?)`, replacing the old blanket "need scene3d"
+message. Worker-side, a model whose texture fails to resolve or decode is
+a degraded layer (skip-never-reject, like every other texture path) with
+a bounded one-time diagnostic:
+`event=renderer.scene.model_texture_skip count=N`.
+
 ## scene.pkg
 
 **Implemented (M3b)** in `kwe-core` (`crates/kwe-core/src/pkg.rs`) and wired
@@ -563,8 +689,11 @@ into the worker's `--content` path: a `.pkg` content is opened by
 `PkgReader`, its unique `scene.json` entry is parsed in memory, and — when
 `general.script` names a package entry — that entry is extracted into a
 private `kwe-scene-script-<pid>` directory under the worker's HOME (mode
-0700) and loaded like a file scene's script. Textures, models, and other
-assets are **M3c+** and are deliberately not extracted; the renderer logs
+0700) and loaded like a file scene's script. Model, material, and texture
+references resolve against the package entry table too (S1,
+`scenemodel::resolve_model`'s pkg-lane lookup, `kwe_core::asset_entry`) —
+`materials`/`models` subtrees are not bulk-extracted, only the specific
+entries a resolved model layer needs; the renderer logs
 `event=renderer.scene.pkg entries=N script_entry=...`.
 
 The **extension selects the reader**: `--content` ending in `.json` takes

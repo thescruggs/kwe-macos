@@ -141,7 +141,47 @@ entries:
     license_observed: GPL-3.0-only (check upstream LICENSE)
     use: adapted
     approved_for_code_use: true
-    notes: relicensed project to GPL-3.0-or-later 2026-08-22; scene renderer work adapts this project
+    notes: >
+      relicensed project to GPL-3.0-or-later 2026-08-22; scene renderer work
+      adapts this project. S1 (scene port, texture container + model/material
+      resolution) adapted files, each carrying a Borrowed-From comment at the
+      adapted function/struct:
+      src/WallpaperEngine/Data/Parsers/TextureParser.cpp (container/header/
+      mipmap/frame-table parsing, format enum) -> crates/kwe-scene-renderer/src/texv.rs;
+      src/WallpaperEngine/Data/Assets/Texture.h (format/flags/container-version
+      enums, Mipmap/Frame/Texture field shapes) -> crates/kwe-scene-renderer/src/texv.rs;
+      src/WallpaperEngine/Render/CTexture.cpp (raw-format-to-GL upload rule:
+      which formats decode via stb_image vs. raw/BC upload, and ARGB8888's
+      untransformed R,G,B,A byte order) -> crates/kwe-scene-renderer/src/texv.rs
+      (re-expressed as a CPU RGBA8 expansion; upstream hands bytes to OpenGL
+      unchanged, this decoder produces pixels instead);
+      src/WallpaperEngine/Data/Parsers/ModelParser.cpp (image -> model.json ->
+      material path walk) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Data/Parsers/MaterialParser.cpp (material.json ->
+      passes[0] -> texture-slot walk) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Data/Model/Material.h (MaterialPass/Material field
+      shapes) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::texture's
+      "materials/<name>.tex" naming rule) -> crates/kwe-core/src/scenemodel.rs.
+      Verified cross-checked against real Workshop payloads under
+      /media/crushinator/steamapps/workshop/content/431960/*/ (never
+      committed as fixtures; synthetic buffers only in tests).
+
+  - id: rust-texture2ddecoder
+    project: texture2ddecoder
+    url: https://crates.io/crates/texture2ddecoder
+    revision: 0.1.2
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: >
+      Pure-Rust, no_std CPU block decoder for DXT1/DXT3/DXT5/BC7 (S1 TEXV
+      texture decode, crates/kwe-scene-renderer/src/texv.rs). Used only by
+      the separate-process kwe-scene-renderer worker, never in plasmashell.
+      Its block decoders write packed u32 pixels as
+      u32::from_le_bytes([b, g, r, a]) (BGRA in-memory byte order); texv.rs
+      swaps R/B per pixel to produce this project's straight RGBA8
+      convention before handing pixels to the compositor.
 
   - id: pipewire-tools
     project: PipeWire tools (pw-record, pw-dump)
