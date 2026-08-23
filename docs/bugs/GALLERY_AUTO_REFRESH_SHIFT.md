@@ -6,7 +6,7 @@
 - **Severity:** Medium user-facing — nothing breaks, but the selection grid
   is visibly unstable: cards move under the pointer, which makes clicking
   the wallpaper you meant to click a matter of timing.
-- **Status:** FIXED 2026-08-23 (smallest fix from the list below):
+- **Status:** FIXED 2026-08-23 in two parts — (2) the background auto-refresh now runs SILENTLY (`CatalogClient::beginSilent`: the state stays Ready, so the gallery sections bound to `catalogClient.state` no longer hide/show every 5 s; the maintainer still saw the shift after part 1 because this state flip, not only the model reset, moved the layout), and (1) the smallest fix from the list below:
   `CatalogModel::replaceFromCatalog` keeps the last applied `items` array and
   returns before `beginResetModel` when the refreshed payload is identical,
   so the 5 s auto-refresh no longer rebuilds the grid unless the catalog

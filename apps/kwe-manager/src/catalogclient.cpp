@@ -31,7 +31,13 @@ CatalogClient::CatalogClient(QString socketPath, QObject *parent)
     m_autoRefreshTimer.setInterval(AutomaticRefreshMilliseconds);
     m_autoRefreshTimer.setTimerType(Qt::CoarseTimer);
     connect(&m_autoRefreshTimer, &QTimer::timeout, this, [this] {
-        if (m_state != Loading)
+        // B3: poll silently while a catalog is on screen; a request already
+        // in flight (socket not idle) is left alone.
+        if (m_state == Loading || m_socket.state() != QLocalSocket::UnconnectedState)
+            return;
+        if (m_haveCatalog)
+            beginSilent(LoadCatalog);
+        else
             refresh();
     });
     m_autoRefreshTimer.start();
@@ -50,10 +56,20 @@ void CatalogClient::clearHistory() {
 }
 
 void CatalogClient::begin(Operation operation) {
+    m_silent = false;
     m_socket.abort();
     m_buffer.clear();
     m_operation = operation;
     setState(Loading);
+    m_socket.connectToServer(m_socketPath, QIODevice::ReadWrite);
+}
+
+void CatalogClient::beginSilent(Operation operation) {
+    m_silent = true;
+    m_socket.abort();
+    m_buffer.clear();
+    m_operation = operation;
+    // State stays Ready: the gallery keeps its layout while the poll runs.
     m_socket.connectToServer(m_socketPath, QIODevice::ReadWrite);
 }
 

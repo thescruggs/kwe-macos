@@ -49,6 +49,11 @@ signals:
 private:
     enum Operation { LoadCatalog, RescanCatalog };
     void begin(Operation operation);
+    /// B3: a background auto-refresh keeps the Ready state (the gallery binds
+    /// section visibility to it; flipping to Loading every few seconds made
+    /// the grid hide/show and re-settle). Only the first load, an explicit
+    /// refresh(), and rescan() show Loading.
+    void beginSilent(Operation operation);
     void sendRequest();
     void consumeResponse();
     void setState(State state, const QString &error = {});
@@ -66,6 +71,7 @@ private:
     QByteArray m_catalogSnapshot;
     QString m_changeMessage;
     bool m_haveCatalog = false;
+    bool m_silent = false;
     QHash<QString, QString> m_workshopStates;
     QHash<QString, int> m_workshopProgress;
     QStringList m_changeHistory;
