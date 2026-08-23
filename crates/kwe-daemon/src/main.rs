@@ -281,10 +281,22 @@ fn main() -> Result<()> {
     } else {
         arguments.steam_roots
     };
-    let scene_assets_dir = arguments
-        .wallpaper_engine_assets
-        .clone()
-        .or_else(|| kwe_core::default_wallpaper_engine_assets_dir(&roots));
+    // S1 review #6: an explicit --wallpaper-engine-assets that does not
+    // exist/is not a directory previously no-oped silently (every model
+    // lookup against it simply fails `canonicalize()`, with nothing
+    // naming why). Validate and log it explicitly instead of falling
+    // through to auto-detection unannounced.
+    let scene_assets_dir = match arguments.wallpaper_engine_assets {
+        Some(explicit) if explicit.is_dir() => Some(explicit),
+        Some(explicit) => {
+            eprintln!(
+                "event=daemon.config.invalid_assets_dir path={} detail=not-a-directory",
+                explicit.display()
+            );
+            None
+        }
+        None => kwe_core::default_wallpaper_engine_assets_dir(&roots),
+    };
     let default_paths = default_renderer_paths()?;
     let renderer_paths = BTreeMap::from([
         (
@@ -864,7 +876,14 @@ fn process_request(
                             "detail": "restart the daemon with --allow-test-faults for synthetic testing"
                         })
                     }
-                    Ok(params) => match StartSpec::try_from(params) {
+                    Ok(params) => match StartSpec::try_from(params).and_then(|spec| {
+                        // S1 review #5: the same assets root spawn_worker
+                        // forwards to the worker unconditionally, so
+                        // preflight (here) and spawn agree regardless of
+                        // which RPC validated the spec.
+                        let assets_dir = apply.and_then(|handle| handle.scene_assets_dir());
+                        spec.into_validated(assets_dir)
+                    }) {
                         Ok(spec) if request.method == "renderer.retry" => {
                             supervisor_call(supervisor, |handle| handle.retry(spec))
                         }
@@ -1076,14 +1095,17 @@ impl TryFrom<RendererStartParams> for StartSpec {
             stderr_lines: params.stderr_lines,
             scaling: params.scaling,
         };
-        // Single validation point per start: the supervisor event loop no
-        // longer re-validates, so content preflight cannot block it twice.
-        // This raw renderer.start RPC predates S1's assets-root plumbing
-        // and has no ApplyHandle to read it from; a scene started this way
-        // resolves model layers only against the scene's own pkg/directory
-        // (the primary wallpaper.apply path in apply.rs threads the real
-        // configured assets root through).
-        spec.into_validated(None)
+        // Field mapping only — NOT validated here (S1 review #5): the
+        // caller (the "renderer.start"/"renderer.retry" RPC arm) calls
+        // `into_validated` with the daemon's configured assets root, read
+        // from its `ApplyHandle`, so a scene started through this
+        // low-level RPC gets the same scene preflight outcome the primary
+        // `wallpaper.apply` path (apply.rs) would give it — `spawn_worker`
+        // (supervisor.rs) already forwards the real assets root to the
+        // worker unconditionally regardless of which RPC validated the
+        // spec, so preflight disagreeing with it here was an avoidable,
+        // fails-closed inconsistency between the two entry points.
+        Ok(spec)
     }
 }
 
@@ -2064,6 +2086,59 @@ mod tests {
             format!("{error}").contains("without a newline"),
             "unexpected error: {error}"
         );
+    }
+
+    /// S1 review #5: `renderer.start`'s `StartSpec::try_from` used to call
+    /// `into_validated(None)` unconditionally, so a model-layer scene that
+    /// resolves and draws fine at runtime (through `wallpaper.apply`,
+    /// which threads the daemon's configured assets root) could still be
+    /// needlessly refused at preflight through this lower-level RPC.
+    /// Exercises the exact two-step the RPC arm now runs: `try_from` for
+    /// field mapping, then `into_validated` with the assets dir.
+    #[test]
+    fn renderer_start_scene_preflight_honors_the_configured_assets_dir() {
+        let root = temp_dir("renderer-start-scene");
+        let assets = temp_dir("renderer-start-assets");
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::create_dir_all(root.join("materials")).unwrap();
+        std::fs::create_dir_all(assets.join("materials")).unwrap();
+        std::fs::write(
+            root.join("models/a.json"),
+            br#"{"material": "materials/a.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("materials/a.json"),
+            br#"{"passes": [{"textures": ["a"]}]}"#,
+        )
+        .unwrap();
+        // Bytes need not be a real TEXV container: this test is about
+        // whether the assets root is consulted at all, not about texture
+        // decodability (kwe-core's own tests cover that).
+        std::fs::write(assets.join("materials/a.tex"), b"placeholder").unwrap();
+        let scene = root.join("scene.json");
+        std::fs::write(
+            &scene,
+            br#"{"objects": [{"name": "a", "image": "models/a.json"}]}"#,
+        )
+        .unwrap();
+
+        let params: RendererStartParams = serde_json::from_str(&format!(
+            r#"{{"wallpaper_id":"x","content_hash":"y","kind":"scene","content":{:?}}}"#,
+            scene.to_string_lossy()
+        ))
+        .unwrap();
+        let spec = StartSpec::try_from(params).unwrap();
+        assert!(
+            spec.clone().into_validated(None).is_err(),
+            "no assets root configured: the model stays unresolved"
+        );
+        assert!(
+            spec.into_validated(Some(&assets)).is_ok(),
+            "assets root configured: the model resolves and preflight accepts"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&assets);
     }
 
     #[test]

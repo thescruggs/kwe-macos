@@ -24,8 +24,12 @@ use serde_json::{Map, Value};
 /// What one `objects[i]` entry is, under the rules above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneObjectKind {
-    /// `image` references a `.json` model instance: scene3d, BETA_M3h.
-    /// Skipped by the renderer before any validation.
+    /// `image` references a `.json` model instance (the WE solid-model
+    /// architecture). S1: resolved model -> material -> texture
+    /// (`kwe_core::scenemodel`) and, when that resolves, drawn as a
+    /// textured quad — a malformed model object still registers nothing
+    /// (skip-never-reject, `crates/kwe-scene-renderer/src/scene.rs`'s
+    /// `parse_model_layer`), but a well-formed one now IS a real layer.
     Model,
     /// `image` references a texture this build can decode (png/jpeg/webp).
     Image,
@@ -239,6 +243,23 @@ pub fn summarize_scene_objects(root: &Value) -> SceneObjectSummary {
 /// calling it. Shared by preflight (`preflight_scene`/`preflight_pkg`) and
 /// the worker's own B2 gate (main.rs adds the resolved count the same
 /// way after `load_model_textures` runs).
+/// Cap on how many model objects `summarize_scene_objects_resolved` will
+/// actually attempt to resolve in one preflight call (S1 review #3): each
+/// attempt costs up to three `confined_read`/pkg-entry lookups, each of
+/// which is a handful of blocking syscalls, run synchronously inside the
+/// trusted `kwe-daemon` process as part of validating one request — with
+/// no cap, a crafted scene.json under the existing whole-file size caps
+/// (~16 MiB, room for ~10^5-10^6 minimal `{"image":"models/m.json"}`
+/// objects) turns one apply/preflight request into hundreds of thousands
+/// of inline syscalls, a control-plane DoS distinct from anything the
+/// sandboxed renderer bounds. Mirrors `kwe-scene-renderer`'s
+/// `layers::MAX_LAYERS` (256) — a scene with more model objects than that
+/// gets rejected by the worker's own layer cap anyway once every
+/// well-formed one of them registers as a layer (S1), so bounding
+/// preflight's attempt count at the same number costs no honesty against
+/// what the worker would actually do.
+pub const MAX_MODEL_RESOLUTIONS: usize = 256;
+
 pub fn summarize_scene_objects_resolved(
     root: &Value,
     resolve: &mut crate::scenemodel::AssetLookup<'_>,
@@ -250,7 +271,11 @@ pub fn summarize_scene_objects_resolved(
     let Some(objects) = root.get("objects").and_then(Value::as_array) else {
         return summary;
     };
+    let mut attempted = 0usize;
     for entry in objects {
+        if attempted >= MAX_MODEL_RESOLUTIONS {
+            break;
+        }
         let Some(object) = entry.as_object() else {
             continue;
         };
@@ -264,6 +289,7 @@ pub fn summarize_scene_objects_resolved(
         else {
             continue; // malformed model reference: stays unresolved
         };
+        attempted += 1;
         if crate::scenemodel::resolve_model(reference, resolve).is_ok() {
             summary.models_resolved += 1;
         }
@@ -277,6 +303,58 @@ mod tests {
 
     fn object(json: &str) -> Map<String, Value> {
         serde_json::from_str(json).expect("test object")
+    }
+
+    /// S1 review #3: a crafted scene declaring far more model objects than
+    /// `MAX_MODEL_RESOLUTIONS` must not turn preflight into an unbounded
+    /// number of lookup-closure calls (each a handful of syscalls in the
+    /// real pkg/dir/assets lookup) — the cap must stop ATTEMPTING
+    /// resolution, not merely stop counting successes, so every model here
+    /// is deliberately resolvable if attempted.
+    #[test]
+    fn model_resolution_attempts_are_capped() {
+        let total = MAX_MODEL_RESOLUTIONS + 50;
+        let mut objects = String::from(r#"{"objects": ["#);
+        for i in 0..total {
+            objects.push_str(&format!(
+                r#"{{"name": "m{i}", "image": "models/m{i}.json"}},"#
+            ));
+        }
+        objects.push_str(r#"{"name": "tail", "image": null}]}"#);
+        let root: Value = serde_json::from_str(&objects).unwrap();
+
+        let calls = std::cell::Cell::new(0usize);
+        let mut resolve = |reference: &str| {
+            calls.set(calls.get() + 1);
+            if let Some(name) = reference
+                .strip_prefix("models/")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                return Some(format!(r#"{{"material": "materials/{name}.json"}}"#).into_bytes());
+            }
+            if let Some(name) = reference
+                .strip_prefix("materials/")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                return Some(format!(r#"{{"passes": [{{"textures": ["{name}"]}}]}}"#).into_bytes());
+            }
+            if reference.starts_with("materials/") && reference.ends_with(".tex") {
+                return Some(b"bytes".to_vec());
+            }
+            None
+        };
+
+        let summary = summarize_scene_objects_resolved(&root, &mut resolve);
+        assert_eq!(summary.models, total);
+        assert_eq!(
+            summary.models_resolved, MAX_MODEL_RESOLUTIONS,
+            "every model is resolvable, so a correct cap stops attempts at exactly the cap"
+        );
+        assert!(
+            calls.get() <= MAX_MODEL_RESOLUTIONS * 3,
+            "resolution attempts must stay bounded: {} lookup calls for {total} declared models",
+            calls.get()
+        );
     }
 
     #[test]

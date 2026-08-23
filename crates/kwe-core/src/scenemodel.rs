@@ -32,6 +32,15 @@ use serde_json::Value;
 /// headroom without exposing the JSON parser to an unbounded buffer.
 pub const MAX_MODEL_JSON_BYTES: u64 = 1024 * 1024;
 
+/// Per-file read cap for the model-resolution lookup's scene-directory,
+/// assets-root, and pkg-entry steps (S1 review NIT #10 — this used to be
+/// two separate `const` definitions, one in `preflight.rs` and one in
+/// `pkg.rs`, that happened to agree on the same value): generous headroom
+/// over any real `.tex` (mirrors `kwe_core::pkg::MAX_PKG_ENTRY_BYTES`).
+/// The model/material JSON steps apply their own tighter
+/// `MAX_MODEL_JSON_BYTES` cap inside `resolve_model`.
+pub const MODEL_ASSET_READ_CAP: u64 = 64 * 1024 * 1024;
+
 /// The lookup a caller supplies to `resolve_model`: given a reference (a
 /// package-relative path like `models/foo.json`, `materials/foo.json`, or
 /// `materials/foo.tex`), return its bytes if found. Callers compose the
@@ -158,6 +167,28 @@ pub fn resolve_model(
     let texture_ref = texture_asset_path(&texture_name);
     let texture_bytes = lookup(&texture_ref)
         .ok_or_else(|| format!("material texture \"{texture_ref}\" could not be resolved"))?;
+    // S1 review #2 (preflight/worker agreement): the pre-fix contract only
+    // checked that texture BYTES exist, never whether the worker could
+    // actually decode them — a resolvable-but-undecodable `.tex` (corrupt
+    // header, an unimplemented format) passed preflight and only failed
+    // once the worker parsed the identical scene, rolling the apply back
+    // after `wallpaper.apply` had already reported success. This cheap,
+    // decode-free header check (`crate::texvheader`, mirrors
+    // `kwe-scene-renderer::texv::parse_header`'s field layout without
+    // duplicating the LZ4/mip-chain/BC-decode machinery kwe-core cannot
+    // depend on) closes that gap for the common failure modes: a
+    // corrupt/truncated header, an unimplemented format, or a texture
+    // whose real dimensions alone would blow the shared texture budget.
+    if crate::texvheader::is_texv(&texture_bytes) {
+        let real_bytes = crate::texvheader::check_header(&texture_bytes).map_err(|reason| {
+            format!("material texture \"{texture_ref}\" is not decodable: {reason}")
+        })?;
+        if real_bytes > crate::texvheader::MAX_SINGLE_TEXTURE_BUDGET_BYTES {
+            return Err(format!(
+                "material texture \"{texture_ref}\" exceeds the texture budget"
+            ));
+        }
+    }
 
     let shader = pass0
         .get("shader")
@@ -198,13 +229,24 @@ pub fn resolve_model(
 
 /// Confined read used by preflight's directory- and assets-root lookup
 /// steps: relative reference, no `..`/absolute/backslash/NUL components,
-/// canonicalized inside `root` (so a symlink cannot smuggle a read outside
-/// it), a regular file, bounded to `cap` bytes. Mirrors the containment
-/// rule `kwe-scene-renderer`'s `resolve_layer_image` enforces for the
-/// worker's own file-lane resolution (kept as a separate, smaller
-/// implementation here since kwe-core cannot depend on
-/// kwe-scene-renderer).
-pub fn confined_read(root: &Path, reference: &str, cap: u64) -> Option<Vec<u8>> {
+/// confined inside `root_canonical`, a regular file, bounded to `cap`
+/// bytes. Mirrors the containment rule `kwe-scene-renderer`'s
+/// `resolve_layer_image` enforces for the worker's own file-lane
+/// resolution (kept as a separate, smaller implementation here since
+/// kwe-core cannot depend on kwe-scene-renderer).
+///
+/// **Precondition**: `root_canonical` must already be `Path::canonicalize`d
+/// by the caller (S1 review #3) — every lookup for one scene reuses the
+/// same one or two roots (scene directory, assets root), so canonicalizing
+/// per call turned O(1) syscalls per root into O(models-attempted); the
+/// callers below (`preflight::file_lane_asset_lookup`,
+/// `pkg::pkg_lane_asset_lookup`) canonicalize each root exactly once,
+/// outside the per-object lookup closure. A `root_canonical` that is not
+/// actually canonical only makes `starts_with` stricter (fails closed:
+/// `candidate.canonicalize()`'s result would need to start with a path
+/// that itself may carry unresolved components), never a containment
+/// weakening.
+pub fn confined_read(root_canonical: &Path, reference: &str, cap: u64) -> Option<Vec<u8>> {
     if reference.is_empty() || reference.contains('\0') || reference.contains('\\') {
         return None;
     }
@@ -220,14 +262,18 @@ pub fn confined_read(root: &Path, reference: &str, cap: u64) -> Option<Vec<u8>> 
             return None;
         }
     }
-    let root_canonical = root.canonicalize().ok()?;
     let candidate = root_canonical.join(joined);
+    // canonicalize() fully resolves symlinks, so `canonical` can never
+    // itself be a symlink — the containment defense is entirely the
+    // `starts_with` check below (S1 review NIT #7: a prior
+    // `symlink_metadata(&canonical).is_symlink()` check here was always
+    // false and did nothing).
     let canonical = candidate.canonicalize().ok()?;
-    if !canonical.starts_with(&root_canonical) {
+    if !canonical.starts_with(root_canonical) {
         return None;
     }
-    let metadata = std::fs::symlink_metadata(&canonical).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() {
         return None;
     }
     if metadata.len() > cap {
@@ -275,13 +321,19 @@ mod tests {
                     "textures": ["deco"]}]}"#
                     .to_vec(),
             ),
-            ("materials/deco.tex", b"TEXV0005fake".to_vec()),
+            (
+                "materials/deco.tex",
+                crate::texvheader::valid_minimal_texv(4, 4),
+            ),
         ]);
         let resolved = resolve_model("models/deco.json", &mut lookup).expect("resolves");
         assert_eq!(resolved.material_ref, "materials/deco.json");
         assert_eq!(resolved.texture_name, "deco");
         assert_eq!(resolved.texture_ref, "materials/deco.tex");
-        assert_eq!(resolved.texture_bytes, b"TEXV0005fake");
+        assert_eq!(
+            resolved.texture_bytes,
+            crate::texvheader::valid_minimal_texv(4, 4)
+        );
         assert_eq!(resolved.shader.as_deref(), Some("genericimage2"));
         assert_eq!(resolved.blending.as_deref(), Some("translucent"));
         assert!(resolved.extra_textures.is_empty());
@@ -373,6 +425,34 @@ mod tests {
         assert!(error.contains("materials/ghost.tex"));
     }
 
+    /// S1 review #2: preflight and the worker used to disagree on a
+    /// resolvable-but-undecodable `.tex` — resolve_model counted the model
+    /// as drawable once bytes existed, the worker's real TEXV decoder then
+    /// failed on the exact same bytes, and the apply transaction rolled
+    /// back after `wallpaper.apply` had already reported success. A
+    /// header check now runs on any texture bytes carrying the TEXV0005
+    /// magic, so a corrupt/unimplemented-format container is refused here
+    /// too, before the apply transaction ever starts.
+    #[test]
+    fn resolvable_but_undecodable_texture_is_refused() {
+        let mut lookup = map_lookup(vec![
+            (
+                "models/m.json",
+                br#"{"material": "materials/m.json"}"#.to_vec(),
+            ),
+            (
+                "materials/m.json",
+                br#"{"passes": [{"textures": ["broken"]}]}"#.to_vec(),
+            ),
+            (
+                "materials/broken.tex",
+                b"TEXV0005-but-the-rest-of-this-is-garbage-not-a-real-header".to_vec(),
+            ),
+        ]);
+        let error = resolve_model("models/m.json", &mut lookup).unwrap_err();
+        assert!(error.contains("not decodable"), "unexpected: {error}");
+    }
+
     #[test]
     fn oversized_json_is_refused_before_parsing() {
         let huge = vec![b' '; (MAX_MODEL_JSON_BYTES + 1) as usize];
@@ -400,18 +480,30 @@ mod tests {
         )
         .unwrap();
 
+        // confined_read's precondition: the caller canonicalizes the root
+        // once (S1 review #3), not per lookup.
+        let root_canonical = root.canonicalize().unwrap();
         assert_eq!(
-            confined_read(&root, "materials/a.tex", 1024),
+            confined_read(&root_canonical, "materials/a.tex", 1024),
             Some(b"hello".to_vec())
         );
-        assert_eq!(confined_read(&root, "../outside/secret.tex", 1024), None);
-        assert_eq!(confined_read(&root, "/etc/passwd", 1024), None);
-        assert_eq!(confined_read(&root, "materials/link.tex", 1024), None);
-        assert_eq!(confined_read(&root, "materials/missing.tex", 1024), None);
-        assert_eq!(confined_read(&root, "", 1024), None);
+        assert_eq!(
+            confined_read(&root_canonical, "../outside/secret.tex", 1024),
+            None
+        );
+        assert_eq!(confined_read(&root_canonical, "/etc/passwd", 1024), None);
+        assert_eq!(
+            confined_read(&root_canonical, "materials/link.tex", 1024),
+            None
+        );
+        assert_eq!(
+            confined_read(&root_canonical, "materials/missing.tex", 1024),
+            None
+        );
+        assert_eq!(confined_read(&root_canonical, "", 1024), None);
         // Over the cap: refused even though the file exists and is small
         // enough to read — the cap gates by exact declared size.
-        assert_eq!(confined_read(&root, "materials/a.tex", 2), None);
+        assert_eq!(confined_read(&root_canonical, "materials/a.tex", 2), None);
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);

@@ -349,21 +349,54 @@ struct Mipmap<'a> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
+/// The pixel-format byte count a mip's declared `uncompressedSize` must
+/// equal exactly: the format+dimensions-derived expectation this decoder
+/// checks the declared size against before any LZ4/allocation work (a
+/// lying declared size is exactly the decompression-bomb vector this
+/// bound exists for). `None` for a FIF-tagged container (the payload is
+/// an encoded image file of arbitrary size) or a format this decoder does
+/// not implement (decode will refuse it later; no size expectation to
+/// check here). Computed from the HEADER's format/fif, not per-container-
+/// version — this must run identically for every `ContainerVersion`,
+/// `TEXB0004` included (review S1#1: this used to be computed by the
+/// caller via an 8-byte peek-and-rewind that unconditionally skipped
+/// `TEXB0004`, so a `TEXB0004` mip's declared size was never checked
+/// against its dimensions at all).
+fn expected_mip_size(header: &Header, mip_w: u32, mip_h: u32) -> Option<u64> {
+    if header.fif.is_some() {
+        return None;
+    }
+    if let Some(bpp) = header.format.raw_bytes_per_pixel() {
+        return Some(u64::from(mip_w) * u64::from(mip_h) * u64::from(bpp));
+    }
+    if let Some(block_bytes) = header.format.block_bytes() {
+        let blocks_x = u64::from(mip_w).div_ceil(4);
+        let blocks_y = u64::from(mip_h).div_ceil(4);
+        return Some(blocks_x * blocks_y * u64::from(block_bytes));
+    }
+    None
+}
+
 /// `parseMipmap` (`TextureParser.cpp:40-93`): width/height, then (from
 /// `TEXB0002` on) a compression flag and declared uncompressed size, then
 /// a declared compressed/stored size, then the payload — LZ4 block if
-/// `compression == 1`, raw otherwise. `expected_size` is the pixel-format
-/// byte count this decoder independently computes from the mip's own
-/// width/height/format (or `None` for a FIF-tagged mip, whose payload is
-/// an encoded image file of arbitrary size) — the declared uncompressed
-/// size must match it exactly, or the mip is refused before any
-/// LZ4/allocation work: a lying declared size is exactly the
-/// decompression-bomb vector this bound exists for.
+/// `compression == 1`, raw otherwise. The declared-size-vs-`expected_mip_size`
+/// consistency check now runs from inside this function (see that
+/// function's doc), uniformly across every container version.
+///
+/// `keep`: only image-0/mip-0 is ever decoded further (`decode_texv`), so
+/// every other mip is validated (dimensions, declared-size consistency,
+/// allocation cap) but its payload is only *skipped over* — advanced past
+/// with `Reader::take`, never LZ4-decompressed or copied — returning
+/// `Ok(None)` (review RECOMMENDED#4: without this, a container with the
+/// maximum 256 mips near the per-mip allocation cap could force ~17 GB of
+/// cumulative, wasted LZ4 decompression work for mips this decoder always
+/// discards).
 fn parse_mipmap<'a>(
     reader: &mut Reader<'a>,
     header: &Header,
-    expected_size: Option<u64>,
-) -> Result<Mipmap<'a>, TexvError> {
+    keep: bool,
+) -> Result<Option<Mipmap<'a>>, TexvError> {
     if header.container_version == ContainerVersion::Texb0004 {
         let _ignored_a = reader.u32()?;
         let _ignored_b = reader.u32()?;
@@ -384,6 +417,7 @@ fn parse_mipmap<'a>(
             "mipmap {width}x{height} exceeds the {MAX_MIP_PIXELS} pixel cap"
         )));
     }
+    let expected_size = expected_mip_size(header, width, height);
 
     let mut compression = 0u32;
     let mut uncompressed_size: i32 = 0;
@@ -427,6 +461,21 @@ fn parse_mipmap<'a>(
         )));
     }
 
+    if !keep {
+        // Validated above; advance past the payload bytes without
+        // decompressing or allocating an owned copy — this mip is
+        // discarded either way (only image-0/mip-0 is ever kept).
+        let skip_len = if compression == 1 {
+            compressed_size
+        } else {
+            uncompressed_size
+        };
+        let skip_len = usize::try_from(skip_len)
+            .map_err(|_| TexvError::new("mipmap payload size does not fit usize"))?;
+        reader.take(skip_len)?;
+        return Ok(None);
+    }
+
     let payload = if compression == 1 {
         let compressed = reader.take(compressed_size as usize)?;
         let uncompressed_size_usize = usize::try_from(uncompressed_size)
@@ -437,12 +486,12 @@ fn parse_mipmap<'a>(
         reader.take(uncompressed_size as usize)?.to_vec()
     };
 
-    Ok(Mipmap {
+    Ok(Some(Mipmap {
         width,
         height,
         payload,
         _phantom: std::marker::PhantomData,
-    })
+    }))
 }
 
 /// `parseFrameV1` (`TextureParser.cpp:95-108`, `TEXS0001`).
@@ -607,21 +656,6 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
     let mut reader = Reader::new(bytes);
     let header = parse_header(&mut reader)?;
 
-    let expected_mip_size = |mip_w: u32, mip_h: u32| -> Option<u64> {
-        if header.fif.is_some() {
-            return None; // encoded image container: no fixed size to check
-        }
-        if let Some(bpp) = header.format.raw_bytes_per_pixel() {
-            return Some(u64::from(mip_w) * u64::from(mip_h) * u64::from(bpp));
-        }
-        if let Some(block_bytes) = header.format.block_bytes() {
-            let blocks_x = u64::from(mip_w).div_ceil(4);
-            let blocks_y = u64::from(mip_h).div_ceil(4);
-            return Some(blocks_x * blocks_y * u64::from(block_bytes));
-        }
-        None // format not implemented: no size check, decode will refuse it
-    };
-
     let mut first_image_mip0: Option<Mipmap<'_>> = None;
     for image in 0..header.image_count {
         let mipmap_count = reader.u32()?;
@@ -631,38 +665,13 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
             )));
         }
         for mip_index in 0..mipmap_count {
-            // The mip's own declared width/height are read before we can
-            // compute an expected size, but parse_mipmap needs the
-            // expectation up front to refuse before decompressing — so
-            // peek the two dimension u32s, then rewind. Cheap and bounded
-            // (8 bytes), never allocates.
-            let peek_pos = reader.pos;
-            let json_probe_pos = if header.container_version == ContainerVersion::Texb0004 {
-                // Skip the two ignored u32s + the bounded cstring to reach
-                // width/height; on failure just let parse_mipmap surface
-                // the real error below.
-                None
-            } else {
-                Some(peek_pos)
-            };
-            let (mip_w, mip_h) = if let Some(pos) = json_probe_pos {
-                let w = bytes
-                    .get(pos..pos + 4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                let h = bytes
-                    .get(pos + 4..pos + 8)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                (w, h)
-            } else {
-                (None, None)
-            };
-            let expected = match (mip_w, mip_h) {
-                (Some(w), Some(h)) => expected_mip_size(w, h),
-                _ => None,
-            };
-            let mipmap = parse_mipmap(&mut reader, &header, expected)?;
-            if image == 0 && mip_index == 0 {
-                first_image_mip0 = Some(mipmap);
+            // Only image-0/mip-0 is ever decoded further; every other mip
+            // is validated then skipped without decompression work (see
+            // parse_mipmap's `keep` doc).
+            let keep = image == 0 && mip_index == 0;
+            let mipmap = parse_mipmap(&mut reader, &header, keep)?;
+            if keep {
+                first_image_mip0 = mipmap;
             }
         }
     }
@@ -698,6 +707,28 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
             header.format
         )));
     };
+
+    // Defense in depth (S1 review #1): by construction `rgba_full` should
+    // already be exactly `mip0.width * mip0.height * 4` bytes (the raw
+    // and block-decode paths above are each sized from `mip0.width`/
+    // `mip0.height`, and `parse_mipmap` now checks the declared payload
+    // size against those same dimensions before ever producing `payload`
+    // for a raw format). Check it explicitly anyway rather than trust
+    // that invariant transitively — `crop_top_left` indexes rows by
+    // `mip0.width`/`mip0.height`, and a future change to either path that
+    // breaks the invariant must fail cleanly here, not panic on a slice
+    // range.
+    let needed_bytes = (mip0.width as usize)
+        .checked_mul(mip0.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4));
+    match needed_bytes {
+        Some(needed) if rgba_full.len() >= needed => {}
+        _ => {
+            return Err(TexvError::new(
+                "decoded mip buffer is smaller than its declared dimensions",
+            ));
+        }
+    }
 
     let cropped = crop_top_left(
         &rgba_full,
@@ -987,6 +1018,132 @@ mod tests {
             "unexpected: {}",
             error.message
         );
+    }
+
+    /// Builds a minimal TEXB0004 container: same fixed header as
+    /// `build_argb8888`, but the `TEXB0004` sub-container (extra
+    /// `is_video_mp4` field) and the `TEXB0004` mip header shape (two
+    /// ignored u32s, a bounded null-terminated editor-JSON string, one
+    /// more ignored u32, THEN width/height) — the one container version
+    /// the pre-fix decoder never applied its declared-size check to
+    /// (S1 review #1). `compressed_size` is the lever: for
+    /// `compression == 0` it becomes the effective payload length
+    /// (`parse_mipmap` overwrites `uncompressed_size` with it), so a
+    /// caller can lie about the payload size independently of the actual
+    /// `pixels` bytes supplied.
+    fn build_texb0004(
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        declared_compressed_size: i32,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"TEXV0005 ");
+        out.extend_from_slice(b"TEXI0001 ");
+        out.extend_from_slice(&0u32.to_le_bytes()); // format ARGB8888
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // ignored
+        out.extend_from_slice(b"TEXB0004 ");
+        out.extend_from_slice(&1u32.to_le_bytes()); // image count
+        out.extend_from_slice(&(-1i32).to_le_bytes()); // FIF_UNKNOWN
+        out.extend_from_slice(&0u32.to_le_bytes()); // is_video_mp4 = false
+        out.extend_from_slice(&1u32.to_le_bytes()); // mipmap count
+        // TEXB0004 mip header: two ignored u32s, a NUL-terminated editor
+        // JSON string (empty here), one more ignored u32.
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(0); // empty json string, NUL-terminated
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // compression = 0
+        out.extend_from_slice(&(pixels.len() as i32).to_le_bytes()); // uncompressedSize (ignored when compression=0)
+        out.extend_from_slice(&declared_compressed_size.to_le_bytes());
+        out.extend_from_slice(pixels);
+        out
+    }
+
+    #[test]
+    fn texb0004_happy_path_decodes_like_texb0003() {
+        let pixels = [
+            10u8, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let bytes = build_texb0004(2, 2, &pixels, pixels.len() as i32);
+        let decoded = decode_texv(&bytes).expect("TEXB0004 container decodes");
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert_eq!(&decoded.rgba[0..4], &[10, 20, 30, 255]);
+    }
+
+    /// The exact regression case for S1 review #1: a `TEXB0004` mip lies
+    /// about its payload size (4 declared bytes for a 4x4 ARGB8888 mip
+    /// that needs 64) — this must be refused at `parse_mipmap`'s
+    /// declared-size-vs-dimensions check (not merely by the downstream
+    /// defense-in-depth length guard; real==in-memory dims here, so no
+    /// crop ever runs) rather than producing a short buffer a later step
+    /// panics on.
+    #[test]
+    fn texb0004_short_lying_payload_is_refused_not_panicked() {
+        let short_payload = [0u8, 0, 0, 0]; // 4 bytes; 4x4 ARGB8888 needs 64
+        let bytes = build_texb0004(4, 4, &short_payload, short_payload.len() as i32);
+        let error = decode_texv(&bytes).unwrap_err();
+        assert!(
+            error.message.contains("expected"),
+            "unexpected: {}",
+            error.message
+        );
+    }
+
+    /// The literal crash PoC from S1 review #1: a padded (in-memory
+    /// larger than real) `TEXB0004` mip with a short lying payload used
+    /// to reach `crop_top_left`'s row-slicing with a buffer far shorter
+    /// than `mip0.width * mip0.height * 4` — `rgba[16..272]` on a 16-byte
+    /// `Vec` panics on the slice range. Must now be refused before
+    /// `crop_top_left` is ever called.
+    #[test]
+    fn texb0004_short_payload_with_padding_does_not_panic_on_crop() {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"TEXV0005 ");
+        out.extend_from_slice(b"TEXI0001 ");
+        out.extend_from_slice(&0u32.to_le_bytes()); // format ARGB8888
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&4u32.to_le_bytes()); // in-memory width (padded)
+        out.extend_from_slice(&4u32.to_le_bytes()); // in-memory height (padded)
+        out.extend_from_slice(&2u32.to_le_bytes()); // real width (smaller: forces cropping)
+        out.extend_from_slice(&2u32.to_le_bytes()); // real height
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(b"TEXB0004 ");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(-1i32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&4u32.to_le_bytes()); // mip width (matches in-memory)
+        out.extend_from_slice(&4u32.to_le_bytes()); // mip height
+        out.extend_from_slice(&0u32.to_le_bytes()); // compression = 0
+        let short_payload = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 16 bytes; 4x4 ARGB8888 needs 64
+        out.extend_from_slice(&(short_payload.len() as i32).to_le_bytes());
+        out.extend_from_slice(&(short_payload.len() as i32).to_le_bytes());
+        out.extend_from_slice(&short_payload);
+        // Must return Err, and — the actual regression under test — must
+        // not panic getting there (the test harness itself catches a
+        // panic as a failure).
+        assert!(decode_texv(&out).is_err());
+    }
+
+    #[test]
+    fn texb0004_truncated_buffers_never_panic() {
+        let pixels = [1u8, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
+        let valid = build_texb0004(2, 2, &pixels, pixels.len() as i32);
+        for cut in 0..valid.len() {
+            let _ = decode_texv(&valid[..cut]); // must not panic
+        }
     }
 
     #[test]

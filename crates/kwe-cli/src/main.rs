@@ -217,8 +217,19 @@ fn main() -> Result<()> {
         } => {
             let (json, safe) = match (path, video, web) {
                 (Some(path), None, None) => {
-                    let assets_dir = assets_dir
-                        .or_else(|| default_wallpaper_engine_assets_dir(&default_steam_roots()));
+                    // S1 review #6: an explicit --assets-dir that does not
+                    // exist/is not a directory previously no-oped silently.
+                    let assets_dir = match assets_dir {
+                        Some(explicit) if explicit.is_dir() => Some(explicit),
+                        Some(explicit) => {
+                            eprintln!(
+                                "warning: --assets-dir {} is not a directory; model layers will not resolve against it",
+                                explicit.display()
+                            );
+                            None
+                        }
+                        None => default_wallpaper_engine_assets_dir(&default_steam_roots()),
+                    };
                     let report = preflight_scene(&path, assets_dir.as_deref());
                     (serde_json::to_string_pretty(&report)?, report.safe)
                 }

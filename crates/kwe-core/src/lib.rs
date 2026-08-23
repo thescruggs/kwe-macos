@@ -18,6 +18,7 @@ mod preflight;
 mod scan;
 mod scenemodel;
 mod sceneobjects;
+mod texvheader;
 mod webpreflight;
 mod websandbox;
 
@@ -48,8 +49,8 @@ pub use scenemodel::{
     texture_asset_path,
 };
 pub use sceneobjects::{
-    SceneObjectKind, SceneObjectSummary, classify_scene_object, scene_property_value,
-    summarize_scene_objects, summarize_scene_objects_resolved,
+    MAX_MODEL_RESOLUTIONS, SceneObjectKind, SceneObjectSummary, classify_scene_object,
+    scene_property_value, summarize_scene_objects, summarize_scene_objects_resolved,
 };
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{

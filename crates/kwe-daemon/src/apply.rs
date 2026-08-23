@@ -1511,6 +1511,18 @@ impl ApplyService {
 }
 
 impl ApplyHandle {
+    /// The configured Wallpaper Engine assets root (S1 review #5): so
+    /// entry points other than `wallpaper.apply` (namely the low-level
+    /// `renderer.start`/`renderer.retry` RPCs, `main.rs`) can thread the
+    /// same assets dir through scene preflight that `spawn_worker`
+    /// (`supervisor.rs`) already forwards to the worker unconditionally —
+    /// without this, a model-layer scene that resolves and draws fine at
+    /// runtime could be needlessly refused at preflight when started
+    /// through `renderer.start` instead of `wallpaper.apply`.
+    pub fn scene_assets_dir(&self) -> Option<&Path> {
+        self.scene_assets_dir.as_deref()
+    }
+
     /// Test-only constructor with an injectable probe (the RPC tests swap
     /// in a stub; the production probe goes through `ApplyService::new`).
     /// Takes an `Arc` so the test can keep its own reference to the stub

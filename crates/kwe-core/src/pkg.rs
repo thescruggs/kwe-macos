@@ -807,25 +807,39 @@ fn script_reference_from_json(bytes: &[u8]) -> Result<String, ()> {
 /// entries first, then the scene's own directory (the pkg's parent, for
 /// the rare corpus layout with loose files beside the archive), then the
 /// Wallpaper Engine assets root. Mirrors `preflight::file_lane_asset_lookup`'s
-/// read cap.
+/// read cap. `pkg_dir` is already canonicalized by the caller
+/// (`preflight_pkg`); `assets_dir` is canonicalized exactly once here,
+/// not per model object resolved (S1 review #3 — `confined_read` requires
+/// an already-canonical root).
 fn pkg_lane_asset_lookup<'a>(
     reader: &'a PkgReader,
     pkg_dir: Option<&'a Path>,
-    assets_dir: Option<&'a Path>,
+    assets_dir: Option<&Path>,
 ) -> impl FnMut(&str) -> Option<Vec<u8>> + 'a {
-    const READ_CAP: u64 = 64 * 1024 * 1024;
+    let assets_dir_canonical = assets_dir.and_then(|dir| dir.canonicalize().ok());
     move |reference: &str| {
         if let Ok(idx) = asset_entry(reference, reader.entries())
-            && let Ok(bytes) = reader.read_entry_bounded(idx, READ_CAP)
+            && let Ok(bytes) =
+                reader.read_entry_bounded(idx, crate::scenemodel::MODEL_ASSET_READ_CAP)
         {
             return Some(bytes);
         }
         if let Some(dir) = pkg_dir
-            && let Some(bytes) = crate::scenemodel::confined_read(dir, reference, READ_CAP)
+            && let Some(bytes) = crate::scenemodel::confined_read(
+                dir,
+                reference,
+                crate::scenemodel::MODEL_ASSET_READ_CAP,
+            )
         {
             return Some(bytes);
         }
-        assets_dir.and_then(|assets| crate::scenemodel::confined_read(assets, reference, READ_CAP))
+        assets_dir_canonical.as_deref().and_then(|assets| {
+            crate::scenemodel::confined_read(
+                assets,
+                reference,
+                crate::scenemodel::MODEL_ASSET_READ_CAP,
+            )
+        })
     }
 }
 
@@ -1458,7 +1472,11 @@ mod tests {
         );
         let pkg = write_bytes(&dir, "model.pkg", &writer.build("0001"));
         fs::create_dir_all(assets.join("materials")).unwrap();
-        fs::write(assets.join("materials/a.tex"), b"TEXV0005fake").unwrap();
+        fs::write(
+            assets.join("materials/a.tex"),
+            crate::texvheader::valid_minimal_texv(4, 4),
+        )
+        .unwrap();
 
         assert!(
             !preflight_pkg(&pkg, None).safe,
