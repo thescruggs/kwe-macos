@@ -3228,4 +3228,133 @@ grep -q "event=renderer.scene.unsupported exit_code=74" "$b2_standalone_log"
 [[ ! -f "$smoke_root/standalone-b2.bin" ]]
 echo "scene smoke passed (B2 d): standalone model-only scene -> exit 74, no frame published"
 
+# S2: a model layer whose material names a custom shader (not one of the
+# real Wallpaper Engine asset shaders) — the test writes a tiny synthetic
+# shaders/ tree into its own --assets-dir and the material pipeline must
+# preprocess, compile, and draw through it: a deterministic solid colour,
+# independent of the texture (the fragment shader ignores v_TexCoord),
+# proving the full shaderpre -> shaderc -> Vulkan material-pipeline path
+# end to end rather than just falling back to the S1 base-texture quad.
+s2_assets_dir="$smoke_root/s2-assets"
+mkdir -p "$s2_assets_dir/shaders"
+cat >"$s2_assets_dir/shaders/smoketest.vert" <<'VERT'
+attribute vec3 a_Position;
+attribute vec2 a_TexCoord;
+uniform mat4 g_ModelViewProjectionMatrix;
+varying vec2 v_TexCoord;
+void main() {
+	gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);
+	v_TexCoord = a_TexCoord;
+}
+VERT
+cat >"$s2_assets_dir/shaders/smoketest.frag" <<'FRAG'
+varying vec2 v_TexCoord;
+void main() {
+	gl_FragColor = vec4(0.2, 0.6, 0.8, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);
+}
+FRAG
+
+s2_material_pkg="$smoke_root/s2-material.pkg"
+python3 - "$s2_material_pkg" <<'S2PY'
+import struct
+import sys
+
+
+def build_pkg(entries, version="0001"):
+    out = bytearray(struct.pack("<I", 8) + b"PKGV" + version.encode())
+    out += struct.pack("<I", len(entries))
+    offset = 0
+    table = bytearray()
+    for path, payload in entries:
+        table += struct.pack("<I", len(path.encode()))
+        table += path.encode()
+        table += struct.pack("<I", offset)
+        table += struct.pack("<I", len(payload))
+        offset += len(payload)
+    out += table
+    for _, payload in entries:
+        out += payload
+    return bytes(out)
+
+
+def texv_argb8888(width, height, rgba):
+    out = bytearray()
+    out += b"TEXV0005\0"
+    out += b"TEXI0001\0"
+    out += struct.pack("<I", 0)  # format ARGB8888
+    out += struct.pack("<I", 0)  # flags
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # ignored
+    out += b"TEXB0003\0"
+    out += struct.pack("<I", 1)  # image count
+    out += struct.pack("<i", -1)  # FIF_UNKNOWN
+    out += struct.pack("<I", 1)  # mipmap count
+    out += struct.pack("<I", width)
+    out += struct.pack("<I", height)
+    out += struct.pack("<I", 0)  # compression = 0
+    pixels = bytes(rgba) * (width * height)
+    out += struct.pack("<i", len(pixels))  # uncompressedSize
+    out += struct.pack("<i", len(pixels))  # compressedSize
+    out += pixels
+    return bytes(out)
+
+
+# The texture colour (255, 0, 0, 255) is deliberately NOT the shader's
+# output colour: the oracle below only matches the shader's hard-coded
+# vec4(0.2, 0.6, 0.8, 1.0), so a S2 regression that quietly fell back to
+# drawing the base texture as a flat quad (the S1 path) would sample red,
+# not the shader's colour, and the oracle would catch it.
+scene_json = (
+    b'{"general": {"clearcolor": [0.0, 0.0, 0.0, 1.0], "resolution": [160, 90], "fps": 30},'
+    b' "objects": [{"name": "solid", "image": "models/solid.json",'
+    b' "origin": [0.0, 0.0], "size": [160.0, 90.0]}]}'
+)
+model_json = b'{"material": "materials/solid.json"}'
+material_json = b'{"passes": [{"shader": "smoketest", "textures": ["solid"]}]}'
+texture = texv_argb8888(4, 4, (255, 0, 0, 255))
+
+open(sys.argv[1], "wb").write(
+    build_pkg(
+        [
+            ("scene.json", scene_json),
+            ("models/solid.json", model_json),
+            ("materials/solid.json", material_json),
+            ("materials/solid.tex", texture),
+        ]
+    )
+)
+S2PY
+
+s2_standalone_log="$smoke_root/standalone-s2-material.log"
+VK_ICD_FILENAMES="$lvp_icd" "$target_dir/debug/kwe-scene-renderer" \
+    --output "$smoke_root/standalone-s2-material.bin" --width 160 --height 90 --fps 30 \
+    --content "$s2_material_pkg" --assets-dir "$s2_assets_dir" --device llvmpipe \
+    >"$s2_standalone_log" 2>&1 &
+s2_standalone_pid=$!
+for _attempt in {1..400}; do
+    [[ -f "$smoke_root/standalone-s2-material.bin" ]] && head -c 8 "$smoke_root/standalone-s2-material.bin" | grep -q KWEFRM1 && break
+    kill -0 "$s2_standalone_pid" 2>/dev/null || {
+        echo "standalone S2 material renderer exited early" >&2
+        sed -n '1,120p' "$s2_standalone_log" >&2
+        exit 1
+    }
+    sleep 0.05
+done
+head -c 8 "$smoke_root/standalone-s2-material.bin" | grep -q KWEFRM1
+# The KWEFRM1 magic is written when the frame mapping is created — well
+# before material-shader compilation runs (main.rs step 5a), let alone the
+# first render — so the "shaders compiled=" log line is not guaranteed to
+# exist yet at this point. `scene_pixel_wait` polls until the shader has
+# actually drawn its colour (compilation is necessarily done by then), so
+# check the log line AFTER it rather than racing the worker's own startup
+# order.
+# B8G8R8A8 memory order: B=0.8*255=204, G=0.6*255=153, R=0.2*255=51.
+scene_pixel_wait "$smoke_root/standalone-s2-material.bin" 80 45 "204,153,51,255" 1 "$s2_standalone_log"
+grep -q "event=renderer.scene.shaders compiled=1 fallback=0" "$s2_standalone_log"
+stop_standalone "$s2_standalone_pid" "$s2_standalone_log" "standalone S2 material renderer"
+echo "scene smoke passed (S2): pkg model layer with a custom material shader -> compiles and draws through the material pipeline, not the S1 base texture"
+
 echo "all scene smoke cases passed"
