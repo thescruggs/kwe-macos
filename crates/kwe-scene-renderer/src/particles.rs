@@ -37,7 +37,7 @@ use std::rc::Rc;
 
 use crate::layers::{BlendMode, DrawKind, LayerDraw, MAX_LAYERS};
 use crate::scene::ParticleSpec;
-use crate::textures::SpritesheetGrid;
+use crate::textures::{DecodedTexture, SpritesheetGrid};
 
 /// Hard cap on the number of particle systems a scene can register. Raised
 /// from 16 to 64 in S7: the corpus's "Avatar" report showed
@@ -447,6 +447,39 @@ fn uniform(prng: &mut SplitMix64, min: f32, max: f32) -> f32 {
     }
 }
 
+/// S7 (P7): a file-based particle system's sprite aspect ratio — the
+/// spritesheet FRAME ratio when the texture has one (`(texH/rows) /
+/// (texW/cols)`), else the whole texture's own height/width ratio, else
+/// 1.0 (no texture, or a zero-width texture — defensive, never divides by
+/// zero). Free function (not a method) purely so `ParticleSystemState::
+/// from_spec` and this module's tests can call it without a whole state.
+///
+/// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+/// src/WallpaperEngine/Render/Objects/CParticle.cpp:1832-1844,1912-1940 @
+/// b016d7d1 — adapted (upstream's `textureRatio`/`ComputeParticlePosition`).
+fn texture_ratio_for(texture: Option<&DecodedTexture>) -> f32 {
+    let Some(texture) = texture else {
+        return 1.0;
+    };
+    if texture.width == 0 {
+        return 1.0;
+    }
+    match texture.spritesheet {
+        Some(grid) => {
+            let cols = grid.cols.max(1) as f32;
+            let rows = grid.rows.max(1) as f32;
+            let frame_w = texture.width as f32 / cols;
+            let frame_h = texture.height as f32 / rows;
+            if frame_w > 0.0 {
+                frame_h / frame_w
+            } else {
+                1.0
+            }
+        }
+        None => texture.height as f32 / texture.width as f32,
+    }
+}
+
 /// Upstream's `fadeValue`: a linear ramp from `(from, start)` to `(to,
 /// end)`, clamped to `[start, end]`'s range at the endpoints (matches
 /// `glm::clamp(mix(...), min(start,end), max(start,end))` semantics without
@@ -583,6 +616,17 @@ pub struct ParticleSystemState {
     /// `None` draws the whole texture per particle (a static sprite — the
     /// pre-S7, and still correct, behavior for a non-spritesheet texture).
     pub(crate) spritesheet: Option<SpritesheetGrid>,
+    /// S7 (P7): the object's own `scale` (`ParticleSpec.scale`, from
+    /// `common.scale`) — applied ONLY to component-model (file-based)
+    /// systems' sprite quads in `build_vertex_bytes`; the flat M3f model
+    /// never reads this field (its pre-S7 square-quad-in-absolute-scene-
+    /// units behavior is unchanged). Default (1, 1) = no-op.
+    pub(crate) scale: [f32; 2],
+    /// S7 (P7): this system's sprite aspect ratio (`texture_ratio_for`) —
+    /// the spritesheet FRAME ratio when the texture has one, else the
+    /// whole texture's own height/width ratio, else 1.0 (no texture).
+    /// Same component-model-only scope as `scale` above.
+    pub(crate) texture_ratio: f32,
 }
 
 impl ParticleSystemState {
@@ -673,6 +717,8 @@ impl ParticleSystemState {
             turbulence_runtime,
             sim_time: 0.0,
             spritesheet: spec.texture.as_ref().and_then(|texture| texture.spritesheet),
+            scale: spec.scale,
+            texture_ratio: texture_ratio_for(spec.texture.as_ref()),
         }
     }
 
@@ -1160,9 +1206,31 @@ impl ParticleSystemState {
                 ];
                 (size, color)
             };
-            let half = size * 0.5;
-            let (x0, x1) = (particle.x - half, particle.x + half);
-            let (y0, y1) = (particle.y - half, particle.y + half);
+            // S7 (P7): component-model (file-based) systems apply the
+            // object's own `scale` and this system's texture aspect ratio
+            // to the sprite quad — upstream's model matrix =
+            // translate(origin)·rotate·scale(object scale), sprite quad =
+            // size × (1, textureRatio) (`CParticle.cpp:1832-1844,
+            // 1912-1940`). The flat M3f model below is BYTE-IDENTICAL to
+            // pre-S7: square quads in absolute scene units, ignoring scale
+            // entirely (every M3f smoke oracle depends on this).
+            let (x0, x1, y0, y1) = if self.component.is_some() {
+                let lx = particle.x - self.origin[0];
+                let ly = particle.y - self.origin[1];
+                let cx = self.origin[0] + lx * self.scale[0];
+                let cy = self.origin[1] + ly * self.scale[1];
+                let half_x = size * 0.5 * self.scale[0].abs();
+                let half_y = size * 0.5 * self.scale[1].abs() * self.texture_ratio;
+                (cx - half_x, cx + half_x, cy - half_y, cy + half_y)
+            } else {
+                let half = size * 0.5;
+                (
+                    particle.x - half,
+                    particle.x + half,
+                    particle.y - half,
+                    particle.y + half,
+                )
+            };
             // S7: when this system's texture is a spritesheet, remap the
             // 0..1 corner UVs below into the current frame's box instead of
             // sampling the whole atlas (upstream `ComputeSpriteFrame` +
@@ -1893,6 +1961,114 @@ mod tests {
         assert_eq!(state.particles.len(), 1);
         assert_eq!(state.particles[0].size, 40.0);
         assert_eq!(state.particles[0].initial_size, 40.0);
+    }
+
+    /// Reads vertex `i`'s (x, y) position out of a `build_vertex_bytes`
+    /// scratch buffer (40-byte stride: pos.xy, uv.xy, color.rgba, size,
+    /// pad — see `PARTICLE_VERTEX_BYTES`).
+    fn vertex_pos(bytes: &[u8], i: usize) -> (f32, f32) {
+        let off = i * PARTICLE_VERTEX_BYTES;
+        let x = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let y = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+        (x, y)
+    }
+
+    /// S7 (P7): a component-model system's own `scale` multiplies BOTH the
+    /// particle's offset from the system origin AND the quad's half-extent
+    /// — upstream's translate(origin)·rotate·scale(object scale) model
+    /// matrix. Corner order is tl(0), tr(1), br(2)/(2 dup at 3), bl(4),
+    /// tl(5) — see the doc comment above `build_vertex_bytes`'s corner
+    /// array — so vertex 0's x is the quad's left edge and vertex 1's x is
+    /// the right edge.
+    #[test]
+    fn component_model_scale_doubles_offset_and_quad_width() {
+        let mut state = component_state(
+            ComponentModel {
+                maxcount: 100,
+                emitters: vec![],
+                initializers: vec![],
+                operators: vec![],
+            },
+            100,
+        );
+        state.scale = [2.0, 1.0];
+        state.particles.push(Particle {
+            x: 10.0, // 10 px right of the origin (0, 0)
+            y: 0.0,
+            size: 4.0,
+            life: 1.0,
+            ..Default::default()
+        });
+        let mut scratch = Vec::new();
+        let count = state.build_vertex_bytes(&mut scratch);
+        assert_eq!(count, 6);
+        let (x0, _) = vertex_pos(&scratch, 0);
+        let (x1, _) = vertex_pos(&scratch, 1);
+        // cx = origin.x + (10 - origin.x) * 2 = 20; half_x = 4 * 0.5 * 2 = 4.
+        assert_eq!((x0, x1), (16.0, 24.0));
+    }
+
+    /// S7 (P7): `texture_ratio` (from the system's texture aspect) scales
+    /// only the quad's HEIGHT, not its width — a 0.5 ratio halves the
+    /// y-extent while the x-extent stays the plain `size * 0.5 *
+    /// scale.x.abs()`.
+    #[test]
+    fn component_model_texture_ratio_scales_quad_height_only() {
+        let mut state = component_state(
+            ComponentModel {
+                maxcount: 100,
+                emitters: vec![],
+                initializers: vec![],
+                operators: vec![],
+            },
+            100,
+        );
+        state.texture_ratio = 0.5;
+        state.particles.push(Particle {
+            x: 0.0,
+            y: 0.0,
+            size: 10.0,
+            life: 1.0,
+            ..Default::default()
+        });
+        let mut scratch = Vec::new();
+        state.build_vertex_bytes(&mut scratch);
+        let (x0, y0) = vertex_pos(&scratch, 0);
+        let (x1, y1) = vertex_pos(&scratch, 2); // br corner
+        assert_eq!((x0, x1), (-5.0, 5.0), "x-extent unaffected by texture_ratio");
+        assert_eq!((y0, y1), (-2.5, 2.5), "y-extent halved by texture_ratio 0.5");
+    }
+
+    /// S7 (P7): a negative scale component mirrors that axis — the
+    /// particle's offset from the origin flips sign (upstream's
+    /// `wind-blur` object, scale `(-2, 2)`, is the corpus example this
+    /// regresses against). The quad half-extent uses the ABSOLUTE value
+    /// (a mirrored quad is not an inside-out one).
+    #[test]
+    fn component_model_negative_scale_mirrors_the_axis() {
+        let mut state = component_state(
+            ComponentModel {
+                maxcount: 100,
+                emitters: vec![],
+                initializers: vec![],
+                operators: vec![],
+            },
+            100,
+        );
+        state.scale = [-2.0, 1.0];
+        state.particles.push(Particle {
+            x: 10.0,
+            y: 0.0,
+            size: 4.0,
+            life: 1.0,
+            ..Default::default()
+        });
+        let mut scratch = Vec::new();
+        state.build_vertex_bytes(&mut scratch);
+        let (x0, _) = vertex_pos(&scratch, 0);
+        let (x1, _) = vertex_pos(&scratch, 1);
+        // cx = 0 + (10 - 0) * -2 = -20; half_x = 4 * 0.5 * |-2| = 4.
+        assert_eq!((x0, x1), (-24.0, -16.0));
     }
 
     #[test]
