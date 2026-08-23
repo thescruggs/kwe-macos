@@ -73,7 +73,7 @@ use layers::{LayerState, MAX_LAYERS, frame_draws, merged_draws};
 use particles::{MAX_PARTICLE_SYSTEMS, ParticleSystemState, particle_draws};
 use scene::{SceneConfig, SceneError, read_bounded};
 use text::{MAX_TEXT_LAYERS, TextRenderer};
-use textures::{MAX_TEXTURE_SOURCE_BYTES, decode_texture, texture_budget_allows};
+use textures::{MAX_TEXTURE_SOURCE_BYTES, texture_budget_allows};
 use vulkan::{
     EffectTargetRequest, LayerRenderer, MaterialTextureBind, RenderError, is_fence_timeout,
 };
@@ -1412,7 +1412,11 @@ fn load_layer_textures(
                 continue;
             }
         };
-        let Some(texture) = decode_texture(&bytes) else {
+        // S7: route through `texv::decode_model_texture` (falls back to
+        // plain `decode_texture` for non-TEXV0005 bytes) so a `.tex`-backed
+        // animated image layer decodes AND carries its spritesheet grid,
+        // instead of unconditionally failing decode as a plain image.
+        let Some(texture) = texv::decode_model_texture(&bytes) else {
             eprintln!(
                 "event=renderer.scene.layer_skip layer={} detail=undecodable-or-over-budget",
                 layer.name
@@ -1465,7 +1469,11 @@ fn load_particle_textures(
                 continue;
             }
         };
-        let Some(texture) = decode_texture(&bytes) else {
+        // S7: same `decode_model_texture` swap as `load_layer_textures` —
+        // a flat-model (M3f) particle system whose `material` names a
+        // `.tex` spritesheet now decodes (and animates) instead of
+        // silently drawing nothing.
+        let Some(texture) = texv::decode_model_texture(&bytes) else {
             eprintln!(
                 "event=renderer.scene.particle_skip system={} detail=undecodable-or-over-budget",
                 particle.name
@@ -1549,6 +1557,43 @@ fn load_particle_file_definitions(
         particle.max_count = particles::clamp_max_count(u64::from(component.maxcount));
         particle.texture = Some(texture);
         particle.component = Some(component);
+        // S7 (P4): honour the material's own blend mode instead of the
+        // object's colorBlendMode (0 = normal) — every file-based particle
+        // system previously drew with plain alpha blending, so an
+        // additive star/halo/fog/bokeh sprite's black background drew as
+        // an opaque black box (Avatar report: "stars ... blocked out
+        // around"). Borrowed-From: Almamu/linux-wallpaperengine
+        // (GPL-3.0-or-later) src/WallpaperEngine/Render/Objects/
+        // CPass.cpp:129-140 @ b016d7d1 — adapted (this crate's
+        // `material_blend_mode` already implements the same additive/
+        // translucent mapping other material paths use).
+        if let Some(blending) = resolved_file.material.blending.as_deref() {
+            particle.blend_mode = material_blend_mode(Some(blending)).as_u32();
+        }
+        // S7 (P4): the material constant `ui_editor_properties_overbright`
+        // multiplies the drawn color (upstream `CParticle.cpp:122-126`,
+        // `genericparticle.frag: color.rgb *= g_Overbright`) — folded here
+        // into the existing `brightness` multiplier instead of adding a
+        // new uniform, since this renderer's particle draw already
+        // multiplies color by `particle.brightness` (see `particles.rs`).
+        // A non-finite or unparsable value leaves `particle.brightness`
+        // untouched (no multiply), matching this file's other "absent or
+        // garbage -> keep the default" constant-parsing contract.
+        // Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+        // src/WallpaperEngine/Render/Objects/CParticle.cpp:122-126 @
+        // b016d7d1 — adapted.
+        if let Some(overbright) = resolved_file
+            .material
+            .constant_shader_values
+            .get("ui_editor_properties_overbright")
+            .and_then(parse_constant_components)
+            .map(|components| components[0])
+            .filter(|value| value.is_finite())
+        {
+            particle.brightness = layers::clamp_layer_brightness(
+                f64::from(particle.brightness) * f64::from(overbright),
+            );
+        }
         resolved += 1;
     }
     if skipped > 0 {
@@ -3875,6 +3920,121 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    // ---- S7 (P4): particle-file material blending/overbright ----
+
+    /// A minimal `ParticleSpec` naming an external particle file reference
+    /// (S4b) — every other field takes the M3f flat-model default, mirroring
+    /// `scene::particle_spec_defaults` (private to scene.rs, so this test
+    /// helper duplicates the defaults directly rather than reaching in).
+    fn particle_spec_with_file_ref(file_ref: &str) -> scene::ParticleSpec {
+        scene::ParticleSpec {
+            name: "test".to_string(),
+            scene_order: 0,
+            origin: [0.0, 0.0],
+            spawn_rate: particles::DEFAULT_PARTICLE_SPAWN_RATE,
+            life: particles::DEFAULT_PARTICLE_LIFE,
+            speed_min: particles::DEFAULT_PARTICLE_SPEED,
+            speed_max: particles::DEFAULT_PARTICLE_SPEED,
+            direction: particles::DEFAULT_PARTICLE_DIRECTION,
+            spread: particles::DEFAULT_PARTICLE_SPREAD,
+            gravity: particles::DEFAULT_PARTICLE_GRAVITY,
+            size_start: particles::DEFAULT_PARTICLE_SIZE,
+            size_end: particles::DEFAULT_PARTICLE_SIZE,
+            color_start: [1.0, 1.0, 1.0, 1.0],
+            color_end: [1.0, 1.0, 1.0, 1.0],
+            alpha_start: particles::DEFAULT_PARTICLE_ALPHA_START,
+            alpha_end: particles::DEFAULT_PARTICLE_ALPHA_END,
+            material: None,
+            max_count: particles::DEFAULT_PARTICLE_MAX_COUNT,
+            blend_mode: layers::BlendMode::Normal.as_u32(),
+            alpha: 1.0,
+            visible: true,
+            brightness: 1.0,
+            texture: None,
+            file_ref: Some(file_ref.to_string()),
+            component: None,
+        }
+    }
+
+    /// A particle-file/material/texture fixture resolver: `particles/p.json`
+    /// names `materials/p.json`, which declares `blending` and
+    /// `constantshadervalues.ui_editor_properties_overbright` from the two
+    /// arguments, and points its slot-0 texture at `materials/p.tex` (a
+    /// real decodable PNG — `tiny_png()` — so the texture-decode step that
+    /// gates `load_particle_file_definitions` succeeds).
+    fn particle_material_fixture(
+        blending: &str,
+        overbright: &str,
+    ) -> impl FnMut(&str) -> Option<Vec<u8>> {
+        let png = tiny_png();
+        move |reference: &str| match reference {
+            "particles/p.json" => {
+                Some(br#"{"material": "materials/p.json", "maxcount": 100}"#.to_vec())
+            }
+            "materials/p.json" => Some(
+                format!(
+                    r#"{{"passes": [{{"textures": ["p"], "blending": "{blending}",
+                         "constantshadervalues": {{"ui_editor_properties_overbright": {overbright}}}}}]}}"#
+                )
+                .into_bytes(),
+            ),
+            "materials/p.tex" => Some(png.clone()),
+            _ => None,
+        }
+    }
+
+    /// S7 (P4): the material's own `blending` — not the object's
+    /// `colorBlendMode` — decides a file-based particle system's blend
+    /// mode. `additive` -> `BlendMode::Add` (WE 6); before this fix every
+    /// file-based system drew with plain alpha (0) regardless of the
+    /// material, so an additive sprite's black background painted an
+    /// opaque black box.
+    #[test]
+    fn particle_file_material_additive_blending_maps_to_add() {
+        let mut systems = vec![particle_spec_with_file_ref("particles/p.json")];
+        let mut used_bytes = 0u64;
+        let resolved = load_particle_file_definitions(
+            &mut systems,
+            &mut used_bytes,
+            particle_material_fixture("additive", "1.0"),
+        );
+        assert_eq!(resolved, 1);
+        assert_eq!(systems[0].blend_mode, layers::BlendMode::Add.as_u32());
+    }
+
+    #[test]
+    fn particle_file_material_translucent_blending_maps_to_normal() {
+        let mut systems = vec![particle_spec_with_file_ref("particles/p.json")];
+        let mut used_bytes = 0u64;
+        let resolved = load_particle_file_definitions(
+            &mut systems,
+            &mut used_bytes,
+            particle_material_fixture("translucent", "1.0"),
+        );
+        assert_eq!(resolved, 1);
+        assert_eq!(systems[0].blend_mode, layers::BlendMode::Normal.as_u32());
+    }
+
+    /// S7 (P4): `ui_editor_properties_overbright` multiplies the drawn
+    /// brightness (folded into the existing `brightness` field, which
+    /// defaults to 1.0 for a flat-model particle system, so 0.25 -> 0.25).
+    #[test]
+    fn particle_file_material_overbright_multiplies_brightness() {
+        let mut systems = vec![particle_spec_with_file_ref("particles/p.json")];
+        let mut used_bytes = 0u64;
+        let resolved = load_particle_file_definitions(
+            &mut systems,
+            &mut used_bytes,
+            particle_material_fixture("translucent", "0.25"),
+        );
+        assert_eq!(resolved, 1);
+        assert!(
+            (systems[0].brightness - 0.25).abs() < 1e-6,
+            "brightness={}",
+            systems[0].brightness
+        );
     }
 
     /// One effect chain with a single untargeted material pass whose only
