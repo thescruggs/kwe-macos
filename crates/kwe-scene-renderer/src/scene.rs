@@ -445,6 +445,35 @@ pub struct ParticleSpec {
     /// failed to resolve/parse — the existing honest fallback: the system
     /// stays registered with its M3f defaults rather than vanishing).
     pub component: Option<particles::ComponentModel>,
+    /// S7 (P6): the object's `instanceoverride` scalar multipliers —
+    /// `count, rate, size, lifetime, speed, alpha`, each possibly wrapped
+    /// as `{user|script, value}`, default 1.0 (upstream `ObjectParser.cpp:
+    /// 867-878`). Applied by `particles.rs::ParticleSystemState::from_spec`
+    /// as the INITIAL value of the same-named script-writable instance
+    /// factors (`count`/`rate`/`size`/`lifetime`/`speed`/`alpha_factor`) —
+    /// a scene-authored override and a later script write share one field,
+    /// exactly like upstream shares one state slot for both.
+    pub instance_count: f32,
+    pub instance_rate: f32,
+    pub instance_size: f32,
+    pub instance_lifetime: f32,
+    pub instance_speed: f32,
+    pub instance_alpha: f32,
+    /// S7 (P6): `instanceoverride.colorn` (or `color`, the same field) — a
+    /// vector string `"r g b"`, reduced to the MEAN of its three
+    /// components (documented scalar approximation of WE's per-channel
+    /// tint: the runtime `colorn` state this feeds is itself scalar, see
+    /// `particles::ParticleSystemState::colorn`), clamped 0..=1. Default
+    /// 1.0.
+    pub instance_colorn: f32,
+    /// S7 (P7): the object's own `scale` (`common.scale`, already parsed
+    /// for every object kind) — unlike `origin`'s doc comment above still
+    /// says for angles, `scale` IS now applied to file-based (component-
+    /// model) particle systems' sprite quads (`particles.rs::
+    /// build_vertex_bytes`); the flat M3f model stays byte-identical
+    /// (ignores this field, matching its pre-S7 world-space-only
+    /// behavior).
+    pub scale: [f32; 2],
 }
 
 /// One `objects` entry interpreted as a text layer (M3e). Field names
@@ -1401,6 +1430,14 @@ fn particle_spec_defaults(common: CommonProps, index: usize) -> ParticleSpec {
         texture: None,
         file_ref: None,
         component: None,
+        instance_count: 1.0,
+        instance_rate: 1.0,
+        instance_size: 1.0,
+        instance_lifetime: 1.0,
+        instance_speed: 1.0,
+        instance_alpha: 1.0,
+        instance_colorn: 1.0,
+        scale: common.scale,
     }
 }
 
@@ -1422,6 +1459,66 @@ fn parse_particle_system(
 ) -> Result<ParticleSpec, SceneError> {
     let common = parse_common_props(object, index, "particle")?;
     let mut spec = particle_spec_defaults(common, index);
+
+    // S7 (P6): `instanceoverride` (per-instance multipliers) applies to
+    // EVERY particle system, inline or file-referenced — read it before
+    // the `file_ref` early return below, unlike the flat-model fields
+    // further down which only exist for an inline (object-valued)
+    // `particle`. Lenient like every other M3f particle field: missing or
+    // unparsable takes the identity 1.0, never a scene reject (WE's own
+    // `ObjectParser.cpp:867-878` default).
+    //
+    // Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    // src/WallpaperEngine/Core/Objects/Effects/ObjectParser.cpp:867-878 @
+    // b016d7d1 — adapted (the defaults/field set; the actual per-particle
+    // application lives in particles.rs, see its own Borrowed-From
+    // comments).
+    if let Some(Value::Object(overrides)) = object.get("instanceoverride").map(scene_property_value)
+    {
+        let numeric = |value: &Value| -> Option<f64> {
+            if let Some(number) = value.as_f64() {
+                Some(number)
+            } else if let Some(text) = value.as_str() {
+                text.parse::<f64>().ok()
+            } else {
+                None
+            }
+        };
+        let factor = |name: &str, max: f64| -> f32 {
+            overrides
+                .get(name)
+                .map(scene_property_value)
+                .and_then(numeric)
+                .map(|value| particles::clamp_instance_factor(value, max))
+                .unwrap_or(1.0)
+        };
+        spec.instance_count = factor("count", 1e6);
+        spec.instance_rate = factor("rate", 1e6);
+        spec.instance_size = factor("size", 1e6);
+        spec.instance_lifetime = factor("lifetime", 1e6);
+        spec.instance_speed = factor("speed", 1e6);
+        spec.instance_alpha = factor("alpha", 1.0);
+        // `colorn` (upstream's intentional backward-compatibility spelling)
+        // and `color`, same meaning: a WE vector string reduced to the
+        // MEAN of its three components (documented scalar approximation —
+        // the runtime `colorn` state this feeds is itself scalar, see
+        // `particles::ParticleSystemState::colorn`). A malformed vector
+        // (wrong shape, unparsable tokens) is unparsable -> 1.0, never a
+        // scene reject.
+        spec.instance_colorn = overrides
+            .get("colorn")
+            .or_else(|| overrides.get("color"))
+            .map(scene_property_value)
+            .and_then(|value| {
+                parse_vector(value, &field(index, "instanceoverride.colorn"), &[3], false).ok()
+            })
+            .map(|components| {
+                let mean = (components[0] + components[1] + components[2]) / 3.0;
+                mean.clamp(0.0, 1.0)
+            })
+            .unwrap_or(1.0);
+    }
+
     let raw = scene_property_value(object.get("particle").expect("caller checked"));
     if let Value::String(reference) = raw {
         // S4b: an external particle definition file reference. The actual
@@ -3438,6 +3535,72 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    /// S7 (P6): `instanceoverride` — the scene's per-instance multipliers
+    /// (WE `{user|script, value}`-wrapped scalars, plus `colorn`'s vector
+    /// string form) parse into `ParticleSpec`'s `instance_*` fields.
+    /// `count`'s `{script, value: 0.0}` shape is Avatar's night-sky star
+    /// systems (day = zero stars) — the exact case P6 exists for.
+    #[test]
+    fn instanceoverride_scalars_and_colorn_parse() {
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "stars", "particle": {},
+                "instanceoverride": {
+                    "count": {"script": "day", "value": 0.0},
+                    "rate": 0.5,
+                    "alpha": 0.3,
+                    "colorn": "0.5 0.5 0.5"
+                }
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].instance_count, 0.0);
+        assert_eq!(particles[0].instance_rate, 0.5);
+        assert_eq!(particles[0].instance_alpha, 0.3);
+        assert!((particles[0].instance_colorn - 0.5).abs() < 1e-6);
+        // Every field not named in `instanceoverride` keeps the identity.
+        assert_eq!(particles[0].instance_size, 1.0);
+        assert_eq!(particles[0].instance_lifetime, 1.0);
+        assert_eq!(particles[0].instance_speed, 1.0);
+    }
+
+    /// S7 (P6): missing/malformed `instanceoverride` fields (and a missing
+    /// `instanceoverride` object entirely) are lenient — every
+    /// `instance_*` field stays the 1.0 identity, never a scene reject.
+    #[test]
+    fn instanceoverride_absent_or_malformed_defaults_to_identity() {
+        let particles = parse_particles_of(r#"{"objects": [{"name": "dust", "particle": {}}]}"#)
+            .unwrap();
+        assert_eq!(particles[0].instance_count, 1.0);
+        assert_eq!(particles[0].instance_colorn, 1.0);
+
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "dust", "particle": {},
+                "instanceoverride": {"count": "not a number", "colorn": [1, 2]}
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].instance_count, 1.0);
+        assert_eq!(particles[0].instance_colorn, 1.0);
+    }
+
+    /// S7 (P6/P7): `instanceoverride` applies even when `particle` is a
+    /// STRING (an external particle-file reference) — parsed before the
+    /// `file_ref` early return — and the object's own `scale` (already
+    /// parsed for every object kind) lands on `ParticleSpec.scale`.
+    #[test]
+    fn instanceoverride_applies_to_file_ref_systems_and_scale_is_captured() {
+        let particles = parse_particles_of(
+            r#"{"objects": [{"name": "stars", "particle": "particles/stars.json",
+                "scale": [4, 0.8],
+                "instanceoverride": {"count": 0.0}
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(particles[0].file_ref.as_deref(), Some("particles/stars.json"));
+        assert_eq!(particles[0].instance_count, 0.0);
+        assert_eq!(particles[0].scale, [4.0, 0.8]);
     }
 
     #[test]

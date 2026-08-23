@@ -1554,7 +1554,27 @@ fn load_particle_file_definitions(
         unsupported.unsupported_emitters += stats.unsupported_emitters;
         unsupported.unsupported_initializers += stats.unsupported_initializers;
         unsupported.unsupported_operators += stats.unsupported_operators;
-        particle.max_count = particles::clamp_max_count(u64::from(component.maxcount));
+        // S7 (P6): the scene's `instanceoverride.count` scales the file's
+        // own `maxcount` BEFORE the cap clamps it — WE's day/night star
+        // systems carry `instanceoverride.count = {..., value: 0.0}` to
+        // show no stars by day (Avatar's night-sky systems; we drew 750
+        // regardless before this). `clamp_max_count` floors its input to 1
+        // (the flat-model default-count contract, unrelated to this path),
+        // so a scaled result of exactly 0 is special-cased directly to 0
+        // rather than going through it — "nothing ever spawns" needs an
+        // actual zero, not the floor.
+        //
+        // Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+        // src/WallpaperEngine/Render/Objects/CParticle.cpp:59-61 @
+        // b016d7d1 — adapted.
+        let scaled_maxcount = (f64::from(component.maxcount) * f64::from(particle.instance_count))
+            .round()
+            .max(0.0) as u64;
+        particle.max_count = if scaled_maxcount == 0 {
+            0
+        } else {
+            particles::clamp_max_count(scaled_maxcount)
+        };
         particle.texture = Some(texture);
         particle.component = Some(component);
         // S7 (P4): honour the material's own blend mode instead of the
@@ -3955,6 +3975,14 @@ mod tests {
             texture: None,
             file_ref: Some(file_ref.to_string()),
             component: None,
+            instance_count: 1.0,
+            instance_rate: 1.0,
+            instance_size: 1.0,
+            instance_lifetime: 1.0,
+            instance_speed: 1.0,
+            instance_alpha: 1.0,
+            instance_colorn: 1.0,
+            scale: [1.0, 1.0],
         }
     }
 

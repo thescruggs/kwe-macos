@@ -37,11 +37,20 @@ use std::rc::Rc;
 
 use crate::layers::{BlendMode, DrawKind, LayerDraw, MAX_LAYERS};
 use crate::scene::ParticleSpec;
+use crate::textures::SpritesheetGrid;
 
-/// Hard cap on the number of particle systems a scene can register.
-/// Mirrors text::MAX_TEXT_LAYERS; systems past it are skipped (counted for
-/// the worker's one-time diagnostic, never a rejection).
-pub const MAX_PARTICLE_SYSTEMS: usize = 16;
+/// Hard cap on the number of particle systems a scene can register. Raised
+/// from 16 to 64 in S7: the corpus's "Avatar" report showed
+/// `particle_system_skip count=12 (cap is 16)` — real scenes with more
+/// systems than the old cap were silently losing whole particle systems,
+/// not just capping their individual particle counts. 64 is a bounded
+/// generous ceiling (still a small constant multiple of the previous cap,
+/// and `TEXTURE_SLOT_COUNT`/the descriptor pool in vulkan.rs are derived
+/// from this constant, not hardcoded, so raising it costs a proportionally
+/// larger but still fixed-size pool, never unbounded growth). Systems past
+/// it are skipped (counted for the worker's one-time diagnostic, never a
+/// rejection).
+pub const MAX_PARTICLE_SYSTEMS: usize = 64;
 
 /// Hard cap on live particles per system. A scene's `maxCount` clamps to
 /// this; the JS emitParticles() burst clamps to it too.
@@ -516,6 +525,16 @@ pub struct ParticleSystemState {
     /// Color modifier; the trailing "n" is WE's intentional backward
     /// compatibility spelling (documented in the API research).
     pub colorn: f32,
+    /// S7 (P6): the scene's `instanceoverride.rate` multiplier, folded into
+    /// BOTH emission accumulators (`spawn_accumulator`/the component-model
+    /// per-emitter accumulators) — distinct from `rate` above, which is a
+    /// SIM-TIME multiplier (`sim_accumulator += dt * self.rate`) and must
+    /// never be fed an instance-override value (WE's `rate` instance
+    /// override scales EMISSION density, not simulation speed). Default
+    /// 1.0; not currently script-writable (no `Scene.getParticleSystem`
+    /// proxy field for it — the M3f script surface only covers the
+    /// pre-existing `rate`/`count`/etc. above).
+    pub emission_rate: f32,
     // Simulation state.
     /// Emission on/off. pause() leaves live particles simulating; stop()
     /// clears them immediately (researched WE semantics).
@@ -559,6 +578,11 @@ pub struct ParticleSystemState {
     /// long-uptime caveat every other age/time field in this module
     /// already carries.
     pub(crate) sim_time: f32,
+    /// S7: this system's texture's spritesheet grid, when its material
+    /// resolved to a `.tex` container with a usable `TEXS*` frame table.
+    /// `None` draws the whole texture per particle (a static sprite — the
+    /// pre-S7, and still correct, behavior for a non-spritesheet texture).
+    pub(crate) spritesheet: Option<SpritesheetGrid>,
 }
 
 impl ParticleSystemState {
@@ -618,13 +642,24 @@ impl ParticleSystemState {
             alpha: spec.alpha,
             brightness: spec.brightness,
             visible: spec.visible,
-            count: 1.0,
-            speed: 1.0,
-            lifetime: 1.0,
-            size: 1.0,
-            alpha_factor: 1.0,
+            // S7 (P6): initial value comes from the scene's own
+            // `instanceoverride` (default 1.0 when absent, `scene.rs`'s
+            // job) — a scene-authored override and a later script write
+            // through `Scene.getParticleSystem(...).instance` share this
+            // one field, exactly like upstream shares one state slot for
+            // both (`ObjectParser.cpp:867-878` sets the initial value;
+            // `CParticle.cpp` reads it as of whenever it's last written).
+            count: spec.instance_count,
+            speed: spec.instance_speed,
+            lifetime: spec.instance_lifetime,
+            size: spec.instance_size,
+            alpha_factor: spec.instance_alpha,
+            // `rate` is the SIM-TIME multiplier, unrelated to
+            // `instanceoverride.rate` — see this field's own doc comment
+            // and `emission_rate` below.
             rate: 1.0,
-            colorn: 1.0,
+            colorn: spec.instance_colorn,
+            emission_rate: spec.instance_rate,
             emitting: true,
             particles: Vec::new(),
             spawn_accumulator: 0.0,
@@ -637,6 +672,7 @@ impl ParticleSystemState {
             emitter_accumulators,
             turbulence_runtime,
             sim_time: 0.0,
+            spritesheet: spec.texture.as_ref().and_then(|texture| texture.spritesheet),
         }
     }
 
@@ -678,7 +714,11 @@ impl ParticleSystemState {
         } else if self.emitting || self.burst > 0 {
             let mut requested: u32 = 0;
             if self.emitting {
-                self.spawn_accumulator += self.spawn_rate * self.count * h;
+                // S7 (P6): `emission_rate` (`instanceoverride.rate`,
+                // default 1.0) scales emission density — a numerically
+                // inert factor for every pre-S7 scene (no `instanceoverride`
+                // -> 1.0 -> byte-identical spawn counts).
+                self.spawn_accumulator += self.spawn_rate * self.count * self.emission_rate * h;
                 if self.spawn_accumulator > MAX_SPAWN_ACCUMULATOR {
                     self.spawn_accumulator = MAX_SPAWN_ACCUMULATOR;
                 }
@@ -746,7 +786,9 @@ impl ParticleSystemState {
                 let mut requested: u32 = 0;
                 if self.emitting && rate > 0.0 {
                     let accumulator = &mut self.emitter_accumulators[index];
-                    *accumulator += rate * self.count * h;
+                    // S7 (P6): same `emission_rate` factor as the flat
+                    // model's `spawn_accumulator` above.
+                    *accumulator += rate * self.count * self.emission_rate * h;
                     if *accumulator > MAX_SPAWN_ACCUMULATOR {
                         *accumulator = MAX_SPAWN_ACCUMULATOR;
                     }
@@ -1009,6 +1051,30 @@ impl ParticleSystemState {
         for initializer in &component.initializers {
             apply_initializer(initializer, &mut particle, &mut self.prng);
         }
+        // S7 (P6): the instance-override factors apply AFTER the
+        // initializers set their baseline values — Avatar's "Fog 2" (rate
+        // 0.58), "Light shafts" (rate 3.35, alpha 0.055), "Dust motes"
+        // (size 0.35) etc. all rely on this; a factor of 1.0 (the
+        // pre-instanceoverride default, and every scene without one) makes
+        // every line below a no-op, so this is numerically inert for the
+        // flat (M3f) model, which never calls `spawn_component` at all.
+        // `initial_*` are refreshed too since they are the baseline
+        // `build_vertex_bytes`/operators read back for a component system.
+        //
+        // Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+        // src/WallpaperEngine/Render/Objects/CParticle.cpp:715-790 @
+        // b016d7d1 — adapted.
+        particle.size *= self.size;
+        particle.initial_size = particle.size;
+        particle.alpha *= self.alpha_factor;
+        particle.initial_alpha = particle.alpha;
+        for channel in &mut particle.color {
+            *channel *= self.colorn;
+        }
+        particle.initial_color = particle.color;
+        particle.life *= self.lifetime;
+        particle.vx *= self.speed;
+        particle.vy *= self.speed;
         particle.life = particle.life.max(FIXED_STEP);
         self.particles.push(particle);
     }
@@ -1097,15 +1163,32 @@ impl ParticleSystemState {
             let half = size * 0.5;
             let (x0, x1) = (particle.x - half, particle.x + half);
             let (y0, y1) = (particle.y - half, particle.y + half);
+            // S7: when this system's texture is a spritesheet, remap the
+            // 0..1 corner UVs below into the current frame's box instead of
+            // sampling the whole atlas (upstream `ComputeSpriteFrame` +
+            // `genericparticle.vert`'s `v_TexCoord += uvOffsets.xyxy`,
+            // re-derived for CPU use in `SpritesheetGrid`). The frame is
+            // picked fresh every rebuild from age/life — no persisted
+            // per-particle frame field needed, see `SpritesheetGrid::
+            // frame_for`'s doc.
+            let (uv_origin, uv_size) = match self.spritesheet {
+                Some(grid) => {
+                    let life_fraction = (particle.age / particle.life).clamp(0.0, 1.0);
+                    let frame = grid.frame_for(particle.age, life_fraction);
+                    grid.frame_uv_origin_and_size(frame)
+                }
+                None => ([0.0, 0.0], [1.0, 1.0]),
+            };
             // Corner order mirrors UNIT_QUAD and the text glyph quads:
-            // tl, tr, br, br, bl, tl, full-texture UVs.
+            // tl, tr, br, br, bl, tl, full-texture UVs (remapped into the
+            // frame box above when spritesheet is Some).
             for (px, py, u, v) in [
-                (x0, y0, 0.0_f32, 0.0_f32),
-                (x1, y0, 1.0_f32, 0.0_f32),
-                (x1, y1, 1.0_f32, 1.0_f32),
-                (x1, y1, 1.0_f32, 1.0_f32),
-                (x0, y1, 0.0_f32, 1.0_f32),
-                (x0, y0, 0.0_f32, 0.0_f32),
+                (x0, y0, uv_origin[0], uv_origin[1]),
+                (x1, y0, uv_origin[0] + uv_size[0], uv_origin[1]),
+                (x1, y1, uv_origin[0] + uv_size[0], uv_origin[1] + uv_size[1]),
+                (x1, y1, uv_origin[0] + uv_size[0], uv_origin[1] + uv_size[1]),
+                (x0, y1, uv_origin[0], uv_origin[1] + uv_size[1]),
+                (x0, y0, uv_origin[0], uv_origin[1]),
             ] {
                 scratch.extend_from_slice(&px.to_le_bytes());
                 scratch.extend_from_slice(&py.to_le_bytes());
@@ -1479,6 +1562,14 @@ mod tests {
             texture: None,
             file_ref: None,
             component: None,
+            instance_count: 1.0,
+            instance_rate: 1.0,
+            instance_size: 1.0,
+            instance_lifetime: 1.0,
+            instance_speed: 1.0,
+            instance_alpha: 1.0,
+            instance_colorn: 1.0,
+            scale: [1.0, 1.0],
         };
         f(&mut spec);
         spec
@@ -1658,6 +1749,74 @@ mod tests {
     }
 
     #[test]
+    fn spritesheet_remaps_particle_uvs_into_the_current_frame_box() {
+        // S7 regression for the "rainbow stars" bug: a system whose texture
+        // is a 4x1 spritesheet must sample ONE frame's box per particle,
+        // never the whole atlas (the pre-S7 behavior — uv (0,0)..(1,1)
+        // every time, drawing every frame's colors stacked into one
+        // sprite).
+        let mut state = state_with(|s| {
+            s.spawn_rate = 0.0;
+            s.size_start = 10.0;
+            s.size_end = 10.0;
+            s.life = 4.0;
+        });
+        state.spritesheet = Some(SpritesheetGrid {
+            cols: 4,
+            rows: 1,
+            frame_count: 4,
+            duration: 0.0, // life-fraction driven
+        });
+        state.particles.push(Particle {
+            age: 2.0, // life fraction 0.5 -> frame 2 of 4 (col 2, row 0)
+            life: 4.0,
+            ..Default::default()
+        });
+        let mut scratch = Vec::new();
+        let count = state.build_vertex_bytes(&mut scratch);
+        assert_eq!(count, 6);
+        let uv = |i: usize| {
+            let off = i * PARTICLE_VERTEX_BYTES + 2 * 4;
+            let u = f32::from_le_bytes(scratch[off..off + 4].try_into().unwrap());
+            let v = f32::from_le_bytes(scratch[off + 4..off + 8].try_into().unwrap());
+            (u, v)
+        };
+        // Corner 0 (tl) sits at the frame origin; corner 3 (br) at
+        // origin + frame size (0.25, 1.0) — NEVER (0,0)/(1,1), which would
+        // be the whole-atlas UVs this fix replaces.
+        assert_eq!(uv(0), (0.5, 0.0));
+        assert_eq!(uv(3), (0.75, 1.0));
+    }
+
+    #[test]
+    fn no_spritesheet_still_draws_the_whole_texture() {
+        // Non-spritesheet systems (the overwhelming majority) must keep the
+        // pre-S7 full 0..1 UVs exactly — this is the regression guard for
+        // every existing static-sprite particle system.
+        let mut state = state_with(|s| {
+            s.spawn_rate = 0.0;
+            s.size_start = 10.0;
+            s.size_end = 10.0;
+        });
+        assert!(state.spritesheet.is_none());
+        state.particles.push(Particle {
+            age: 0.5,
+            life: 1.0,
+            ..Default::default()
+        });
+        let mut scratch = Vec::new();
+        state.build_vertex_bytes(&mut scratch);
+        let uv = |i: usize| {
+            let off = i * PARTICLE_VERTEX_BYTES + 2 * 4;
+            let u = f32::from_le_bytes(scratch[off..off + 4].try_into().unwrap());
+            let v = f32::from_le_bytes(scratch[off + 4..off + 8].try_into().unwrap());
+            (u, v)
+        };
+        assert_eq!(uv(0), (0.0, 0.0));
+        assert_eq!(uv(3), (1.0, 1.0));
+    }
+
+    #[test]
     fn instance_factors_fold_into_vertices() {
         let mut state = state_with(|s| {
             s.spawn_rate = 0.0;
@@ -1687,6 +1846,53 @@ mod tests {
         assert_eq!(v(&scratch, 7), 0.25, "alpha factor scales the vertex alpha");
         assert_eq!(v(&scratch, 4), 0.5, "colorn scales RGB");
         assert_eq!(v(&scratch, 6), 0.5);
+    }
+
+    /// S7 (P6): `instanceoverride.count` (fed into `spec.instance_count` ->
+    /// `state.count`, the SAME field the flat model's spawn accumulator
+    /// already used) at 0.0 must stop emission entirely — WE's day/night
+    /// star systems (Avatar) rely on this to show no stars by day. Not
+    /// just "fewer" particles: exactly zero, after a full 2 s of updates.
+    #[test]
+    fn instance_count_zero_spawns_nothing_after_two_seconds() {
+        let mut state = state_with(|s| {
+            s.spawn_rate = 100.0;
+            s.life = 10.0;
+            s.instance_count = 0.0;
+        });
+        simulate_frames(&mut state, 1.0 / 60.0, 120); // 2 s
+        assert_eq!(state.particles.len(), 0);
+    }
+
+    /// S7 (P6): the component-model path's own instance factors
+    /// (`spawn_component`, applied AFTER the initializers) — `instance_size`
+    /// 2.0 doubles the freshly spawned particle's size (baseline 20.0, no
+    /// `SizeRandom` initializer in this fixture) and the refreshed
+    /// `initial_size` the operators would read back.
+    #[test]
+    fn component_model_instance_size_factor_doubles_a_freshly_spawned_particle() {
+        let component = ComponentModel {
+            maxcount: 100,
+            emitters: vec![Emitter::Box {
+                rate: 60.0,
+                origin: [0.0, 0.0],
+                directions: [1.0, 1.0],
+                distance_min: [0.0, 0.0],
+                distance_max: [0.0, 0.0],
+            }],
+            initializers: vec![],
+            operators: vec![],
+        };
+        let mut spec = spec_with(|s| {
+            s.max_count = 100;
+            s.instance_size = 2.0;
+        });
+        spec.component = Some(component);
+        let mut state = ParticleSystemState::from_spec(&spec, 0);
+        state.simulate(1.0 / 60.0);
+        assert_eq!(state.particles.len(), 1);
+        assert_eq!(state.particles[0].size, 40.0);
+        assert_eq!(state.particles[0].initial_size, 40.0);
     }
 
     #[test]
@@ -1959,7 +2165,7 @@ mod tests {
         // texture slot layout (MAX_LAYERS + i) and the descriptor pool are
         // sized from.
         const _: () = assert!(
-            MAX_PARTICLE_SYSTEMS <= 16 && MAX_PARTICLE_SYSTEMS <= MAX_LAYERS,
+            MAX_PARTICLE_SYSTEMS <= 64 && MAX_PARTICLE_SYSTEMS <= MAX_LAYERS,
             "particle systems must stay within the fixed texture-slot layout"
         );
     }
