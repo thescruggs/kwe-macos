@@ -175,10 +175,54 @@ pub struct DecodedTexv {
     /// state exists yet), kept for the shader/sampler slice.
     #[allow(dead_code)]
     pub flags: u32,
-    /// Not read outside tests this slice (same reason as `format`): kept
-    /// for the animated-texture slice.
+    /// Kept for callers that want the raw per-frame table (frame timing,
+    /// exact non-uniform frame boxes); most callers should use
+    /// `spritesheet` instead, which is the uniform-grid summary
+    /// `decode_model_texture` actually carries forward.
     #[allow(dead_code)]
     pub frames: Vec<Frame>,
+    /// S7: the inferred uniform spritesheet grid, when `frames` is
+    /// non-empty and its first frame's size evenly tiles the texture (see
+    /// `infer_spritesheet_grid`). `None` for a static texture or a
+    /// `TEXS*` table this heuristic can't grid (e.g. a plain GIF, where
+    /// upstream's own guard also declines to treat it as a spritesheet).
+    pub spritesheet: Option<textures::SpritesheetGrid>,
+}
+
+/// Infer a uniform spritesheet grid from a texture's animation frame table
+/// (upstream `TextureParser.cpp:275-302`, the `TEXS*`-driven half — the
+/// separate `.tex-json` `spritesheetsequences` metadata upstream also reads
+/// is not parsed here, no sidecar file model exists in this crate). Frame 0's
+/// declared box size is assumed to be every frame's size (the common case);
+/// `cols`/`rows` are the rounded texture-size/frame-size ratio, and the grid
+/// is only trusted when it can actually hold every declared frame
+/// (`cols * rows >= frame_count`) — the same guard upstream uses to avoid
+/// treating a plain animated GIF (`frameWidth == textureWidth`, `cols == 1`
+/// but `rows` would have to equal `frame_count`, easy to get by chance on
+/// a tall single-column strip) as a spritesheet when it isn't a grid.
+fn infer_spritesheet_grid(frames: &[Frame], width: u32, height: u32) -> Option<textures::SpritesheetGrid> {
+    let first = frames.first()?;
+    if width == 0 || height == 0 || first.width1 <= 0.0 || first.height1 <= 0.0 {
+        return None;
+    }
+    let cols = (width as f64 / first.width1 as f64).round();
+    let rows = (height as f64 / first.height1 as f64).round();
+    if !(cols.is_finite() && rows.is_finite()) || cols < 1.0 || rows < 1.0 {
+        return None;
+    }
+    let cols = cols as u32;
+    let rows = rows as u32;
+    let frame_count = frames.len() as u32;
+    if (cols as u64) * (rows as u64) < frame_count as u64 {
+        return None;
+    }
+    let duration: f32 = frames.iter().map(|f| f.frametime.max(0.0)).sum();
+    Some(textures::SpritesheetGrid {
+        cols,
+        rows,
+        frame_count,
+        duration,
+    })
 }
 
 /// A small bounds-checked cursor: every read either returns bytes or a
@@ -684,6 +728,7 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
 
     let mip0 = first_image_mip0
         .ok_or_else(|| TexvError::new("texture container has no image-0/mip-0 payload"))?;
+    let spritesheet = infer_spritesheet_grid(&frames, header.width, header.height);
 
     let rgba_full = if let Some(_fif) = header.fif {
         let decoded = textures::decode_texture(&mip0.payload).ok_or_else(|| {
@@ -696,6 +741,7 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
             format: header.format,
             flags: header.flags,
             frames,
+            spritesheet,
         });
     } else if let Some(_bpp) = header.format.raw_bytes_per_pixel() {
         expand_raw(header.format, &mip0.payload)
@@ -747,14 +793,16 @@ pub fn decode_texv(bytes: &[u8]) -> Result<DecodedTexv, TexvError> {
         format: header.format,
         flags: header.flags,
         frames,
+        spritesheet,
     })
 }
 
 /// Decode either a TEXV0005 container or a plain image (png/jpeg/webp) to
 /// a `textures::DecodedTexture`, dispatching on the magic prefix. Used
 /// wherever a model's resolved material texture bytes need pixels (S1);
-/// direct `.tex` image-layer references are unaffected by this slice
-/// (they still go through `textures::decode_texture` only).
+/// direct `.tex` image-layer/particle-texture references now also go
+/// through this function (S7), so `spritesheet` is populated for them too
+/// — see `main.rs`'s `load_layer_textures`/`load_particle_textures`.
 pub fn decode_model_texture(bytes: &[u8]) -> Option<DecodedTexture> {
     if bytes.len() >= 8 && &bytes[..8] == b"TEXV0005" {
         let decoded = decode_texv(bytes).ok()?;
@@ -765,6 +813,7 @@ pub fn decode_model_texture(bytes: &[u8]) -> Option<DecodedTexture> {
             rgba: decoded.rgba,
             width: decoded.width,
             height: decoded.height,
+            spritesheet: decoded.spritesheet,
         });
     }
     textures::decode_texture(bytes)
@@ -1228,6 +1277,75 @@ mod tests {
         let decoded = decode_texv(&out).expect("animated container decodes");
         assert_eq!(decoded.frames.len(), 2);
         assert_eq!(&decoded.rgba[0..4], &[1, 2, 3, 255]);
+        // S7: a 2x2 real texture with two 1x1 frames grids as 2 cols x 2
+        // rows (only 2 of the 4 cells are ever selected, matching upstream
+        // TextureParser.cpp:275-302's "grid can hold every frame" guard).
+        let grid = decoded.spritesheet.expect("2x2 real / 1x1 frames grids");
+        assert_eq!(grid.cols, 2);
+        assert_eq!(grid.rows, 2);
+        assert_eq!(grid.frame_count, 2);
+        assert!((grid.duration - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spritesheet_grid_is_not_populated_when_it_cannot_hold_every_frame() {
+        // A GIF-shaped animation: each "frame" is the full texture size
+        // (frameWidth == textureWidth), so a naive cols=1/rows=1 grid could
+        // only ever hold 1 frame — upstream's own guard (and
+        // `infer_spritesheet_grid`'s) declines to treat this as a
+        // spritesheet at all, matching the module doc's "not a hidden GIF
+        // treated as a 1x1 spritesheet" note.
+        let frames = vec![
+            Frame {
+                frame_number: 0,
+                frametime: 0.1,
+                x: 0.0,
+                y: 0.0,
+                width1: 4.0,
+                height1: 4.0,
+            },
+            Frame {
+                frame_number: 1,
+                frametime: 0.1,
+                x: 0.0,
+                y: 0.0,
+                width1: 4.0,
+                height1: 4.0,
+            },
+        ];
+        assert_eq!(infer_spritesheet_grid(&frames, 4, 4), None);
+    }
+
+    #[test]
+    fn spritesheet_grid_frame_math_matches_upstream_computespriteframe() {
+        // 4 cols x 2 rows, 8 frames declared, no duration (frametime 0 —
+        // lifetime-fraction-driven, the common case for a particle
+        // spritesheet with no authored per-frame timing).
+        let grid = textures::SpritesheetGrid {
+            cols: 4,
+            rows: 2,
+            frame_count: 8,
+            duration: 0.0,
+        };
+        // frame 5 -> col 1, row 1 (5 % 4 = 1, 5 / 4 = 1).
+        let (origin, size) = grid.frame_uv_origin_and_size(5);
+        assert_eq!(size, [0.25, 0.5]);
+        assert_eq!(origin, [0.25, 0.5]);
+        // Out-of-range frame indices clamp into range rather than wrapping
+        // to garbage UVs.
+        let (origin, _) = grid.frame_uv_origin_and_size(99);
+        assert_eq!(origin, grid.frame_uv_origin_and_size(7).0);
+        // No duration -> life-fraction driven: halfway through life selects
+        // roughly the middle frame.
+        assert_eq!(grid.frame_for(0.0, 0.0), 0);
+        assert_eq!(grid.frame_for(0.0, 0.999), 7);
+        // Duration > 0 -> time-based looping independent of life fraction.
+        let timed = textures::SpritesheetGrid {
+            duration: 1.0,
+            ..grid
+        };
+        assert_eq!(timed.frame_for(0.0, 1.0), 0);
+        assert_eq!(timed.frame_for(1.5, 1.0), timed.frame_for(0.5, 1.0));
     }
 
     #[test]

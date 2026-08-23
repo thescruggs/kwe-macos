@@ -1554,6 +1554,23 @@ fn load_particle_file_definitions(
         unsupported.unsupported_emitters += stats.unsupported_emitters;
         unsupported.unsupported_initializers += stats.unsupported_initializers;
         unsupported.unsupported_operators += stats.unsupported_operators;
+        // S7 (P9): merge this file's unrecognized names into the scene-wide
+        // sets, bounded by the SAME per-category cap `parse_component_model`
+        // already enforces per file — `record_unsupported_name`'s own
+        // "first N distinct" rule composes correctly across multiple merges
+        // (a name already present is a no-op re-insert, not a second slot).
+        for name in &stats.unsupported_emitter_names {
+            particlefile::record_unsupported_name(&mut unsupported.unsupported_emitter_names, name);
+        }
+        for name in &stats.unsupported_initializer_names {
+            particlefile::record_unsupported_name(
+                &mut unsupported.unsupported_initializer_names,
+                name,
+            );
+        }
+        for name in &stats.unsupported_operator_names {
+            particlefile::record_unsupported_name(&mut unsupported.unsupported_operator_names, name);
+        }
         // S7 (P6): the scene's `instanceoverride.count` scales the file's
         // own `maxcount` BEFORE the cap clamps it — WE's day/night star
         // systems carry `instanceoverride.count = {..., value: 0.0}` to
@@ -1623,11 +1640,23 @@ fn load_particle_file_definitions(
         || unsupported.unsupported_initializers > 0
         || unsupported.unsupported_operators > 0
     {
+        // S7 (P9): name the actual unrecognized kinds (bounded — up to
+        // MAX_UNSUPPORTED_NAMES distinct names per category, merged across
+        // every resolved file this scene load touched) instead of just a
+        // count, so the diagnostic says what's actually missing.
+        let names: Vec<&str> = unsupported
+            .unsupported_emitter_names
+            .iter()
+            .chain(unsupported.unsupported_initializer_names.iter())
+            .chain(unsupported.unsupported_operator_names.iter())
+            .map(String::as_str)
+            .collect();
         eprintln!(
-            "event=renderer.scene.particle_file_unsupported_items emitters={} initializers={} operators={} note=unrecognized-kind-skipped",
+            "event=renderer.scene.particle_file_unsupported_items emitters={} initializers={} operators={} names={} note=unrecognized-kind-skipped",
             unsupported.unsupported_emitters,
             unsupported.unsupported_initializers,
-            unsupported.unsupported_operators
+            unsupported.unsupported_operators,
+            names.join(",")
         );
     }
     resolved
@@ -2459,12 +2488,37 @@ type CompiledMaterial = (
 /// itself is silent per-attempt (matching this file's one-line-per-reason
 /// convention). Returns `None` on any failure, having already
 /// incremented the matching `fallback_reasons` entry.
+/// S7 (P9): how many distinct `"{shader_name}: {error}"` entries
+/// `preprocess_failed_detail` keeps — bounded independent of how many
+/// materials in a scene fail to preprocess (a hostile/degenerate scene
+/// with hundreds of distinct shader names must not grow this set
+/// unboundedly), matching this file's other "first N distinct" diags.
+const MAX_PREPROCESS_FAILED_DETAILS: usize = 8;
+
+/// Record one `"{shader_name}: {error}"` detail line into a bounded set
+/// (S7, P9) — first `MAX_PREPROCESS_FAILED_DETAILS` distinct entries only,
+/// each truncated to 160 chars so one pathological error message cannot
+/// blow up the eventual one-line diagnostic. Called from both
+/// `compile_one_material`'s preprocess failure sites (vertex, fragment).
+fn record_preprocess_failed_detail(
+    details: &mut std::collections::BTreeSet<String>,
+    shader_name: &str,
+    error: &shaderpre::PreprocessError,
+) {
+    if details.len() >= MAX_PREPROCESS_FAILED_DETAILS {
+        return;
+    }
+    let detail = text::truncate_chars(&format!("{shader_name}: {error}"), 160);
+    details.insert(detail);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_one_material(
     lookup: &mut dyn FnMut(&str) -> Option<Vec<u8>>,
     material: &PlannedMaterial,
     fallback_reasons: &mut std::collections::BTreeMap<&'static str, usize>,
     unsupported_uniform_names: &mut std::collections::BTreeSet<String>,
+    preprocess_failed_detail: &mut std::collections::BTreeSet<String>,
 ) -> Option<CompiledMaterial> {
     let shader_name = material.shader.as_deref().or_else(|| {
         *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
@@ -2501,8 +2555,9 @@ fn compile_one_material(
         &mut include,
     ) {
         Ok(output) => output,
-        Err(_) => {
+        Err(error) => {
             *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+            record_preprocess_failed_detail(preprocess_failed_detail, shader_name, &error);
             return None;
         }
     };
@@ -2524,8 +2579,9 @@ fn compile_one_material(
         &mut include,
     ) {
         Ok(output) => output,
-        Err(_) => {
+        Err(error) => {
             *fallback_reasons.entry("preprocess_failed").or_insert(0) += 1;
+            record_preprocess_failed_detail(preprocess_failed_detail, shader_name, &error);
             return None;
         }
     };
@@ -2750,6 +2806,13 @@ fn compile_material_layers(
     // end rather than per layer.
     let mut unsupported_uniform_names: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    // S7 (P9): the actual preprocess error text behind every
+    // "preprocess_failed" fallback count — bounded, deduplicated, shared
+    // across both the base-material and effect-pass compile call sites
+    // (mirrors `unsupported_uniform_names` just above), printed once after
+    // the whole loop instead of per-material.
+    let mut preprocess_failed_detail: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     // S3: build every plan up front (pure, no I/O) so the FBO targets it
     // needs can all be created in ONE `prepare_effect_targets` call before
@@ -2894,6 +2957,7 @@ fn compile_material_layers(
                 &material,
                 &mut fallback_reasons,
                 &mut unsupported_uniform_names,
+                &mut preprocess_failed_detail,
             )
         else {
             continue;
@@ -2995,6 +3059,7 @@ fn compile_material_layers(
                     pass_material,
                     &mut effect_fallback_reasons,
                     &mut unsupported_uniform_names,
+                    &mut preprocess_failed_detail,
                 )
             else {
                 continue;
@@ -3069,6 +3134,21 @@ fn compile_material_layers(
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(",")
+        );
+    }
+    // S7 (P9): one bounded line naming the actual preprocess failures
+    // behind the "preprocess_failed" fallback counts above/below (base
+    // material and effect passes share this one set) — never per-material,
+    // matching every other load-time-only diagnostic in this file.
+    if !preprocess_failed_detail.is_empty() {
+        eprintln!(
+            "event=renderer.scene.shader_preprocess_failed_detail count={} first={}",
+            preprocess_failed_detail.len(),
+            preprocess_failed_detail
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(";")
         );
     }
     let fallback_total: usize = fallback_reasons.values().sum();
@@ -3918,6 +3998,35 @@ mod tests {
         assert!(foreign.exists(), "foreign dirs must not be touched");
         cleanup_script_dir(None);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    // ---- S7 (P9): bounded shader_preprocess_failed_detail diagnostic ----
+
+    #[test]
+    fn record_preprocess_failed_detail_is_bounded_and_truncates() {
+        let mut details = std::collections::BTreeSet::new();
+        for i in 0..(MAX_PREPROCESS_FAILED_DETAILS + 5) {
+            record_preprocess_failed_detail(
+                &mut details,
+                &format!("shader{i}"),
+                &shaderpre::PreprocessError::IncludeDepthExceeded,
+            );
+        }
+        assert_eq!(details.len(), MAX_PREPROCESS_FAILED_DETAILS);
+
+        let mut details = std::collections::BTreeSet::new();
+        let long_name = "x".repeat(500);
+        record_preprocess_failed_detail(
+            &mut details,
+            &long_name,
+            &shaderpre::PreprocessError::IncludeDepthExceeded,
+        );
+        let entry = details.iter().next().unwrap();
+        assert!(
+            entry.chars().count() <= 160,
+            "detail entry must truncate to 160 chars, got {}",
+            entry.chars().count()
+        );
     }
 
     // ---- M3c: layer image resolution and loading ----

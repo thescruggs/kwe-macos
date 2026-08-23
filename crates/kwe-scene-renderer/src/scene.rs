@@ -3641,7 +3641,8 @@ mod tests {
     fn particle_system_cap_counts_skips() {
         // Systems past particles::MAX_PARTICLE_SYSTEMS are skipped and
         // counted (never a rejection); the pool is separate from the layer
-        // cap — 16 particle systems plus 256 image layers still parses.
+        // cap — MAX_PARTICLE_SYSTEMS (64, S7) particle systems plus 256
+        // image layers still parses.
         let mut objects = String::from(r#"{"objects": ["#);
         for i in 0..particles::MAX_PARTICLE_SYSTEMS {
             objects.push_str(&format!(r#"{{"name": "p{i}", "particle": {{}}}},"#));
@@ -3656,7 +3657,7 @@ mod tests {
         assert_eq!(counts.particle_system_skips, 1);
         assert_eq!(layers.len(), 1);
         // The layer cap is untouched by the particle pool: 256 layers plus
-        // 16 systems together.
+        // MAX_PARTICLE_SYSTEMS (64, S7) systems together.
         let mut objects = String::from(r#"{"objects": ["#);
         for i in 0..MAX_LAYERS {
             objects.push_str(&format!(r#"{{"name": "l{i}", "image": "t.png"}},"#));

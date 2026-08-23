@@ -18,6 +18,67 @@ pub struct DecodedTexture {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// The texture's animation grid (S7), when its container carried a
+    /// `TEXS*` frame table AND that table's per-frame size evenly tiles the
+    /// texture (see `texv::infer_spritesheet_grid`) — `None` for a plain
+    /// (non-`.tex`) image or a `.tex` with no usable frame table. `decode_texture`
+    /// (this module — plain png/jpeg/webp) never produces one; only
+    /// `texv::decode_model_texture` does.
+    pub spritesheet: Option<SpritesheetGrid>,
+}
+
+/// A texture's spritesheet animation grid: `cols`×`rows` equal-size frames
+/// packed left-to-right, top-to-bottom (upstream `Texture::spritesheetCols/
+/// Rows/Frames/Duration`, `Data/Assets/Texture.h`). `frame_count` is the
+/// number of frames actually declared by the `TEXS*` table — it can be less
+/// than `cols * rows` (a partially-filled grid; the remaining cells are
+/// never selected). `duration` is the sum of every frame's `frametime`
+/// (seconds for one full loop); 0.0 when the table declared no frametime
+/// values, in which case a consumer should fall back to a lifetime-fraction
+/// based frame pick instead of a time-based one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpritesheetGrid {
+    pub cols: u32,
+    pub rows: u32,
+    pub frame_count: u32,
+    pub duration: f32,
+}
+
+impl SpritesheetGrid {
+    /// The 0..=1 UV origin (top-left) and per-frame UV size for `frame`
+    /// (clamped into `0..frame_count`) — upstream `CParticle.cpp`'s
+    /// `ComputeSpriteFrame`, re-derived here for CPU-side use: row-major,
+    /// `col = frame % cols`, `row = frame / cols`, frame box
+    /// `[col/cols, row/rows] .. [+1/cols, +1/rows]`.
+    pub fn frame_uv_origin_and_size(&self, frame: u32) -> ([f32; 2], [f32; 2]) {
+        let frame = frame.min(self.frame_count.saturating_sub(1));
+        let cols = self.cols.max(1);
+        let rows = self.rows.max(1);
+        let col = frame % cols;
+        let row = frame / cols;
+        let size = [1.0 / cols as f32, 1.0 / rows as f32];
+        let origin = [col as f32 * size[0], row as f32 * size[1]];
+        (origin, size)
+    }
+
+    /// The frame index to draw at simulation time `elapsed_secs`/lifetime
+    /// fraction `life_fraction` (0..=1): time-based looping when `duration`
+    /// is known (>0, independent of the particle/layer's own lifetime —
+    /// upstream's default when the texture declares frame timings),
+    /// otherwise a lifetime-fraction-based pick spanning the whole grid
+    /// once per life (upstream's fallback when no duration is known).
+    pub fn frame_for(&self, elapsed_secs: f32, life_fraction: f32) -> u32 {
+        if self.frame_count == 0 {
+            return 0;
+        }
+        let unit = if self.duration > 0.0 {
+            (elapsed_secs.max(0.0) / self.duration).fract()
+        } else {
+            life_fraction.clamp(0.0, 1.0)
+        };
+        let raw = (unit * self.frame_count as f32).floor();
+        (raw as u32).min(self.frame_count - 1)
+    }
 }
 
 /// Maximum texture edge in pixels (mirrors the web worker's Limits).
@@ -57,6 +118,7 @@ pub fn decode_texture(bytes: &[u8]) -> Option<DecodedTexture> {
         rgba: rgba.into_raw(),
         width,
         height,
+        spritesheet: None,
     })
 }
 

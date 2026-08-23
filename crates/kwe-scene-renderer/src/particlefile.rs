@@ -23,20 +23,57 @@
 //! or rejection) — matches upstream's own "Unknown emitter/initializer
 //! type" `sLog.out` + `continue` behavior.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value};
 
 use crate::particles::{self, ComponentModel, Emitter, Initializer, Operator};
 use crate::scene::parse_vector;
 
+/// How many distinct unrecognized `name` values this parse will remember
+/// per category (emitter/initializer/operator) — the caller's diagnostic
+/// names them (S7: "particle_file_unsupported_items ... kind=X"), but the
+/// set itself must stay bounded independent of how many distinct garbage
+/// `name` strings a hostile particle file declares.
+const MAX_UNSUPPORTED_NAMES: usize = 8;
+
 /// How many emitter/initializer/operator entries this parse skipped
 /// because their `name` was not one of the implemented kinds — the
 /// caller's one-time, per-scene-load diagnostic (mirrors every other
-/// bounded skip counter in this crate; never a per-item eprintln).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// bounded skip counter in this crate; never a per-item eprintln). The
+/// `_names` sets (S7) carry up to `MAX_UNSUPPORTED_NAMES` distinct unknown
+/// `name` values per category, so the diagnostic can name what's actually
+/// missing instead of just a count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComponentParseStats {
     pub unsupported_emitters: usize,
     pub unsupported_initializers: usize,
     pub unsupported_operators: usize,
+    pub unsupported_emitter_names: BTreeSet<String>,
+    pub unsupported_initializer_names: BTreeSet<String>,
+    pub unsupported_operator_names: BTreeSet<String>,
+}
+
+/// Record one unrecognized `name` into a bounded set (S7): only the first
+/// `MAX_UNSUPPORTED_NAMES` distinct names are kept, matching this crate's
+/// other "first N distinct, bounded" diagnostic patterns (e.g. the
+/// shader-preprocess-failure log this slice adds elsewhere). `pub(crate)`
+/// so `main.rs::load_particle_file_definitions` can reuse the exact same
+/// bounding rule when it merges every resolved file's stats into one
+/// scene-wide set for the one-time diagnostic.
+pub(crate) fn record_unsupported_name(names: &mut BTreeSet<String>, name: &str) {
+    if names.len() < MAX_UNSUPPORTED_NAMES || names.contains(name) {
+        names.insert(name.to_string());
+    }
+}
+
+/// The `"name"` string of an emitter/initializer/operator entry this
+/// module failed to recognize, for the caller's bounded diagnostic —
+/// `"?"` when the entry has no string `name` (the shape `parse_emitter`/
+/// `parse_initializer`/`parse_operator` already reject on their own first
+/// line for a real WE entry, but a hostile/malformed one may lack it).
+fn entry_name(object: &Map<String, Value>) -> &str {
+    object.get("name").and_then(Value::as_str).unwrap_or("?")
 }
 
 /// Parse `root` (the particle file's already-bounded-and-validated root
@@ -61,7 +98,10 @@ pub fn parse_component_model(root: &Map<String, Value>) -> (ComponentModel, Comp
             };
             match parse_emitter(object) {
                 Some(emitter) => emitters.push(emitter),
-                None => stats.unsupported_emitters += 1,
+                None => {
+                    stats.unsupported_emitters += 1;
+                    record_unsupported_name(&mut stats.unsupported_emitter_names, entry_name(object));
+                }
             }
         }
     }
@@ -74,7 +114,13 @@ pub fn parse_component_model(root: &Map<String, Value>) -> (ComponentModel, Comp
             };
             match parse_initializer(object) {
                 Some(initializer) => initializers.push(initializer),
-                None => stats.unsupported_initializers += 1,
+                None => {
+                    stats.unsupported_initializers += 1;
+                    record_unsupported_name(
+                        &mut stats.unsupported_initializer_names,
+                        entry_name(object),
+                    );
+                }
             }
         }
     }
@@ -87,7 +133,10 @@ pub fn parse_component_model(root: &Map<String, Value>) -> (ComponentModel, Comp
             };
             match parse_operator(object) {
                 Some(operator) => operators.push(operator),
-                None => stats.unsupported_operators += 1,
+                None => {
+                    stats.unsupported_operators += 1;
+                    record_unsupported_name(&mut stats.unsupported_operator_names, entry_name(object));
+                }
             }
         }
     }
@@ -376,6 +425,40 @@ mod tests {
         assert_eq!(stats.unsupported_initializers, 1);
         assert_eq!(model.operators.len(), 1);
         assert_eq!(stats.unsupported_operators, 1);
+        // S7 (P9): the actual unrecognized `name` strings are recorded too,
+        // not just the count.
+        assert!(stats.unsupported_emitter_names.contains("wobblerandom"));
+        assert!(stats.unsupported_initializer_names.contains("rotationrandom"));
+        assert!(stats.unsupported_operator_names.contains("vortex"));
+    }
+
+    /// S7 (P9): `record_unsupported_name`'s bound holds across many
+    /// distinct unrecognized names in one parse — never grows past
+    /// `MAX_UNSUPPORTED_NAMES` regardless of how many a hostile/degenerate
+    /// particle file declares.
+    #[test]
+    fn unsupported_names_are_bounded() {
+        // MAX_COMPONENT_ITEMS (16) distinct unrecognized emitter names —
+        // more than MAX_UNSUPPORTED_NAMES (8), so the name SET caps while
+        // the plain COUNT keeps counting every skipped entry.
+        let mut emitters = String::new();
+        for i in 0..particles::MAX_COMPONENT_ITEMS {
+            emitters.push_str(&format!(r#"{{"name": "unknown{i}"}},"#));
+        }
+        emitters.pop();
+        let (_, stats) =
+            parse_component_model(&root(&format!(r#"{{"emitter": [{emitters}]}}"#)));
+        assert_eq!(stats.unsupported_emitters, particles::MAX_COMPONENT_ITEMS);
+        assert_eq!(stats.unsupported_emitter_names.len(), MAX_UNSUPPORTED_NAMES);
+    }
+
+    /// S7 (P9): an entry with no string `"name"` at all records as `"?"`
+    /// rather than panicking or silently dropping the diagnostic.
+    #[test]
+    fn unsupported_entry_without_a_name_records_as_question_mark() {
+        let (_, stats) = parse_component_model(&root(r#"{"emitter": [{"rate": 5}]}"#));
+        assert_eq!(stats.unsupported_emitters, 1);
+        assert!(stats.unsupported_emitter_names.contains("?"));
     }
 
     #[test]
