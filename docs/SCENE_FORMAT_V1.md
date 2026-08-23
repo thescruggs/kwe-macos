@@ -908,6 +908,101 @@ once per distinct reason after load (`no_shader_name`,
 that falls back stays covered by S1's `texture_ok`/base-texture path —
 this step only ever ADDS a material draw on top, never removes one.
 
+### `compile_failed` root causes fixed (S4b)
+
+Priority item 4 of the S4b slice: the S4a change-log's 13 pkg-bundled
+`compile_failed` shaders were traced to their actual root causes (not
+just their `shaderc` error text) and four distinct preprocessor bugs
+fixed — all four are `crates/kwe-scene-renderer/src/shaderpre.rs` changes,
+none touch the material pipeline or Vulkan layer.
+
+1. **`#include` placement** (`resolve_includes`): this module previously
+   inlined an `#include`'s resolved text at its EXACT source position —
+   documented at the time as equivalent to upstream's real behavior
+   (`ShaderUnit::preprocessIncludes` collects every include's text and
+   splices it in just before `main()`) because "every `#include` in the
+   corpus sits at file scope above any function definition." That premise
+   was false for three real corpus shaders — `shine_gaussian.frag`,
+   `godrays_gaussian.frag`, `blur_precise_gaussian.frag` — which all
+   `#include "common_blur.h"` as their FIRST line, before the
+   `uniform sampler2D g_Texture0;` `common_blur.h`'s own `blur13`/`blur7`/
+   `blur3` functions read. In-place inlining put those functions
+   textually ahead of the declaration they depend on — `shaderc` reported
+   `'g_Texture0' : undeclared identifier`. Fixed to match upstream's real
+   placement: every `#include`'s resolved text is now collected into one
+   accumulator (flattened across nesting, in encounter order) and spliced
+   in just before the file's own `main(` definition, so every top-level
+   declaration in the file — regardless of whether it sits before or
+   after the `#include` line — is visible to whatever the included text
+   defines. A combo-gated `main(` (behind its own `#if`) is not handled
+   the way upstream's `#if`-aware placement search would — the local
+   corpus has none — and falls back to appending at the very end (never
+   silently dropping the included text) if no `main(` is found at all.
+2. **`g_Point<N>` type narrowing** (`standard_uniform_expr`): the shared
+   `MaterialUniforms` UBO backs every `g_Point<N>` with a `vec4` slot, but
+   `effects/perspective.vert` (used by the large majority of the local
+   corpus's effect chains — `common_perspective.h`'s `squareToQuad`
+   helper) declares it locally as `uniform vec2 g_Point0;` and calls
+   `squareToQuad(vec2, vec2, vec2, vec2)`. Folding to the bare `vec4`
+   expression changed the CALL-SITE type — `shaderc` reported
+   `'squareToQuad' : no matching overloaded function found` (a function
+   that exists, called with the wrong argument type) and a cascading
+   `'inverse' : no matching overloaded function found` plus a `'=' :
+   cannot convert from const float to 3x3 matrix` on the very same line.
+   Fixed: the folded expression now carries a narrowing swizzle (`.xy`
+   for a `vec2` declaration, `.xyz` for `vec3`, none for `vec4` — the
+   common case, byte-identical to the pre-fix output) matching the
+   shader's OWN declared type, scraped by the same `parse_decl` call that
+   already reads the type for every other declaration path.
+3. **Array uniforms left as loose declarations** (`fold_declarations`):
+   an array-typed uniform (e.g. `uniform float g_AudioSpectrum16Left
+   [16];`, an audio-visualizer material's spectrum-band uniform — this
+   renderer does not feed live spectrum data into any shader) was
+   explicitly excluded from every folding path (the standard-uniform,
+   material-constant, and zero-default branches all guard on `!name.
+   contains('[')`) and fell through to the generic per-line pass-through,
+   leaving the ORIGINAL `uniform TYPE NAME[N];` line in the compiled
+   text. Vulkan's GLSL profile requires every non-opaque uniform to live
+   inside a named block — `shaderc` reported `'non-opaque uniforms
+   outside a block' : not allowed when using GLSL for Vulkan`. Fixed: an
+   array uniform of a recognized element type now gets the same "still
+   compiles, just inert" zero-default treatment as a scalar/vector
+   uniform — a NON-`uniform`, explicitly zero-initialized array
+   (`TYPE NAME[N] = TYPE[N](zero, zero, ...)`, GLSL has no broadcast
+   shorthand for array initializers) the rest of the shader can still
+   read by the same name. Bounded: `MAX_ZERO_ARRAY_LEN` (1024 elements,
+   generous over the local corpus's largest real array, 64) — a
+   declaration past that bound is left on the pre-existing pass-through
+   path (still `compile_failed`, never an unbounded initializer-list
+   string).
+4. **`max()` argument order** (`SHADER_HEADER`): `#define max(x, y)
+   max(y, x)` is upstream's OWN header macro, dropped from this
+   module's port on the theory that GLSL already defines `max` the same
+   way HLSL does. That theory missed the actual corpus shape: HLSL's
+   `max(scalar, vecN)` broadcasts regardless of argument position, but
+   GLSL's overload set only has `genType max(genType x, float y)` — the
+   scalar must be SECOND, and an integer literal like the bare `0` in
+   `max(0, albedo.rgb)` (`workshop/2423477561/effects/nitro.frag`,
+   `workshop/2988515046/effects/nitro.frag` — both pkg-bundled) needs
+   GLSL's int→float implicit conversion on that second-position argument
+   to resolve at all. `shaderc` reported `'max' : no matching overloaded
+   function found` for the un-swapped call. Restored upstream's macro
+   verbatim; safe as a blanket swap because `max` is mathematically
+   commutative for any call that already resolves correctly — swapping a
+   currently-working `max(vector, scalar)` call changes nothing but
+   argument ORDER in the generated text, not the computed value, and the
+   full local-corpus sweep (below) found no case where the corpus itself
+   relies on the un-swapped order.
+
+Pinned by `shaderpre.rs` unit tests for each fix
+(`include_content_lands_before_main_not_at_its_own_line_position`,
+`point_uniform_narrows_to_the_shaders_own_declared_type`,
+`array_uniform_zero_fills_instead_of_leaving_a_loose_declaration`,
+`max_macro_swaps_arguments_matching_upstreams_header`, plus bounds/
+hostile-input siblings for each). See the S4b change-log entry in
+`AI-Skills/BETA_PLAN.md` for the before/after corpus `compile_failed`
+count and the byte-identity sweep result.
+
 ## Effects and render targets (S3)
 
 **Implemented (S3)**: an object's `effects[]` array — an ordered list of
