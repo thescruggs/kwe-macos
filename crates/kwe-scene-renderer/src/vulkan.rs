@@ -476,6 +476,11 @@ pub struct LayerRenderer {
     /// rectangle in scene units (defaults to the canvas size).
     world_width: f32,
     world_height: f32,
+    /// S6: the scene-space point (absolute, top-left origin, +y down —
+    /// the same frame `origin`/`t` use) that maps to the centre of
+    /// `world_width`x`world_height`; subtracted from every draw's `t`
+    /// before the NDC divide. See `set_world_extent`'s doc comment.
+    scene_center: [f32; 2],
     device_name: String,
     device_kind: String,
     /// S2: shared across every material pipeline — the descriptor set
@@ -594,12 +599,50 @@ pub struct LayerRenderer {
     _entry: Entry,
 }
 
+/// S6: fold a layer's absolute-origin translation (`LayerDraw::t`, scene
+/// units, top-left origin, +y down) back onto the visible rectangle's own
+/// centre, so the NDC divide (`world × 2 / extent`, both the S1
+/// push-constant path below and `materialshader::build_orthographic_mvp`)
+/// can treat world `(0,0)` as that centre. Pure; unit-tested directly
+/// since neither call site is. See `LayerRenderer::set_world_extent`'s
+/// doc comment for the root cause and the upstream citation.
+#[must_use]
+fn recenter(t: [f32; 2], scene_center: [f32; 2]) -> [f32; 2] {
+    [t[0] - scene_center[0], t[1] - scene_center[1]]
+}
+
 impl LayerRenderer {
-    /// F1: set the visible world rectangle (scene units) the canvas shows;
-    /// quads are positioned against it instead of the canvas size.
-    pub fn set_world_extent(&mut self, width: f32, height: f32) {
+    /// F1/S6: set the visible world rectangle (scene units) the canvas
+    /// shows, and the scene-space point that maps to its centre.
+    ///
+    /// `scene_center` is scene units, top-left origin, +y down — the same
+    /// absolute coordinate frame `origin`/`t` (layers.rs) is expressed in
+    /// (declared scene resolution / 2, or canvas size / 2 when the scene
+    /// has none — `main.rs`'s caller computes it alongside `world_extent`).
+    /// S6 root cause: every layer's `t` is its scene.json `origin`, an
+    /// ABSOLUTE scene-pixel position (e.g. `1701 1134` for a full-screen
+    /// layer in a 3402x2268 scene — the layer's own centre point, not an
+    /// offset from the scene's centre). The NDC divisor below
+    /// (`world × 2 / extent`) only centers correctly when the input is
+    /// already relative to the visible rectangle's own centre, so every
+    /// draw must subtract `scene_center` from `t` first — done once here
+    /// and reused by both draw paths (`render`'s push-constant quads and
+    /// `materialshader::build_orthographic_mvp`) instead of duplicating
+    /// the subtraction at each call site.
+    ///
+    /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
+    /// src/WallpaperEngine/Render/Objects/CImage.cpp:259-262
+    /// (`this->m_pos.x -= scene_width / 2; ...`, the recentering upstream
+    /// applies to an image's absolute-origin corners before the camera's
+    /// `glm::ortho(-width/2, width/2, ...)` projection) @ b016d7d1 —
+    /// adapted: upstream also flips y there (`scene_height/2 - y`, to
+    /// match OpenGL's y-up NDC); this renderer targets Vulkan's native
+    /// y-down NDC and already documents "no y-flip" (`shaders/quad.vert`),
+    /// so only the centre subtraction is ported, not the flip.
+    pub fn set_world_extent(&mut self, width: f32, height: f32, scene_center: [f32; 2]) {
         self.world_width = width.max(1.0);
         self.world_height = height.max(1.0);
+        self.scene_center = scene_center;
     }
 
     pub fn new(device_filter: Option<&str>, width: u32, height: u32) -> Result<Self, RenderError> {
@@ -1195,6 +1238,14 @@ impl LayerRenderer {
             height,
             world_width: width as f32,
             world_height: height as f32,
+            // S6: NOT `[width/2, height/2]` — every pre-existing caller
+            // (every test below, and any future one that skips
+            // `set_world_extent`) already treats `t=[0,0]` as "world
+            // centre" directly, matching the pre-F1/pre-scene.json-origin
+            // convention `docs/SCENE_FORMAT_V1.md` still documents for a
+            // bare quad. Only `set_world_extent` (driven by a real scene's
+            // declared resolution) should introduce a non-zero centre.
+            scene_center: [0.0, 0.0],
             device_name,
             device_kind,
             material_descriptor_set_layout,
@@ -2578,21 +2629,37 @@ impl LayerRenderer {
     }
 
     /// S3: create every effect render target a scene's resolved effect
-    /// chains need — `_rt_FullFrameBuffer` (whenever `requests` is
-    /// non-empty: at least one layer has a resolved effect chain) plus
-    /// every distinct requested name (see [`EffectTargetRequest`]).
-    /// Idempotent (a name already present, e.g. because two effects
-    /// share an `fbos[]` name, is left alone — the documented S3 scope
-    /// limit on `effect_targets`'s global namespace). Returns the number
-    /// of targets actually created (diagnostics: `main.rs`'s
-    /// `event=renderer.scene.effects` line).
+    /// chains need — `_rt_FullFrameBuffer` plus every distinct requested
+    /// name (see [`EffectTargetRequest`]). Idempotent (a name already
+    /// present, e.g. because two effects share an `fbos[]` name, is left
+    /// alone — the documented S3 scope limit on `effect_targets`'s
+    /// global namespace). Returns the number of targets actually created
+    /// (diagnostics: `main.rs`'s `event=renderer.scene.effects` line).
+    ///
+    /// S6: `_rt_FullFrameBuffer` is created UNCONDITIONALLY, even when
+    /// `requests` is empty. This used to early-return before creating
+    /// anything at all when `requests` was empty (`requests` is built
+    /// from resolved effect CHAINS only — `main.rs::effect_target_
+    /// requests` skips any layer with no `effects[]`), on the doc
+    /// comment's own stated assumption that `_rt_FullFrameBuffer` is
+    /// only ever needed "whenever... at least one layer has a resolved
+    /// effect chain". That assumption is wrong for the real corpus's
+    /// "bare copybackground" shape this renderer otherwise explicitly
+    /// supports (`models/util/fullscreenlayer.json`, no `effects[]` at
+    /// all — see `main.rs`'s `ffb_only_passthrough` carve-out and
+    /// `docs/SCENE_FORMAT_V1.md`): a layer's OWN base material can
+    /// reference `_rt_FullFrameBuffer` directly with no effect chain
+    /// anywhere in the scene, and the early return meant that reference
+    /// silently sampled a target that was NEVER CREATED (not merely
+    /// unwritten this frame) — a scene with such a layer draws
+    /// perpetually transparent-black there instead of the same-frame
+    /// snapshot S5 built. Creating one canvas-sized FBO is bounded and
+    /// cheap (the existing per-scene byte budget below still applies),
+    /// so there is no reason to gate it behind any other target request.
     pub fn prepare_effect_targets(
         &mut self,
         requests: &[EffectTargetRequest],
     ) -> Result<usize, RenderError> {
-        if requests.is_empty() {
-            return Ok(0);
-        }
         self.ensure_effect_render_pass()?;
         let mut created = 0usize;
         let mut budget_bytes: u64 = self
@@ -3554,6 +3621,12 @@ impl LayerRenderer {
                 let time = self.material_frame_counter as f32 / 60.0;
                 let world_width = self.world_width;
                 let world_height = self.world_height;
+                // S6: `draw.t` is the layer's raw scene.json `origin` —
+                // an absolute scene-pixel position, not an offset from
+                // the visible rectangle's centre — so it must be
+                // recentered the same way the push-constant path below
+                // does (see `set_world_extent`'s doc comment).
+                let t = recenter(draw.t, self.scene_center);
                 let Some(binding) = self
                     .material_bindings
                     .get_mut(draw.layer_index)
@@ -3569,8 +3642,7 @@ impl LayerRenderer {
                 // g_Brightness. Everything else in the UBO (textures,
                 // material constants, points/parallax/pointer defaults)
                 // was set once at `bind_material_layer` time.
-                binding.uniforms.mvp =
-                    build_orthographic_mvp(draw.m, draw.t, world_width, world_height);
+                binding.uniforms.mvp = build_orthographic_mvp(draw.m, t, world_width, world_height);
                 binding.uniforms.time_alpha_brightness = [time, draw.alpha, draw.brightness, 0.0];
                 let uniforms_ptr = std::ptr::from_ref(&binding.uniforms).cast::<u8>();
                 let ubo_mapped = binding.ubo_mapped;
@@ -3655,14 +3727,19 @@ impl LayerRenderer {
             // shader's single alpha scale covers the layer alpha and the
             // tint alpha together (multiplication is commutative, so the
             // math is exact).
+            // S6: recenter the layer's raw absolute-origin `t` onto the
+            // visible rectangle's own centre — see `set_world_extent`'s
+            // doc comment; the material path above applies the identical
+            // subtraction so both draw paths land on the same pixels.
+            let t = recenter(draw.t, self.scene_center);
             let push: [f32; 16] = [
                 draw.m[0][0],
                 draw.m[1][0],
-                draw.t[0],
+                t[0],
                 0.0,
                 draw.m[0][1],
                 draw.m[1][1],
-                draw.t[1],
+                t[1],
                 draw.alpha * draw.tint[3],
                 self.world_width,
                 self.world_height,
@@ -4876,6 +4953,78 @@ mod tests {
         }
     }
 
+    /// S6 regression: `recenter` is a no-op exactly when `t` already IS
+    /// the visible rectangle's centre (the historical/synthetic-test
+    /// convention every device test in this module still relies on —
+    /// `LayerRenderer::new`'s `scene_center` default is `[0,0]` so a
+    /// caller that never touches `set_world_extent` sees this).
+    #[test]
+    fn recenter_is_identity_at_the_default_zero_centre() {
+        assert_eq!(recenter([12.5, -7.0], [0.0, 0.0]), [12.5, -7.0]);
+    }
+
+    /// S6 root cause, pinned directly: a layer's `t` is its scene.json
+    /// `origin` verbatim — an ABSOLUTE scene-pixel position (S1725674512
+    /// "Aurora Borealis"'s full-screen background: `origin="1701 1134 0"`
+    /// in a 3402x2268 scene, i.e. the layer's OWN centre point, not an
+    /// offset from the scene's centre). `recenter` must fold that back to
+    /// world `(0,0)` — the bug this slice fixes was feeding the raw
+    /// origin straight into the NDC divide, landing the whole picture a
+    /// quadrant off from centre (top-left of the image at canvas centre).
+    #[test]
+    fn recenter_maps_a_full_screen_layers_origin_to_world_zero() {
+        assert_eq!(recenter([1701.0, 1134.0], [1701.0, 1134.0]), [0.0, 0.0]);
+    }
+
+    /// S6 end-to-end (pure): the same quad-centre invariant the device
+    /// test below exercises on real hardware, checked here against just
+    /// the CPU-side math both draw paths share (`layers::layer_model` ->
+    /// `recenter` -> `materialshader::build_orthographic_mvp`) — a layer
+    /// declared full-screen in a scene whose declared resolution does NOT
+    /// match the canvas (the exact `world_extent` letterbox shape the bug
+    /// needed) must still land its own centre at NDC `(0,0)` and its
+    /// corners at NDC `(±1,±1)`, matching `LayerDraw`'s documented
+    /// contract ("world = m·pos + t for pos ∈ [-0.5,0.5]²").
+    #[test]
+    fn build_orthographic_mvp_centers_a_full_screen_layer_after_recentering() {
+        // A 1920x1080 scene, letterboxed (F1 `aspect`) into a 2560x720
+        // canvas: world extent becomes 3840x1080 (`world_extent`,
+        // main.rs) — narrower than the canvas is wide relative to the
+        // scene, i.e. `world_extent() != declared resolution`, the exact
+        // shape that makes `world_width/2` differ from the real scene
+        // centre and is why `scene_center` must come from the DECLARED
+        // resolution, not the extent.
+        let (scene_w, scene_h) = (1920.0_f32, 1080.0_f32);
+        let (world_w, world_h) = (3840.0_f32, 1080.0_f32);
+        let scene_center = [scene_w / 2.0, scene_h / 2.0];
+        // Upstream/WE convention: a full-screen layer's origin is its own
+        // centre point, i.e. exactly the scene's centre.
+        let (m, raw_t) =
+            crate::layers::layer_model(0.0, [1.0, 1.0], [scene_w, scene_h], scene_center);
+        let t = recenter(raw_t, scene_center);
+        assert_eq!(
+            t,
+            [0.0, 0.0],
+            "a full-screen layer's origin recenters to world zero"
+        );
+        let mvp = build_orthographic_mvp(m, t, world_w, world_h);
+        // Column 3 (translation): the layer's own centre must land at NDC
+        // (0,0) — mvp[12..14] is (tx', ty'), mvp[15] the homogeneous w.
+        assert_eq!([mvp[12], mvp[13], mvp[15]], [0.0, 0.0, 1.0]);
+        // Corner (0.5, 0.5) of the local quad (pos in [-0.5,0.5]^2, per
+        // `LayerDraw`'s contract) must land at NDC (0.5, 1.0): the scene
+        // is only half as wide as the letterboxed world extent (960/3840
+        // half-widths), but exactly as tall (540/1080 half-heights) — a
+        // regression that dropped the `world_extent`-vs-`declared
+        // resolution` distinction and centered on `world_width/2` instead
+        // would get this axis right by accident but the letterboxed axis
+        // wrong.
+        let ndc_x = mvp[0] * 0.5 + mvp[4] * 0.5 + mvp[12];
+        let ndc_y = mvp[1] * 0.5 + mvp[5] * 0.5 + mvp[13];
+        assert!((ndc_x - 0.5).abs() < 1e-6, "ndc_x={ndc_x}");
+        assert!((ndc_y - 1.0).abs() < 1e-6, "ndc_y={ndc_y}");
+    }
+
     /// The six attributes' byte ranges must not overlap, and must all
     /// fit within `MATERIAL_UNIT_QUAD_STRIDE` — a future edit to
     /// `material_attribute_layout` or `MATERIAL_UNIT_QUAD` that
@@ -5054,6 +5203,142 @@ mod tests {
         let input = vec![10_u8, 20, 30, 255, 40, 50, 60, 128];
         assert_eq!(bgra_premultiplied(&input, true).len(), input.len());
         assert_eq!(bgra_premultiplied(&input, false).len(), input.len());
+    }
+
+    /// S6 end-to-end, device-gated: a centred solid-colour material layer
+    /// whose declared scene resolution matches the canvas, but whose
+    /// `origin` sits at the scene's OWN centre (`[32,24]`, not `[0,0]`) —
+    /// the exact real-corpus shape (`docs/SCENE_FORMAT_V1.md`, e.g.
+    /// Workshop 1725674512's `origin="1701 1134 0"` in a 3402x2268 scene)
+    /// that exposed the bug: feeding that absolute origin straight into
+    /// the NDC divide (pre-fix) landed the layer's own top-left corner at
+    /// canvas centre instead of centering it, so only one quadrant of a
+    /// full-canvas layer painted and every corner sample below would have
+    /// picked up the LAYER's colour instead of the clear colour. The
+    /// layer here is deliberately smaller than the canvas (half width and
+    /// height) so a broken recenter is visible at BOTH ends: a wrong
+    /// offset either paints a corner (false negative on "clear at the
+    /// corners") or fails to paint the true centre (false negative on
+    /// "solid at the centre").
+    #[test]
+    fn material_layer_centered_on_a_nonzero_scene_origin_paints_center_not_corners() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "material_layer_centered_on_a_nonzero_scene_origin_paints_center_not_corners: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 64, 48).expect("create renderer");
+        // S6: declared scene resolution == canvas (no letterbox math to
+        // also exercise here — `build_orthographic_mvp_centers_a_full_
+        // screen_layer_after_recentering` above already pins the
+        // letterboxed-extent shape) but a NON-zero scene centre, the
+        // thing this test exists to exercise end-to-end.
+        renderer.set_world_extent(64.0, 48.0, [32.0, 24.0]);
+
+        let vertex_source = "attribute vec3 a_Position;\nattribute vec2 a_TexCoord;\nuniform mat4 g_ModelViewProjectionMatrix;\nvarying vec2 v_TexCoord;\nvoid main() {\n    gl_Position = mul(vec4(a_Position, 1.0), g_ModelViewProjectionMatrix);\n    v_TexCoord = a_TexCoord;\n}\n";
+        let fragment_source = "varying vec2 v_TexCoord;\nvoid main() {\n    gl_FragColor = vec4(0.2, 0.6, 0.8, 1.0) + 0.0 * vec4(v_TexCoord, 0.0, 0.0);\n}\n";
+        let mut locations = std::collections::BTreeMap::new();
+        let mut include: Box<crate::shaderpre::IncludeLookup<'static>> = Box::new(|_: &str| None);
+        let vertex_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Vertex,
+            "s6_center.vert",
+            vertex_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("vertex preprocesses");
+        let fragment_pre = crate::shaderpre::preprocess(
+            crate::shaderpre::Stage::Fragment,
+            "s6_center.frag",
+            fragment_source,
+            &std::collections::BTreeMap::new(),
+            &[],
+            &mut locations,
+            &mut include,
+        )
+        .expect("fragment preprocesses");
+        let vertex_spirv = crate::materialshader::compile_stage(
+            &vertex_pre.source,
+            crate::materialshader::Stage::Vertex,
+            "s6_center.vert",
+        )
+        .expect("vertex compiles");
+        let fragment_spirv = crate::materialshader::compile_stage(
+            &fragment_pre.source,
+            crate::materialshader::Stage::Fragment,
+            "s6_center.frag",
+        )
+        .expect("fragment compiles");
+        let key = MaterialKey::compute(
+            "s6_center",
+            &fragment_pre.combos,
+            BlendMode::Normal.variant_index(),
+        );
+        renderer
+            .register_material_pipeline(
+                key.clone(),
+                &vertex_spirv,
+                &fragment_spirv,
+                BlendMode::Normal,
+                &vertex_pre.attributes,
+            )
+            .expect("register pipeline");
+        renderer
+            .bind_material_layer(
+                0,
+                key,
+                &[None, None, None, None, None, None, None, None],
+                MaterialUniforms::default(),
+            )
+            .expect("bind material layer");
+
+        // Origin = the scene's own centre (matches a real full-screen WE
+        // layer's `origin`, e.g. `[sceneW/2, sceneH/2]`), size = half the
+        // scene on each axis: a 32x24 quad centered in the 64x48 canvas,
+        // covering roughly x in [16,48), y in [12,36).
+        let draws = [LayerDraw {
+            kind: DrawKind::Image,
+            layer_index: 0,
+            scene_order: 0,
+            m: [[32.0, 0.0], [0.0, 24.0]],
+            t: [32.0, 24.0],
+            alpha: 1.0,
+            blend_mode: BlendMode::Normal,
+            brightness: 1.0,
+            tint: [1.0, 1.0, 1.0, 1.0],
+            material: true,
+        }];
+        let clear = [0.1, 0.1, 0.1, 1.0];
+        let pixels = renderer.render(clear, &draws, &[]).expect("render once");
+        assert_eq!(pixels.len(), 64 * 48 * 4);
+        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 64 + x) * 4;
+            [
+                pixels[offset],
+                pixels[offset + 1],
+                pixels[offset + 2],
+                pixels[offset + 3],
+            ]
+        };
+        // Centre: solid layer colour (B8G8R8A8: B≈204, G≈153, R≈51).
+        let center = pixel_at(32, 24);
+        assert!((203..=205).contains(&center[0]), "centre B={center:?}");
+        assert!((152..=154).contains(&center[1]), "centre G={center:?}");
+        assert!((50..=52).contains(&center[2]), "centre R={center:?}");
+        // All four corners: untouched clear colour (B8G8R8A8: 0.1*255≈26
+        // on every channel). A broken (pre-fix) recenter would have
+        // landed the quad's own top-left at canvas centre, painting the
+        // bottom-right corner with the layer colour instead of clear.
+        for (x, y) in [(0usize, 0usize), (63, 0), (0, 47), (63, 47)] {
+            let corner = pixel_at(x, y);
+            assert!(
+                corner.iter().take(3).all(|&c| (24..=28).contains(&c)),
+                "corner ({x},{y})={corner:?} must stay clear-colour, not the layer's"
+            );
+        }
     }
 
     /// S2 end-to-end: a synthetic material shader (no texture sampling —

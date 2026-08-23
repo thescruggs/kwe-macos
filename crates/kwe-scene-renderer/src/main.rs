@@ -958,7 +958,22 @@ fn main() -> Result<()> {
         (spec.width, spec.height),
         &arguments.scaling,
     );
-    renderer.set_world_extent(world_w, world_h);
+    // S6: every layer's `t` (layers.rs `layer_model`) is its scene.json
+    // `origin` verbatim — an absolute scene-pixel position, top-left
+    // origin, +y down (`docs/SCENE_FORMAT_V1.md`) — not an offset from
+    // the visible rectangle's centre. `world_extent`'s letterbox/crop
+    // rectangle is, by construction, centered on the SCENE's own centre
+    // (declared resolution / 2), which is not always `world_w/2,
+    // world_h/2` once letterboxing or cropping makes the extent differ
+    // from the declared resolution on one axis (`fill` crops one axis
+    // short of the scene; `aspect` pads one axis past it). Falls back to
+    // the canvas centre when there is no declared resolution, matching
+    // `world_extent`'s own "scene units are canvas pixels" fallback.
+    let scene_center = config.resolution.map_or(
+        (spec.width as f32 / 2.0, spec.height as f32 / 2.0),
+        |(w, h)| (w as f32 / 2.0, h as f32 / 2.0),
+    );
+    renderer.set_world_extent(world_w, world_h, [scene_center.0, scene_center.1]);
     if (world_w, world_h) != (spec.width as f32, spec.height as f32) {
         eprintln!(
             "event=renderer.scene.world_extent scaling={} extent={world_w}x{world_h} canvas={}x{}",
