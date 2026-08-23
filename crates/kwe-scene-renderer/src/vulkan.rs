@@ -1736,10 +1736,21 @@ impl LayerRenderer {
     // simpler than a one-call-site `type` item purely to satisfy the lint
     // (the same tradeoff `FoldedDeclarations` elsewhere in this crate
     // resolves the other way because it has multiple call sites).
+    /// S7 (P2): also gains `uniforms` so a `RenderTarget` slot can fill in
+    /// `uniforms.texture_resolution[slot]` — before this, only `Bytes`
+    /// slots did (`main.rs::build_material_textures`), so every effect
+    /// pass sampling a render target (slot 0 = `previous`/`_rt_*`, e.g.
+    /// `bokeh_blur`'s `gaussian.vert`) saw `g_TexelSize`/
+    /// `g_TextureNResolution` as zero, dividing 0/0 into NaN UV offsets.
+    /// A target not yet registered (or the dummy view) falls back to the
+    /// renderer's own canvas size (`self.width`/`self.height`) rather than
+    /// leaving zeros — never zero, matching this function's existing
+    /// degrade-not-fail contract for a missing target.
     #[allow(clippy::type_complexity)]
     fn resolve_texture_slots(
         &mut self,
         textures: &[Option<MaterialTextureBind>],
+        uniforms: &mut MaterialUniforms,
     ) -> Result<
         (
             [vk::DescriptorImageInfo; MAX_MATERIAL_TEXTURES],
@@ -1749,6 +1760,8 @@ impl LayerRenderer {
     > {
         let mut owned_textures: Vec<(u32, LayerTexture)> = Vec::new();
         let mut image_infos = [vk::DescriptorImageInfo::default(); MAX_MATERIAL_TEXTURES];
+        let canvas_width = self.width;
+        let canvas_height = self.height;
         for (slot, image_info) in image_infos.iter_mut().enumerate() {
             let view = match textures.get(slot).and_then(|entry| entry.as_ref()) {
                 Some(MaterialTextureBind::Bytes(rgba, width, height)) => {
@@ -1783,10 +1796,19 @@ impl LayerRenderer {
                         }
                     }
                 }
-                Some(MaterialTextureBind::RenderTarget(name)) => self
-                    .effect_targets
-                    .get(name.as_str())
-                    .map_or(self.dummy_texture.view, |fbo| fbo.view),
+                Some(MaterialTextureBind::RenderTarget(name)) => {
+                    match self.effect_targets.get(name.as_str()) {
+                        Some(fbo) => {
+                            uniforms.texture_resolution[slot] = resolution_vec4(fbo.width, fbo.height);
+                            fbo.view
+                        }
+                        None => {
+                            uniforms.texture_resolution[slot] =
+                                resolution_vec4(canvas_width, canvas_height);
+                            self.dummy_texture.view
+                        }
+                    }
+                }
                 None => self.dummy_texture.view,
             };
             *image_info = vk::DescriptorImageInfo::default()
@@ -1815,7 +1837,7 @@ impl LayerRenderer {
             ));
         };
 
-        let (image_infos, owned_textures) = self.resolve_texture_slots(textures)?;
+        let (image_infos, owned_textures) = self.resolve_texture_slots(textures, &mut uniforms)?;
 
         let ubo_info = vk::BufferCreateInfo::default()
             .size(MATERIAL_UNIFORMS_SIZE as vk::DeviceSize)
@@ -2804,7 +2826,7 @@ impl LayerRenderer {
             Err((_, result)) => return Err(result.into()),
         };
 
-        let (image_infos, owned_textures) = match self.resolve_texture_slots(textures) {
+        let (image_infos, owned_textures) = match self.resolve_texture_slots(textures, &mut uniforms) {
             Ok(result) => result,
             Err(error) => {
                 unsafe { self.device.destroy_pipeline(pipeline, None) };
@@ -3954,6 +3976,17 @@ impl LayerRenderer {
 /// background·(1−background), which a device oracle caught. Subtract is
 /// REVERSE_SUBTRACT (dst − src) clamped to 0 by the operation, Photoshop's
 /// base − blend, the spec's max(0, c2−c1) with c1 = texel, c2 = background.
+/// S7 (P2): `g_Texture<N>Resolution`'s xy/zw convention — pixel resolution
+/// then texel size (1/width, 1/height) — as a pure function so
+/// `resolve_texture_slots`'s two call sites (a registered render target,
+/// and its canvas-size fallback) share one computation instead of
+/// duplicating the reciprocal/`.max(1.0)` guard.
+fn resolution_vec4(width: u32, height: u32) -> [f32; 4] {
+    let w = width as f32;
+    let h = height as f32;
+    [w, h, 1.0 / w.max(1.0), 1.0 / h.max(1.0)]
+}
+
 fn blend_attachment_for(mode: BlendMode) -> vk::PipelineColorBlendAttachmentState {
     let write_mask = vk::ColorComponentFlags::R
         | vk::ColorComponentFlags::G
@@ -5991,6 +6024,86 @@ mod tests {
     #[test]
     fn full_frame_buffer_snapshot_cap_matches_the_documented_bound() {
         assert_eq!(MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME, 8);
+    }
+
+    /// S7 (P2): pure — no device needed. `g_TextureNResolution`'s
+    /// xy/zw convention (pixel resolution, then texel size) computed
+    /// without a divide-by-zero for a degenerate 0-sized dimension.
+    #[test]
+    fn resolution_vec4_is_pixels_then_texel_size() {
+        assert_eq!(resolution_vec4(1920, 1080), [1920.0, 1080.0, 1.0 / 1920.0, 1.0 / 1080.0]);
+        assert_eq!(resolution_vec4(0, 0), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// S7 (P2) regression: before this fix, only `Bytes` slots got
+    /// `uniforms.texture_resolution` filled in
+    /// (`main.rs::build_material_textures`) — a `RenderTarget` slot left
+    /// the `[0,0,0,0]` default, so every effect pass sampling a render
+    /// target (slot 0 = `previous`/`_rt_*`) saw resolution 0 and divided
+    /// 0/0 into NaN UV offsets (the Avatar report's vertical streaks).
+    /// Skip-by-default: needs a Vulkan device — run with `KWE_TEST_DEVICE`
+    /// set (llvmpipe-gated like the other vulkan tests).
+    #[test]
+    fn resolve_texture_slots_fills_render_target_resolution_never_zero() {
+        let Ok(binding) = std::env::var("KWE_TEST_DEVICE") else {
+            eprintln!(
+                "resolve_texture_slots_fills_render_target_resolution_never_zero: skipped (set KWE_TEST_DEVICE to run)"
+            );
+            return;
+        };
+        let mut renderer = LayerRenderer::new(Some(&binding), 16, 16).expect("create renderer");
+        renderer
+            .prepare_effect_targets(&[EffectTargetRequest {
+                name: "_rt_Sized".to_string(),
+                width: 8,
+                height: 4,
+            }])
+            .expect("prepare effect targets");
+
+        // A registered target: resolution comes from the FBO's own size,
+        // not the canvas.
+        let textures = [
+            Some(MaterialTextureBind::RenderTarget("_rt_Sized".to_string())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut uniforms = MaterialUniforms::default();
+        let (_, owned) = renderer
+            .resolve_texture_slots(&textures, &mut uniforms)
+            .expect("resolve texture slots");
+        assert!(
+            owned.is_empty(),
+            "a render-target slot uploads nothing new"
+        );
+        assert_eq!(uniforms.texture_resolution[0], resolution_vec4(8, 4));
+
+        // A name with no live entry (not yet registered / dummy view)
+        // falls back to the canvas size (16x16 here) — never zeros.
+        let textures_missing = [
+            Some(MaterialTextureBind::RenderTarget(
+                "_rt_NeverRegistered".to_string(),
+            )),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let mut uniforms_missing = MaterialUniforms::default();
+        let _ = renderer
+            .resolve_texture_slots(&textures_missing, &mut uniforms_missing)
+            .expect("resolve texture slots (missing target)");
+        assert_eq!(
+            uniforms_missing.texture_resolution[0],
+            resolution_vec4(16, 16)
+        );
     }
 
     /// S5 end-to-end: layer 0 draws solid opaque red covering the whole
