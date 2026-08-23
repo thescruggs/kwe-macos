@@ -126,6 +126,11 @@ pub fn classify_scene_object(object: &Map<String, Value>) -> SceneObjectKind {
 pub struct SceneObjectSummary {
     pub objects: usize,
     pub models: usize,
+    /// Of `models`, how many resolved a material texture through the
+    /// caller's lookup (S1, `summarize_scene_objects_resolved`; stays 0
+    /// under the plain `summarize_scene_objects` — no lookup, no I/O,
+    /// pure classification only). Never exceeds `models`.
+    pub models_resolved: usize,
     pub images: usize,
     pub texv_images: usize,
     pub videos: usize,
@@ -137,9 +142,14 @@ pub struct SceneObjectSummary {
 }
 
 impl SceneObjectSummary {
-    /// Objects that can produce pixels in this build.
+    /// Objects that can produce pixels in this build. A model counts only
+    /// when it actually resolved a texture (S1 honesty: unlike a direct
+    /// image reference, which counts statically even before its bytes are
+    /// known to decode, a model layer has no pipeline at all without a
+    /// resolvable texture — see the module doc's B2 reference and
+    /// deliverable 4 of the S1 task).
     pub fn drawable(&self) -> usize {
-        self.images + self.videos + self.particles + self.texts
+        self.images + self.videos + self.particles + self.texts + self.models_resolved
     }
 
     /// Why a scene with no drawable object draws nothing, one clause per
@@ -156,10 +166,16 @@ impl SceneObjectSummary {
     /// being refused cleanly.
     pub fn unsupported_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        if self.models > 0 {
+        let unresolved_models = self.models.saturating_sub(self.models_resolved);
+        if unresolved_models > 0 {
+            // S1: models are no longer a blanket "scene3d, not rendered"
+            // gap — a model whose material texture resolves (pkg/scene
+            // dir/Wallpaper Engine assets root) draws as a textured quad.
+            // What remains unsupported is specifically resolution failure
+            // (most commonly: the assets root was never configured, so no
+            // model's texture can resolve at all).
             reasons.push(format!(
-                "{} model layer(s) need scene3d, which this build does not render yet",
-                self.models
+                "{unresolved_models} model layer(s) whose material textures could not be resolved (missing Wallpaper Engine assets?)"
             ));
         }
         if self.texv_images > 0 {
@@ -207,6 +223,49 @@ pub fn summarize_scene_objects(root: &Value) -> SceneObjectSummary {
             SceneObjectKind::Text => summary.texts += 1,
             SceneObjectKind::TexturelessImage => summary.textureless_images += 1,
             SceneObjectKind::Other => summary.other += 1,
+        }
+    }
+    summary
+}
+
+/// Census the `objects` array, additionally resolving each model layer's
+/// material texture through `resolve` (`crate::scenemodel::resolve_model`:
+/// model.json -> material path -> material.json -> passes[0] -> first
+/// texture slot -> `materials/<name>.tex`), so `models_resolved` and
+/// therefore `drawable()`/`unsupported_reasons()` reflect reality instead
+/// of the static "models never draw" assumption. `resolve` is the
+/// caller's composed lookup (pkg entries -> scene directory -> Wallpaper
+/// Engine assets root); this function performs no I/O of its own beyond
+/// calling it. Shared by preflight (`preflight_scene`/`preflight_pkg`) and
+/// the worker's own B2 gate (main.rs adds the resolved count the same
+/// way after `load_model_textures` runs).
+pub fn summarize_scene_objects_resolved(
+    root: &Value,
+    resolve: &mut crate::scenemodel::AssetLookup<'_>,
+) -> SceneObjectSummary {
+    let mut summary = summarize_scene_objects(root);
+    if summary.models == 0 {
+        return summary;
+    }
+    let Some(objects) = root.get("objects").and_then(Value::as_array) else {
+        return summary;
+    };
+    for entry in objects {
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        if classify_scene_object(object) != SceneObjectKind::Model {
+            continue;
+        }
+        let Some(reference) = object
+            .get("image")
+            .map(scene_property_value)
+            .and_then(Value::as_str)
+        else {
+            continue; // malformed model reference: stays unresolved
+        };
+        if crate::scenemodel::resolve_model(reference, resolve).is_ok() {
+            summary.models_resolved += 1;
         }
     }
     summary

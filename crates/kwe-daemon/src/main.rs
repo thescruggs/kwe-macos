@@ -78,6 +78,13 @@ struct Arguments {
     /// Scene renderer executable (default: kwe-scene-renderer beside the daemon).
     #[arg(long)]
     renderer_scene: Option<PathBuf>,
+    /// Wallpaper Engine assets root (S1), passed to the scene worker and
+    /// to scene preflight so model layers can resolve their material
+    /// textures. Default: the first existing
+    /// `<steam root>/steamapps/common/wallpaper_engine/assets` over the
+    /// resolved Steam roots.
+    #[arg(long = "wallpaper-engine-assets")]
+    wallpaper_engine_assets: Option<PathBuf>,
     /// Private directory for ephemeral renderer frame files.
     #[arg(long)]
     renderer_runtime_dir: Option<PathBuf>,
@@ -274,6 +281,10 @@ fn main() -> Result<()> {
     } else {
         arguments.steam_roots
     };
+    let scene_assets_dir = arguments
+        .wallpaper_engine_assets
+        .clone()
+        .or_else(|| kwe_core::default_wallpaper_engine_assets_dir(&roots));
     let default_paths = default_renderer_paths()?;
     let renderer_paths = BTreeMap::from([
         (
@@ -359,6 +370,7 @@ fn main() -> Result<()> {
         web_heartbeat_ms: arguments.renderer_web_heartbeat_ms,
         web_heartbeat_max_failures: arguments.renderer_web_heartbeat_max_failures,
         resource_limits_by_kind,
+        scene_assets_dir: scene_assets_dir.clone(),
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -388,6 +400,7 @@ fn main() -> Result<()> {
             systemctl_binary: arguments.systemctl_binary,
             probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
             promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
+            scene_assets_dir: scene_assets_dir.clone(),
         },
         catalog.clone(),
         supervisor.clone(),
@@ -1065,7 +1078,12 @@ impl TryFrom<RendererStartParams> for StartSpec {
         };
         // Single validation point per start: the supervisor event loop no
         // longer re-validates, so content preflight cannot block it twice.
-        spec.into_validated()
+        // This raw renderer.start RPC predates S1's assets-root plumbing
+        // and has no ApplyHandle to read it from; a scene started this way
+        // resolves model layers only against the scene's own pkg/directory
+        // (the primary wallpaper.apply path in apply.rs threads the real
+        // configured assets root through).
+        spec.into_validated(None)
     }
 }
 
@@ -1510,6 +1528,7 @@ mod tests {
                 (RendererKind::Web, limits),
                 (RendererKind::Scene, limits),
             ]),
+            scene_assets_dir: None,
         })
         .unwrap()
     }
@@ -2417,6 +2436,7 @@ with open(args.output, "wb") as frame:
                 (RendererKind::Web, limits),
                 (RendererKind::Scene, limits),
             ]),
+            scene_assets_dir: None,
         }
     }
 
@@ -3041,6 +3061,7 @@ with open(args.output, "wb") as frame:
                 (RendererKind::Web, limits),
                 (RendererKind::Scene, limits),
             ]),
+            scene_assets_dir: None,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

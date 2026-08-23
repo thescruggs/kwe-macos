@@ -40,6 +40,7 @@ mod particles;
 mod scene;
 mod text;
 mod textures;
+mod texv;
 mod video;
 mod vulkan;
 
@@ -75,8 +76,10 @@ use vulkan::{LayerRenderer, RenderError, is_fence_timeout};
 /// Backend rejection: the scene cannot be rendered at all.
 const EXIT_BACKEND_REJECT: i32 = 73;
 /// B2: the scene declares objects and NONE of them can put a pixel on the
-/// screen in this build — every layer is a model (scene3d, M3h), a texture
-/// that would not decode, or a particle system with no material. Compositing
+/// screen in this build — every layer is a model whose material texture
+/// could not be resolved (S1: no Wallpaper Engine assets configured, or
+/// the corpus reference simply does not resolve), a texture that would
+/// not decode, or a particle system with no material. Compositing
 /// it would publish the bare clear colour as a healthy frame and the desktop
 /// would go flat with nothing anywhere saying why, so the worker refuses
 /// before the first publish and the apply transaction rolls back. Preflight
@@ -188,6 +191,12 @@ struct Arguments {
     /// separated) for standalone lanes.
     #[arg(long)]
     font_dir: Vec<PathBuf>,
+    /// Wallpaper Engine assets root (S1), consulted after the scene's own
+    /// package/directory when resolving a model layer's material texture
+    /// (kwe_core::scenemodel::resolve_model). Optional: without it, model
+    /// layers only resolve against assets the scene itself carries.
+    #[arg(long = "assets-dir")]
+    assets_dir: Option<PathBuf>,
 }
 
 fn try_memory_pressure(mib: Option<u64>) -> Result<(), ()> {
@@ -776,7 +785,7 @@ fn main() -> Result<()> {
     let video_cleanup = VideoCleanupGuard::new();
 
     // 1. Scene: parse and reject (exit 73) anything the engine cannot render.
-    let mut config = load_scene(&content);
+    let mut config = load_scene(&content, arguments.assets_dir.as_deref());
     // 1b. M3g: open the video decoders before the script engine, so a layer
     //     that declared size [0, 0] carries the video's own dimensions by
     //     the time init() reads it (the same rule image layers follow).
@@ -798,30 +807,37 @@ fn main() -> Result<()> {
         );
     }
 
-    if config.model_layer_skips > 0 {
-        eprintln!(
-            "event=renderer.scene.model_layer_skip count={} (scene3d model layers are BETA_M3h)",
-            config.model_layer_skips
-        );
-    }
+    // S1: `config.model_layer_skips` now counts every model object the
+    // parse saw (registered or not; the field predates texture
+    // resolution). Whether each one actually draws depends on
+    // `load_model_textures` (run inside `load_scene` above), whose own
+    // one-time diagnostic (`event=renderer.scene.model_texture_skip`)
+    // already named how many failed to resolve or decode — no separate
+    // diagnostic here, to avoid two overlapping lines for the same fact.
 
-    // 1c. B2 no-drawable-content guard: the same static rule preflight runs
-    // (`kwe_core::classify_scene_object`), applied to the scene this worker
-    // actually parsed. A scene that declares objects and can draw NONE of
-    // them composites to bare clear colour forever — no script can change
-    // that, because a script only moves and recolours what the scene
-    // declared — so the worker refuses before its first publish and the
-    // apply transaction rolls back instead of promoting a flat frame.
+    // 1c. B2 no-drawable-content guard: the same rule preflight runs
+    // (`kwe_core::summarize_scene_objects_resolved`), applied to the scene
+    // this worker actually parsed. A scene that declares objects and can
+    // draw NONE of them composites to bare clear colour forever — no
+    // script can change that, because a script only moves and recolours
+    // what the scene declared — so the worker refuses before its first
+    // publish and the apply transaction rolls back instead of promoting a
+    // flat frame.
     //
-    // The rule is deliberately STATIC, not "did any texture upload
-    // succeed": a layer whose content fails to decode or whose video
-    // source will not open is a degraded layer, and degrading a layer
-    // never rejects a scene (the M3c/M3g skip-never-reject contract).
+    // The rule is STATIC for every layer kind except models (S1): a layer
+    // whose content fails to decode or whose video source will not open
+    // is a degraded layer, and degrading a layer never rejects a scene
+    // (the M3c/M3g skip-never-reject contract) — `drawable_objects` still
+    // counts it. A model layer is the one exception: it counts toward
+    // `drawable_objects` only when `load_model_textures` actually resolved
+    // its texture (deliverable 4's honesty gate — see that function's
+    // doc), because unlike a direct image reference a model has no
+    // pipeline at all without a resolvable texture.
     //
     // A scene that declares NO objects at all is exempt: an empty scene is
     // the author's choice (and its script may animate the clear colour),
     // not a feature this build is missing.
-    let declared_objects = config.layers.len() + config.particles.len() + config.model_layer_skips;
+    let declared_objects = config.layers.len() + config.particles.len();
     if declared_objects > 0 && config.drawable_objects == 0 {
         eprintln!(
             "event=renderer.scene.no_drawable_content objects={declared_objects} model_layers={} particle_systems={} layers={} detail=scene renders nothing in this build",
@@ -1047,7 +1063,7 @@ fn world_extent(scene: Option<(u32, u32)>, canvas: (u32, u32), scaling: &str) ->
     }
 }
 
-fn load_scene(content: &Path) -> SceneConfig {
+fn load_scene(content: &Path, assets_dir: Option<&Path>) -> SceneConfig {
     let is_pkg = content
         .extension()
         .and_then(|value| value.to_str())
@@ -1069,6 +1085,16 @@ fn load_scene(content: &Path) -> SceneConfig {
         load_particle_textures(&mut config.particles, &mut used_bytes, |reference| {
             resolve_layer_image(&root, reference)
         });
+        // S1: model layers resolve model -> material -> texture through
+        // kwe_core::scenemodel, looked up against the scene directory
+        // first and the Wallpaper Engine assets root second (file lane
+        // has no package entries to try first).
+        config.drawable_objects +=
+            load_model_textures(&mut config.layers, &mut used_bytes, |reference| {
+                resolve_layer_image(&root, reference).ok().or_else(|| {
+                    assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
+                })
+            });
         // M3g: stage every file-scene video into the worker-owned private
         // directory before libmpv sees it. The source is opened with
         // O_NOFOLLOW and copied through that already-open fd, so a later
@@ -1127,6 +1153,28 @@ fn load_scene(content: &Path) -> SceneConfig {
             .read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
             .map_err(|error| format!("cannot read entry: {error}"))
     });
+    // S1: model layers resolve model -> material -> texture through
+    // kwe_core::scenemodel, looked up against the package entry table
+    // first, the scene's own directory (the pkg's parent — the rare
+    // corpus layout with loose files beside the archive) second, and the
+    // Wallpaper Engine assets root last.
+    let pkg_dir = content
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok());
+    config.drawable_objects +=
+        load_model_textures(&mut config.layers, &mut used_bytes, |reference| {
+            if let Ok(index) = kwe_core::image_entry(reference, reader.entries())
+                && let Ok(bytes) = reader.read_entry_bounded(index, MAX_TEXTURE_SOURCE_BYTES)
+            {
+                return Some(bytes);
+            }
+            if let Some(dir) = &pkg_dir
+                && let Ok(bytes) = resolve_layer_image(dir, reference)
+            {
+                return Some(bytes);
+            }
+            assets_dir.and_then(|assets| resolve_layer_image(assets, reference).ok())
+        });
     // M3g: a packaged video is extracted into the worker's private HOME,
     // because libmpv opens a path rather than a byte slice. Bounded by
     // MAX_VIDEO_SOURCE_BYTES and by the concurrency cap the parse enforced.
@@ -1309,6 +1357,69 @@ fn load_particle_textures(
         *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
         particle.texture = Some(texture);
     }
+}
+
+/// Fill `layers[*].texture` for every model layer (S1): resolve
+/// `model_ref` all the way to a texture through
+/// `kwe_core::scenemodel::resolve_model` (model.json -> material path ->
+/// material.json -> passes[0] -> first texture slot), decode the result
+/// (`texv::decode_model_texture`: TEXV0005 containers, defensively also a
+/// plain image container), and account the decoded bytes against the same
+/// texture budget layer/particle textures share.
+///
+/// A model whose texture never resolves, or whose resolved bytes fail to
+/// decode or exceed the shared budget, is a degraded layer — it stays
+/// registered (a script can still reach it by name) but never uploads a
+/// texture; this is the skip-never-reject contract every other texture
+/// path in this file already follows. Both failure classes fold into one
+/// bounded, one-time diagnostic (`event=renderer.scene.model_texture_skip
+/// count=N`) rather than one line per layer, matching the model of the
+/// pre-S1 `model_layer_skip` diagnostic this replaces for texture
+/// failures specifically.
+///
+/// Returns the count of layers whose texture actually resolved and
+/// decoded — the honest addend to `drawable_objects` the B2 gate reads
+/// (deliverable 4: unlike a direct image reference, which counts as
+/// drawable statically even before its bytes are known to decode, a model
+/// layer has no pipeline at all without a resolved texture).
+fn load_model_textures(
+    layers: &mut [scene::LayerSpec],
+    used_bytes: &mut u64,
+    mut resolve_asset: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> usize {
+    let mut resolved = 0usize;
+    let mut skipped = 0usize;
+    for layer in layers.iter_mut() {
+        let Some(model_ref) = layer.model_ref.as_deref() else {
+            continue; // not a model layer
+        };
+        let resolved_model = match kwe_core::resolve_model(model_ref, &mut resolve_asset) {
+            Ok(resolved_model) => resolved_model,
+            Err(_detail) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let Some(texture) = texv::decode_model_texture(&resolved_model.texture_bytes) else {
+            skipped += 1;
+            continue;
+        };
+        let pixels = u64::from(texture.width) * u64::from(texture.height);
+        if !texture_budget_allows(*used_bytes, texture.width, texture.height) {
+            skipped += 1;
+            continue;
+        }
+        *used_bytes = used_bytes.saturating_add(pixels.saturating_mul(4));
+        if layer.size == [0.0, 0.0] {
+            layer.size = [texture.width as f32, texture.height as f32];
+        }
+        layer.texture = Some(texture);
+        resolved += 1;
+    }
+    if skipped > 0 {
+        eprintln!("event=renderer.scene.model_texture_skip count={skipped}");
+    }
+    resolved
 }
 
 /// Upload the decoded layer textures into the compositor. Index-aligned
@@ -2138,6 +2249,7 @@ mod tests {
             name: name.into(),
             scene_order: 0,
             image: image.map(Into::into),
+            model_ref: None,
             origin: [0.0, 0.0],
             angles: [0.0, 0.0, 0.0],
             scale: [1.0, 1.0],
@@ -2234,6 +2346,93 @@ mod tests {
             "an explicit size is never overwritten by the texture"
         );
         assert!(layers[0].texture.is_some());
+    }
+
+    /// A minimal TEXV0005/TEXI0001/TEXB0003 ARGB8888 container: same shape
+    /// texv.rs's own tests build, duplicated here (private to that
+    /// module's `#[cfg(test)]`) so this integration test does not need a
+    /// visibility change just to reuse a fixture builder.
+    fn solid_texv_argb8888(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"TEXV0005\0");
+        out.extend_from_slice(b"TEXI0001\0");
+        out.extend_from_slice(&0u32.to_le_bytes()); // format ARGB8888
+        out.extend_from_slice(&0u32.to_le_bytes()); // flags
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(b"TEXB0003\0");
+        out.extend_from_slice(&1u32.to_le_bytes()); // image count
+        out.extend_from_slice(&(-1i32).to_le_bytes()); // FIF_UNKNOWN
+        out.extend_from_slice(&1u32.to_le_bytes()); // mipmap count
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // compression = 0
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            pixels.extend_from_slice(&rgba);
+        }
+        out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
+        out.extend_from_slice(&(pixels.len() as i32).to_le_bytes());
+        out.extend_from_slice(&pixels);
+        out
+    }
+
+    /// S1 end-to-end: a model layer whose model -> material -> texture
+    /// chain resolves through the lookup closure decodes its TEXV texture,
+    /// fills the layer's size from the decoded dimensions, and counts
+    /// toward the returned resolved count (the honest addend to
+    /// `drawable_objects` main() adds after `load_scene`).
+    #[test]
+    fn load_model_textures_resolves_decodes_and_counts_drawable() {
+        let mut assets: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        assets.insert(
+            "models/deco.json".into(),
+            br#"{"material": "materials/deco.json"}"#.to_vec(),
+        );
+        assets.insert(
+            "materials/deco.json".into(),
+            br#"{"passes": [{"shader": "genericimage2", "textures": ["deco"]}]}"#.to_vec(),
+        );
+        assets.insert(
+            "materials/deco.tex".into(),
+            solid_texv_argb8888(4, 4, [10, 20, 30, 255]),
+        );
+
+        let mut layers = vec![layer("m", None)];
+        layers[0].model_ref = Some("models/deco.json".into());
+        let mut used_bytes = 0u64;
+        let resolved = load_model_textures(&mut layers, &mut used_bytes, |reference| {
+            assets.get(reference).cloned()
+        });
+
+        assert_eq!(resolved, 1);
+        let texture = layers[0].texture.as_ref().expect("model texture decodes");
+        assert_eq!((texture.width, texture.height), (4, 4));
+        assert_eq!(&texture.rgba[0..4], &[10, 20, 30, 255]);
+        assert_eq!(
+            layers[0].size,
+            [4.0, 4.0],
+            "absent size takes the decoded texture's dimensions, like an image layer"
+        );
+        assert!(used_bytes > 0);
+    }
+
+    /// The honesty half of deliverable 4: an unresolvable model layer
+    /// (no assets to satisfy the lookup) counts 0 toward the resolved
+    /// return value and stays textureless — never a scene rejection.
+    #[test]
+    fn load_model_textures_unresolvable_model_is_skipped_not_rejected() {
+        let mut layers = vec![layer("m", None)];
+        layers[0].model_ref = Some("models/missing.json".into());
+        let mut used_bytes = 0u64;
+        let resolved = load_model_textures(&mut layers, &mut used_bytes, |_reference| None);
+        assert_eq!(resolved, 0);
+        assert!(layers[0].texture.is_none());
+        assert_eq!(used_bytes, 0);
     }
 
     #[test]

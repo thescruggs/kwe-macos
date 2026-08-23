@@ -31,8 +31,11 @@ pub struct ScenePreflight {
 /// objects at all is the author's empty scene, not a missing feature.
 /// See `crate::sceneobjects` for the classification and
 /// docs/bugs/SCENE_APPLY_BLANK_CLEAR_COLOR.md for the evidence.
-pub(crate) fn no_drawable_content_reasons(root: &serde_json::Value) -> Vec<String> {
-    let summary = crate::summarize_scene_objects(root);
+pub(crate) fn no_drawable_content_reasons(
+    root: &serde_json::Value,
+    resolve: &mut crate::scenemodel::AssetLookup<'_>,
+) -> Vec<String> {
+    let summary = crate::summarize_scene_objects_resolved(root, resolve);
     if summary.drawable() > 0 {
         return Vec::new();
     }
@@ -52,7 +55,38 @@ pub(crate) fn no_drawable_content_reasons(root: &serde_json::Value) -> Vec<Strin
     )]
 }
 
-pub fn preflight_scene(path: &Path) -> ScenePreflight {
+/// Per-file read cap for the model-resolution lookup's scene-directory
+/// and assets-root steps: generous headroom over any real `.tex`
+/// (mirrors `kwe_core::pkg::MAX_PKG_ENTRY_BYTES`); the model/material JSON
+/// steps apply their own tighter 1 MiB cap inside `scenemodel::resolve_model`.
+const MODEL_ASSET_READ_CAP: u64 = 64 * 1024 * 1024;
+
+/// S1: preflight's model-resolution lookup for the scene-json (file) lane
+/// — scene directory, then the Wallpaper Engine assets root, in that
+/// order. A `.pkg` lane's lookup (pkg entries first) lives in
+/// `crate::pkg::preflight_pkg`.
+fn file_lane_asset_lookup<'a>(
+    scene_dir: &'a Path,
+    assets_dir: Option<&'a Path>,
+) -> impl FnMut(&str) -> Option<Vec<u8>> + 'a {
+    move |reference: &str| {
+        if let Some(bytes) =
+            crate::scenemodel::confined_read(scene_dir, reference, MODEL_ASSET_READ_CAP)
+        {
+            return Some(bytes);
+        }
+        assets_dir.and_then(|assets| {
+            crate::scenemodel::confined_read(assets, reference, MODEL_ASSET_READ_CAP)
+        })
+    }
+}
+
+/// `assets_dir`: the Wallpaper Engine assets root (S1), consulted after
+/// the scene's own package/directory when resolving a model layer's
+/// material texture (`crate::scenemodel::resolve_model`). `None` when not
+/// configured — models then only resolve against assets the scene itself
+/// carries.
+pub fn preflight_scene(path: &Path, assets_dir: Option<&Path>) -> ScenePreflight {
     let mut report = ScenePreflight {
         path: path.to_path_buf(),
         safe: false,
@@ -113,7 +147,11 @@ pub fn preflight_scene(path: &Path) -> ScenePreflight {
         match fs::read(path) {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(value) if value.is_object() => {
-                    report.reasons.extend(no_drawable_content_reasons(&value));
+                    let scene_dir = path.parent().unwrap_or_else(|| Path::new("."));
+                    let mut lookup = file_lane_asset_lookup(scene_dir, assets_dir);
+                    report
+                        .reasons
+                        .extend(no_drawable_content_reasons(&value, &mut lookup));
                 }
                 Ok(_) => report
                     .reasons
@@ -128,7 +166,7 @@ pub fn preflight_scene(path: &Path) -> ScenePreflight {
         // M3b: the .pkg branch is structurally validated by the archive
         // reader (magic, version, entry table, bounds, paths). Before M3b
         // this branch passed unconditionally (M1 finding G12).
-        return crate::pkg::preflight_pkg(path);
+        return crate::pkg::preflight_pkg(path, assets_dir);
     }
     report.safe = report.reasons.is_empty();
     report
@@ -237,7 +275,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let valid = root.join("scene.json");
         fs::write(&valid, br#"{"objects":[]}"#).unwrap();
-        let report = preflight_scene(&valid);
+        let report = preflight_scene(&valid, None);
         assert!(report.safe);
         assert_eq!(report.format, "scene-json");
         let invalid = root.join("bad.json");
@@ -245,7 +283,7 @@ mod tests {
             .unwrap()
             .write_all(b"not json")
             .unwrap();
-        assert!(!preflight_scene(&invalid).safe);
+        assert!(!preflight_scene(&invalid, None).safe);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -263,10 +301,13 @@ mod tests {
             br#"{"objects": [{"name": "a", "image": "models/a.json"}]}"#,
         )
         .unwrap();
-        let report = preflight_scene(&blank);
+        let report = preflight_scene(&blank, None);
         assert!(!report.safe);
         assert!(
-            report.reasons.join("; ").contains("scene3d"),
+            report
+                .reasons
+                .join("; ")
+                .contains("material textures could not be resolved"),
             "{:?}",
             report.reasons
         );
@@ -279,15 +320,63 @@ mod tests {
                              {"name": "b", "image": "textures/b.png"}]}"#,
         )
         .unwrap();
-        assert!(preflight_scene(&mixed).safe);
+        assert!(preflight_scene(&mixed, None).safe);
 
         // An objectless scene is empty by authorship, not by a missing
         // feature (the existing accepts_object_scene_json case), so it
         // stays safe.
         let empty = root.join("empty.json");
         fs::write(&empty, br#"{"objects": []}"#).unwrap();
-        assert!(preflight_scene(&empty).safe);
+        assert!(preflight_scene(&empty, None).safe);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// S1: with an assets root configured and a real model/material/tex
+    /// chain resolvable inside it, the model layer now counts as
+    /// drawable — the scene that used to refuse on "scene3d" passes.
+    #[test]
+    fn model_layer_resolves_and_applies_with_an_assets_root() {
+        let root =
+            std::env::temp_dir().join(format!("kwe-preflight-model-ok-{}", std::process::id()));
+        let assets =
+            std::env::temp_dir().join(format!("kwe-preflight-model-assets-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&assets);
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::create_dir_all(assets.join("materials")).unwrap();
+        fs::write(
+            root.join("models").join("a.json"),
+            br#"{"material": "materials/a.json"}"#,
+        )
+        .unwrap();
+        // The material lives in the scene directory too (a common corpus
+        // layout); only the .tex asset itself needs the assets root.
+        fs::create_dir_all(root.join("materials")).unwrap();
+        fs::write(
+            root.join("materials").join("a.json"),
+            br#"{"passes": [{"shader": "genericimage2", "textures": ["a"]}]}"#,
+        )
+        .unwrap();
+        fs::write(assets.join("materials").join("a.tex"), b"TEXV0005fake").unwrap();
+
+        let scene = root.join("scene.json");
+        fs::write(
+            &scene,
+            br#"{"objects": [{"name": "a", "image": "models/a.json"}]}"#,
+        )
+        .unwrap();
+
+        let without_assets = preflight_scene(&scene, None);
+        assert!(!without_assets.safe, "no assets root: still unresolved");
+
+        let with_assets = preflight_scene(&scene, Some(&assets));
+        assert!(
+            with_assets.safe,
+            "resolvable model must apply: {:?}",
+            with_assets.reasons
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(assets);
     }
 
     #[test]
@@ -434,7 +523,7 @@ mod tests {
         let mut writer = crate::pkg::testutil::PkgWriter::new();
         writer.add("scene.json", br#"{"general":{}}"#);
         writer.write(&root.join("scene.pkg"), "0001");
-        let report = preflight_scene(&root.join("scene.pkg"));
+        let report = preflight_scene(&root.join("scene.pkg"), None);
         assert!(
             report.safe,
             "valid pkg must pass preflight: {:?}",
@@ -463,7 +552,7 @@ mod tests {
         ] {
             let path = root.join(name);
             fs::write(&path, bytes).unwrap();
-            let report = preflight_scene(&path);
+            let report = preflight_scene(&path, None);
             assert!(!report.safe, "{name} must be rejected");
             assert_eq!(report.format, "scene-package");
             assert!(
@@ -490,7 +579,7 @@ mod tests {
         writer.write(&real, "0001");
         let link = root.join("link.pkg");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let report = preflight_scene(&link);
+        let report = preflight_scene(&link, None);
         assert!(!report.safe);
         assert!(
             report
@@ -516,7 +605,7 @@ mod tests {
         let mut writer = crate::pkg::testutil::PkgWriter::new();
         writer.add("scene.json", &vec![0_u8; 16 * 1024 * 1024 + 1]);
         writer.write(&root.join("big-scene.pkg"), "0001");
-        let report = preflight_scene(&root.join("big-scene.pkg"));
+        let report = preflight_scene(&root.join("big-scene.pkg"), None);
         assert!(!report.safe);
         assert!(
             report.reasons.iter().any(|reason| {
@@ -530,7 +619,7 @@ mod tests {
         writer.add("scene.json", br#"{"general":{"script":"script.js"}}"#);
         writer.add("script.js", &vec![0_u8; 2 * 1024 * 1024 + 1]);
         writer.write(&root.join("big-script.pkg"), "0001");
-        let report = preflight_scene(&root.join("big-script.pkg"));
+        let report = preflight_scene(&root.join("big-script.pkg"), None);
         assert!(!report.safe);
         assert!(
             report.reasons.iter().any(|reason| {
@@ -545,7 +634,7 @@ mod tests {
         writer.add("scene.json", br#"{"general":{"script":"script.js"}}"#);
         writer.add("script.js", b"function init() {}");
         writer.write(&root.join("small.pkg"), "0001");
-        let report = preflight_scene(&root.join("small.pkg"));
+        let report = preflight_scene(&root.join("small.pkg"), None);
         assert!(report.safe, "unexpected reasons: {:?}", report.reasons);
         let _ = fs::remove_dir_all(root);
     }

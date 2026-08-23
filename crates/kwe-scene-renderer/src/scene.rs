@@ -172,6 +172,14 @@ pub struct LayerSpec {
     /// value is not a string): the layer is still registered so the script
     /// can reach it, but skipped at load with a bounded diagnostic.
     pub image: Option<String>,
+    /// Raw model `image` reference (S1), `Some` exactly when the object
+    /// classified as `SceneObjectKind::Model` — a `.json` model file whose
+    /// `material` resolves to a texture through `kwe_core::scenemodel`.
+    /// `image` stays `None` for a model layer; `load_model_textures`
+    /// resolves this field instead of the usual `resolve`+`decode_texture`
+    /// path, because resolution needs the model->material->texture walk
+    /// and the pkg/dir/assets-root lookup order, not a single reference.
+    pub model_ref: Option<String>,
     /// Position in scene units (pixels); (0,0) is the scene center, +y
     /// down (researched WE origin semantics).
     pub origin: [f32; 2],
@@ -531,9 +539,12 @@ pub struct ObjectCounts {
 /// models, audio — M3d+). A reference that ends in `.json` is a model
 /// instance under the WE solid-model architecture (620 of the 685 corpus
 /// image references point at model files; the other 65 carry a null image
-/// value) — skipped BEFORE any validation, so a malformed model layer (no
-/// name, out-of-range alpha, ...) can never reject the scene, and it is
-/// not counted toward the layer cap, until models arrive (M3h).
+/// value); `parse_model_layer` runs BEFORE any validation error can
+/// propagate (S1 — it returns `None` instead of `Err`), so a malformed
+/// model layer (no name, out-of-range alpha, ...) can never reject the
+/// scene, exactly like the pre-S1 skip. A model layer that DOES parse now
+/// registers like an image layer and counts toward the layer cap (M3d+
+/// note updated for S1).
 ///
 /// Text layers beyond text::MAX_TEXT_LAYERS are skipped (counted, never a
 /// rejection); particle systems beyond particles::MAX_PARTICLE_SYSTEMS are
@@ -573,15 +584,20 @@ fn parse_objects(
             counts.drawable_objects += 1;
         }
         match kind {
-            // A model instance: WE stores every visual (2D included) as a
-            // model; model layers are M3h. The scene renders without it.
-            // The classification runs on the raw (property-unwrapped)
-            // reference BEFORE parse_image_layer, so a malformed model
-            // layer skips like any model layer instead of rejecting the
-            // whole scene. Counted so the worker can report the skip.
+            // A model instance (S1): WE stores every visual (2D
+            // included) as a model. The classification runs on the raw
+            // (property-unwrapped) reference BEFORE parse_model_layer, so
+            // a malformed model layer skips (parse_model_layer returns
+            // `None`) exactly like the pre-S1 contract instead of
+            // rejecting the whole scene. `model_layer_skips` now counts
+            // every model object seen (registered or not) — the field
+            // name predates S1's texture resolution; see the worker's own
+            // diagnostic (main.rs) for what actually failed to resolve.
             SceneObjectKind::Model => {
                 counts.model_layer_skips += 1;
-                continue;
+                if let Some(layer) = parse_model_layer(object, index) {
+                    layers.push(layer);
+                }
             }
             // An image layer (M3c). TEXV (.tex) references and non-string
             // references register the same way: the layer exists for the
@@ -872,27 +888,13 @@ fn parse_common_props(
     })
 }
 
-/// One image layer entry. Numeric out-of-range values reject the whole
-/// scene (like clearcolor); an unresolvable image never does (the task's
-/// policy — a missing image skips the layer, not the scene).
-fn parse_image_layer(
+/// `size` and `tint`/`color`: shared by image and model layers (S1) — a
+/// model instance is drawn as a quad through the same geometry pipeline an
+/// image layer uses, so it carries the same two fields.
+fn parse_size_and_tint(
     object: &serde_json::Map<String, Value>,
     index: usize,
-) -> Result<LayerSpec, SceneError> {
-    let common = parse_common_props(object, index, "image")?;
-
-    // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
-    // editor serializes user-bindable fields — corpus re-scan: 70%
-    // (315/447) of image layers carrying alpha and 49% (276/568) of those
-    // carrying visible are wrapped. The initial `value` is the behavior
-    // until user properties arrive (M3j); the wrapper is unwrapped here,
-    // and a wrapped scalar without a value rejects like any malformed
-    // scalar.
-    let image = match scene_property_value(object.get("image").expect("caller checked")) {
-        Value::String(reference) => Some(reference.clone()),
-        _ => None,
-    };
-
+) -> Result<([f32; 2], [f32; 4]), SceneError> {
     let size = match object.get("size") {
         None => [0.0, 0.0],
         Some(value) => {
@@ -926,10 +928,80 @@ fn parse_image_layer(
         }
     };
 
+    Ok((size, tint))
+}
+
+/// One model layer entry (S1, `SceneObjectKind::Model`). A model instance
+/// draws as a quad through the same geometry fields an image layer uses
+/// (origin/angles/scale/size/alpha/visible/blend/brightness/tint); its
+/// pixel source is `model_ref` — resolved later (`load_model_textures`,
+/// `kwe_core::scenemodel::resolve_model`) against the pkg/scene-dir/assets
+/// lookup chain, not a direct image reference.
+///
+/// Unlike `parse_image_layer`, a parse failure here is never a scene
+/// rejection: this is the pre-S1 "skip-never-reject" contract for model
+/// layers (`malformed_model_layers_skip_never_reject` — a model layer with
+/// no name, an out-of-range alpha, or any other malformed field must not
+/// take the whole scene down). `None` means "this object registers
+/// nothing" — the caller skips it exactly as if it never resolved.
+fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> Option<LayerSpec> {
+    let common = parse_common_props(object, index, "model").ok()?;
+    let model_ref = match scene_property_value(object.get("image").expect("caller checked")) {
+        Value::String(reference) => reference.clone(),
+        // classify_scene_object requires a string to reach Model at all;
+        // defensive only.
+        _ => return None,
+    };
+    let (size, tint) = parse_size_and_tint(object, index).ok()?;
+
+    Some(LayerSpec {
+        name: common.name,
+        scene_order: index,
+        image: None,
+        model_ref: Some(model_ref),
+        origin: common.origin,
+        angles: common.angles,
+        scale: common.scale,
+        size,
+        alpha: common.alpha,
+        visible: common.visible,
+        blend_mode: common.blend_mode,
+        brightness: common.brightness,
+        tint,
+        texture: None,
+        text: None,
+        video: None,
+    })
+}
+
+/// One image layer entry. Numeric out-of-range values reject the whole
+/// scene (like clearcolor); an unresolvable image never does (the task's
+/// policy — a missing image skips the layer, not the scene).
+fn parse_image_layer(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+) -> Result<LayerSpec, SceneError> {
+    let common = parse_common_props(object, index, "image")?;
+
+    // Property-wrapped values (`{"user": ..., "value": ...}`) are how the
+    // editor serializes user-bindable fields — corpus re-scan: 70%
+    // (315/447) of image layers carrying alpha and 49% (276/568) of those
+    // carrying visible are wrapped. The initial `value` is the behavior
+    // until user properties arrive (M3j); the wrapper is unwrapped here,
+    // and a wrapped scalar without a value rejects like any malformed
+    // scalar.
+    let image = match scene_property_value(object.get("image").expect("caller checked")) {
+        Value::String(reference) => Some(reference.clone()),
+        _ => None,
+    };
+
+    let (size, tint) = parse_size_and_tint(object, index)?;
+
     Ok(LayerSpec {
         name: common.name,
         scene_order: index,
         image,
+        model_ref: None,
         origin: common.origin,
         angles: common.angles,
         scale: common.scale,
@@ -1031,6 +1103,7 @@ fn parse_text_layer(
         name: common.name.clone(),
         scene_order: index,
         image: None,
+        model_ref: None,
         origin: common.origin,
         angles: common.angles,
         scale: common.scale,
@@ -1139,6 +1212,7 @@ fn parse_video_layer(
         name: common.name,
         scene_order: index,
         image: None,
+        model_ref: None,
         origin: common.origin,
         angles: common.angles,
         scale: common.scale,
@@ -2364,27 +2438,55 @@ mod tests {
     }
 
     #[test]
-    fn model_json_references_skipped_as_m3h() {
-        // All 685 corpus image references point at model .json files (WE's
-        // solid-model architecture): they are model layers, not textures —
-        // skipped, and not counted toward the layer cap.
+    fn model_json_references_now_register_as_model_layers() {
+        // S1: 620 of the corpus's 685 image references point at model
+        // .json files. Before S1 they were all skipped ("scene3d,
+        // BETA_M3h"); now a model reference with a valid name registers a
+        // model layer (image stays None, model_ref carries the
+        // reference) — the same as an image layer, minus the texture
+        // reference — and counts toward the layer cap like one.
         let mut objects = r#"{"objects": ["#.to_string();
-        for i in 0..300 {
+        for i in 0..200 {
             objects.push_str(&format!(
                 r#"{{"name": "m{i}", "image": "models/util/m{i}.json"}},"#
             ));
         }
         objects.push_str(r#"{"name": "real", "image": "tex.png"}]}"#);
         let layers = parse_objects_of(&objects).unwrap();
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].name, "real");
+        assert_eq!(layers.len(), 201);
+        assert_eq!(layers[0].name, "m0");
+        assert_eq!(layers[0].image, None);
+        assert_eq!(layers[0].model_ref.as_deref(), Some("models/util/m0.json"));
+        assert_eq!(layers[200].name, "real");
+        assert_eq!(layers[200].model_ref, None);
     }
 
-    /// B2: model skips are counted so the worker can report them. A scene
-    /// made only of model layers registers nothing and is exactly the case
-    /// that used to composite to bare clear colour in silence.
+    /// S1: 200 well-formed model layers plus the pre-S1 malformed-model
+    /// skip test (below) still push the model object count over
+    /// MAX_LAYERS if uncapped; this keeps the count in bounds while still
+    /// exercising 200 real model layers.
     #[test]
-    fn model_layer_skips_are_counted() {
+    fn too_many_model_and_image_layers_combined_rejected() {
+        let mut objects = r#"{"objects": ["#.to_string();
+        for i in 0..(MAX_LAYERS + 1) {
+            objects.push_str(&format!(
+                r#"{{"name": "m{i}", "image": "models/m{i}.json"}},"#
+            ));
+        }
+        objects.push_str(r#"{"name": "real", "image": "tex.png"}]}"#);
+        let error = parse_objects_of(&objects).unwrap_err();
+        assert_eq!(error.kind, SceneErrorKind::Shape);
+    }
+
+    /// B2 (updated for S1): `model_layer_skips` now counts every model
+    /// object seen, whether or not it went on to register a layer (the
+    /// field name predates texture resolution). A scene made only of
+    /// unresolvable model layers still degrades honestly — the worker
+    /// adds the resolved count separately (main.rs) after
+    /// `load_model_textures` runs, which this parse-only test does not
+    /// exercise.
+    #[test]
+    fn model_layer_skips_counts_every_model_object_seen() {
         let value: Value = serde_json::from_str(
             r#"{"objects": [
                 {"name": "a", "image": "models/a.json"},
@@ -2395,7 +2497,11 @@ mod tests {
         .unwrap();
         let (layers, particles, counts) = parse_objects(value.as_object().unwrap()).unwrap();
         assert_eq!(counts.model_layer_skips, 2);
-        assert_eq!(layers.len(), 1);
+        // Both well-formed model layers register now (S1) — plus the
+        // image layer, that is 3.
+        assert_eq!(layers.len(), 3);
+        assert_eq!(layers[0].model_ref.as_deref(), Some("models/a.json"));
+        assert_eq!(layers[1].model_ref.as_deref(), Some("models/b.JSON"));
         assert!(particles.is_empty());
     }
 

@@ -16,6 +16,7 @@ mod playlist_runtime;
 mod policy;
 mod preflight;
 mod scan;
+mod scenemodel;
 mod sceneobjects;
 mod webpreflight;
 mod websandbox;
@@ -27,7 +28,7 @@ pub use permissions::PermissionPolicy;
 pub use pipewire::{PipewireStatus, probe_pipewire};
 pub use pkg::{
     MAX_SCENE_JSON_BYTES, MAX_SCRIPT_BYTES, PkgEntry, PkgError, PkgErrorKind, PkgReader,
-    image_entry, preflight_pkg, scene_json_entry, script_entry, video_entry,
+    asset_entry, image_entry, preflight_pkg, scene_json_entry, script_entry, video_entry,
 };
 pub use playlist::{Playlist, PlaylistStore, PlaylistTransition};
 pub use playlist_runtime::{PlaylistDecision, PlaylistRuntime, PlaylistRuntimeSnapshot};
@@ -39,11 +40,16 @@ pub use preflight::{
 };
 pub use scan::{
     Catalog, CatalogItem, CatalogStats, Compatibility, Diagnostic, DiagnosticLevel, ProjectKind,
-    ScanLimits, SteamLibrary, default_steam_roots, discover_libraries, scan_installed,
+    ScanLimits, SteamLibrary, default_steam_roots, default_wallpaper_engine_assets_dir,
+    discover_libraries, scan_installed,
+};
+pub use scenemodel::{
+    AssetLookup, MAX_MODEL_JSON_BYTES, ResolvedModel, confined_read, resolve_model,
+    texture_asset_path,
 };
 pub use sceneobjects::{
     SceneObjectKind, SceneObjectSummary, classify_scene_object, scene_property_value,
-    summarize_scene_objects,
+    summarize_scene_objects, summarize_scene_objects_resolved,
 };
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{

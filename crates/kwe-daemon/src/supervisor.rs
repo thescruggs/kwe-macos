@@ -126,6 +126,11 @@ pub struct SupervisorConfig {
     pub web_heartbeat_max_failures: u32,
     /// Per-kind pre-exec resource ceilings; every kind must be present.
     pub resource_limits_by_kind: BTreeMap<RendererKind, RendererResourceLimits>,
+    /// The Wallpaper Engine assets root (S1), passed to the scene worker
+    /// as `--assets-dir` when set. `None` when not configured/detected —
+    /// scene model layers then only resolve against assets the scene
+    /// itself carries (pkg entries / its own directory).
+    pub scene_assets_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -303,7 +308,11 @@ pub struct StartSpec {
 }
 
 impl StartSpec {
-    pub fn validate(&self) -> Result<()> {
+    /// `assets_dir`: the configured Wallpaper Engine assets root (S1),
+    /// forwarded to `preflight_scene`/`preflight_pkg` so a scene's model
+    /// layers can resolve their material textures during preflight, not
+    /// just at worker spawn.
+    pub fn validate(&self, assets_dir: Option<&Path>) -> Result<()> {
         validate_identity_part("wallpaper_id", &self.wallpaper_id)?;
         validate_identity_part("content_hash", &self.content_hash)?;
         let frame_spec = FrameSpec::new(self.width, self.height)?;
@@ -349,7 +358,7 @@ impl StartSpec {
                 }
             }
             (RendererKind::Scene, Some(ContentSpec::Scene { path })) => {
-                let report = preflight_scene(path);
+                let report = preflight_scene(path, assets_dir);
                 if !report.safe {
                     bail!(
                         "scene preflight rejected {}: {}",
@@ -393,8 +402,8 @@ impl StartSpec {
     /// and then canonicalized into the validated spec so spawn passes the
     /// resolved file rather than the caller-supplied path, which could be
     /// re-pointed between validation and exec.
-    pub fn into_validated(mut self) -> Result<Self> {
-        self.validate()?;
+    pub fn into_validated(mut self, assets_dir: Option<&Path>) -> Result<Self> {
+        self.validate(assets_dir)?;
         if self.kind == RendererKind::Video
             && let Some(ContentSpec::Video { path }) = &self.content
         {
@@ -1162,6 +1171,11 @@ impl SupervisorRuntime {
                 ContentSpec::Web { root } => root,
             };
             command.arg("--content").arg(path);
+        }
+        if spec.kind == RendererKind::Scene
+            && let Some(assets_dir) = &self.config.scene_assets_dir
+        {
+            command.arg("--assets-dir").arg(assets_dir);
         }
         if let Some(count) = spec.stderr_lines {
             command.arg("--stderr-lines").arg(count.to_string());
@@ -2457,17 +2471,17 @@ mod tests {
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
         };
-        assert!(valid.validate().is_ok());
+        assert!(valid.validate(None).is_ok());
         let mut invalid = valid.clone();
         invalid.wallpaper_id = "../escape".into();
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate(None).is_err());
         invalid = valid.clone();
         invalid.fps = 0;
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate(None).is_err());
         invalid = valid.clone();
         invalid.width = 8192;
         invalid.height = 8192;
-        assert!(invalid.validate().is_err());
+        assert!(invalid.validate(None).is_err());
         let mut invalid_scene = StartSpec {
             wallpaper_id: "431960-123".into(),
             content_hash: "abc123".into(),
@@ -2482,10 +2496,10 @@ mod tests {
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
         };
-        assert!(invalid_scene.validate().is_err());
+        assert!(invalid_scene.validate(None).is_err());
         invalid_scene.kind = RendererKind::Test;
         invalid_scene.content = None;
-        assert!(invalid_scene.validate().is_ok());
+        assert!(invalid_scene.validate(None).is_ok());
     }
 
     #[test]
@@ -2507,10 +2521,10 @@ mod tests {
         mismatched.content = Some(ContentSpec::Video {
             path: std::env::temp_dir().join("kwe-any.mp4"),
         });
-        assert!(mismatched.validate().is_err());
+        assert!(mismatched.validate(None).is_err());
         // Video requires video content.
         mismatched.kind = RendererKind::Video;
-        assert!(mismatched.validate().is_err());
+        assert!(mismatched.validate(None).is_err());
         // Missing video file fails the static video preflight.
         let missing_video = StartSpec {
             kind: RendererKind::Video,
@@ -2519,7 +2533,7 @@ mod tests {
             }),
             ..base.clone()
         };
-        assert!(missing_video.validate().is_err());
+        assert!(missing_video.validate(None).is_err());
         // A symlinked video path is rejected before it could resolve.
         let root = temporary_directory("video-symlink");
         fs::create_dir_all(&root).unwrap();
@@ -2532,7 +2546,7 @@ mod tests {
             }),
             ..base.clone()
         };
-        assert!(symlink_video.validate().is_err());
+        assert!(symlink_video.validate(None).is_err());
         // A disallowed extension is rejected at validation with the
         // preflight reason surfaced in the error.
         let bad_extension = root.join("garbage.bin");
@@ -2544,7 +2558,7 @@ mod tests {
             }),
             ..base.clone()
         };
-        let error = format!("{}", bad_ext_video.validate().unwrap_err());
+        let error = format!("{}", bad_ext_video.validate(None).unwrap_err());
         assert!(
             error.contains("video preflight rejected")
                 && error.contains("unsupported video extension"),
@@ -2554,12 +2568,12 @@ mod tests {
         // stderr_lines is a test-renderer dev helper.
         let mut dev_only = base.clone();
         dev_only.stderr_lines = Some(10);
-        assert!(dev_only.validate().is_ok());
+        assert!(dev_only.validate(None).is_ok());
         dev_only.kind = RendererKind::Scene;
-        assert!(dev_only.validate().is_err());
+        assert!(dev_only.validate(None).is_err());
         dev_only.kind = RendererKind::Test;
         dev_only.stderr_lines = Some(0);
-        assert!(dev_only.validate().is_err());
+        assert!(dev_only.validate(None).is_err());
     }
 
     #[test]
@@ -2727,6 +2741,7 @@ mod tests {
                 ),
                 (RendererKind::Scene, limits),
             ]),
+            scene_assets_dir: None,
         }
         .validate()
         .unwrap()
@@ -2912,7 +2927,7 @@ mod tests {
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
         };
-        let validated = spec.into_validated().unwrap();
+        let validated = spec.into_validated(None).unwrap();
         let path = match validated.content.expect("video content kept") {
             ContentSpec::Video { path } => path,
             _ => panic!("expected video content"),

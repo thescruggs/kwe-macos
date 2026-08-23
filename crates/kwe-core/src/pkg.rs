@@ -681,7 +681,11 @@ pub fn scene_json_entry(entries: &[PkgEntry]) -> Result<usize, String> {
 /// one match. Entry paths were already validated at package open (no `..`,
 /// no absolute paths), so resolution can never leave the table; the
 /// diagnostic strings exist for the caller's error message, not for safety.
-fn resolve_pkg_entry(reference: &str, entries: &[PkgEntry], what: &str) -> Result<usize, String> {
+pub(crate) fn resolve_pkg_entry(
+    reference: &str,
+    entries: &[PkgEntry],
+    what: &str,
+) -> Result<usize, String> {
     if reference.starts_with('/')
         || reference.contains('\\')
         || reference.contains('\0')
@@ -742,6 +746,18 @@ pub fn script_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, Stri
 /// exactly one match. The image's format is decided by the renderer's
 /// decoder (png/jpeg/webp); a reference naming a non-image entry resolves
 /// fine here and is skipped at decode.
+/// Resolve a model/material/texture reference against the package entry
+/// table (S1, `scenemodel::resolve_model`'s pkg-lane lookup): the same
+/// containment rule as `image_entry`/`video_entry`, with a generic "asset"
+/// diagnostic word since the reference may name a `.json` model, a
+/// `.json` material, or a `.tex` texture.
+pub fn asset_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, String> {
+    if reference.is_empty() {
+        return Err("scene asset reference must not be empty".into());
+    }
+    resolve_pkg_entry(reference, entries, "asset")
+}
+
 pub fn image_entry(reference: &str, entries: &[PkgEntry]) -> Result<usize, String> {
     if reference.is_empty() {
         return Err("scene layer image reference must not be empty".into());
@@ -787,7 +803,35 @@ fn script_reference_from_json(bytes: &[u8]) -> Result<String, ()> {
 /// is read in its stored form — never decompressed (preflight stays
 /// structural: a compressed descriptor skips the script check, and the
 /// renderer's bounded decode still enforces the cap when it reads it).
-pub fn preflight_pkg(path: &Path) -> ScenePreflight {
+/// S1: preflight's model-resolution lookup for the `.pkg` lane — package
+/// entries first, then the scene's own directory (the pkg's parent, for
+/// the rare corpus layout with loose files beside the archive), then the
+/// Wallpaper Engine assets root. Mirrors `preflight::file_lane_asset_lookup`'s
+/// read cap.
+fn pkg_lane_asset_lookup<'a>(
+    reader: &'a PkgReader,
+    pkg_dir: Option<&'a Path>,
+    assets_dir: Option<&'a Path>,
+) -> impl FnMut(&str) -> Option<Vec<u8>> + 'a {
+    const READ_CAP: u64 = 64 * 1024 * 1024;
+    move |reference: &str| {
+        if let Ok(idx) = asset_entry(reference, reader.entries())
+            && let Ok(bytes) = reader.read_entry_bounded(idx, READ_CAP)
+        {
+            return Some(bytes);
+        }
+        if let Some(dir) = pkg_dir
+            && let Some(bytes) = crate::scenemodel::confined_read(dir, reference, READ_CAP)
+        {
+            return Some(bytes);
+        }
+        assets_dir.and_then(|assets| crate::scenemodel::confined_read(assets, reference, READ_CAP))
+    }
+}
+
+/// `assets_dir`: the Wallpaper Engine assets root (S1), consulted when
+/// resolving a model layer's material texture — see `preflight_scene`.
+pub fn preflight_pkg(path: &Path, assets_dir: Option<&Path>) -> ScenePreflight {
     let mut report = ScenePreflight {
         path: path.to_path_buf(),
         safe: false,
@@ -848,9 +892,14 @@ pub fn preflight_pkg(path: &Path) -> ScenePreflight {
             // package's scene.json. The entry is read (and decompressed)
             // under the worker's own cap, so a hostile package cannot make
             // preflight allocate more than the renderer would.
+            let pkg_dir = path.parent().and_then(|p| p.canonicalize().ok());
+            let mut lookup = pkg_lane_asset_lookup(&reader, pkg_dir.as_deref(), assets_dir);
             report
                 .reasons
-                .extend(crate::preflight::no_drawable_content_reasons(&root));
+                .extend(crate::preflight::no_drawable_content_reasons(
+                    &root,
+                    &mut lookup,
+                ));
             if let Ok(reference) = script_reference_from_json(&bytes)
                 && let Ok(script_idx) = script_entry(&reference, reader.entries())
                 && reader.entries()[script_idx].size > MAX_SCRIPT_BYTES
@@ -1352,7 +1401,7 @@ mod tests {
         let pkg = write_bytes(&dir, "empty.pkg", &writer.build("0001"));
         let reader = PkgReader::open(&pkg).unwrap();
         assert!(reader.entries().is_empty());
-        let report = preflight_pkg(&pkg);
+        let report = preflight_pkg(&pkg, None);
         assert!(report.safe);
         assert_eq!(report.format, "scene-package");
         let _ = fs::remove_dir_all(dir);
@@ -1375,16 +1424,50 @@ mod tests {
             ]}"#,
         );
         let pkg = write_bytes(&dir, "models.pkg", &writer.build("0001"));
-        let report = preflight_pkg(&pkg);
+        let report = preflight_pkg(&pkg, None);
         assert!(!report.safe, "{:?}", report.reasons);
         let reason = report.reasons.join("; ");
         assert!(reason.contains("draws nothing"), "unexpected: {reason}");
-        assert!(reason.contains("scene3d"), "unexpected: {reason}");
+        assert!(
+            reason.contains("material textures could not be resolved"),
+            "unexpected: {reason}"
+        );
         assert!(
             reason.contains("external particle files"),
             "unexpected: {reason}"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// S1: with an assets root that carries the model's material texture,
+    /// the same package now applies (degraded — the particle-file layer
+    /// still does not draw, but the model does).
+    #[test]
+    fn model_package_resolves_with_an_assets_root() {
+        let dir = tmpdir();
+        let assets = tmpdir();
+        let mut writer = PkgWriter::new();
+        writer.add(
+            "scene.json",
+            br#"{"objects": [{"name": "a", "image": "models/a.json"}]}"#,
+        );
+        writer.add("models/a.json", br#"{"material": "materials/a.json"}"#);
+        writer.add(
+            "materials/a.json",
+            br#"{"passes": [{"shader": "genericimage2", "textures": ["a"]}]}"#,
+        );
+        let pkg = write_bytes(&dir, "model.pkg", &writer.build("0001"));
+        fs::create_dir_all(assets.join("materials")).unwrap();
+        fs::write(assets.join("materials/a.tex"), b"TEXV0005fake").unwrap();
+
+        assert!(
+            !preflight_pkg(&pkg, None).safe,
+            "no assets root: unresolved"
+        );
+        let report = preflight_pkg(&pkg, Some(&assets));
+        assert!(report.safe, "unexpected reasons: {:?}", report.reasons);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(assets);
     }
 
     /// One drawable object is enough to apply: the scene is degraded, not
@@ -1401,7 +1484,7 @@ mod tests {
             ]}"#,
         );
         let pkg = write_bytes(&dir, "mixed.pkg", &writer.build("0001"));
-        let report = preflight_pkg(&pkg);
+        let report = preflight_pkg(&pkg, None);
         assert!(report.safe, "{:?}", report.reasons);
         let _ = fs::remove_dir_all(dir);
     }

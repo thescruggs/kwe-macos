@@ -760,6 +760,7 @@ mod tests {
             name: "t".into(),
             scene_order: 0,
             image: None,
+            model_ref: None,
             origin: [1.0, 2.0],
             angles: [0.0, 0.0, 0.0],
             scale: [2.0, 2.0],

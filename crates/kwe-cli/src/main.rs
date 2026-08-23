@@ -11,8 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kwe_core::{
-    ScanLimits, default_steam_roots, preflight_scene, preflight_video, preflight_web, probe_mpris,
-    probe_pipewire, sandbox_root, scan_installed, web_renderer_command,
+    ScanLimits, default_steam_roots, default_wallpaper_engine_assets_dir, preflight_scene,
+    preflight_video, preflight_web, probe_mpris, probe_pipewire, sandbox_root, scan_installed,
+    web_renderer_command,
 };
 
 #[derive(Debug, Parser)]
@@ -52,6 +53,12 @@ enum Command {
         /// Web wallpaper directory to validate.
         #[arg(long)]
         web: Option<PathBuf>,
+        /// Wallpaper Engine assets root (S1), used to resolve a scene
+        /// model layer's material texture. Defaults to the first existing
+        /// `<steam root>/steamapps/common/wallpaper_engine/assets` over
+        /// the discovered Steam roots when omitted.
+        #[arg(long = "assets-dir")]
+        assets_dir: Option<PathBuf>,
     },
     /// Statically validate a web wallpaper directory without launching a browser.
     WebPreflight {
@@ -202,10 +209,17 @@ fn main() -> Result<()> {
             }
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
-        Command::Preflight { path, video, web } => {
+        Command::Preflight {
+            path,
+            video,
+            web,
+            assets_dir,
+        } => {
             let (json, safe) = match (path, video, web) {
                 (Some(path), None, None) => {
-                    let report = preflight_scene(&path);
+                    let assets_dir = assets_dir
+                        .or_else(|| default_wallpaper_engine_assets_dir(&default_steam_roots()));
+                    let report = preflight_scene(&path, assets_dir.as_deref());
                     (serde_json::to_string_pretty(&report)?, report.safe)
                 }
                 (None, Some(path), None) => {

@@ -129,6 +129,19 @@ pub fn default_steam_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// The Wallpaper Engine assets root, if any configured Steam root has one
+/// installed: the first `<steam root>/steamapps/common/wallpaper_engine/assets`
+/// that exists, in `steam_roots` order (S1; the default the daemon and
+/// `kwe preflight` use when `--wallpaper-engine-assets`/`--assets-dir` is
+/// not given explicitly). `None` when no root has it — model layers then
+/// resolve only against the scene's own package/directory.
+pub fn default_wallpaper_engine_assets_dir(steam_roots: &[PathBuf]) -> Option<PathBuf> {
+    steam_roots.iter().find_map(|root| {
+        let candidate = root.join("steamapps/common/wallpaper_engine/assets");
+        candidate.is_dir().then_some(candidate)
+    })
+}
+
 pub fn discover_libraries(steam_roots: &[PathBuf]) -> (Vec<SteamLibrary>, Vec<Diagnostic>) {
     let mut candidates = BTreeSet::new();
     let mut diagnostics = Vec::new();
@@ -685,6 +698,24 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(path.join("steamapps/workshop/content/431960/100")).unwrap();
         path
+    }
+
+    #[test]
+    fn default_wallpaper_engine_assets_dir_finds_the_first_existing_root() {
+        let a = temp_fixture("assets-a");
+        let b = temp_fixture("assets-b");
+        // Neither root has the assets dir yet: None.
+        assert_eq!(
+            default_wallpaper_engine_assets_dir(&[a.clone(), b.clone()]),
+            None
+        );
+        fs::create_dir_all(b.join("steamapps/common/wallpaper_engine/assets")).unwrap();
+        assert_eq!(
+            default_wallpaper_engine_assets_dir(&[a.clone(), b.clone()]),
+            Some(b.join("steamapps/common/wallpaper_engine/assets"))
+        );
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
     }
 
     #[test]

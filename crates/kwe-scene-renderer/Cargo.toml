@@ -21,3 +21,5 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 libc.workspace = true
 rquickjs.workspace = true
 serde_json.workspace = true
+texture2ddecoder = "0.1.2"
+lz4_flex.workspace = true

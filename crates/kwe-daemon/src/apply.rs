@@ -1246,6 +1246,10 @@ pub struct ApplyConfig {
     pub probe_timeout: Duration,
     /// Deadline for the renderer to reach a live phase after start.
     pub promotion_timeout: Duration,
+    /// The Wallpaper Engine assets root (S1), forwarded to scene preflight
+    /// (`StartSpec::into_validated`) so a scene's model layers can resolve
+    /// their material textures before the apply transaction runs.
+    pub scene_assets_dir: Option<PathBuf>,
 }
 
 /// The `wallpaper.*` API errors. Codes are the wire contract
@@ -1444,6 +1448,7 @@ pub struct ApplyHandle {
     supervisor: SupervisorHandle,
     apply_lock: Arc<Mutex<()>>,
     promotion_timeout: Duration,
+    scene_assets_dir: Option<PathBuf>,
 }
 
 /// Output enumeration cache: fresh for `OUTPUT_CACHE_TTL` after a probe,
@@ -1495,6 +1500,7 @@ impl ApplyService {
                 supervisor,
                 apply_lock: Arc::new(Mutex::new(())),
                 promotion_timeout: config.promotion_timeout,
+                scene_assets_dir: config.scene_assets_dir,
             },
         })
     }
@@ -1525,6 +1531,7 @@ impl ApplyHandle {
             supervisor,
             apply_lock: Arc::new(Mutex::new(())),
             promotion_timeout,
+            scene_assets_dir: None,
         }
     }
 
@@ -1577,7 +1584,7 @@ impl ApplyHandle {
 
         // 1. Validate the request into a supervisor StartSpec (single
         // validation point; content preflight runs here).
-        let mut spec = build_apply_spec(&params)?;
+        let mut spec = build_apply_spec(&params, self.scene_assets_dir.as_deref())?;
 
         // 2. Catalog lookup: the id must be a usable local item of the
         // requested kind.
@@ -1614,7 +1621,7 @@ impl ApplyHandle {
         }
         spec.content = Some(content_spec_for(params.kind, &content));
         spec = spec
-            .into_validated()
+            .into_validated(self.scene_assets_dir.as_deref())
             .map_err(|error| ApplyError::Invalid(error.to_string()))?;
         spec.content_hash = content_hash_for(&item, &content);
 
@@ -2124,7 +2131,7 @@ impl PlaylistApplyLane for ApplyHandle {
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
         }
-        .into_validated()
+        .into_validated(self.scene_assets_dir.as_deref())
         .map_err(|error| ApplyError::Invalid(error.to_string()))?;
         spec.content_hash = content_hash_for(&item, &content);
 
@@ -2217,7 +2224,10 @@ fn phase_name(phase: &WorkerPhase) -> &'static str {
 
 /// Builds the validated StartSpec from apply params (with a placeholder
 /// content hash; the catalog lookup replaces it once the item is known).
-fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyError> {
+fn build_apply_spec(
+    params: &ApplyWallpaperParams,
+    assets_dir: Option<&Path>,
+) -> Result<StartSpec, ApplyError> {
     if params.kind == RendererKind::Test {
         return Err(ApplyError::Invalid(
             "wallpaper.apply does not accept the test renderer kind".into(),
@@ -2272,7 +2282,7 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
         stderr_lines: None,
         scaling: params.scaling,
     }
-    .into_validated()
+    .into_validated(assets_dir)
     .map_err(|error| ApplyError::Invalid(error.to_string()))
 }
 

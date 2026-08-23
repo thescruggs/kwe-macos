@@ -1627,6 +1627,7 @@ mod tests {
                 (crate::supervisor::RendererKind::Web, limits),
                 (crate::supervisor::RendererKind::Scene, limits),
             ]),
+            scene_assets_dir: None,
         }
     }
 
