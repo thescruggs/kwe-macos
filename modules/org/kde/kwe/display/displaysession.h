@@ -21,6 +21,9 @@ class DisplaySession : public QObject {
       qulonglong displayGeneration READ displayGeneration NOTIFY sourceChanged)
   Q_PROPERTY(bool active READ active NOTIFY activeChanged)
   Q_PROPERTY(QString phase READ phase NOTIFY phaseChanged)
+  /// F1: the live renderer's scaling mode ("aspect" | "fill" | "stretch"),
+  /// from renderer.status; "aspect" when the daemon predates the field.
+  Q_PROPERTY(QString scaling READ scaling NOTIFY scalingChanged)
   Q_PROPERTY(bool awaitingDisplayAck READ awaitingDisplayAck NOTIFY
                  awaitingDisplayAckChanged)
 
@@ -38,6 +41,7 @@ public:
   qulonglong displayGeneration() const { return m_displayGeneration; }
   bool active() const { return m_active; }
   QString phase() const { return m_phase; }
+  QString scaling() const { return m_scaling; }
   bool awaitingDisplayAck() const { return m_awaitingDisplayAck; }
 
   void setSocketPath(const QString &socketPath);
@@ -53,6 +57,7 @@ signals:
   void sourceChanged();
   void activeChanged();
   void phaseChanged();
+  void scalingChanged();
   void awaitingDisplayAckChanged();
 
 private:
@@ -67,6 +72,7 @@ private:
   void failRequest(const QString &message);
   void setState(State state, const QString &error = {});
   void setPhase(const QString &phase);
+  void setScaling(const QString &scaling);
   void setAwaitingDisplayAck(bool awaiting);
   void setActive(bool active);
   bool validatedSourceIsCurrent() const;
@@ -74,6 +80,7 @@ private:
   QString m_socketPath;
   QString m_frameFile;
   QString m_phase = QStringLiteral("idle");
+  QString m_scaling = QStringLiteral("aspect");
   QString m_errorMessage;
   QString m_validatedFrameFile;
   qulonglong m_displayGeneration = 0;

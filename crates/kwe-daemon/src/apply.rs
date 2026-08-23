@@ -64,7 +64,8 @@ use kwe_core::{Catalog, CatalogItem, ProjectKind};
 use crate::persist::{atomic_write, ensure_private_dir, quarantine_invalid_state, unix_seconds};
 use crate::playlist_session::{PlaylistApplyLane, foreign_renderer_live};
 use crate::supervisor::{
-    ContentSpec, RendererKind, StartSpec, SupervisorHandle, WorkerPhase, validate_identity_part,
+    ContentSpec, RendererKind, ScalingMode, StartSpec, SupervisorHandle, WorkerPhase,
+    validate_identity_part,
 };
 
 const ASSIGNMENTS_FILE: &str = "assignments-v1.json";
@@ -120,6 +121,10 @@ pub struct Assignment {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// F1: how the picture maps onto the output. Additive: records written
+    /// before F1 read back as `aspect`, the only behaviour they had.
+    #[serde(default)]
+    pub scaling: ScalingMode,
     pub applied_at_unix_seconds: u64,
     pub previous: Option<PreviousWallpaper>,
 }
@@ -1338,12 +1343,20 @@ pub struct ApplyWallpaperParams {
     pub kind: RendererKind,
     #[serde(default)]
     pub content: Option<PathBuf>,
-    #[serde(default = "default_apply_width")]
-    pub width: u32,
-    #[serde(default = "default_apply_height")]
-    pub height: u32,
+    /// Frame canvas size. Omitted (F1): derived from the output's geometry
+    /// — the output's own aspect, long edge capped at `MAX_FRAME_EDGE` —
+    /// so every scaling mode maps a canvas that already fits the display
+    /// instead of upscaling a fixed 960x540. Explicit values are bounded
+    /// by the frame protocol / supervisor limits exactly as before.
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
     #[serde(default = "default_apply_fps")]
     pub fps: u32,
+    /// F1: `aspect` (default) | `fill` | `stretch`; persisted per output.
+    #[serde(default)]
+    pub scaling: ScalingMode,
     /// Clear this identity's quarantine record before starting (B4): the
     /// user saw `apply_quarantined` with the reason and chose to try
     /// anyway. Routes through the supervisor's `Retry` command — the same
@@ -1354,6 +1367,54 @@ pub struct ApplyWallpaperParams {
 
 pub const fn default_apply_width() -> u32 {
     960
+}
+
+/// Longest frame-canvas edge the daemon derives from an output (F1). A
+/// 2560-wide canvas keeps the web screencast's JPEG decode, libmpv's
+/// software render and the Vulkan compositor inside the budgets measured
+/// for 960x540 × ~4.5; larger outputs are upscaled by the plugin. Explicit
+/// `width`/`height` params are not capped by this (only by the protocol).
+pub const MAX_FRAME_EDGE: u32 = 2560;
+/// Smallest derived edge: a degenerate/empty geometry never produces a
+/// canvas the renderers cannot use.
+const MIN_FRAME_EDGE: u32 = 64;
+
+/// The frame canvas for an apply: explicit params win; otherwise the
+/// output's geometry (width/height, aspect kept, long edge capped at
+/// `MAX_FRAME_EDGE`, never below `MIN_FRAME_EDGE`); otherwise the legacy
+/// 960x540. Pure and bounded — its result always passes `FrameSpec` and
+/// the supervised mapping cap (2560x2560x4x2 slots < 128 MiB).
+pub fn frame_size_for(
+    width: Option<u32>,
+    height: Option<u32>,
+    geometry: Option<[i32; 4]>,
+) -> (u32, u32) {
+    if let (Some(width), Some(height)) = (width, height) {
+        return (width, height);
+    }
+    let Some([_, _, out_w, out_h]) = geometry else {
+        return (
+            width.unwrap_or(default_apply_width()),
+            height.unwrap_or(default_apply_height()),
+        );
+    };
+    if out_w <= 0 || out_h <= 0 {
+        return (
+            width.unwrap_or(default_apply_width()),
+            height.unwrap_or(default_apply_height()),
+        );
+    }
+    let (mut w, mut h) = (out_w as u64, out_h as u64);
+    let long = w.max(h);
+    if long > MAX_FRAME_EDGE as u64 {
+        // Scale both edges by the same factor, rounding to even pixels
+        // (video decoders and JPEG like even dimensions).
+        w = (w * MAX_FRAME_EDGE as u64 / long) & !1;
+        h = (h * MAX_FRAME_EDGE as u64 / long) & !1;
+    }
+    let w = (w as u32).clamp(MIN_FRAME_EDGE, MAX_FRAME_EDGE);
+    let h = (h as u32).clamp(MIN_FRAME_EDGE, MAX_FRAME_EDGE);
+    (width.unwrap_or(w), height.unwrap_or(h))
 }
 
 pub const fn default_apply_height() -> u32 {
@@ -1566,6 +1627,12 @@ impl ApplyHandle {
         let desktop_index = output.desktop_index.ok_or_else(|| {
             ApplyError::Transaction(format!("output {} has no desktop containment", output.name))
         })?;
+        // 3a. F1: the frame canvas follows the output unless the client
+        // pinned it. Pure and bounded (see frame_size_for), so the validated
+        // spec stays valid.
+        let (width, height) = frame_size_for(params.width, params.height, output.geometry);
+        spec.width = width;
+        spec.height = height;
 
         // 3b. The pre-apply wallpaper state. When a stored assignment
         // exists AND the live enumeration already shows our plugin, the
@@ -1728,6 +1795,7 @@ impl ApplyHandle {
             width: spec.width,
             height: spec.height,
             fps: spec.fps,
+            scaling: spec.scaling,
             applied_at_unix_seconds: unix_seconds(),
             previous: Some(previous),
         };
@@ -2054,6 +2122,7 @@ impl PlaylistApplyLane for ApplyHandle {
             content: Some(content_spec_for(kind, &content)),
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         }
         .into_validated()
         .map_err(|error| ApplyError::Invalid(error.to_string()))?;
@@ -2073,11 +2142,20 @@ impl PlaylistApplyLane for ApplyHandle {
             ))
         })?;
         let previous = self.previous_for(output_info)?;
+        // F1: canvas from the output; the scaling mode is the output's
+        // current one (a playlist advance keeps what the user chose there).
+        let (width, height) = frame_size_for(None, None, output_info.geometry);
+        spec.width = width;
+        spec.height = height;
 
         // 4+. Start the renderer; EVERY failure from here on rolls back
         // exactly like wallpaper.apply (same ownership guard, same store
         // revert).
         let old_assignment = self.stored_assignment(&resolved_output)?;
+        spec.scaling = old_assignment
+            .as_ref()
+            .map(|assignment| assignment.scaling)
+            .unwrap_or_default();
         let result = self.complete_apply(
             &spec,
             &content,
@@ -2152,13 +2230,14 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
         return Ok(StartSpec {
             wallpaper_id: params.wallpaper_id.clone(),
             content_hash: "pending".into(),
-            width: params.width,
-            height: params.height,
+            width: params.width.unwrap_or(default_apply_width()),
+            height: params.height.unwrap_or(default_apply_height()),
             fps: params.fps,
             kind: params.kind,
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: params.scaling,
         });
     };
     let content = match params.kind {
@@ -2176,13 +2255,14 @@ fn build_apply_spec(params: &ApplyWallpaperParams) -> Result<StartSpec, ApplyErr
     StartSpec {
         wallpaper_id: params.wallpaper_id.clone(),
         content_hash: "pending".into(),
-        width: params.width,
-        height: params.height,
+        width: params.width.unwrap_or(default_apply_width()),
+        height: params.height.unwrap_or(default_apply_height()),
         fps: params.fps,
         kind: params.kind,
         content: Some(content),
         test_fault: None,
         stderr_lines: None,
+        scaling: params.scaling,
     }
     .into_validated()
     .map_err(|error| ApplyError::Invalid(error.to_string()))
@@ -2313,6 +2393,7 @@ mod tests {
             width: 960,
             height: 540,
             fps: 30,
+            scaling: ScalingMode::Aspect,
             applied_at_unix_seconds: 1_787_188_979,
             previous: Some(PreviousWallpaper {
                 wallpaper_plugin: "org.kde.image".into(),
@@ -3338,5 +3419,45 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn frame_size_follows_the_output_within_the_cap() {
+        // Explicit always wins.
+        assert_eq!(
+            frame_size_for(Some(320), Some(180), Some([0, 0, 2926, 823])),
+            (320, 180)
+        );
+        // No geometry: the legacy canvas (and one explicit edge is kept).
+        assert_eq!(frame_size_for(None, None, None), (960, 540));
+        assert_eq!(frame_size_for(Some(800), None, None), (800, 540));
+        // Small output: exact.
+        assert_eq!(
+            frame_size_for(None, None, Some([0, 0, 1920, 1080])),
+            (1920, 1080)
+        );
+        // Long edge capped, aspect kept, even pixels.
+        assert_eq!(
+            frame_size_for(None, None, Some([0, 0, 2926, 823])),
+            (2560, 720)
+        );
+        assert_eq!(
+            frame_size_for(None, None, Some([0, 0, 3840, 2160])),
+            (2560, 1440)
+        );
+        let (w, h) = frame_size_for(None, None, Some([0, 0, 1080, 3840]));
+        assert_eq!((w, h), (720, 2560));
+        // Degenerate geometry falls back; never below the floor.
+        assert_eq!(frame_size_for(None, None, Some([0, 0, 0, 823])), (960, 540));
+        assert_eq!(
+            frame_size_for(None, None, Some([0, 0, 10000, 8])),
+            (2560, 64)
+        );
+        // Every derived canvas passes the frame spec and the supervised cap.
+        for geometry in [[0, 0, 7680, 4320], [0, 0, 2926, 823], [0, 0, 640, 480]] {
+            let (w, h) = frame_size_for(None, None, Some(geometry));
+            let spec = kwe_frame_protocol::FrameSpec::new(w, h).unwrap();
+            assert!(spec.file_bytes <= 128 * 1024 * 1024);
+        }
     }
 }

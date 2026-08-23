@@ -141,6 +141,13 @@ struct Arguments {
     /// Publish pacing in frames per second.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
+    /// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): how the picture maps
+    /// onto the frame canvas — `aspect` (letterbox), `fill` (crop),
+    /// `stretch`. Video: libmpv letterboxes by default (`aspect`);
+    /// `fill` = `panscan=1.0` (cover, crop the overflow), `stretch` =
+    /// `keepaspect=no`.
+    #[arg(long, default_value = "aspect", value_parser = ["aspect", "fill", "stretch"])]
+    scaling: String,
     /// Video file to decode (daemon-validated before spawn). Only `--probe`
     /// may omit it.
     #[arg(long, required_unless_present = "probe")]
@@ -410,7 +417,7 @@ extern "C" fn on_render_update(context: *mut c_void) {
 }
 
 impl MpvSession {
-    fn create(hwdec: &str, spec: FrameSpec) -> Result<Self> {
+    fn create(hwdec: &str, spec: FrameSpec, scaling: &str) -> Result<Self> {
         // SAFETY: mpv_create returns a valid handle or NULL (no preconditions).
         let handle = unsafe { mpv_ffi::mpv_create() };
         if handle.is_null() {
@@ -434,6 +441,15 @@ impl MpvSession {
             ("cache", "yes"),
         ] {
             session.set_option(name, value)?;
+        }
+        // F1 scaling: mpv's video→canvas mapping. `aspect` is mpv's default
+        // (fit + letterbox). `fill` pans-and-scans to cover the canvas,
+        // `stretch` drops the aspect lock. Unknown values were rejected by
+        // clap, so the match is exhaustive over what can arrive.
+        match scaling {
+            "fill" => session.set_option("panscan", "1.0")?,
+            "stretch" => session.set_option("keepaspect", "no")?,
+            _ => {}
         }
         // The software render context must exist before mpv_initialize;
         // libmpv 0.41 aborts if it is created afterwards (verified, see
@@ -839,7 +855,7 @@ impl VideoWorker {
     fn run_playback(&mut self, hwdec: &str) -> Result<Playback> {
         // Session creation happens here so the hwdec=no retry gets a fresh
         // handle (mpv can be initialized only once per handle).
-        let mut session = MpvSession::create(hwdec, self.spec)?;
+        let mut session = MpvSession::create(hwdec, self.spec, &self.arguments.scaling)?;
         session.initialize()?;
         session.load_file(&self.content)?;
         // The duration bound is per-file, so both decode attempts reject an

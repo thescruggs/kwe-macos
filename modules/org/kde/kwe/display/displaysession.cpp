@@ -251,6 +251,12 @@ bool DisplaySession::applyStatus(const QJsonObject &status, QString *error) {
   }
 
   setPhase(phaseValue.toString());
+  // F1: optional (older daemons omit it); only the three known modes are
+  // accepted, anything else falls back to the pre-F1 behaviour.
+  const QString scaling = status.value(QStringLiteral("scaling")).toString();
+  setScaling(scaling == QStringLiteral("fill") || scaling == QStringLiteral("stretch")
+                 ? scaling
+                 : QStringLiteral("aspect"));
   setAwaitingDisplayAck(awaitingValue.toBool());
   setActive(hasSource);
   if (hasSource &&
@@ -304,6 +310,13 @@ void DisplaySession::setPhase(const QString &phase) {
   m_phase = phase;
   emit phaseChanged();
   emit stateChanged();
+}
+
+void DisplaySession::setScaling(const QString &scaling) {
+  if (m_scaling == scaling)
+    return;
+  m_scaling = scaling;
+  emit scalingChanged();
 }
 
 void DisplaySession::setAwaitingDisplayAck(bool awaiting) {

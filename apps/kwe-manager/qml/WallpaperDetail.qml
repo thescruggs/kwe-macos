@@ -250,6 +250,34 @@ Kirigami.ScrollablePage {
                     ? qsTr("The wallpaper service reports no display outputs")
                     : qsTr("The display outputs have not been enumerated yet")
         }
+        // F1: how the picture maps onto the output. Aspect keeps the whole
+        // picture (letterboxed), Fill crops to cover, Stretch ignores the
+        // aspect ratio — the daemon renders the canvas at the output's own
+        // size, so the mode mostly decides what a wallpaper whose own aspect
+        // differs from the display does.
+        RowLayout {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length > 0
+            Controls.Label {
+                text: qsTr("Scaling")
+            }
+            Controls.ComboBox {
+                id: scalingPicker
+                Layout.fillWidth: true
+                textRole: "text"
+                valueRole: "value"
+                model: [
+                    { text: qsTr("Aspect (fit, letterbox)"), value: "aspect" },
+                    { text: qsTr("Fill (crop to cover)"), value: "fill" },
+                    { text: qsTr("Stretch (ignore aspect)"), value: "stretch" }
+                ]
+                enabled: !applyClient.busy
+                Accessible.name: qsTr("Scaling mode")
+                Accessible.description: qsTr("How the wallpaper picture maps onto the display: keep the whole picture, crop to cover, or stretch")
+                Controls.ToolTip.visible: hovered
+                Controls.ToolTip.text: Accessible.description
+            }
+        }
         Controls.Label {
             Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== "" && applyClient.outputs.length === 0
@@ -282,7 +310,7 @@ Kirigami.ScrollablePage {
                         : qsTr("Apply this wallpaper to the selected display output")
             onClicked: applyClient.applyWallpaper(outputPicker.currentText,
                 WallpaperSelection.selectedId, WallpaperSelection.selectedKind,
-                detailPage.applyContentUrl())
+                detailPage.applyContentUrl(), scalingPicker.currentValue)
         }
         Controls.Label {
             Layout.fillWidth: true

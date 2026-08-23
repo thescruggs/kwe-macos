@@ -1,7 +1,17 @@
 # Feature request: per-wallpaper scaling modes (stretch / fill / aspect)
 
 - **Requested:** 2026-08-22 (user request)
-- **Status:** Accepted into the plan, not scheduled to a slice yet.
+- **Status:** IMPLEMENTED 2026-08-22 (F1, branch `beta-b4-apply-quarantine`,
+  commit "feat(f1)"): everything under "Where it lands" below, plus the
+  render-resolution decision (5): the daemon derives the canvas from the
+  output geometry (aspect kept, long edge ≤ 2560) when the client omits
+  `width`/`height`, and the mode is applied at BOTH layers — in the renderer
+  (video: libmpv letterbox / panscan / keepaspect=no; scene: the declared
+  scene rectangle is mapped onto the canvas by the mode — before F1 scene
+  units were canvas pixels 1:1, so a 1920x1080 scene in a 960x540 canvas
+  showed its centre quarter) and in the plugin (`FrameSurface.scaling`).
+  Left open: a per-mode live pixel oracle in a smoke lane, and the
+  letterbox colour (still black).
 
 ## Ask
 

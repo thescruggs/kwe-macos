@@ -76,8 +76,11 @@ public:
     /// is the catalog content path as a URL: the entry file for video/scene,
     /// the content root for web; an empty URL is omitted and the daemon
     /// starts its own catalog content.
+    /// `scaling` (F1): "aspect" (default) | "fill" | "stretch" — how the
+    /// picture maps onto the output; persisted per output by the daemon.
     Q_INVOKABLE void applyWallpaper(const QString &output, const QString &wallpaperId,
-                                    const QString &kind, const QUrl &content);
+                                    const QString &kind, const QUrl &content,
+                                    const QString &scaling = QStringLiteral("aspect"));
     /// Safe-mode restore (wallpaper.restore): reverts the saved previous
     /// wallpaper config on the output, or restores the stock image wallpaper
     /// when no assignment exists.
@@ -115,6 +118,10 @@ private:
         /// quarantine record before starting. Set only by retry() after an
         /// `apply_quarantined` failure, never by a first apply.
         bool retry = false;
+        /// F1 scaling mode for an apply ("aspect" | "fill" | "stretch").
+        /// Last on purpose: the other lanes aggregate-initialise Pending
+        /// positionally and stop before it.
+        QString scaling;
     };
 
     void send(Pending pending);
@@ -130,7 +137,7 @@ private:
     void recordFailure(const Pending &pending);
     /// The apply request builder shared by applyWallpaper() and retry().
     void sendApply(const QString &output, const QString &wallpaperId, const QString &kind,
-                   const QUrl &content, bool retry);
+                   const QUrl &content, const QString &scaling, bool retry);
     int requestTimeoutMilliseconds(Method method) const;
     void drainQueue();
     void retryLater();
@@ -146,6 +153,7 @@ private:
     static QString mapError(const QString &code, const QString &detail);
     static bool validIdentity(const QString &value);
     static bool validKind(const QString &kind);
+    static bool validScaling(const QString &scaling);
 
     QString m_socketPath;
     QLocalSocket m_socket;
@@ -173,6 +181,7 @@ private:
     QString m_lastFailedWallpaperId;
     QString m_lastFailedKind;
     QString m_lastFailedContent;
+    QString m_lastFailedScaling;
     /// The last apply failed with `apply_quarantined`: Try Again must ask
     /// the daemon to clear the record (retry: true) or it would fail again
     /// with the same answer.

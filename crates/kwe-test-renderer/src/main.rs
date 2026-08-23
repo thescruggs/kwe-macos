@@ -30,6 +30,12 @@ struct Arguments {
     height: u32,
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
+    /// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): how the picture maps
+    /// onto the frame canvas — `aspect` (letterbox), `fill` (crop),
+    /// `stretch`. The test pattern fills the canvas; the flag is
+    /// accepted so the supervisor can pass it to every kind uniformly.
+    #[arg(long, default_value = "aspect", value_parser = ["aspect", "fill", "stretch"])]
+    scaling: String,
     /// Stop cleanly after this many published frames; unlimited when omitted.
     #[arg(long)]
     frames: Option<u64>,

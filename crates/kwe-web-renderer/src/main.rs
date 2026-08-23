@@ -317,6 +317,13 @@ struct Arguments {
     /// Publish pacing in frames per second.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
+    /// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): how the picture maps
+    /// onto the frame canvas — `aspect` (letterbox), `fill` (crop),
+    /// `stretch`. The page lays itself out at the canvas size
+    /// (responsive HTML), so there is nothing to letterbox or crop here;
+    /// accepted for the uniform supervisor argv.
+    #[arg(long, default_value = "aspect", value_parser = ["aspect", "fill", "stretch"])]
+    scaling: String,
     /// Content root directory (must contain index.html; daemon-validated
     /// before spawn and preflight-checked again here). Only `--probe` may
     /// omit it.

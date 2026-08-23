@@ -25,6 +25,7 @@ WallpaperItem {
 
         anchors.fill: parent
         frameFile: displaySession.frameFile
+        scaling: displaySession.scaling
         Accessible.name: qsTr("Animated wallpaper")
         Accessible.description: qsTr("Validated frames from an isolated wallpaper renderer")
         onFrameFileOpened: (path) => {

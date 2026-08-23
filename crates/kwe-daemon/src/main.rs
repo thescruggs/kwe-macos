@@ -40,7 +40,7 @@ use playlist_session::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supervisor::{
-    ContentSpec, RendererKind, RendererResourceLimits, StartSpec, SupervisorConfig,
+    ContentSpec, RendererKind, RendererResourceLimits, ScalingMode, StartSpec, SupervisorConfig,
     SupervisorHandle, SupervisorService, TestFault, WorkerStatus, validate_identity_part,
 };
 use workshop_cache::WorkshopCache;
@@ -917,6 +917,9 @@ struct RendererStartParams {
     test_fault: Option<TestFaultParams>,
     /// Development-only: ask the test renderer for this many stderr lines.
     stderr_lines: Option<u32>,
+    /// F1: `aspect` (default) | `fill` | `stretch`.
+    #[serde(default)]
+    scaling: ScalingMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1058,6 +1061,7 @@ impl TryFrom<RendererStartParams> for StartSpec {
             content,
             test_fault,
             stderr_lines: params.stderr_lines,
+            scaling: params.scaling,
         };
         // Single validation point per start: the supervisor event loop no
         // longer re-validates, so content preflight cannot block it twice.
@@ -2278,6 +2282,7 @@ parser.add_argument("--output", required=True)
 parser.add_argument("--width", type=int, default=320)
 parser.add_argument("--height", type=int, default=180)
 parser.add_argument("--fps", type=int, default=30)
+parser.add_argument("--scaling", default="aspect")
 parser.add_argument("--content")
 args = parser.parse_args()
 
@@ -2488,6 +2493,67 @@ with open(args.output, "wb") as frame:
         assert_eq!(status.phase, WorkerPhase::Live);
         assert!(!status.quarantined);
         assert_eq!(status.failures, 0);
+    }
+
+    #[test]
+    fn apply_derives_the_canvas_from_the_output_and_persists_the_scaling_mode() {
+        // F1: no width/height in the request -> the canvas follows the
+        // output geometry (2926x823 -> long edge capped at 2560, aspect
+        // kept, even pixels); `scaling` rides into the renderer argv, the
+        // status and the persisted assignment.
+        let root = temp_dir("apply-scaling");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone());
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","scaling":"fill"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply failed: {result}");
+        assert_eq!(result["applied"]["scaling"], "fill");
+        let (width, height) = apply::frame_size_for(None, None, Some([0, 0, 2926, 823]));
+        assert_eq!(result["applied"]["width"], width);
+        assert_eq!(result["applied"]["height"], height);
+        assert_eq!(width, 2560);
+        assert_eq!(height, 720);
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+        assert_eq!(status.scaling, ScalingMode::Fill);
+        // Persisted and reported back.
+        let (ok, listing) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(listing["outputs"]["DP-1"]["scaling"], "fill");
+        assert_eq!(listing["outputs"]["DP-1"]["width"], 2560);
+        // Explicit size still wins, unknown mode is rejected at the boundary.
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","width":320,"height":180}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "explicit-size apply failed: {result}");
+        assert_eq!(result["applied"]["width"], 320);
+        assert_eq!(result["applied"]["scaling"], "aspect");
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene","scaling":"tile"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
     }
 
     /// One stub system output on "DP-1".
@@ -2899,6 +2965,7 @@ with open(args.output, "wb") as frame:
                         width: 320,
                         height: 180,
                         fps: 30,
+                        scaling: ScalingMode::Aspect,
                         applied_at_unix_seconds: 1,
                         previous: None,
                     },
@@ -3050,6 +3117,7 @@ with open(args.output, "wb") as frame:
                 }),
                 test_fault: None,
                 stderr_lines: None,
+                scaling: ScalingMode::Aspect,
             })
             .unwrap();
         assert_eq!(foreign.requested_wallpaper_id.as_deref(), Some("other"));
@@ -3195,6 +3263,7 @@ with open(args.output, "wb") as frame:
                     width: 320,
                     height: 180,
                     fps: 30,
+                    scaling: ScalingMode::Aspect,
                     applied_at_unix_seconds: 42,
                     previous: Some(apply::PreviousWallpaper {
                         wallpaper_plugin: "org.kde.image".into(),
@@ -3447,6 +3516,7 @@ with open(args.output, "wb") as frame:
                     width: 320,
                     height: 180,
                     fps: 30,
+                    scaling: ScalingMode::Aspect,
                     applied_at_unix_seconds: 1,
                     previous: None,
                 },
@@ -3497,10 +3567,11 @@ with open(args.output, "wb") as frame:
                 wallpaper_id: "2".into(),
                 kind: RendererKind::Scene,
                 content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
-                width: 320,
-                height: 180,
+                width: Some(320),
+                height: Some(180),
                 fps: 30,
                 retry: false,
+                scaling: ScalingMode::Aspect,
             })
             .unwrap();
         wait_for_settled(&supervisor, &probe, "2", 1);
@@ -3553,10 +3624,11 @@ with open(args.output, "wb") as frame:
             wallpaper_id: "2".into(),
             kind: RendererKind::Scene,
             content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
-            width: 320,
-            height: 180,
+            width: Some(320),
+            height: Some(180),
             fps: 30,
             retry: false,
+            scaling: ScalingMode::Aspect,
         });
         assert!(
             user_apply.is_ok(),

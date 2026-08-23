@@ -159,6 +159,7 @@ parser.add_argument("--output", required=True)
 parser.add_argument("--width", type=int, default=320)
 parser.add_argument("--height", type=int, default=180)
 parser.add_argument("--fps", type=int, default=30)
+parser.add_argument("--scaling", default="aspect")
 parser.add_argument("--content")
 args = parser.parse_args()
 

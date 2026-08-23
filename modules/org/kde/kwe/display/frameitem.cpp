@@ -353,20 +353,45 @@ void FrameItem::paint(QPainter *painter) {
   if (m_image.isNull())
     return;
   painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+  // Fill overflows the item on one axis; the item bounds are the crop.
+  painter->setClipRect(boundingRect());
   painter->drawImage(imageDestination(), m_image);
+}
+
+void FrameItem::setScaling(const QString &scaling) {
+  const QString mode = scaling == QStringLiteral("fill") ||
+                               scaling == QStringLiteral("stretch")
+                           ? scaling
+                           : QStringLiteral("aspect");
+  if (m_scaling == mode)
+    return;
+  m_scaling = mode;
+  emit scalingChanged();
+  update();
+}
+
+QRectF kweFrameDestination(const QSizeF &image, const QSizeF &item,
+                           const QString &mode) {
+  if (image.isEmpty() || item.isEmpty())
+    return {};
+  if (mode == QStringLiteral("stretch"))
+    return {QPointF(0, 0), item};
+  QSizeF target = image;
+  target.scale(item, mode == QStringLiteral("fill")
+                         ? Qt::KeepAspectRatioByExpanding
+                         : Qt::KeepAspectRatio);
+  return {
+      (item.width() - target.width()) / 2.0,
+      (item.height() - target.height()) / 2.0,
+      target.width(),
+      target.height(),
+  };
 }
 
 QRectF FrameItem::imageDestination() const {
   if (m_image.isNull())
     return {};
-  QSizeF target = m_image.size();
-  target.scale(boundingRect().size(), Qt::KeepAspectRatio);
-  return {
-      (width() - target.width()) / 2.0,
-      (height() - target.height()) / 2.0,
-      target.width(),
-      target.height(),
-  };
+  return kweFrameDestination(m_image.size(), boundingRect().size(), m_scaling);
 }
 
 void FrameItem::hoverEnterEvent(QHoverEvent *event) {

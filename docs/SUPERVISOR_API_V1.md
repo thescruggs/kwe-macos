@@ -43,7 +43,12 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 }
 ```
 
-*(M1a: `kind` and `content` replaced the alpha's `scene_path`.)* `kind` names
+*(M1a: `kind` and `content` replaced the alpha's `scene_path`.)* *(F1: an
+optional `"scaling": "aspect"|"fill"|"stretch"` (default `aspect`) is passed
+to every renderer as `--scaling`; the video renderer letterboxes/crops/
+stretches the clip, the scene renderer maps the declared scene rectangle
+onto the canvas by it, web and test accept it for the uniform argv.)*
+`kind` names
 the renderer family — `test`, `video`, `web`, or `scene` — and defaults to
 `test`. `content` is the validated content path: a video file for `video`, a
 directory with an `index.html` for `web`, and a scene file for `scene`. Test
@@ -129,7 +134,9 @@ exit 73/74 before first publish — reported, never restarted, never
 counted). `quarantined` (B4) is true when the requested identity's
 persisted record is quarantined; a quarantined `renderer.start` leaves the
 record's `last_failure`/`last_failure_detail` in the status so the caller
-can say why.
+can say why. `scaling` (F1) is the active worker's scaling mode (the
+requested one while nothing is live) — the plugin reads it for the frame →
+output mapping.
 
 The PID/frame/sequence fields always describe the active display source.
 Candidate state is separate in `requested_*`, `candidate_pid`,
@@ -330,8 +337,18 @@ format, and safe-mode restore contract are documented in
   (desktop mapping) and is cached 5 s per call — never indefinitely, and
   the apply transaction always probes fresh.
 - `wallpaper.apply` — params `{"output", "wallpaper_id", "kind", "content",
-  "width"?, "height"?, "fps"?, "retry"?}` (`width` 960 / `height` 540 /
-  `fps` 30 defaults; `retry` false). `kind`/`content` follow the
+  "width"?, "height"?, "fps"?, "retry"?, "scaling"?}` (`fps` 30 default;
+  `retry` false; `scaling` `aspect`). **F1 (2026-08-22):** `width`/`height`
+  omitted → the frame canvas is derived from the output's geometry (its own
+  aspect, long edge capped at 2560, even pixels, never below 64; no geometry
+  → the legacy 960x540); explicit values are used as given, bounded by the
+  frame protocol as before. `scaling` is `aspect` (fit, letterbox — the
+  pre-F1 behaviour), `fill` (crop to cover) or `stretch`; it is passed to
+  the renderer as `--scaling`, reported by `renderer.status` (`scaling`) for
+  the display plugin's frame → output mapping, and persisted in the
+  assignment (`assignments-v1.json`, additive field, older records read as
+  `aspect`). The success result's `applied` record carries `width`,
+  `height` and `scaling` as resolved. `kind`/`content` follow the
   `renderer.start` rules; the `test` kind is not assignable. Completes on
   renderer *promotion* (phase `live` or `awaiting_ack`), not on display
   acknowledgement. Success returns the persisted assignment with

@@ -64,12 +64,19 @@ void ApplyClient::listOutputs() {
 }
 
 void ApplyClient::applyWallpaper(const QString &output, const QString &wallpaperId,
-                                 const QString &kind, const QUrl &content) {
-    sendApply(output, wallpaperId, kind, content, false);
+                                 const QString &kind, const QUrl &content,
+                                 const QString &scaling) {
+    sendApply(output, wallpaperId, kind, content, scaling, false);
 }
 
 void ApplyClient::sendApply(const QString &output, const QString &wallpaperId,
-                            const QString &kind, const QUrl &content, bool retry) {
+                            const QString &kind, const QUrl &content, const QString &scaling,
+                            bool retry) {
+    if (!validScaling(scaling)) {
+        setErrorMessage(tr("The scaling mode is invalid for applying."));
+        setState(Failed);
+        return;
+    }
     if (!validIdentity(output) || !validIdentity(wallpaperId)) {
         setErrorMessage(tr("The output or wallpaper id is invalid for applying."));
         setState(Failed);
@@ -91,7 +98,7 @@ void ApplyClient::sendApply(const QString &output, const QString &wallpaperId,
                      if (ok)
                          refreshAssignments();
                  },
-                 retry});
+                 retry, scaling});
 }
 
 void ApplyClient::restoreWallpaper(const QString &output) {
@@ -128,7 +135,8 @@ void ApplyClient::retry() {
         // the user read the reason and chose to try anyway; without the
         // flag the daemon would answer apply_quarantined again.
         sendApply(m_lastFailedOutput, m_lastFailedWallpaperId, m_lastFailedKind,
-                  QUrl::fromLocalFile(m_lastFailedContent), m_lastFailedQuarantined);
+                  QUrl::fromLocalFile(m_lastFailedContent), m_lastFailedScaling,
+                  m_lastFailedQuarantined);
     } else if (m_lastFailedMethod == Restore) {
         restoreWallpaper(m_lastFailedOutput);
     } else if (m_lastFailedMethod == ListOutputs) {
@@ -203,6 +211,11 @@ void ApplyClient::writeRequest() {
             params.insert(QStringLiteral("content"), m_current.content);
         if (m_current.retry)
             params.insert(QStringLiteral("retry"), true);
+        // F1: the daemon defaults to aspect; only a non-default mode needs
+        // the wire field (keeps older daemons' deny_unknown_fields happy
+        // for the default path).
+        if (!m_current.scaling.isEmpty() && m_current.scaling != QStringLiteral("aspect"))
+            params.insert(QStringLiteral("scaling"), m_current.scaling);
         break;
     case Restore:
         params.insert(QStringLiteral("output"), m_current.output);
@@ -269,6 +282,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
     const auto wallpaperId = m_current.wallpaperId;
     const auto kind = m_current.kind;
     const auto content = m_current.content;
+    const auto scaling = m_current.scaling;
     const auto callback = std::move(m_current.callback);
     m_current = {};
     emit busyChanged();
@@ -284,6 +298,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_lastFailedWallpaperId = wallpaperId;
             m_lastFailedKind = kind;
             m_lastFailedContent = content;
+            m_lastFailedScaling = scaling.isEmpty() ? QStringLiteral("aspect") : scaling;
             m_lastFailedQuarantined = errorCode == QStringLiteral("apply_quarantined");
             clearResult();
             // The UI's Try Again only makes sense for operations with a
@@ -564,4 +579,9 @@ bool ApplyClient::validIdentity(const QString &value) {
 bool ApplyClient::validKind(const QString &kind) {
     return kind == QStringLiteral("video") || kind == QStringLiteral("web") ||
            kind == QStringLiteral("scene");
+}
+
+bool ApplyClient::validScaling(const QString &scaling) {
+    return scaling.isEmpty() || scaling == QStringLiteral("aspect")
+        || scaling == QStringLiteral("fill") || scaling == QStringLiteral("stretch");
 }

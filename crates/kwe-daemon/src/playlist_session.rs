@@ -1963,6 +1963,7 @@ mod tests {
             last_failure: None,
             last_failure_detail: None,
             quarantined: false,
+            scaling: crate::supervisor::ScalingMode::Aspect,
             requested_wallpaper_id: requested.map(str::to_string),
             requested_content_hash: None,
             candidate_pid: None,

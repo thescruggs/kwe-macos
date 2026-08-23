@@ -255,6 +255,36 @@ impl SupervisorConfig {
     }
 }
 
+/// How a wallpaper's picture maps onto the output (BETA F1,
+/// `docs/backlog/WALLPAPER_SCALING_MODES.md`). The same mode travels to two
+/// places: the renderer (content → frame canvas: the video renderer's
+/// letterbox/crop/stretch of the clip, the scene renderer's scene-units →
+/// canvas mapping) and the Plasma plugin (frame canvas → output item), so
+/// when the canvas already has the output's aspect the plugin step is the
+/// identity and the renderer step is what the user sees.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalingMode {
+    /// Whole picture visible, aspect preserved, letterboxed (the only
+    /// behaviour before F1).
+    #[default]
+    Aspect,
+    /// Aspect preserved, scaled to cover, overflow cropped.
+    Fill,
+    /// Scaled to the exact target, aspect ignored.
+    Stretch,
+}
+
+impl ScalingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScalingMode::Aspect => "aspect",
+            ScalingMode::Fill => "fill",
+            ScalingMode::Stretch => "stretch",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StartSpec {
     pub wallpaper_id: String,
@@ -267,6 +297,9 @@ pub struct StartSpec {
     pub test_fault: Option<TestFault>,
     /// Development-only: ask the test renderer for this many stderr lines.
     pub stderr_lines: Option<u32>,
+    /// F1: passed to every renderer as `--scaling`; not part of the
+    /// failure-record identity (a mode change never earns a new budget).
+    pub scaling: ScalingMode,
 }
 
 impl StartSpec {
@@ -439,6 +472,9 @@ pub struct WorkerStatus {
     /// (three strikes); the apply lane reports this as `apply_quarantined`
     /// with the record's last detail instead of a bare phase name (B4).
     pub quarantined: bool,
+    /// F1: the active worker's scaling mode (the requested one while
+    /// nothing is live), for the display plugin's frame → output mapping.
+    pub scaling: ScalingMode,
     pub requested_wallpaper_id: Option<String>,
     pub requested_content_hash: Option<String>,
     pub candidate_pid: Option<u32>,
@@ -1117,7 +1153,9 @@ impl SupervisorRuntime {
             .arg("--height")
             .arg(spec.height.to_string())
             .arg("--fps")
-            .arg(spec.fps.to_string());
+            .arg(spec.fps.to_string())
+            .arg("--scaling")
+            .arg(spec.scaling.as_str());
         if let Some(content) = &spec.content {
             let path = match content {
                 ContentSpec::Video { path } | ContentSpec::Scene { path } => path,
@@ -1806,6 +1844,10 @@ impl SupervisorRuntime {
             last_failure: self.last_failure.as_ref().map(|(kind, _)| *kind),
             last_failure_detail: self.last_failure.as_ref().map(|(_, detail)| detail.clone()),
             quarantined: record.is_some_and(|record| record.quarantined),
+            scaling: active
+                .map(|worker| worker.spec.scaling)
+                .or_else(|| requested.map(|spec| spec.scaling))
+                .unwrap_or_default(),
             requested_wallpaper_id: requested.map(|spec| spec.wallpaper_id.clone()),
             requested_content_hash: requested.map(|spec| spec.content_hash.clone()),
             candidate_pid: candidate.map(|worker| worker.child.id()),
@@ -2413,6 +2455,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         assert!(valid.validate().is_ok());
         let mut invalid = valid.clone();
@@ -2437,6 +2480,7 @@ mod tests {
             }),
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         assert!(invalid_scene.validate().is_err());
         invalid_scene.kind = RendererKind::Test;
@@ -2456,6 +2500,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         // Test takes no content.
         let mut mismatched = base.clone();
@@ -2747,6 +2792,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         let mut worker = runtime.spawn_worker(spec).unwrap();
         // Each launch gets its own 0700 HOME under the daemon runtime dir.
@@ -2803,6 +2849,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         let video = StartSpec {
             kind: RendererKind::Video,
@@ -2863,6 +2910,7 @@ mod tests {
             content: Some(ContentSpec::Video { path: real.clone() }),
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         let validated = spec.into_validated().unwrap();
         let path = match validated.content.expect("video content kept") {
@@ -2966,6 +3014,7 @@ mod tests {
             content: Some(ContentSpec::Web { root: root.clone() }),
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         let error = runtime
             .spawn_worker(spec)
@@ -3073,6 +3122,7 @@ mod tests {
                 content: None,
                 test_fault: None,
                 stderr_lines: None,
+                scaling: ScalingMode::Aspect,
             },
             child,
             home_path: PathBuf::new(),
@@ -3179,6 +3229,7 @@ mod tests {
             content: Some(ContentSpec::Web { root: root.clone() }),
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         };
         // The fake renderer records its argv asynchronously; poll for it
         // within a bounded window (the script writes before it exits).
@@ -3270,6 +3321,7 @@ mod tests {
                 content: None,
                 test_fault: None,
                 stderr_lines: None,
+                scaling: ScalingMode::Aspect,
             },
             child,
             home_path: PathBuf::new(),
@@ -3374,6 +3426,7 @@ mod tests {
             content: None,
             test_fault: None,
             stderr_lines: None,
+            scaling: ScalingMode::Aspect,
         }
     }
 

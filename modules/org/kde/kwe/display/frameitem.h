@@ -10,6 +10,15 @@
 #include <QTimer>
 #include <qqmlintegration.h>
 
+/// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): where an `image`-sized
+/// frame lands inside an `item`-sized surface under `mode` ("aspect": fit +
+/// centre, the pre-F1 behaviour; "fill": cover + centre, overflow outside
+/// the item; "stretch": the item itself; anything else: aspect). Pure — the
+/// pointer mapping normalises against the same rectangle, so a cursor over
+/// a cropped (fill) frame still reports the frame pixel under it in 0..1.
+QRectF kweFrameDestination(const QSizeF &image, const QSizeF &item,
+                           const QString &mode);
+
 class FrameItem : public QQuickPaintedItem {
   Q_OBJECT
   QML_NAMED_ELEMENT(FrameSurface)
@@ -21,6 +30,8 @@ class FrameItem : public QQuickPaintedItem {
   Q_PROPERTY(qulonglong sequence READ sequence NOTIFY sequenceChanged)
   Q_PROPERTY(bool hasFrame READ hasFrame NOTIFY hasFrameChanged)
   Q_PROPERTY(QSize frameSize READ frameSize NOTIFY frameSizeChanged)
+  /// F1: "aspect" | "fill" | "stretch" (unknown → aspect).
+  Q_PROPERTY(QString scaling READ scaling WRITE setScaling NOTIFY scalingChanged)
 
 public:
   enum Status { Waiting, Live, Frozen, Invalid, Stopped };
@@ -38,6 +49,8 @@ public:
   QSize frameSize() const { return m_image.size(); }
 
   void setFrameFile(const QString &path);
+  QString scaling() const { return m_scaling; }
+  void setScaling(const QString &scaling);
   Q_INVOKABLE bool openFrameFile(const QString &path);
   void paint(QPainter *painter) override;
 
@@ -54,6 +67,7 @@ signals:
   void sequenceChanged();
   void hasFrameChanged();
   void frameSizeChanged();
+  void scalingChanged();
   void pointerPosition(const QString &phase, qreal x, qreal y);
 
 private:
@@ -77,6 +91,7 @@ private:
   bool load32(qsizetype offset, quint32 *value) const;
 
   QString m_frameFile;
+  QString m_scaling = QStringLiteral("aspect");
   QFile m_file;
   qsizetype m_fileBytes = 0;
   Layout m_layout;

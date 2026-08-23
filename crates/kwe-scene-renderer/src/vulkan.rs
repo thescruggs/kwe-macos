@@ -285,6 +285,10 @@ pub struct LayerRenderer {
     fence: vk::Fence,
     width: u32,
     height: u32,
+    /// F1: the NDC divisor for layer/particle quads — the visible world
+    /// rectangle in scene units (defaults to the canvas size).
+    world_width: f32,
+    world_height: f32,
     device_name: String,
     device_kind: String,
     // Kept alive for the whole renderer lifetime: ash 0.38's Entry owns the
@@ -296,6 +300,13 @@ pub struct LayerRenderer {
 }
 
 impl LayerRenderer {
+    /// F1: set the visible world rectangle (scene units) the canvas shows;
+    /// quads are positioned against it instead of the canvas size.
+    pub fn set_world_extent(&mut self, width: f32, height: f32) {
+        self.world_width = width.max(1.0);
+        self.world_height = height.max(1.0);
+    }
+
     pub fn new(device_filter: Option<&str>, width: u32, height: u32) -> Result<Self, RenderError> {
         // SAFETY: loading the Vulkan loader functions is safe as long as the
         // returned entry is used only to call Vulkan functions, which is all
@@ -794,6 +805,8 @@ impl LayerRenderer {
             fence,
             width,
             height,
+            world_width: width as f32,
+            world_height: height as f32,
             device_name,
             device_kind,
             _entry: entry,
@@ -1549,8 +1562,8 @@ impl LayerRenderer {
                 draw.m[1][1],
                 draw.t[1],
                 draw.alpha * draw.tint[3],
-                self.width as f32,
-                self.height as f32,
+                self.world_width,
+                self.world_height,
                 0.0,
                 0.0,
                 draw.brightness,

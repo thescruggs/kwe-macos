@@ -139,6 +139,14 @@ struct Arguments {
     /// Publish pacing in frames per second.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
+    /// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): how the picture maps
+    /// onto the frame canvas — `aspect` (letterbox), `fill` (crop),
+    /// `stretch`. Scene: scene units are the declared scene
+    /// resolution; the compositor maps that rectangle onto the canvas by
+    /// this mode (before F1 scene units were canvas pixels 1:1, so a
+    /// 1920x1080 scene in a 960x540 canvas showed its centre quarter).
+    #[arg(long, default_value = "aspect", value_parser = ["aspect", "fill", "stretch"])]
+    scaling: String,
     /// Scene descriptor (scene.json) to render (daemon-validated before
     /// spawn). Only `--probe` may omit it.
     #[arg(long, required_unless_present = "probe")]
@@ -867,6 +875,22 @@ fn main() -> Result<()> {
             }
         };
 
+    // 4b. F1: the scene rectangle (declared resolution, scene units) maps
+    //     onto the canvas by the scaling mode; the compositor's NDC divisor
+    //     becomes the visible world extent instead of the canvas size.
+    let (world_w, world_h) = world_extent(
+        config.resolution,
+        (spec.width, spec.height),
+        &arguments.scaling,
+    );
+    renderer.set_world_extent(world_w, world_h);
+    if (world_w, world_h) != (spec.width as f32, spec.height as f32) {
+        eprintln!(
+            "event=renderer.scene.world_extent scaling={} extent={world_w}x{world_h} canvas={}x{}",
+            arguments.scaling, spec.width, spec.height
+        );
+    }
+
     // 5. Layer textures: upload every decoded layer texture before the first
     //    render (all uploads share the startup fence, which is waited to
     //    completion per upload). A failed upload skips the layer with a
@@ -995,6 +1019,34 @@ fn reject_render(error: &RenderError, detail: &str) -> ! {
 /// with bounded limits (textures.rs). A missing, escaping, unreadable, or
 /// over-budget image skips its layer with a bounded one-time diagnostic;
 /// only the descriptor and script problems above reject the scene.
+/// The visible world rectangle, in scene units, that the canvas shows
+/// (F1). `aspect`: the whole scene fits with letterbox (extent ≥ scene on
+/// one axis); `fill`: the scene covers the canvas and is cropped (extent ≤
+/// scene on one axis); `stretch`: the extent IS the scene (aspect ignored).
+/// No declared resolution → scene units are canvas pixels, as before F1.
+/// Pure; unit-tested.
+fn world_extent(scene: Option<(u32, u32)>, canvas: (u32, u32), scaling: &str) -> (f32, f32) {
+    let (cw, ch) = (canvas.0.max(1) as f32, canvas.1.max(1) as f32);
+    let Some((sw, sh)) = scene else {
+        return (cw, ch);
+    };
+    if sw == 0 || sh == 0 {
+        return (cw, ch);
+    }
+    let (sw, sh) = (sw as f32, sh as f32);
+    match scaling {
+        "stretch" => (sw, sh),
+        "fill" => {
+            let scale = (cw / sw).max(ch / sh);
+            (cw / scale, ch / scale)
+        }
+        _ => {
+            let scale = (cw / sw).min(ch / sh);
+            (cw / scale, ch / scale)
+        }
+    }
+}
+
 fn load_scene(content: &Path) -> SceneConfig {
     let is_pkg = content
         .extension()
@@ -2534,5 +2586,27 @@ mod tests {
             open_video_layers(&mut layers).is_empty(),
             "an unresolved source opens nothing"
         );
+    }
+
+    #[test]
+    fn world_extent_follows_the_scaling_mode() {
+        // No declared resolution: scene units are canvas pixels.
+        assert_eq!(world_extent(None, (960, 540), "aspect"), (960.0, 540.0));
+        // 16:9 scene on a wider canvas: aspect letterboxes (wider extent),
+        // fill crops (shorter extent), stretch is the scene itself.
+        let scene = Some((1920, 1080));
+        let (w, h) = world_extent(scene, (2926, 823), "aspect");
+        assert!((h - 1080.0).abs() < 0.01 && w > 1920.0, "{w}x{h}");
+        let (w, h) = world_extent(scene, (2926, 823), "fill");
+        assert!((w - 1920.0).abs() < 0.01 && h < 1080.0, "{w}x{h}");
+        assert_eq!(
+            world_extent(scene, (2926, 823), "stretch"),
+            (1920.0, 1080.0)
+        );
+        // Matching aspect: every mode shows exactly the scene.
+        assert_eq!(world_extent(scene, (960, 540), "aspect"), (1920.0, 1080.0));
+        assert_eq!(world_extent(scene, (960, 540), "fill"), (1920.0, 1080.0));
+        // Degenerate declared size falls back to the canvas.
+        assert_eq!(world_extent(Some((0, 0)), (100, 50), "fill"), (100.0, 50.0));
     }
 }
