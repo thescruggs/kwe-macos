@@ -466,6 +466,38 @@ while a foreign (user) renderer is live the session yields to it — a `Busy`
 from the shared transaction lock or a foreign renderer live after the lock
 is a transient yield, never a failure, and clears any armed backoff.
 
+**SR-1c2: the playlist lane runs the same scene capability gate.** The
+playlist apply lane (`PlaylistApplyLane::apply_playlist`, driving the
+timer/policy-advance/manual-play/restart-restore transaction above) runs
+the identical SR-1c gate — single-sourced classification
+(`scene_capability_gate` in `apply.rs`) — placed at the same point in the
+transaction: the last step before any renderer/wallpaper touch. Only the
+refusal's HANDLING differs from `wallpaper.apply`:
+
+- A `blocking`-missing required capability, or the inspector's own
+  `incompatible` refusal, is **not** a hard client-facing failure the way
+  a direct `wallpaper.apply` gets: the lane returns the same
+  `ApplyError::CapabilityGate` (`apply_incompatible`, `{"missing": [...]}`
+  or `{"missing": [], "inspection_reason": "<reason>"}`), and the
+  playlist session's own fold logic treats it as **skip-and-advance**
+  instead of a generic apply failure — the refused entry is recorded
+  (`event=playlist.entry_gate_refused wallpaper=<id>
+  missing=<comma-separated ids>`) and excluded from the next decision the
+  same way a crash-quarantined entry already is (`unavailable_ids` in
+  `SessionStatus`), so the playlist advances to the next eligible entry.
+  It is never retried with a backoff timer the way a transient apply
+  failure is — the gate's answer cannot change on its own between one
+  playlist tick and the next, only a rebuilt daemon or an edited scene
+  changes it, so retrying on a clock is pointless; re-evaluating the
+  playlist (deactivate/reactivate, or a daemon restart) clears the
+  exclusion. A refusal never wedges or stops the playlist.
+- A `limitations` (tolerated-missing) or `unknown`-outcome (inspector
+  timeout/unavailable/failed) result proceeds exactly like
+  `wallpaper.apply`: `capability_limitations` rides into the started
+  worker's `StartSpec`/`renderer.status` the same way, and the
+  `"inspection"`/`"inspection_reason"` notes merge into the (internal,
+  not RPC-surfaced) apply result the lane returns to the session worker.
+
 ## Lifecycle and recovery
 
 The daemon starts each worker in a new process group with `no_new_privs` and a

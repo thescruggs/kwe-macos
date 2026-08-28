@@ -1081,5 +1081,5 @@ STOP findings:           None that blocked the slice. Every candidate STOP
                          No non-comparable struct member was found needing
                          a hand-written partial Eq. No external SceneError
                          message-text consumer was found.
-Commit(s):               933b430, (fill in after commit)
+Commit(s):               933b430, 5b80f1d
 ```

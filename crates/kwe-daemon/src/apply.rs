@@ -1491,6 +1491,123 @@ pub struct RestoreWallpaperParams {
     pub output: String,
 }
 
+/// SR-1c's capability-gate classification, factored out in SR-1c2 so both
+/// apply lanes (`ApplyHandle::apply`, the direct lane, and
+/// `PlaylistApplyLane::apply_playlist`, the playlist lane) run the exact
+/// SAME policy — single-sourced, per SR-1c2 conductor decision (a). Only
+/// the refusal HANDLING differs by lane: the direct lane fails the whole
+/// apply on `Err`; the playlist lane returns the identical
+/// `ApplyError::CapabilityGate` and lets its caller
+/// (`playlist_session.rs`'s `fold_apply_completions`) treat it as
+/// skip-and-advance instead of the generic backoff-and-retry every other
+/// apply failure gets.
+struct GateOutcome {
+    /// Tolerated-missing capability ids this scene required — threaded
+    /// into the started worker's `StartSpec.capability_limitations`
+    /// exactly like the direct lane (SR-1c2 decision (b)).
+    limitations: Vec<String>,
+    /// Notes merged into the success JSON as top-level siblings, mirroring
+    /// the direct lane's pre-factor `gate_notes` map: `"limitations"` when
+    /// non-empty, or `"inspection"`/`"inspection_reason"` on an `unknown`
+    /// outcome.
+    notes: serde_json::Map<String, Value>,
+}
+
+/// Runs `inspect::run_inspection` and classifies the outcome per SR-1c's
+/// conductor decisions (a)/(b): an `inventoried` outcome splits `required`
+/// into blocking (refuse, `Err`) vs. tolerated-missing (limitations,
+/// `Ok`); `incompatible` refuses; anything else (`unknown` — timeout,
+/// report-*, inspector unavailable/failed — or an unrecognized outcome
+/// shape) proceeds per decision (b), attaching the reason to `notes` for
+/// diagnosability. Scene-kind gating is the CALLER's responsibility (both
+/// callers already branch on `RendererKind::Scene` before reaching here),
+/// so this function runs unconditionally on whatever `content` it is
+/// given.
+fn scene_capability_gate(
+    inspect_config: &InspectConfig,
+    content: &Path,
+) -> Result<GateOutcome, ApplyError> {
+    let inspection = inspect::run_inspection(inspect_config, content);
+    match inspection.get("outcome").and_then(Value::as_str) {
+        Some("inventoried") => {
+            let required: BTreeSet<String> = inspection
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
+            let implemented: BTreeSet<&str> =
+                SCENE_CAPABILITIES_IMPLEMENTED.iter().copied().collect();
+            let tolerated: BTreeSet<&str> = SCENE_CAPABILITIES_LIMITATION_TOLERATED
+                .iter()
+                .copied()
+                .collect();
+            let missing: BTreeSet<&str> = required
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !implemented.contains(id))
+                .collect();
+            let blocking: Vec<String> = missing
+                .iter()
+                .filter(|id| !tolerated.contains(*id))
+                .map(|id| id.to_string())
+                .collect();
+            if !blocking.is_empty() {
+                return Err(ApplyError::CapabilityGate {
+                    detail: format!(
+                        "scene requires capabilities this build does not implement: {}",
+                        blocking.join(", ")
+                    ),
+                    missing: blocking,
+                    inspection_reason: None,
+                });
+            }
+            let limitations: Vec<String> = missing
+                .iter()
+                .filter(|id| tolerated.contains(*id))
+                .map(|id| id.to_string())
+                .collect();
+            let mut notes = serde_json::Map::new();
+            if !limitations.is_empty() {
+                notes.insert("limitations".into(), json!(limitations));
+            }
+            Ok(GateOutcome { limitations, notes })
+        }
+        Some("incompatible") => {
+            let reason = inspection
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("incompatible")
+                .to_string();
+            Err(ApplyError::CapabilityGate {
+                detail: format!("scene inspection refused the content: {reason}"),
+                missing: Vec::new(),
+                inspection_reason: Some(reason),
+            })
+        }
+        // "unknown" (any reason: timeout, report-*, inspector
+        // unavailable/failed) or an unrecognized outcome shape: decision
+        // (b) — proceed exactly as today, never block on an
+        // infrastructure failure. The reason rides along in `notes` for
+        // diagnosability.
+        _ => {
+            let reason = inspection
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable")
+                .to_string();
+            let mut notes = serde_json::Map::new();
+            notes.insert("inspection".into(), json!("unavailable"));
+            notes.insert("inspection_reason".into(), json!(reason));
+            Ok(GateOutcome {
+                limitations: Vec::new(),
+                notes,
+            })
+        }
+    }
+}
+
 /// The service object; the daemon holds one handle and passes it to the
 /// API boundary. The handle is cheaply cloneable; its locks are only
 /// contended within one request at a time (the daemon is single-threaded).
@@ -1749,82 +1866,17 @@ impl ApplyHandle {
         // renderer/wallpaper touch (old_assignment above is the rollback
         // target; complete_apply below is where renderer.start actually
         // happens). No cache (conductor decision (c)): a `retry: true`
-        // apply re-runs this exactly like a fresh one.
+        // apply re-runs this exactly like a fresh one. SR-1c2: the
+        // classification itself is factored into `scene_capability_gate`,
+        // shared with the playlist lane below — only a REFUSAL's HANDLING
+        // differs per lane; this lane fails the whole apply on Err.
         let mut gate_notes = serde_json::Map::new();
         if spec.kind == RendererKind::Scene {
-            let inspection = inspect::run_inspection(&self.inspect_config, &content);
-            match inspection.get("outcome").and_then(Value::as_str) {
-                Some("inventoried") => {
-                    let required: BTreeSet<String> = inspection
-                        .get("required")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|value| value.as_str().map(str::to_string))
-                        .collect();
-                    let implemented: BTreeSet<&str> =
-                        SCENE_CAPABILITIES_IMPLEMENTED.iter().copied().collect();
-                    let tolerated: BTreeSet<&str> = SCENE_CAPABILITIES_LIMITATION_TOLERATED
-                        .iter()
-                        .copied()
-                        .collect();
-                    let missing: BTreeSet<&str> = required
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|id| !implemented.contains(id))
-                        .collect();
-                    let blocking: Vec<String> = missing
-                        .iter()
-                        .filter(|id| !tolerated.contains(*id))
-                        .map(|id| id.to_string())
-                        .collect();
-                    if !blocking.is_empty() {
-                        return Err(ApplyError::CapabilityGate {
-                            detail: format!(
-                                "scene requires capabilities this build does not implement: {}",
-                                blocking.join(", ")
-                            ),
-                            missing: blocking,
-                            inspection_reason: None,
-                        });
-                    }
-                    let limitations: Vec<String> = missing
-                        .iter()
-                        .filter(|id| tolerated.contains(*id))
-                        .map(|id| id.to_string())
-                        .collect();
-                    if !limitations.is_empty() {
-                        spec.capability_limitations = limitations.clone();
-                        gate_notes.insert("limitations".into(), json!(limitations));
-                    }
-                }
-                Some("incompatible") => {
-                    let reason = inspection
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("incompatible")
-                        .to_string();
-                    return Err(ApplyError::CapabilityGate {
-                        detail: format!("scene inspection refused the content: {reason}"),
-                        missing: Vec::new(),
-                        inspection_reason: Some(reason),
-                    });
-                }
-                // "unknown" (any reason: timeout, report-*, inspector
-                // unavailable/failed) or an unrecognized outcome shape:
-                // decision (b) — proceed exactly as today, never block on
-                // an infrastructure failure. The reason rides along on the
-                // success result for diagnosability.
-                _ => {
-                    let reason = inspection
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unavailable")
-                        .to_string();
-                    gate_notes.insert("inspection".into(), json!("unavailable"));
-                    gate_notes.insert("inspection_reason".into(), json!(reason));
-                }
+            let outcome = scene_capability_gate(&self.inspect_config, &content)?;
+            if !outcome.limitations.is_empty() {
+                spec.capability_limitations = outcome.limitations;
             }
+            gate_notes = outcome.notes;
         }
 
         // 4+. Start the renderer; EVERY failure from here on rolls back.
@@ -2344,6 +2396,28 @@ impl PlaylistApplyLane for ApplyHandle {
         // exactly like wallpaper.apply (same ownership guard, same store
         // revert).
         let old_assignment = self.stored_assignment(&resolved_output)?;
+
+        // SR-1c2: the same scene apply gate the direct lane runs (SR-1c),
+        // placed here for the same reason — the last point before any
+        // renderer/wallpaper touch (old_assignment above is the rollback
+        // target the direct lane also captures first; complete_apply below
+        // is where renderer.start actually happens). Classification is
+        // shared via `scene_capability_gate` (decision (a): single-sourced
+        // policy); a refusal returns the SAME `ApplyError::CapabilityGate`
+        // the direct lane returns, un-rolled-back (nothing has touched the
+        // supervisor or store yet) — the playlist lane's caller
+        // (`playlist_session.rs`) is what treats it as skip-and-advance
+        // instead of the direct lane's hard failure; that is the only
+        // place the two lanes' handling actually diverges.
+        let mut gate_notes = serde_json::Map::new();
+        if kind == RendererKind::Scene {
+            let outcome = scene_capability_gate(&self.inspect_config, &content)?;
+            if !outcome.limitations.is_empty() {
+                spec.capability_limitations = outcome.limitations;
+            }
+            gate_notes = outcome.notes;
+        }
+
         spec.scaling = old_assignment
             .as_ref()
             .map(|assignment| assignment.scaling)
@@ -2364,11 +2438,20 @@ impl PlaylistApplyLane for ApplyHandle {
             previous,
             false,
         );
-        if let Err(error) = result {
-            self.rollback_after_failure(&spec, &resolved_output, old_assignment);
-            return Err(error);
+        match result {
+            Ok(mut value) => {
+                if !gate_notes.is_empty()
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.extend(gate_notes);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                self.rollback_after_failure(&spec, &resolved_output, old_assignment);
+                Err(error)
+            }
         }
-        result
     }
 }
 

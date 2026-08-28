@@ -481,7 +481,10 @@ Open risks:              capability_limitations is transient (StartSpec/
                          and deliberate (the task scoped this slice to
                          "wallpaper.apply" specifically), but worth closing
                          in a follow-up so the gate is not bypassable via the
-                         playlist.
+                         playlist. RESOLVED by SR-1c2 (docs/SR1.md's SR-1c2
+                         addendum below) -- the playlist lane now runs the
+                         identical gate, single-sourced via
+                         scene_capability_gate.
                          The renderer-worker's own report-FD stream
                          (report-late/report-unavailable, extending SR-1b's
                          pattern to spawn_worker) remains unimplemented --
@@ -489,6 +492,196 @@ Open risks:              capability_limitations is transient (StartSpec/
                          narrower conductor decisions; still a later slice's
                          territory.
 Commit(s):               5069b0f
+```
+
+## SR-1c2 — the playlist apply lane runs the same scene capability gate
+
+A small follow-up slice closing SR-1c's recorded open risk "playlist lane
+ungated" (above), filed after SR-2c merged (trunk `5b80f1d`).
+
+Conductor decisions (verbatim):
+
+- **(a)** Same classification (IMPLEMENTED/TOLERATED via kwe-core), same
+  decision (b) proceed-on-unknown. But the FAILURE handling differs by
+  lane nature: a playlist entry whose scene is gate-refused
+  (blocking-missing or inspector-refused content) is SKIPPED — the
+  playlist advances to the next entry exactly the way it already handles
+  an entry whose apply fails (mirror that existing skip/advance path;
+  find it in playlist_session.rs / the playlist lane in apply.rs). A
+  refusal must never wedge or stop the playlist.
+- **(b)** The skip is diagnosable: reuse whatever per-entry
+  failure/diagnostic record the playlist lane already keeps (event log
+  line at minimum: `event=playlist.entry_gate_refused wallpaper=<id>
+  missing=<csv>`), and the limitations list rides into the started
+  worker's StartSpec.capability_limitations exactly like the direct lane.
+
+```text
+Task:            The playlist apply lane runs the SR-1c scene capability
+                 gate. Single-sourced classification; only the refusal's
+                 handling differs by lane (direct: fail closed; playlist:
+                 skip-and-advance).
+Milestone/Slice: SR-1c2
+Goal:            Close SR-1c's own recorded gap: a playlist-driven advance
+                 onto a scene requiring an unimplemented capability was
+                 not refused the way a direct wallpaper.apply is,
+                 bypassing the gate entirely via the playlist.
+Outcome:         crates/kwe-daemon/src/apply.rs: SR-1c's gate
+                 classification (previously inlined in ApplyHandle::
+                 apply) factored into a new private GateOutcome/
+                 scene_capability_gate(inspect_config, content) function
+                 -- same three-way branch (inventoried -> blocking refuse/
+                 limitations proceed; incompatible -> refuse; unknown ->
+                 proceed with notes), returning Result<GateOutcome,
+                 ApplyError> where GateOutcome{limitations, notes} mirrors
+                 what the direct lane's own gate_notes/spec.
+                 capability_limitations assignment already did. Both
+                 ApplyHandle::apply (direct lane, unchanged behavior --
+                 all 7 existing SR-1c gate tests pass unmodified) and the
+                 new call in PlaylistApplyLane::apply_playlist (playlist
+                 lane) call this SAME function, RendererKind::Scene only,
+                 placed at the identical point in each transaction: right
+                 after old_assignment is captured (the rollback target)
+                 and before complete_apply (renderer.start). A refusal
+                 returns the SAME ApplyError::CapabilityGate either way --
+                 un-rolled-back (nothing touched yet in either lane) --
+                 only the CALLER'S handling of that Err diverges.
+                 crates/kwe-daemon/src/playlist_session.rs: SessionRuntime
+                 gains gate_refused_ids: BTreeSet<String> (mirrors
+                 quarantined_ids structurally), fed into unavailable_for
+                 alongside it -- once an id lands there the decision
+                 engine (PlaylistRuntime::tick, kwe-core) routes around it
+                 exactly the way it already routes around a crash-
+                 quarantined one (existing quarantined_entry_is_never_
+                 applied test), so the playlist advances. Unlike
+                 quarantine (known upfront, refreshed live from the
+                 supervisor) a gate refusal is discovered REACTIVELY: the
+                 first apply attempt for that entry still happens once,
+                 fold_apply_completions's new Err(ApplyError::
+                 CapabilityGate{missing, ..}) arm records the id and logs
+                 event=playlist.entry_gate_refused wallpaper=<id>
+                 missing=<csv> (decision (b)) -- no backoff/failure count
+                 (the gate's answer cannot change on a retry timer the way
+                 a transient failure might). reset_apply (playlist
+                 switch/deactivation) clears gate_refused_ids: a fresh
+                 activation deserves a fresh evaluation.
+                 A genuine ordering bug found by this slice's own new
+                 test (entry_gate_refused_is_skipped_and_the_playlist_
+                 advances first failed with 2 attempts recorded for the
+                 refused entry, not 1): fold_apply_completions was called
+                 from inside maybe_apply, AFTER tick_session had already
+                 computed that tick's `decision`/wallpaper_id from a STALE
+                 (pre-fold) unavailable set -- so the very tick that
+                 learned of a refusal could still re-dispatch the SAME
+                 entry once more before the NEXT tick's fresh unavailable
+                 finally excluded it. Fixed by moving the
+                 fold_apply_completions() call from maybe_apply to the top
+                 of tick_session (right after refresh_quarantine, before
+                 unavailable/decision are computed), so decision itself
+                 already reflects the freshest fold within the same tick
+                 -- not a playlist-lane-specific fix, a general session
+                 correctness fix this slice's new adversarial test
+                 happened to be the first to exercise (the pre-existing
+                 quarantine tests never hit it because quarantine is known
+                 BEFORE the first tick, never learned reactively mid-
+                 session).
+                 docs/SUPERVISOR_API_V1.md: new "SR-1c2" paragraph under
+                 the SR-1c gate section. docs/SR1.md (this section) + the
+                 SR-1c/epic-close open-risk lines annotated resolved, not
+                 deleted. docs/Scene-Rendering-Plan.md's status line
+                 annotated the same way.
+In scope:        crates/kwe-daemon/src/apply.rs (GateOutcome/
+                 scene_capability_gate factored out; apply_playlist's new
+                 gate stage + gate_notes merge into its Ok result), crates/
+                 kwe-daemon/src/playlist_session.rs (gate_refused_ids,
+                 unavailable_for, reset_apply, fold_apply_completions's
+                 new CapabilityGate arm, the fold_apply_completions
+                 ordering fix, RecordingLane's new gate_refusing builder
+                 for the session-level test), crates/kwe-daemon/src/
+                 main.rs (4 new playlist-lane gate-classification tests
+                 mirroring the existing SR-1c direct-lane ones),
+                 docs/SUPERVISOR_API_V1.md, docs/SR1.md, docs/
+                 Scene-Rendering-Plan.md.
+Out of scope:    Persisting capability_limitations into the assignment
+                 (still SR-1c's own open risk, unchanged). Inspection
+                 caching (still SR-1c decision (c)'s open risk,
+                 unchanged). Re-evaluating a gate refusal without a
+                 playlist deactivate/reactivate or a daemon restart --
+                 gate_refused_ids has no live-refresh oracle the way
+                 quarantined_ids does (open risk below). The renderer-
+                 worker's own report-FD stream (unrelated, still SR-1c's
+                 own recorded gap).
+Acceptance tests:        crates/kwe-daemon: 1 new playlist_session::tests
+                         test (entry_gate_refused_is_skipped_and_the_
+                         playlist_advances -- 2-entry-visible playlist,
+                         RecordingLane.gate_refusing(&["1"]), asserts entry
+                         2 is applied, entry 1 is attempted exactly once
+                         (not retried), and SessionStatus.unavailable_ids
+                         surfaces the refusal) + 4 new main.rs tests
+                         calling PlaylistApplyLane::apply_playlist directly
+                         against a REAL ApplyHandle + fake inspector,
+                         mirroring the SR-1c direct-lane tests exactly:
+                         scene_apply_gate_refuses_a_missing_required_
+                         capability_through_the_playlist_lane (blocking,
+                         CapabilityGate{missing} returned, no switch script
+                         runs, supervisor stays Idle),
+                         scene_apply_gate_proceeds_with_a_tolerated_
+                         limitation_through_the_playlist_lane (limitations
+                         in the result + WorkerStatus.
+                         capability_limitations), scene_apply_gate_
+                         proceeds_when_the_inspector_hangs_through_the_
+                         playlist_lane (decision (b), no double-wait),
+                         scene_apply_gate_runs_no_inspection_for_a_video_
+                         kind_playlist_entry (marker file never written).
+                         876 workspace tests total, up from 871.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 876 passed, 0 failed.
+                         ./scripts/check.sh -- exit 0, green end to end.
+Failure/recovery tests:  Covered by the acceptance tests above -- the
+                         blocking-refuse case IS the failure/recovery
+                         case for this slice (nothing touched, supervisor
+                         stays Idle, the playlist keeps running against
+                         the next entry instead of wedging).
+Upstream/provenance:    Original; the factored scene_capability_gate is a
+                         byte-for-byte extraction of SR-1c's own existing
+                         classification logic (no behavior change to the
+                         direct lane, proven by its 7 pre-existing tests
+                         passing unmodified) -- no third-party source
+                         consulted.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 876 passed, 0 failed.
+                         ./scripts/check.sh -- exit 0, green end-to-end.
+Open risks:              gate_refused_ids has no live-refresh oracle (unlike
+                         quarantined_ids, which the session re-polls from
+                         the supervisor every tick): once an entry is
+                         gate-refused it stays excluded until the playlist
+                         is deactivated/reactivated or the daemon
+                         restarts, even if a later build implements the
+                         missing capability. Acceptable for this slice
+                         (the gate's answer genuinely does not change on
+                         its own) but worth a follow-up if a future slice
+                         wants "capability added, playlist entry becomes
+                         eligible again without a manual reactivate."
+                         SR-1c's own two still-open risks (no inspection
+                         cache, capability_limitations not persisted) are
+                         unchanged by this slice and apply to the playlist
+                         lane's gate calls identically.
+STOP findings:           None. The fold_apply_completions ordering bug
+                         (see Outcome above) was found and fixed within
+                         this slice, not left as a STOP -- it was a small,
+                         contained, mechanically obvious reordering with
+                         no architectural ambiguity, and the direct-lane
+                         gate's own placement (already the last point
+                         before any touch) was reachable in the playlist
+                         lane without any service-ownership restructuring
+                         (the task's own STOP condition: apply_playlist
+                         already owns self.inspect_config, self.
+                         complete_apply, and old_assignment the same way
+                         apply() does -- no new plumbing was needed).
+Commit(s):               (fill in after commit)
 ```
 
 ## SR-1d — report/inspector version-skew matrix
@@ -825,14 +1018,20 @@ the apply window today, but a cache design is still open); **limitations
 not persisted** (capability_limitations/`limitations` is transient
 daemon- and manager-side; a restart loses the notice until the next
 apply — SR-1c and SR-1e both flag this at the point it matters);
-**playlist lane ungated** (`PlaylistApplyLane::apply_playlist` does not
+~~**playlist lane ungated**~~ (`PlaylistApplyLane::apply_playlist` did not
 run the SR-1c gate — a playlist-driven advance onto a scene requiring an
-unimplemented capability is not refused the way a direct
-`wallpaper.apply` is, SR-1c's recorded gap); and **render-report kind 2
+unimplemented capability was not refused the way a direct
+`wallpaper.apply` is, SR-1c's recorded gap) — **RESOLVED by SR-1c2**
+(below): the playlist lane now runs the identical, single-sourced gate;
+only the refusal's handling differs (skip-and-advance instead of a hard
+failure); and **render-report kind 2
 reserved but unused** (`docs/REPORT_PROTOCOL_V1.md`'s `SceneRenderReportV1`
 frame kind, and the renderer-worker's own report-FD stream generally —
 `report-late`/the renderer-worker sense of `report-unavailable` — never
 landed in SR-1; SR-1c and SR-1d both scoped themselves away from it
 explicitly rather than silently missing it). None of these four risks
 block using what SR-1 shipped; each is a named, findable next step rather
-than an undocumented gap.
+than an undocumented gap. One of the four (playlist lane ungated) is now
+closed by SR-1c2 (the addendum immediately below); its history is
+annotated above, not deleted, per this doc's standing convention for a
+closed risk. The other three remain open.

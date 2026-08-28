@@ -3328,6 +3328,146 @@ write_frame(1, payload)
     }
 
     // -------------------------------------------------------------------
+    // SR-1c2: the playlist apply lane runs the SAME scene capability gate
+    // (docs/SR1.md's SR-1c2 addendum). These three exercise the gate
+    // CLASSIFICATION through `PlaylistApplyLane::apply_playlist` directly
+    // (mirroring the SR-1c `scene_apply_gate_*` tests above, which do the
+    // same against `ApplyHandle::apply`) — proving `scene_capability_gate`
+    // is genuinely single-sourced between the two lanes, not just
+    // superficially similar code. The SESSION-level skip-and-advance
+    // behavior (a BLOCKING refusal specifically) is covered separately in
+    // playlist_session.rs's own `entry_gate_refused_is_skipped_and_the_
+    // playlist_advances`, since that is where the session's exclusion/
+    // decision machinery — not the gate itself — lives.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn scene_apply_gate_refuses_a_missing_required_capability_through_the_playlist_lane() {
+        let root = temp_dir("gate-playlist-blocking");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector.py",
+            &["scene.layer.image", "scene.future-thing"],
+        );
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let entries: BTreeSet<String> = ["1".to_string()].into_iter().collect();
+        let error = handle
+            .apply_playlist(Some("DP-1".into()), "1".into(), &entries, None)
+            .expect_err("a blocking-missing capability must refuse through the playlist lane too");
+        match error {
+            apply::ApplyError::CapabilityGate { missing, .. } => {
+                assert_eq!(missing, vec!["scene.future-thing".to_string()]);
+            }
+            other => panic!("expected CapabilityGate, got {other:?}"),
+        }
+        assert!(
+            !probe
+                .scripts()
+                .iter()
+                .any(|script| script.contains("org.kde.kwe.wallpaper")),
+            "no switch script may run before the gate decides: {:?}",
+            probe.scripts()
+        );
+        let status = supervisor.status().unwrap();
+        assert_eq!(
+            status.phase,
+            WorkerPhase::Idle,
+            "no renderer may be spawned when the gate refuses"
+        );
+    }
+
+    #[test]
+    fn scene_apply_gate_proceeds_with_a_tolerated_limitation_through_the_playlist_lane() {
+        let root = temp_dir("gate-playlist-tolerated");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector.py",
+            &["scene.layer.image", "scene.layer.sound"],
+        );
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let entries: BTreeSet<String> = ["1".to_string()].into_iter().collect();
+        let result = handle
+            .apply_playlist(Some("DP-1".into()), "1".into(), &entries, None)
+            .expect("a tolerated-missing capability must still apply");
+        assert_eq!(result["limitations"], json!(["scene.layer.sound"]));
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+        // Decision (b): the limitations list rides into the started
+        // worker's StartSpec.capability_limitations exactly like the
+        // direct lane.
+        assert_eq!(
+            status.capability_limitations,
+            vec!["scene.layer.sound".to_string()]
+        );
+    }
+
+    #[test]
+    fn scene_apply_gate_proceeds_when_the_inspector_hangs_through_the_playlist_lane() {
+        let root = temp_dir("gate-playlist-hang");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_hang(&root, "fake-inspector.py");
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_millis(300)),
+        );
+        let entries: BTreeSet<String> = ["1".to_string()].into_iter().collect();
+        let started = Instant::now();
+        let result = handle
+            .apply_playlist(Some("DP-1".into()), "1".into(), &entries, None)
+            .expect("decision (b): an unknown outcome must never block the playlist lane either");
+        assert!(started.elapsed() < Duration::from_secs(5), "no double-wait");
+        assert_eq!(result["inspection"], "unavailable");
+        assert_eq!(result["inspection_reason"], "timeout");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+    }
+
+    #[test]
+    fn scene_apply_gate_runs_no_inspection_for_a_video_kind_playlist_entry() {
+        let root = temp_dir("gate-playlist-video-skip");
+        let catalog = video_catalog_with_content(&root, "1");
+        let script = root.join("fake-video-renderer.py");
+        fs::write(&script, FAKE_SCENE_RENDERER).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = fast_scene_supervisor_config(&root);
+        config
+            .renderer_paths
+            .insert(RendererKind::Video, script.clone());
+        let supervisor_service = SupervisorService::start(config).unwrap();
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let marker = root.join("inspector-ran.marker");
+        let inspector = fake_inspector_marker(&root, "fake-inspector.py", &marker);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let entries: BTreeSet<String> = ["1".to_string()].into_iter().collect();
+        let result = handle.apply_playlist(Some("DP-1".into()), "1".into(), &entries, None);
+        assert!(
+            result.is_ok(),
+            "a video-kind playlist entry must be unaffected by the gate: {result:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the scene inspector must never run for a video-kind playlist entry"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // SR-1d: version-skew matrix — end-to-end gaps closed at the apply
     // level (docs/REPORT_PROTOCOL_V1.md's "Version-skew matrix").
     // -------------------------------------------------------------------

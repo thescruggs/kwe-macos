@@ -11,8 +11,11 @@ all 60). **SR-1 complete 2026-08-28** (`docs/SR1.md`): taxonomy frozen v1
 (§11.3, maintainer go), report protocol v1 + report FD, scene apply gate
 (refuse-before-replace + apply-with-limitations), version-skew matrix,
 manager result states. Open risks carried: no inspection cache; limitations
-not persisted; playlist lane ungated; render-report kind 2 reserved.
-Next: SR-2 (asset VFS, typed IR, module split).
+not persisted; ~~playlist lane ungated~~ (resolved 2026-08-28, SR-1c2:
+`docs/SR1.md`); render-report kind 2 reserved.
+Next: SR-2 (asset VFS, typed IR, module split) — SR-2a/2b/2c merged
+2026-08-27/28 (`docs/SR2.md`); SR-1c2 (small follow-up, playlist gate
+parity) merged 2026-08-28 (`docs/SR1.md`).
 
 **Baseline:** repository HEAD `93bae3b284d6221a7dd3b328eb12569edfa12524`, 2026-08-23.
 

@@ -355,6 +355,21 @@ struct SessionRuntime {
     last_waiting_persist: Instant,
     valid_ids: Arc<BTreeSet<String>>,
     quarantined_ids: BTreeSet<String>,
+    /// SR-1c2: wallpaper ids the scene capability gate has refused for
+    /// THIS session (`ApplyError::CapabilityGate`, both the blocking-
+    /// missing and inspector-`incompatible` shapes). Fed into
+    /// `unavailable_for` exactly like `quarantined_ids` — once an id lands
+    /// here the decision engine routes around it the same way it already
+    /// routes around a crash-quarantined one (see
+    /// `quarantined_entry_is_never_applied`), so the playlist advances to
+    /// the next eligible entry instead of retrying a refusal that cannot
+    /// resolve itself. Unlike `quarantined_ids` there is no live oracle to
+    /// refresh this from (the gate's answer does not change until the
+    /// scene or the build does), so it is discovered reactively (the
+    /// first apply attempt still happens once) and cleared only by
+    /// `reset_apply` (a playlist switch/deactivation deserves a fresh
+    /// evaluation).
+    gate_refused_ids: BTreeSet<String>,
     /// The wallpaper the session last applied successfully (or satisfied
     /// itself was live). Distinguishes the session's OWN stale renderer
     /// from a foreign (user) one: the session displaces its own stale
@@ -413,6 +428,7 @@ impl SessionRuntime {
             last_waiting_persist: Instant::now(),
             valid_ids: config.valid_ids,
             quarantined_ids: BTreeSet::new(),
+            gate_refused_ids: BTreeSet::new(),
             applied_wallpaper: None,
             apply_failures: 0,
             next_apply_retry: Instant::now(),
@@ -499,7 +515,14 @@ impl SessionRuntime {
         let mut unavailable: Vec<String> = playlist
             .entries
             .iter()
-            .filter(|id| !self.valid_ids.contains(*id) || self.quarantined_ids.contains(*id))
+            .filter(|id| {
+                !self.valid_ids.contains(*id)
+                    || self.quarantined_ids.contains(*id)
+                    // SR-1c2: a gate-refused id is excluded exactly like a
+                    // crash-quarantined one — see `gate_refused_ids`'s doc
+                    // comment.
+                    || self.gate_refused_ids.contains(*id)
+            })
             .cloned()
             .collect();
         unavailable.sort();
@@ -570,9 +593,16 @@ impl SessionRuntime {
         let Some(wallpaper_id) = decision_wallpaper_id(decision) else {
             return;
         };
-        // Fold any completed apply transaction from the worker FIRST so the
-        // verdict below reads the freshest applied/failure state.
-        self.fold_apply_completions();
+        // Completed apply transactions are folded at the TOP of
+        // `tick_session`, BEFORE `decision` (this function's own
+        // parameter) is computed — not here. SR-1c2 found the ordering bug
+        // this avoids: folding only here meant a just-learned gate refusal
+        // could not affect the SAME tick's already-computed `decision`
+        // (still naming the just-refused entry), causing exactly one
+        // extra, otherwise-avoidable re-dispatch of an entry already known
+        // to be excluded before the NEXT tick's fresh `unavailable` finally
+        // caught up. Folding first means `decision` itself already
+        // reflects the freshest state.
         let Some(supervisor) = &self.supervisor else {
             return;
         };
@@ -673,6 +703,24 @@ impl SessionRuntime {
                     self.yield_to_foreign();
                     eprintln!("event=playlist.apply_yielded detail={detail}");
                 }
+                // SR-1c2: the scene capability gate refused this entry
+                // (blocking-missing required capability, or the inspector
+                // itself refused the content) — never a generic failure.
+                // Recording the id in `gate_refused_ids` (read by
+                // `unavailable_for`) is what makes the NEXT tick's decision
+                // route around it, exactly the way a crash-quarantined id
+                // already is — the playlist advances instead of retrying a
+                // refusal that cannot resolve itself. No backoff/failure
+                // count: this is not a transient condition apply_backoff's
+                // doubling delay would help with, and never wedges/stops
+                // the playlist (decision (a)).
+                Err(ApplyError::CapabilityGate { missing, .. }) => {
+                    self.gate_refused_ids.insert(wallpaper_id.clone());
+                    eprintln!(
+                        "event=playlist.entry_gate_refused wallpaper={wallpaper_id} missing={}",
+                        missing.join(",")
+                    );
+                }
                 Err(error) => {
                     self.apply_failures = self.apply_failures.saturating_add(1);
                     let delay = apply_backoff(self.apply_failures);
@@ -730,10 +778,14 @@ impl SessionRuntime {
 
     /// Resets the apply state (playlist switch, deactivation, or the active
     /// playlist disappearing): the new session's first decision applies
-    /// immediately.
+    /// immediately. Also clears `gate_refused_ids` (SR-1c2): a fresh
+    /// playlist activation deserves a fresh gate evaluation rather than
+    /// carrying forward a refusal recorded for a different playlist's
+    /// (coincidentally same-id) entry.
     fn reset_apply(&mut self) {
         self.applied_wallpaper = None;
         self.reset_backoff();
+        self.gate_refused_ids.clear();
     }
 
     /// Persists the active runtime's snapshot if the given decision changed
@@ -772,6 +824,13 @@ impl SessionRuntime {
 
     fn tick_session(&mut self) {
         self.refresh_quarantine();
+        // Fold any completed apply transaction from the worker FIRST
+        // (moved here in SR-1c2, see `maybe_apply`'s doc comment) so BOTH
+        // the `unavailable` set below (gate-refused/quarantined ids) and
+        // the decision computed from it already reflect the freshest
+        // state this tick — not just the verdict maybe_apply computes
+        // from them afterward.
+        self.fold_apply_completions();
         let Some(playlist_id) = self.active.clone() else {
             return;
         };
@@ -1480,6 +1539,12 @@ mod tests {
         remaining_failures: Arc<std::sync::atomic::AtomicU64>,
         remaining_busy: Arc<std::sync::atomic::AtomicU64>,
         remaining_yielded: Arc<std::sync::atomic::AtomicU64>,
+        /// SR-1c2: wallpaper ids this lane always refuses with
+        /// `ApplyError::CapabilityGate` (a fixed "missing" list, since the
+        /// tests using this only care about the session's exclusion/skip
+        /// behavior, not the gate's own classification — that is already
+        /// covered by `apply.rs`'s `scene_capability_gate` tests).
+        gate_refused: Arc<Mutex<BTreeSet<String>>>,
     }
 
     impl RecordingLane {
@@ -1489,12 +1554,22 @@ mod tests {
                 remaining_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 remaining_busy: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 remaining_yielded: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                gate_refused: Arc::new(Mutex::new(BTreeSet::new())),
             }
         }
 
         fn failing(self, failures: u64) -> Self {
             self.remaining_failures
                 .store(failures, std::sync::atomic::Ordering::SeqCst);
+            self
+        }
+
+        /// Always refuses `ids` with `ApplyError::CapabilityGate` (SR-1c2).
+        fn gate_refusing(self, ids: &[&str]) -> Self {
+            self.gate_refused
+                .lock()
+                .unwrap()
+                .extend(ids.iter().map(|id| id.to_string()));
             self
         }
 
@@ -1532,6 +1607,15 @@ mod tests {
                 wallpaper_id.clone(),
                 playlist_entries.clone(),
             ));
+            if self.gate_refused.lock().unwrap().contains(&wallpaper_id) {
+                return Err(ApplyError::CapabilityGate {
+                    detail: "scene requires capabilities this build does not implement: \
+                             fake.missing.capability"
+                        .into(),
+                    missing: vec!["fake.missing.capability".into()],
+                    inspection_reason: None,
+                });
+            }
             if self
                 .remaining_failures
                 .fetch_update(
@@ -2272,6 +2356,51 @@ mod tests {
             lane.calls().iter().all(|(_, id, _)| id == "2"),
             "quarantined entry 1 must never reach the lane: {:?}",
             lane.calls()
+        );
+    }
+
+    /// SR-1c2 (i): a gate-refused entry is SKIPPED and the playlist
+    /// advances to the next entry — unlike a pre-known quarantine, the
+    /// gate's refusal is discovered REACTIVELY (the lane is asked for
+    /// entry 1 once, refuses with `ApplyError::CapabilityGate`), and only
+    /// THEN is entry 1 excluded from the next decision, exactly the way a
+    /// crash-quarantined entry already is (`unavailable_for`). No renderer
+    /// is ever started for entry 1: `RecordingLane` never touches the
+    /// supervisor, so the real supervisor here stays Idle throughout —
+    /// the only apply that reaches "success" state is entry 2's.
+    #[test]
+    fn entry_gate_refused_is_skipped_and_the_playlist_advances() {
+        let (_service, supervisor) = idle_supervisor();
+        let lane = RecordingLane::new().gate_refusing(&["1"]);
+        let session = PlaylistSessionService::start(config_with(
+            temporary_state_dir("gate-refused-skip"),
+            &["1", "2", "3"],
+            supervisor,
+            None,
+            Some(Arc::new(lane.clone())),
+        ));
+        let handle = session.handle();
+        handle.put(daily_playlist()).unwrap();
+        handle.activate(Some("daily".into())).unwrap();
+
+        // Entry 1 is attempted once (reactive discovery), refused, then
+        // excluded — the decision moves on to entry 2 without ever
+        // retrying entry 1.
+        let (_, wallpaper_id, _) = wait_for_apply(&lane, "2");
+        assert_eq!(wallpaper_id, "2", "gate-refused entry 1 must be skipped");
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            lane.calls().iter().filter(|(_, id, _)| id == "1").count(),
+            1,
+            "gate-refused entry 1 must be attempted exactly once, never retried: {:?}",
+            lane.calls()
+        );
+        // Diagnosable via the session status the same way a quarantined
+        // entry already is (SR-1c2 decision (b)).
+        let status = handle.status().unwrap();
+        assert!(
+            status.unavailable_ids.iter().any(|id| id == "1"),
+            "a gate-refused entry must show up as unavailable: {status:?}"
         );
     }
 
