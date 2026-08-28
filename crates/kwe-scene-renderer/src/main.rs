@@ -41,6 +41,7 @@ mod particlefile;
 mod particles;
 mod scene;
 mod scene_ir_adapter;
+mod shader_helper;
 mod shaderpre;
 mod text;
 mod textures;
@@ -203,6 +204,25 @@ struct Arguments {
     /// layers only resolve against assets the scene itself carries.
     #[arg(long = "assets-dir")]
     assets_dir: Option<PathBuf>,
+    /// SR-3b: the killable shader-compile helper binary
+    /// (`kwe-shader-compiler`, `docs/SHADER_HELPER_PROTOCOL_V1.md`).
+    /// Absent -> resolved beside this renderer's own executable (mirrors
+    /// how the daemon resolves its own worker binaries); if that also
+    /// fails, every material shader compile falls back to the in-thread
+    /// path unchanged (decision (c): the helper can only ever make things
+    /// slower, never break rendering — zero behavior change in this
+    /// slice, decision (a)).
+    #[arg(long = "shader-helper")]
+    shader_helper: Option<PathBuf>,
+    /// Wall-clock bound on one helper request/response exchange.
+    #[arg(
+        long = "shader-helper-timeout-ms",
+        default_value_t = shader_helper::DEFAULT_TIMEOUT_MS,
+        value_parser = clap::value_parser!(u64).range(
+            shader_helper::MIN_TIMEOUT_MS..=shader_helper::MAX_TIMEOUT_MS
+        )
+    )]
+    shader_helper_timeout_ms: u64,
 }
 
 fn try_memory_pressure(mib: Option<u64>) -> Result<(), ()> {
@@ -361,7 +381,9 @@ fn media_command_for(playback: &str) -> Option<video::MediaCommand> {
 }
 
 /// Toggle O_NONBLOCK on one standard descriptor inherited from the daemon.
-fn set_nonblocking(fd: libc::c_int) -> Result<()> {
+/// `pub(crate)`: also used by `shader_helper.rs` (SR-3b) for the same
+/// nonblocking-pipe-drain pattern against the helper's own stdout/stderr.
+pub(crate) fn set_nonblocking(fd: libc::c_int) -> Result<()> {
     // SAFETY: `fd` is a standard descriptor of this process; fcntl on it is
     // always safe for our own descriptors.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -1013,6 +1035,14 @@ fn main() -> Result<()> {
     //     failure the layer keeps drawing through the S1 base-texture
     //     quad above (texture_ok already covers it) — this step only ever
     //     ADDS the material pipeline on top, never removes drawability.
+    // SR-3b: one ShaderHelper client for the whole process, constructed
+    // lazily-in-effect (nothing spawns until the first material actually
+    // needs a compile — see compile_one_material) but resolved here once,
+    // before the only call site that can ever need it.
+    let shader_helper = shader_helper::ShaderHelper::new(
+        arguments.shader_helper.clone(),
+        arguments.shader_helper_timeout_ms,
+    );
     let (material_ok, ffb_snapshot_layers) = compile_material_layers(
         &mut config.layers,
         &mut renderer,
@@ -1023,6 +1053,7 @@ fn main() -> Result<()> {
         &content,
         arguments.assets_dir.as_deref(),
         config.resolution,
+        &shader_helper,
     );
 
     // 5b. M3f: particle-system textures (slot MAX_LAYERS + system_index).
@@ -2544,6 +2575,7 @@ fn compile_one_material(
     fallback_reasons: &mut std::collections::BTreeMap<&'static str, usize>,
     unsupported_uniform_names: &mut std::collections::BTreeSet<String>,
     preprocess_failed_detail: &mut std::collections::BTreeSet<String>,
+    shader_helper: &shader_helper::ShaderHelper,
 ) -> Option<CompiledMaterial> {
     let shader_name = material.shader.as_deref().or_else(|| {
         *fallback_reasons.entry("no_shader_name").or_insert(0) += 1;
@@ -2627,6 +2659,17 @@ fn compile_one_material(
         blend_mode.variant_index(),
     );
 
+    // SR-3b decision (a): ask the helper first, but its outcome changes
+    // NOTHING about what happens next -- every path (including the
+    // reserved, not-yet-constructed `Compiled` variant) falls through to
+    // the SAME in-thread `compile_stage` call unconditionally. `compile`
+    // itself already logs its own outcome (bounded, once per class); this
+    // slice does nothing else with the result. SR-3c consumes `Compiled`
+    // here instead of ignoring it.
+    let _ = shader_helper.compile(&shader_helper::ShaderCompileRequest {
+        stage: materialshader::Stage::Vertex,
+        source: &vertex_pre.source,
+    });
     let vertex_spirv = match materialshader::compile_stage(
         &vertex_pre.source,
         materialshader::Stage::Vertex,
@@ -2648,6 +2691,11 @@ fn compile_one_material(
             return None;
         }
     };
+    // SR-3c consumes Compiled here instead of ignoring it.
+    let _ = shader_helper.compile(&shader_helper::ShaderCompileRequest {
+        stage: materialshader::Stage::Fragment,
+        source: &fragment_pre.source,
+    });
     let fragment_spirv = match materialshader::compile_stage(
         &fragment_pre.source,
         materialshader::Stage::Fragment,
@@ -2846,6 +2894,9 @@ fn compile_material_layers(
     // used to decide whether a passthrough layer with a resolved effect
     // chain is scene-covering (see the `base_passthrough` block below).
     scene_resolution: Option<(u32, u32)>,
+    // SR-3b: threaded down to every `compile_one_material` call site
+    // (base material + each effect pass) — see that function's own doc.
+    shader_helper: &shader_helper::ShaderHelper,
 ) -> (Vec<bool>, Vec<usize>) {
     let mut material_ok = vec![false; layers.len()];
     // S5: layer indices whose final bound material samples
@@ -3065,6 +3116,7 @@ fn compile_material_layers(
                 &mut fallback_reasons,
                 &mut unsupported_uniform_names,
                 &mut preprocess_failed_detail,
+                shader_helper,
             )
         else {
             continue;
@@ -3167,6 +3219,7 @@ fn compile_material_layers(
                     &mut effect_fallback_reasons,
                     &mut unsupported_uniform_names,
                     &mut preprocess_failed_detail,
+                    shader_helper,
                 )
             else {
                 continue;

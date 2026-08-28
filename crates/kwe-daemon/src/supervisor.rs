@@ -131,6 +131,16 @@ pub struct SupervisorConfig {
     /// scene model layers then only resolve against assets the scene
     /// itself carries (pkg entries / its own directory).
     pub scene_assets_dir: Option<PathBuf>,
+    /// SR-3b: `kwe-shader-compiler` (SR-3a's killable shader-compile
+    /// helper), passed to the scene worker as `--shader-helper` when set
+    /// — resolved beside the daemon's own executable
+    /// (`default_shader_helper_path`, main.rs), same pattern as
+    /// `default_inspector_path`. `None` when `current_exe()` fails; the
+    /// flag is simply omitted in that case (the renderer's OWN sibling-
+    /// resolution fallback then applies, so this is a belt-and-suspenders
+    /// default, not the only path to a working helper). Scene kind only —
+    /// no other renderer kind ever compiles a material shader.
+    pub shader_helper_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -1187,6 +1197,15 @@ impl SupervisorRuntime {
             && let Some(assets_dir) = &self.config.scene_assets_dir
         {
             command.arg("--assets-dir").arg(assets_dir);
+        }
+        // SR-3b: the killable shader-compile helper, scene kind only.
+        // Absent -> the flag is simply omitted (the renderer's own
+        // sibling-resolution fallback still applies; see
+        // `shader_helper::ShaderHelper::new`, kwe-scene-renderer).
+        if spec.kind == RendererKind::Scene
+            && let Some(shader_helper) = &self.config.shader_helper_path
+        {
+            command.arg("--shader-helper").arg(shader_helper);
         }
         if let Some(count) = spec.stderr_lines {
             command.arg("--stderr-lines").arg(count.to_string());
@@ -2764,6 +2783,7 @@ mod tests {
                 (RendererKind::Scene, limits),
             ]),
             scene_assets_dir: None,
+            shader_helper_path: None,
         }
         .validate()
         .unwrap()
@@ -2864,6 +2884,86 @@ mod tests {
             "exit stderr must be folded into the failure detail: {detail}"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// SR-3b: `--shader-helper <path>` is passed for `RendererKind::Scene`
+    /// only — a Video-kind spawn (or any other kind) never gets it, even
+    /// with `shader_helper_path` configured. Proven by spawning a REAL
+    /// (fake) renderer that dumps its own argv to a file, the same
+    /// technique the other `spawn_worker` tests in this module use for
+    /// exit/stderr behavior.
+    #[test]
+    fn shader_helper_flag_is_passed_for_scene_kind_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Each kind gets its own isolated root/runtime -- spawning two
+        // kinds against the same runtime would engage canary/handoff
+        // machinery unrelated to this test's own question (which argv a
+        // fresh spawn gets), so this stays a single spawn per runtime,
+        // matching every other `spawn_worker` test in this module.
+        fn run_one(root: &Path, kind: RendererKind, shader_helper_path: Option<PathBuf>) -> String {
+            fs::create_dir_all(root).unwrap();
+            let argv_dump = root.join("argv.txt");
+            let script = root.join("argv-dump-renderer");
+            fs::write(
+                &script,
+                format!("#!/bin/sh\necho \"$@\" > {}\nexit 3\n", argv_dump.display()),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let mut config = validated_config(root);
+            config.renderer_paths = BTreeMap::from([(kind, script)]);
+            config.shader_helper_path = shader_helper_path;
+            let config = config.validate().unwrap();
+            let (store, state) = StateStore::open(root.join("state")).unwrap();
+            let mut runtime = SupervisorRuntime::new(
+                config,
+                store,
+                state,
+                GrantStore::open(&root.join("state")).unwrap(),
+            );
+            let spec = StartSpec {
+                wallpaper_id: "431960-123".into(),
+                content_hash: "abc123".into(),
+                width: 160,
+                height: 90,
+                fps: 30,
+                kind,
+                content: None,
+                test_fault: None,
+                stderr_lines: None,
+                scaling: ScalingMode::Aspect,
+                capability_limitations: Vec::new(),
+            };
+            let _worker = runtime.spawn_worker(spec).unwrap();
+            for _ in 0..200 {
+                if let Ok(contents) = fs::read_to_string(&argv_dump) {
+                    return contents;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {} to appear", argv_dump.display());
+        }
+
+        let scene_root = temporary_directory("shader-helper-flag-scene");
+        let helper_path = scene_root.join("kwe-shader-compiler");
+        fs::create_dir_all(&scene_root).unwrap();
+        fs::write(&helper_path, b"x").unwrap();
+        let scene_argv = run_one(&scene_root, RendererKind::Scene, Some(helper_path.clone()));
+        assert!(
+            scene_argv.contains(&format!("--shader-helper {}", helper_path.display())),
+            "scene kind must get --shader-helper: {scene_argv}"
+        );
+        fs::remove_dir_all(&scene_root).unwrap();
+
+        let video_root = temporary_directory("shader-helper-flag-video");
+        let video_argv = run_one(&video_root, RendererKind::Video, Some(helper_path));
+        assert!(
+            !video_argv.contains("--shader-helper"),
+            "video kind must never get --shader-helper even when configured: {video_argv}"
+        );
+        fs::remove_dir_all(&video_root).unwrap();
     }
 
     #[test]

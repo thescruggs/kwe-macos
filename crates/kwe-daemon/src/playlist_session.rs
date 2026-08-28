@@ -1712,6 +1712,7 @@ mod tests {
                 (crate::supervisor::RendererKind::Scene, limits),
             ]),
             scene_assets_dir: None,
+            shader_helper_path: None,
         }
     }
 

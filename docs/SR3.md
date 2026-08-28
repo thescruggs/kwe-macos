@@ -280,3 +280,268 @@ STOP findings:           None. No STOP condition was named for this task,
                          documented above) rather than left ambiguous.
 Commit(s):               31b2c10
 ```
+
+## SR-3b — worker-side helper spawn/containment/reaping (zero behavior change)
+
+Filed after SR-2c2's investigation (docs/SR2.md) closed the frame-
+divergence build blocker, trunk `9271cbf`.
+
+Conductor decisions (verbatim):
+
+- **(a)** This slice wires the plumbing only. The renderer spawns
+  `kwe-shader-compiler`, sends a real kind-16 request for each material-
+  shader compile, receives the skeleton's `unimplemented` response, and
+  FALLS BACK to today's in-thread compile path — so every scene renders
+  byte-identically to trunk. SR-3c flips the first family to actually use
+  helper results.
+- **(b)** Helper lifecycle in this slice: spawn-per-request (one-shot,
+  matching the skeleton's serial contract), lazily on first shader
+  compile, never on scenes without material shaders. Spawn cost is
+  amortization work for SR-3c's measurement — recorded again as an open
+  question below (same one SR-3a already recorded).
+- **(c)** Failure policy: ANY helper problem (missing binary, spawn
+  failure, protocol error, timeout, crash) → log one bounded stderr line
+  and fall back in-thread. The helper can only ever make things slower in
+  this slice, never break rendering.
+
+```text
+Task:            Wire a real client for SR-3a's shader-compile helper into
+                 the renderer (spawn/containment/reaping, a real kind-16
+                 request per material compile) with ZERO behavior change:
+                 every outcome falls through to the existing in-thread
+                 compile path unconditionally.
+Milestone/Slice: SR-3b
+Goal:            Prove the helper is REACHABLE and SAFE (a real process
+                 spawned, contained, and always reaped, under a real
+                 renderer worker's constraints) before SR-3c makes
+                 rendering actually depend on its answer -- the same
+                 "plumbing before behavior" staging SR-1b (report FD
+                 wiring) used ahead of SR-1c's policy.
+Outcome:         New crates/kwe-scene-renderer/src/shader_helper.rs:
+                 ShaderHelper{path: Option<PathBuf>, timeout: Duration,
+                 + 4 AtomicBool log-dedup flags} and ShaderCompileRequest
+                 {stage, source}. compile(&self, &request) -> HelperOutcome
+                 spawns a FRESH helper process per call (decision (b)),
+                 writes one kind-16 frame, closes stdin (so the helper
+                 observes the clean EOF its own one-request contract
+                 expects), drains stdout/stderr nonblocking under a
+                 deadline (mirrors kwe-daemon::inspect::supervise's loop
+                 shape exactly), and classifies the result. Containment,
+                 adapted from kwe-daemon::inspect's one-shot supervision
+                 for a RENDERER WORKER (not the daemon) spawning ITS OWN
+                 child: no setpgid (plan SS4.3 -- the helper stays in the
+                 renderer's own process group so the daemon's existing
+                 group-kill already covers it; this is also why this
+                 module's timeout-kill uses kill(pid, ...) directly, never
+                 kill(-pid, ...), which would signal the renderer itself);
+                 PR_SET_PDEATHSIG SIGKILL + a parent-pid check;
+                 PR_SET_NO_NEW_PRIVS; env_clear() + HOME only (copied from
+                 the renderer's own environment -- no PATH, the helper is
+                 invoked by explicit path and execs nothing itself); a
+                 STRICTER pre_exec rlimit floor than the renderer's own
+                 (address space 512 MiB, file size 16 MiB, 32 open files;
+                 RLIMIT_NPROC deliberately left unset/inherited -- the
+                 renderer has no way to know the daemon's configured
+                 process-count budget, so guessing a number risks being
+                 MORE permissive than the daemon's own floor). Timeout
+                 kill is SIGTERM, a 200ms grace, then SIGKILL (a fake
+                 helper that ignores SIGTERM is still reaped -- tested).
+                 HelperOutcome{Unimplemented, ProtocolError(String),
+                 Unavailable(String), Timeout, Compiled{spirv, response}
+                 (reserved for SR-3c, never constructed this slice)}. One
+                 bounded stderr diagnostic per outcome CLASS per process
+                 (4 AtomicBool flags on ShaderHelper, not per-compile).
+                 Integration point (task's own STOP condition did not
+                 trigger -- exactly one choke point exists):
+                 main.rs's compile_one_material, the SOLE production
+                 caller of materialshader::compile_stage for BOTH stages
+                 (verified: every OTHER compile_stage call site in the
+                 repo is #[cfg(test)]). shaderpre::preprocess has ALREADY
+                 spliced every #include into vertex_pre.source/
+                 fragment_pre.source by the time compile_one_material
+                 reaches this point, so the wire request's own
+                 includes/combos/defines fields are always sent empty --
+                 documented explicitly, since a FUTURE caller (there is
+                 none yet) that has NOT already spliced would need to
+                 populate them instead. shader_helper.compile(...) is
+                 called immediately before EACH compile_stage call
+                 (vertex, then fragment); its result is discarded (`let _
+                 = ...`) with a `// SR-3c consumes Compiled here instead
+                 of ignoring it` marker at each site -- compile_stage's
+                 own call, arguments, and error handling are completely
+                 untouched. ShaderHelper is constructed ONCE in main()
+                 and threaded by shared reference through
+                 compile_material_layers (new trailing parameter) into
+                 compile_one_material (new trailing parameter) -- 2 levels
+                 of threading, both call sites of compile_one_material
+                 updated identically (the base-material path and the
+                 effect-pass path).
+                 New CLI flags: --shader-helper <path> (absent -> resolved
+                 beside the renderer's own executable via current_exe(),
+                 mirroring kwe-daemon::main::default_inspector_path
+                 EXACTLY, including NOT exists()-checking the sibling
+                 path -- an actually-missing binary is discovered via
+                 Command::spawn's own ENOENT, classified Unavailable, the
+                 same way a misconfigured explicit --shader-helper is);
+                 --shader-helper-timeout-ms (default 10000, bounded
+                 100..=30000, kwe_report_protocol-analogous constants
+                 exported from shader_helper.rs).
+                 Daemon: SupervisorConfig gains shader_helper_path:
+                 Option<PathBuf>, resolved by a new
+                 default_shader_helper_path() (byte-for-byte the same
+                 shape as default_inspector_path -- sibling of the
+                 DAEMON's own executable) and overridable by a new daemon
+                 CLI flag --shader-helper (mirroring the existing
+                 --inspector/--renderer-scene precedent: every daemon-
+                 managed binary path is overridable). spawn_worker passes
+                 --shader-helper <path> to the child ONLY for
+                 RendererKind::Scene (proven by a new test spawning a
+                 fake argv-dumping renderer for both Scene and Video
+                 kinds with the SAME configured helper path -- Scene gets
+                 the flag, Video never does). Confirmed (not assumed):
+                 RendererKind::Scene is NOT run inside bwrap by the
+                 daemon -- only RendererKind::Web's own chromium child
+                 gets bwrap sandboxing (supervisor.rs's --allow-network/
+                 bwrap handling is gated on RendererKind::Web
+                 specifically) -- so there is no sandbox boundary this
+                 helper spawn needs to additionally cross.
+                 packaging/PKGBUILD already installs kwe-shader-compiler
+                 (SR-3a) -- nothing to add here.
+In scope:        crates/kwe-scene-renderer/src/shader_helper.rs (new),
+                 crates/kwe-scene-renderer/src/main.rs (mod, 2 new CLI
+                 flags, ShaderHelper construction + threading through
+                 compile_material_layers/compile_one_material, the two
+                 compile() call sites, set_nonblocking widened to
+                 pub(crate) for reuse), crates/kwe-scene-renderer/
+                 Cargo.toml (kwe-report-protocol path dependency, no new
+                 external crate), crates/kwe-daemon/src/supervisor.rs
+                 (SupervisorConfig.shader_helper_path, the spawn_worker
+                 arg, 1 new test, 3 test-fixture field additions),
+                 crates/kwe-daemon/src/main.rs (--shader-helper flag,
+                 default_shader_helper_path, wired into the production
+                 SupervisorConfig, 3 test-fixture field additions),
+                 crates/kwe-daemon/src/playlist_session.rs (1 test-
+                 fixture field addition), docs/SR3.md (this section).
+Out of scope:    Any real shaderc/spirv consumption of a helper response
+                 (SR-3c's own scope -- Compiled is reserved, never
+                 constructed). The long-lived serial-loop question
+                 (decision (b), recorded again below -- SR-3a already
+                 deferred it, still deferred). Reflection/cache (SR-3d/
+                 SR-3e). A genuinely preemptive PDEATHSIG test (documented
+                 -only, per the task's own allowance -- see
+                 shader_helper.rs's own module doc for why: it would
+                 require killing the test harness process itself).
+Acceptance tests:        kwe-scene-renderer: 8 new shader_helper.rs
+                         tests -- valid unimplemented response (fake
+                         python helper, KWR1 over stdin/stdout);
+                         garbage response -> ProtocolError, not a panic;
+                         a hung fake helper -> Timeout, reaped
+                         (kill(pid,0) fails afterward) within
+                         deadline+grace; a fake that IGNORES SIGTERM
+                         still dies to SIGKILL (proves the escalation
+                         path actually reaches SIGKILL, not just that a
+                         plain hang eventually times out); a missing
+                         binary path, and a helper with no path at all
+                         (current_exe-resolution-equivalent) -> both
+                         Unavailable; the fallback-equivalence proof
+                         (decision (a)'s central claim, proven not
+                         assumed): materialshader::compile_stage's OWN
+                         output is byte-identical whether ShaderHelper is
+                         configured-but-missing (--shader-helper
+                         /nonexistent) or entirely unconfigured (no
+                         flag); the real-binary path, spawning the ACTUAL
+                         compiled kwe-shader-compiler (via a target-dir
+                         path convention this test introduces, since
+                         cross-crate CARGO_BIN_EXE does not exist --
+                         skips gracefully with a printed note if the
+                         binary was not already built, mirroring this
+                         repo's other opt-in/skip-if-prerequisite-missing
+                         tests) and confirming it answers Unimplemented --
+                         proving this module's wire client and SR-3a's
+                         own binary genuinely agree on the protocol, not
+                         just against fake scripts.
+                         kwe-daemon: 1 new supervisor.rs test --
+                         --shader-helper is passed for RendererKind::Scene
+                         only, proven against a real (fake) spawned
+                         renderer that dumps its own argv, for BOTH Scene
+                         and Video kinds with the SAME configured helper
+                         path (two isolated runtimes, avoiding any
+                         canary/handoff interaction between the two
+                         spawns -- not the same runtime spawning twice).
+                         922 workspace tests total, up from 913.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 922 passed, 0 failed.
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> cargo test
+                         -p kwe-scene-renderer ir_parity_corpus --
+                         --ignored -- "60/60 item(s) parity-passed"
+                         (unchanged -- this slice touches no scene-
+                         parsing code).
+                         ./scripts/check.sh -- exit 0, green end-to-end.
+                         scripts/smoke-scene.sh -- every case passes
+                         unchanged, INCLUDING every material-shader-
+                         dependent oracle (S2/S3/S4/S5a/S5b) -- the
+                         strongest available proof that decision (a)'s
+                         "zero behavior change" claim holds in practice,
+                         not just in unit tests: these oracles assert
+                         exact pixel values that would move if the
+                         compile_one_material integration point changed
+                         anything observable.
+Failure/recovery tests:  Every HelperOutcome variant except the reserved
+                         Compiled has a dedicated test (garbage/timeout/
+                         SIGTERM-ignored/missing-binary/no-path); the
+                         fallback-equivalence test IS the "zero behavior
+                         change" failure/recovery proof the task asked
+                         for, since it exercises the SAME code path a
+                         real helper failure would (Unavailable) and
+                         confirms it changes nothing downstream.
+Upstream/provenance:    Original; the containment shape is a direct,
+                         cited adaptation of kwe-daemon::inspect's own
+                         SR-0b/SR-1b precedent (not a new design) --
+                         explicitly adapted for a renderer-worker-spawns-
+                         its-own-child shape rather than copied verbatim,
+                         with every departure (no setpgid, no separate
+                         HOME dir, stricter/narrower rlimits, HOME-only
+                         env) documented at the point it differs.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 922 passed, 0 failed.
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> ir_parity_
+                         corpus -- 60/60 parity-passed.
+                         ./scripts/check.sh -- exit 0.
+                         scripts/smoke-scene.sh -- all cases passed.
+Open risks:              The long-lived serial-loop question (decision
+                         (b)) is STILL unresolved -- SR-3a recorded it
+                         first, this slice's own spawn-per-request client
+                         is what SR-3c will actually measure spawn cost
+                         against once it has a real compile to time.
+                         RLIMIT_NPROC is left unset for the helper
+                         (documented above) -- a build with an extremely
+                         tight daemon-configured process budget gets
+                         whatever ceiling the renderer itself inherited,
+                         not a stricter helper-specific one; closing this
+                         would need the daemon to pass its own
+                         RendererResourceLimits down to the renderer
+                         (new plumbing, out of scope here).
+                         The PDEATHSIG mechanism itself is proven by
+                         precedent (the identical call already works in
+                         kwe-daemon::inspect production) rather than by a
+                         test in THIS module (documented-only, per the
+                         task's own allowance) -- a genuinely orphaned-
+                         helper scenario has never been directly observed
+                         under test for this specific spawn site.
+STOP findings:           None -- the task's own STOP condition (no single
+                         compile choke point, or the renderer already
+                         holding shaderc state that makes a pre-compile
+                         helper call structurally awkward) did not
+                         trigger: compile_one_material is the single,
+                         easily-verified choke point (grepped every
+                         compile_stage call site in the repo; every one
+                         outside this function is #[cfg(test)]), and
+                         `shaderc::Compiler` is a lazily-initialized,
+                         stateless-per-call OnceLock the helper call sits
+                         cleanly beside rather than inside.
+Commit(s):               (fill in after commit)
+```

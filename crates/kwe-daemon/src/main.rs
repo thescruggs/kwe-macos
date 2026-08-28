@@ -104,6 +104,15 @@ struct Arguments {
     /// `{"outcome":"unknown","reason":"timeout"}`.
     #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(100..=30_000))]
     inspector_wall_timeout_ms: u64,
+    /// SR-3b: killable shader-compile helper executable (default:
+    /// kwe-shader-compiler beside the daemon), passed to every scene
+    /// worker as `--shader-helper`. Missing/unconfigured is NOT a failure
+    /// (unlike `--inspector`): the flag is simply omitted, and the scene
+    /// renderer's own sibling-resolution fallback still applies — the
+    /// helper can only ever make rendering slower, never break it
+    /// (decision (c)).
+    #[arg(long = "shader-helper")]
+    shader_helper: Option<PathBuf>,
     /// Wallpaper Engine assets root (S1), passed to the scene worker and
     /// to scene preflight so model layers can resolve their material
     /// textures. Default: the first existing
@@ -420,6 +429,10 @@ fn main() -> Result<()> {
         web_heartbeat_max_failures: arguments.renderer_web_heartbeat_max_failures,
         resource_limits_by_kind,
         scene_assets_dir: scene_assets_dir.clone(),
+        shader_helper_path: arguments
+            .shader_helper
+            .clone()
+            .or_else(default_shader_helper_path),
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -1545,6 +1558,19 @@ fn default_inspector_path() -> Option<PathBuf> {
     Some(directory.join("kwe-scene-inspector"))
 }
 
+/// Default `kwe-shader-compiler` binary beside the daemon executable
+/// (SR-3a/SR-3b). Same "allowed to resolve to `None`" shape as
+/// `default_inspector_path` — a daemon that cannot resolve its own
+/// executable path should still start, and a scene worker simply gets no
+/// `--shader-helper` flag (its own sibling-resolution fallback still
+/// applies; decision (c) means an unavailable helper never breaks
+/// rendering either way).
+fn default_shader_helper_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-shader-compiler"))
+}
+
 fn default_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path).join("kwe"));
@@ -1752,6 +1778,7 @@ mod tests {
                 (RendererKind::Scene, limits),
             ]),
             scene_assets_dir: None,
+            shader_helper_path: None,
         })
         .unwrap()
     }
@@ -2860,6 +2887,7 @@ with open(args.output, "wb") as frame:
                 (RendererKind::Scene, limits),
             ]),
             scene_assets_dir: None,
+            shader_helper_path: None,
         }
     }
 
@@ -4340,6 +4368,7 @@ args = parser.parse_args()
                 (RendererKind::Scene, limits),
             ]),
             scene_assets_dir: None,
+            shader_helper_path: None,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

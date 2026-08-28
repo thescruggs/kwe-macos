@@ -452,6 +452,7 @@ dependencies = [
  "kwe-frame-protocol",
  "kwe-input-protocol",
  "kwe-mpv",
+ "kwe-report-protocol",
  "libc",
  "lz4_flex",
  "rquickjs",

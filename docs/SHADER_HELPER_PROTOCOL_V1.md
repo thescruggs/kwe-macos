@@ -39,7 +39,7 @@ Only the wire FORMAT (the 12-byte `KWR1` header, the codec crate, the
 philosophy (bounded, watchdog-guarded, killable) are shared. Nothing about
 report-FD's duplicate/late/missing POLICY (SR-1c) applies to this protocol;
 the shader helper's own policy is decision (c) below and whatever SR-3b's
-daemon-side wiring adds on top of it.
+renderer-side spawn/containment/reaping wiring adds on top of it.
 
 ## Wire format
 
@@ -269,17 +269,20 @@ hard guarantee:
   regardless. Closing that gap needs a genuinely preemptive mechanism (a
   second thread, a signal, a `poll`/`select` with a timeout) this skeleton
   deliberately does not add.
-- **The daemon-side kill (SR-3b, not built yet) is the AUTHORITATIVE bound.**
-  This watchdog is exactly the same class of soft backstop
-  `kwe-scene-inspector`'s own `--max-wall-ms` already is for the daemon's
-  scene-inspection path — real protection against a truly hung child still
-  requires the parent process to hold the kill switch.
+- **The caller-side kill (SR-3b: `kwe-scene-renderer`'s own
+  `shader_helper.rs`, spawn-per-request, no `setpgid` — see below) is the
+  AUTHORITATIVE bound.** This watchdog is exactly the same class of soft
+  backstop `kwe-scene-inspector`'s own `--max-wall-ms` already is for the
+  daemon's scene-inspection path — real protection against a truly hung
+  child still requires the parent process to hold the kill switch.
 
 Expiry exits 64 SILENTLY — no response frame is attempted, on the reasoning
 that a process which has already blown its own time budget should not
 spend more of it constructing a response nobody may still be waiting to
 read (and the caller learns the outcome from the exit code / its own
-timeout regardless, once SR-3b wires that up).
+timeout regardless — SR-3b's client classifies this as `HelperOutcome::
+Timeout` either way, whether the watchdog fires first or the caller's own
+deadline does).
 
 ## SR-3a skeleton scope
 
@@ -289,8 +292,22 @@ structurally valid request gets `{"status": "unimplemented", "reason":
 "skeleton"}`. No `shaderc` dependency exists in `kwe-shader-compiler` yet —
 SR-3c is the slice that decides how (and whether) `shaderc` reaches this
 crate, migrates the first real preprocessing family through it, and starts
-actually emitting kind-18 SPIR-V chunks. SR-3b is the daemon-side spawn/
-containment/reaping wiring (this skeleton has no daemon caller yet — every
-test in this slice drives the compiled binary directly via
+actually emitting kind-18 SPIR-V chunks. SR-3b (built) is the first real
+caller: `kwe-scene-renderer`'s own `shader_helper.rs` spawns this binary
+per material-shader compile, contained the way a renderer worker can
+contain its own child (no `setpgid` — the helper stays in the renderer's
+process group so the daemon's existing group-kill already covers it; see
+`docs/SR3.md`'s SR-3b section for the full containment writeup), and
+FALLS BACK to the existing in-thread `shaderc` compile on every outcome
+this slice can produce (`unimplemented` included) — so trunk still
+renders byte-identically until SR-3c starts consuming a real `Compiled`
+response. The daemon itself never calls this binary directly; it only
+resolves `kwe-scene-renderer`'s sibling path and passes it down via
+`--shader-helper` for `RendererKind::Scene` workers, the same way it
+hands the renderer its other binary paths. Tests in THIS crate (SR-3a)
+still drive the compiled binary directly via
 `CARGO_BIN_EXE_kwe-shader-compiler`, the same pattern `kwe-daemon`'s own
-tests use to drive a real `kwe-scene-inspector` subprocess).
+tests use to drive a real `kwe-scene-inspector` subprocess;
+`kwe-scene-renderer`'s own tests additionally exercise the real binary
+cross-crate via a target-dir path convention (skip-with-note if not
+already built).

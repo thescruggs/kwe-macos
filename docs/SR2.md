@@ -1241,5 +1241,5 @@ STOP findings:           The entire slice IS the STOP finding: no scene-
                          `scripts/scene-corpus-byte-identity-sweep.sh`
                          against the same scene/binaries, run several
                          times).
-Commit(s):               (fill in after commit)
+Commit(s):               9271cbf
 ```
