@@ -22,6 +22,7 @@ mod sceneeffect;
 mod scenemodel;
 mod sceneobjects;
 mod texvheader;
+mod vfs;
 mod webpreflight;
 mod websandbox;
 
@@ -64,6 +65,7 @@ pub use sceneobjects::{
     classify_scene_object, scene_property_value, summarize_scene_objects,
     summarize_scene_objects_resolved,
 };
+pub use vfs::{AssetCategory, ResolvedAsset, ResolvedPath, Vfs, VfsCaps, VfsError, VfsSource};
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{
     WebSandboxCommand, chromium_command, sandbox_root, web_preview_command, web_renderer_command,
