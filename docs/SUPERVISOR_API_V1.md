@@ -576,19 +576,23 @@ typed IR becomes the eventual authority) may all still change.)*
     follow-up slice) fills an `inventoried` record's `required`/`detected`/
     `unknown` from a bounded raw walk of `scene.json`'s `objects[]` array:
     `detected` names each capability found (`scene.layer.image`,
-    `scene.layer.text`, `scene.particle`, `scene.layer.sound`,
-    `scene.lighting`, `scene.effects`, plus `scene.package` for a package
-    whose `scene.json` entry read successfully) with a count and a bounded,
-    sorted sample of logical object ids; `required` is the subset of those
-    capabilities carried by at least one *active* object (no `visible`
-    field, `visible: true`, or a property-bound `visible` value — WE's
-    user-property convention, resolved later by SR-11); `unknown` counts
-    every root/object key and shape this pass does not recognize, never
-    silently dropping one, with its own bounded sample list. Every list has
-    a `truncated` flag and the walk itself is bounded (4096 objects, a
-    wall-clock deadline checked periodically), both surfaced through
-    `bounds.limits_hit` (`objects-cap`, `timeout`) exactly like the other
-    caps above.
+    `scene.layer.video`, `scene.layer.text`, `scene.particle`,
+    `scene.layer.sound`, `scene.lighting`, `scene.effects`, plus
+    `scene.package` for a package whose `scene.json` entry read
+    successfully — even when its content then failed to parse) with a count
+    and a bounded, sorted sample of logical object ids; `required` is the
+    subset of those capabilities carried by at least one *active* object (no
+    `visible` field, `visible: true`, or a property-bound `visible` value —
+    WE's user-property convention, resolved later by SR-11) — except
+    `scene.package`, which `required` always carries for a package whose
+    entry read successfully: the container format is unconditionally
+    required to render a pkg scene at all, independent of any object's
+    visibility; `unknown` counts every root/object key and shape this pass
+    does not recognize, never silently dropping one, with its own bounded
+    sample list. Every list has a `truncated` flag and the walk itself is
+    bounded (4096 objects, a wall-clock deadline checked periodically),
+    both surfaced through `bounds.limits_hit` (`objects-cap`, `timeout`)
+    exactly like the other caps above.
 - No renderer worker state is touched by `scene.inspect`; it shares nothing
   with the active/candidate worker the rest of this document describes.
 

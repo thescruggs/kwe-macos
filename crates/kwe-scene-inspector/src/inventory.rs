@@ -140,10 +140,13 @@ const ROOT_KEYS: &[&str] = &["general", "objects"];
 /// `blendMode`/`colorBlendMode` (aliases), `brightness`, `size`,
 /// `tint`/`color` (aliases), `image`, `effects`, `text`, `font`,
 /// `pointsize`, `video`, `loop`, `rate`, `instanceoverride`, `particle`.
-/// `model`, `sound`, and `light` are not read by any parser in this
-/// workspace yet (no model/sound/light object support has landed), but
-/// this SR-0c task names them directly as classification discriminators
-/// (§1) — they are included here as known so an object using one is never
+/// `image`, `video`, `particle`, and `text` are also this table's
+/// classification discriminators (`walk_object`, in exactly
+/// `classify_scene_object`'s priority order). `model`, `sound`, and
+/// `light` are not read by any parser in this workspace yet (no
+/// model/sound/light object support has landed), but this SR-0c task
+/// names them directly as classification discriminators too (§1) — they
+/// are included here as known so an object using one is never
 /// double-counted as *both* a detected capability *and* an unknown key.
 /// SR-2's typed IR replaces this table with the parser itself as
 /// authority.
@@ -325,15 +328,16 @@ impl<'a> Builder<'a> {
 
         let id = logical_id(object, index, self.caps.max_sample_path_bytes);
 
-        // Discriminating-field classification (mirrors
-        // `kwe_core::sceneobjects::classify_scene_object`'s priority
-        // order: image first, then particle, then text; this SR-0c slice
-        // additionally names sound/light, not yet classified anywhere else
-        // in this workspace, after those. `video` is deliberately not a
-        // discriminator here — the task's §1 discriminator list omits it,
-        // so `scene.layer.video` detection is out of this slice's scope.
+        // Discriminating-field classification, in EXACTLY
+        // `kwe_core::sceneobjects::classify_scene_object`'s priority order:
+        // image, then video, then particle, then text. This SR-0c slice
+        // additionally names sound/light after those — kwe-core does not
+        // classify either yet, so there is no existing priority to match;
+        // they stay last.
         let primary = if object.contains_key("image") || object.contains_key("model") {
             Some("scene.layer.image")
+        } else if object.contains_key("video") {
+            Some("scene.layer.video")
         } else if object.contains_key("particle") {
             Some("scene.particle")
         } else if object.contains_key("text") {
@@ -483,7 +487,8 @@ mod tests {
                 {"id": 7, "image": "textures/a.png", "visible": true},
                 {"name": "caption", "text": "hi", "visible": false},
                 {"name": "sparks", "particle": {"texture": "t.png"}, "effects": [{"name": "glow"}]},
-                {"name": "mystery"}
+                {"name": "mystery"},
+                {"name": "clip", "video": "a.mp4"}
             ]
         }"#;
         let inv = inventory(json);
@@ -510,11 +515,18 @@ mod tests {
         assert_eq!(effects.count, 1);
         assert_eq!(effects.objects, vec!["index:2".to_string()]);
 
+        // R1 review: `video` with no `visible` field defaults to active, so
+        // it lands in both `detected` and `required`.
+        let video = detected_ids(&inv, "scene.layer.video").expect("video detected");
+        assert_eq!(video.count, 1);
+        assert_eq!(video.objects, vec!["index:4".to_string()]);
+
         assert_eq!(
             inv.required,
             vec![
                 "scene.effects".to_string(),
                 "scene.layer.image".to_string(),
+                "scene.layer.video".to_string(),
                 "scene.particle".to_string(),
             ],
             "the visible:false text object must not appear in required"

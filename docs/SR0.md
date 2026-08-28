@@ -208,34 +208,50 @@ Outcome:         New crates/kwe-scene-inspector/src/inventory.rs: parses scene.j
                  parser in this workspace already reads on an objects[i] entry, plus
                  sound/light/model — this SR-0c task's own named discriminators,
                  not yet read by any parser elsewhere). Classifies each object by a
-                 discriminating field in kwe_core::sceneobjects's priority order
-                 (image/model > particle > text > sound > light), independently adds
-                 scene.effects for any object with a non-empty effects array, and
-                 counts an object with none of those as unknown.objects. `required`
-                 collects capabilities from active objects only (no visible field, or
-                 visible:true; a property-bound (object-valued) visible counts as
-                 active per WE's user-property convention, deferring resolution of
-                 the bound value to SR-11). Unknown root/object keys and type
-                 mismatches (root not an object, objects not an array, a non-object
-                 entry) are counted, never dropped, with a bounded top-K-smallest
-                 sample-path list (max_samples 16, max_sample_path_bytes 128) kept
-                 memory-bounded regardless of how many candidates are offered.
-                 max_objects_walked (4096) and a wall-clock deadline (checked every
-                 256 objects) both stop the walk early and mark every affected list
-                 truncated, adding "objects-cap"/"timeout" to limits_hit.
+                 discriminating field in EXACTLY kwe_core::sceneobjects's priority
+                 order (image/model > video > particle > text; sound and light —
+                 not classified anywhere else in this workspace — stay last),
+                 independently adds scene.effects for any object with a non-empty
+                 effects array, and counts an object with none of those as
+                 unknown.objects. `required` collects capabilities from active
+                 objects only (no visible field, or visible:true; a property-bound
+                 (object-valued) visible counts as active per WE's user-property
+                 convention, deferring resolution of the bound value to SR-11).
+                 Unknown root/object keys and type mismatches (root not an object,
+                 objects not an array, a non-object entry) are counted, never
+                 dropped, with a bounded top-K-smallest sample-path list
+                 (max_samples 16, max_sample_path_bytes 128) kept memory-bounded
+                 regardless of how many candidates are offered. max_objects_walked
+                 (4096) and a wall-clock deadline (checked every 256 objects) both
+                 stop the walk early and mark every affected list truncated, adding
+                 "objects-cap"/"timeout" to limits_hit.
                  main.rs wiring: after a successful hash, JsonDir re-reads the same
                  scene.json file bounded to max_bytes (simplest-correct, per the
                  task); Pkg locates and bounded-reads the scene.json entry through
                  kwe-core's real PkgReader/scene_json_entry/MAX_SCENE_JSON_BYTES (the
                  exact sequence kwe-scene-renderer's load_scene and kwe-core's
                  preflight_pkg both already use — no new pkg parser), adding
-                 scene.package to detected on a successful entry read (even when the
-                 bytes then fail to parse as JSON) and answering
-                 incompatible/parse-error with limits_hit "pkg-no-scene-json" when
-                 the entry is missing/unreadable, or "pkg-scene-json-oversize" when
-                 it exceeds the 16 MiB cap. A JSON syntax failure is the one error
-                 inventory_scene_json reports itself (parse-error); every other
-                 malformed shape is counted, never rejected.
+                 scene.package to BOTH detected and required on a successful entry
+                 read (even when the bytes then fail to parse as JSON — the entry
+                 was still read, and rendering it would still require scene.package;
+                 the pkg container format is unconditionally required independent
+                 of any object's visibility, docs/SCENE_CAPABILITIES.md's
+                 scene.package taxonomy row) and answering incompatible/parse-error
+                 with limits_hit "pkg-no-scene-json" when the entry is
+                 missing/unreadable (scene.package never appears there — no entry
+                 was read), or "pkg-scene-json-oversize" when it exceeds the 16 MiB
+                 cap. A JSON syntax failure is the one error inventory_scene_json
+                 reports itself (parse-error); every other malformed shape is
+                 counted, never rejected.
+                 Review fix (R1/R2, one follow-up commit): R1 — `video` was missing
+                 as a classification discriminator; the original SR-0c task's own
+                 §1 field list omitted it (an oversight, not the intentional
+                 materials-style narrowing this task's Open risks originally
+                 guessed it might be — see Commit(s)), unlike kwe_core::sceneobjects
+                 real classifier, which does detect it. Added at the SAME priority
+                 position that classifier gives it (between image and particle).
+                 R2 — scene.package was only in detected, not required; fixed as
+                 described above.
 In scope:        crates/kwe-scene-inspector/src/inventory.rs (new),
                  crates/kwe-scene-inspector/src/main.rs (wiring),
                  crates/kwe-scene-inspector/Cargo.toml (new kwe-core path
@@ -251,9 +267,11 @@ Out of scope:    Materials (deferred, see the conductor note above); any referen
 Acceptance tests:        crates/kwe-scene-inspector/src/inventory.rs (9): golden
                          (one visible image object with id, one visible:false text
                          object, one particle object with a non-empty effects array,
-                         one unclassifiable object, one unknown root key — exact
-                         detected counts/ids; required has scene.layer.image,
-                         scene.particle, scene.effects but NOT scene.layer.text);
+                         one unclassifiable object, one visible video object, one
+                         unknown root key — exact detected counts/ids; required has
+                         scene.layer.image, scene.layer.video, scene.particle,
+                         scene.effects but NOT scene.layer.text — updated by the
+                         R1 review fix to add the video object/assertions);
                          same input twice is byte-identical (Inventory PartialEq);
                          objects-not-an-array is an unknown type, not a parse
                          failure; 4096+50 objects stops the walk at the cap with
@@ -268,18 +286,27 @@ Acceptance tests:        crates/kwe-scene-inspector/src/inventory.rs (9): golden
                          the objects cap; sound/light classify and are never
                          double-counted as unknown keys; a non-object objects[]
                          entry is skipped and counted, never a parse failure.
-                         crates/kwe-scene-inspector/src/main.rs (+5, 19 total in the
-                         crate): a JsonDir scene populates required/detected/unknown
-                         in the actual emitted record; malformed scene.json is
-                         incompatible/parse-error with content.hash still populated
-                         (hashing ran before the inventory parse did); build_record
-                         given identical inputs (including two independently-run
-                         Inventory walks) produces byte-identical records including
-                         the digest, isolated from bounds.wall_ms's real run-to-run
-                         variance; a pkg carrying scene.json with one image object
-                         detects both scene.package and scene.layer.image; a pkg
-                         with no scene.json entry is incompatible/parse-error with
-                         limits_hit ["pkg-no-scene-json"].
+                         crates/kwe-scene-inspector/src/main.rs (+1 new test, plus
+                         assertions added to two existing ones; 20 total in the
+                         crate after the review fix): a JsonDir scene populates
+                         required/detected/unknown in the actual emitted record;
+                         malformed scene.json is incompatible/parse-error with
+                         content.hash still populated (hashing ran before the
+                         inventory parse did); build_record given identical inputs
+                         (including two independently-run Inventory walks) produces
+                         byte-identical records including the digest, isolated from
+                         bounds.wall_ms's real run-to-run variance; a pkg carrying
+                         scene.json with one image object detects scene.package and
+                         scene.layer.image in BOTH detected and required (R2 review
+                         fix: required assertion added); a pkg with no scene.json
+                         entry is incompatible/parse-error with limits_hit
+                         ["pkg-no-scene-json"] and neither detected nor required
+                         carries scene.package (R2 review fix: boundary assertion
+                         added); new (R2 review fix)
+                         pkg_with_unparseable_scene_json_still_requires_scene_package
+                         — a pkg whose scene.json entry reads but is not valid JSON
+                         still answers incompatible/parse-error with required ==
+                         detected == ["scene.package"] alone.
                          Full existing suites stay green: cargo test --workspace,
                          cargo clippy --workspace --all-targets -D warnings,
                          cargo fmt --all --check, ./scripts/check.sh. The daemon's
@@ -297,9 +324,10 @@ Upstream/provenance:     Original; the object-classification priority order mirr
 Commands run and results: cargo fmt --all -- clean.
                          cargo clippy --workspace --all-targets -- -D warnings --
                          clean.
-                         cargo test --workspace -- 776 passed, 0 failed
-                         (kwe-scene-inspector 19, up from 5; kwe-daemon 158,
-                         unchanged).
+                         cargo test --workspace -- 777 passed, 0 failed
+                         (kwe-scene-inspector 20 after the R1/R2 review fix, up
+                         from 19 at the first SR-0c commit and 5 at the SR-0b
+                         skeleton; kwe-daemon 158, unchanged).
                          ./scripts/check.sh -- green end-to-end, including the
                          C++/QML build, qml-typecheck, kwe diagnose, and
                          kwe-vulkan --json.
@@ -331,14 +359,16 @@ Open risks:              The task's literal entry-point signature
                          it does not (serde_json's built-in recursion guard rejects
                          it before this module ever sees it). The test asserts the
                          actual, safer-than-expected behavior instead.
-                         `video` is not a classification discriminator in this
-                         slice (the task's §1 list omits it, unlike
-                         `kwe_core::sceneobjects`'s own classifier, which does
-                         detect video objects) — an object with only a `video` field
-                         currently falls to unknown.objects here. Left as specified;
-                         flagged in case this was an oversight rather than an
-                         intentional narrowing alongside materials.
-Commit(s):               <filled after commit; same commit as this file>
+                         RESOLVED by the R1 review fix: `video` was missing as a
+                         classification discriminator (the task's §1 list omitted
+                         it, unlike `kwe_core::sceneobjects`'s own classifier, which
+                         does detect video objects), and this doc flagged it in
+                         case it was an oversight rather than an intentional
+                         narrowing alongside materials. The conductor confirmed it
+                         was an oversight; `video` is now a discriminator, inserted
+                         at the same priority position (between `image` and
+                         `particle`) `classify_scene_object` gives it.
+Commit(s):               1783148, <filled after the R1/R2 review-fix commit>
 ```
 
 ## SR-0d — Private corpus metadata runner

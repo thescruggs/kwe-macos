@@ -482,7 +482,13 @@ fn package_only_inventory(is_pkg: bool) -> Inventory {
 }
 
 /// Adds `scene.package` (count 1, no object ids) to `detected`, keeping it
-/// sorted by capability id like the walk's own output.
+/// sorted by capability id like the walk's own output. R2 review: also adds
+/// it to `required` — the pkg container format is unconditionally required
+/// to render a pkg scene at all, independent of any object's visibility
+/// (docs/SCENE_CAPABILITIES.md's `scene.package` taxonomy row) — so this
+/// runs on the parse-error path too (`package_only_inventory`): the pkg
+/// itself was still read even when its `scene.json` content then failed to
+/// parse.
 fn add_scene_package(inventory: &mut Inventory) {
     inventory.detected.push(DetectedCapability {
         capability: "scene.package",
@@ -493,6 +499,18 @@ fn add_scene_package(inventory: &mut Inventory) {
     inventory
         .detected
         .sort_by_key(|capability| capability.capability);
+    if !inventory
+        .required
+        .iter()
+        .any(|capability| capability == "scene.package")
+    {
+        let position = inventory
+            .required
+            .partition_point(|existing| existing.as_str() < "scene.package");
+        inventory
+            .required
+            .insert(position, "scene.package".to_string());
+    }
 }
 
 /// Serialize `record`, replacing it with a minimal `report-oversize` record
@@ -807,6 +825,36 @@ mod tests {
             capabilities.contains(&"scene.layer.image"),
             "{capabilities:?}"
         );
+        // R2 review: the pkg container format is unconditionally required
+        // to render a pkg scene, independent of any object's visibility.
+        assert_eq!(
+            record["required"],
+            json!(["scene.layer.image", "scene.package"])
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// R2 review: a pkg whose `scene.json` entry reads successfully but is
+    /// not valid JSON still requires `scene.package` — the entry was read,
+    /// only its content failed to parse.
+    #[test]
+    fn pkg_with_unparseable_scene_json_still_requires_scene_package() {
+        let dir = temp_dir("pkg-unparseable");
+        let pkg_path = dir.join("scene.pkg");
+        fs::write(&pkg_path, build_pkg(&[("scene.json", b"{not json")])).unwrap();
+
+        let record = inspect_input(&pkg_path, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        assert_eq!(record["outcome"], "incompatible", "{record}");
+        assert_eq!(record["reason"], "parse-error");
+        assert_eq!(record["required"], json!(["scene.package"]));
+        let capabilities: Vec<&str> = record["detected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["capability"].as_str().unwrap())
+            .collect();
+        assert_eq!(capabilities, vec!["scene.package"]);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -831,6 +879,11 @@ mod tests {
                 .unwrap()
                 .starts_with("sha256:")
         );
+        // R2 review boundary: no entry was ever read, so — unlike
+        // `pkg_with_unparseable_scene_json_still_requires_scene_package` —
+        // `scene.package` never appears here at all.
+        assert_eq!(record["required"], json!([]));
+        assert_eq!(record["detected"], json!([]));
 
         fs::remove_dir_all(&dir).unwrap();
     }
