@@ -363,6 +363,11 @@ format, and safe-mode restore contract are documented in
   `{"output", "mode": "assignment"|"stock", "wallpaper_plugin",
   "image"}`. Always succeeds on a real output.
 - `wallpaper.assignments` — the full bounded assignment store. No params.
+  Each record: `{"wallpaper_id", "kind", "content", "width", "height",
+  "fps", "scaling", "capability_limitations", "applied_at_unix_seconds",
+  "previous"}` — `capability_limitations` (SR-1c3) is the tolerated-missing
+  capability ids the SR-1c gate found on that apply, `[]` when none or for
+  a non-scene kind; see the SR-1c gate section below for how it is set.
 
 Error responses (all fail closed; detail is bounded): `invalid_params`,
 `apply_unknown_wallpaper`, `apply_incompatible`, `output_missing`,
@@ -419,10 +424,20 @@ capability ids:
   - Otherwise the apply proceeds; `limitations` (possibly empty when
     non-empty) rides along on the success result as `"limitations":
     [...]` and is mirrored into that apply's `renderer.status` as
-    `capability_limitations` — the same "transient per-slot field"
-    mechanism `scaling`/`fps` already use. Not persisted into the
-    assignment in this slice (open risk: invisible again after a daemon
-    restart until a later slice).
+    `capability_limitations`. **SR-1c3 (2026-08-28):** also persisted into
+    the assignment record itself (`capability_limitations`, additive
+    `#[serde(default)]` field — an old record without it loads with an
+    empty list), so `wallpaper.assignments` reports it even for an output
+    the daemon has not re-rendered since a restart (SR-1c's own recorded
+    open risk, now closed). Rebuilt fresh on every successful apply, never
+    merged: a later fully-compatible apply on the same output replaces the
+    prior list with an empty one. Assignments themselves are still NOT
+    auto-reapplied on daemon start (only the playlist session's own
+    restart-restore does that, through the real transaction, which
+    recomputes this field the normal way) — the persisted field's job here
+    is purely so a client reading `wallpaper.assignments` can show the
+    right notice for a wallpaper that is still "assigned" per the store
+    even before anything re-renders.
 - Inspection outcome `incompatible` (the inspector itself refuses the
   content: parse-error/oversize/unrecognized-input) → also
   `apply_incompatible`, with `{"missing": [], "inspection_reason":

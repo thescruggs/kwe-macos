@@ -129,6 +129,18 @@ pub struct Assignment {
     /// before F1 read back as `aspect`, the only behaviour they had.
     #[serde(default)]
     pub scaling: ScalingMode,
+    /// SR-1c3: the SR-1c gate's tolerated-missing capability ids for this
+    /// scene, exactly like `StartSpec`/`WorkerStatus.capability_limitations`
+    /// (SR-1c/SR-1e) — persisted here so the notice survives a daemon
+    /// restart (SR-1's recorded "limitations not persisted" open risk).
+    /// Additive: records written before SR-1c3 read back as an empty list,
+    /// same pattern as `scaling` above. Always non-scene-kind empty; a
+    /// fully-supported scene (or a re-apply after the missing capability
+    /// ships) also writes an empty list here, replacing whatever a PRIOR
+    /// apply on this output recorded — the whole `Assignment` is rebuilt
+    /// fresh on every successful apply, never merged.
+    #[serde(default)]
+    pub capability_limitations: Vec<String>,
     pub applied_at_unix_seconds: u64,
     pub previous: Option<PreviousWallpaper>,
 }
@@ -2039,6 +2051,12 @@ impl ApplyHandle {
             height: spec.height,
             fps: spec.fps,
             scaling: spec.scaling,
+            // SR-1c3: both lanes already set spec.capability_limitations
+            // from the shared scene_capability_gate outcome before
+            // complete_apply runs (SR-1c/SR-1c2) — this single call site
+            // is shared by ApplyHandle::apply and PlaylistApplyLane::
+            // apply_playlist, so persisting it here covers both for free.
+            capability_limitations: spec.capability_limitations.clone(),
             applied_at_unix_seconds: unix_seconds(),
             previous: Some(previous),
         };
@@ -2682,6 +2700,7 @@ mod tests {
             height: 540,
             fps: 30,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
             applied_at_unix_seconds: 1_787_188_979,
             previous: Some(PreviousWallpaper {
                 wallpaper_plugin: "org.kde.image".into(),
@@ -2806,6 +2825,33 @@ mod tests {
         let store = AssignmentStore::open(&root).unwrap();
         assert!(store.all().is_empty());
         assert_eq!(invalid_siblings(&root).len(), 6);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// SR-1c3: `capability_limitations` is additive (`#[serde(default)]`,
+    /// same pattern F1's `scaling` established) — a record written before
+    /// this slice (neither field present) must still load, with both
+    /// defaulting: `scaling` to `aspect` (its own pre-existing default) and
+    /// `capability_limitations` to an empty list, never a quarantine.
+    #[test]
+    fn old_records_without_capability_limitations_load_with_an_empty_list() {
+        let root = temporary_directory("legacy-limitations");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(ASSIGNMENTS_FILE),
+            r#"{"schema_version":1,"outputs":{"DP-1":{"wallpaper_id":"a","kind":"scene","content":"/x","width":960,"height":540,"fps":30,"applied_at_unix_seconds":1,"previous":null}}}"#,
+        )
+        .unwrap();
+        let store = AssignmentStore::open(&root).unwrap();
+        let assignment = store
+            .get("DP-1")
+            .expect("a legacy record must still load, not quarantine");
+        assert_eq!(assignment.scaling, ScalingMode::Aspect);
+        assert!(
+            assignment.capability_limitations.is_empty(),
+            "an old record without capability_limitations must load with an empty list, got {:?}",
+            assignment.capability_limitations
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

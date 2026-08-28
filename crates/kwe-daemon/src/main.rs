@@ -3007,6 +3007,19 @@ write_frame(1, payload)
     /// Seeds `store` with an assignment for `output_name` so a test can
     /// assert a refused apply leaves it untouched.
     fn seed_assignment(store: &mut apply::AssignmentStore, output_name: &str, wallpaper_id: &str) {
+        seed_assignment_with_limitations(store, output_name, wallpaper_id, &[]);
+    }
+
+    /// SR-1c3: like `seed_assignment`, but with an explicit
+    /// `capability_limitations` list — used to prove a later successful
+    /// apply REPLACES a prior record's limitations rather than merging or
+    /// leaving them stale.
+    fn seed_assignment_with_limitations(
+        store: &mut apply::AssignmentStore,
+        output_name: &str,
+        wallpaper_id: &str,
+        limitations: &[&str],
+    ) {
         store
             .set(
                 output_name,
@@ -3018,6 +3031,7 @@ write_frame(1, payload)
                     height: 180,
                     fps: 30,
                     scaling: ScalingMode::Aspect,
+                    capability_limitations: limitations.iter().map(|s| s.to_string()).collect(),
                     applied_at_unix_seconds: 1,
                     previous: None,
                 },
@@ -3118,6 +3132,92 @@ write_frame(1, payload)
             status.capability_limitations,
             vec!["scene.layer.sound".to_string()]
         );
+    }
+
+    /// SR-1c3: `capability_limitations` is persisted into the assignment
+    /// (closing SR-1's "limitations not persisted" open risk) -- exposed
+    /// through `wallpaper.assignments`, and REPLACED (not merged/left
+    /// stale) by a later fully-compatible apply on the SAME output.
+    #[test]
+    fn scene_apply_persists_and_then_clears_capability_limitations_on_a_second_apply() {
+        let root = temp_dir("gate-persist-limitations");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let tolerated_inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector-tolerated.py",
+            &["scene.layer.image", "scene.layer.sound"],
+        );
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(tolerated_inspector), Duration::from_secs(5)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply must proceed: {result}");
+
+        // The RPC's own success result AND the persisted assignment both
+        // carry it.
+        let (ok, assignments) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(
+            assignments["outputs"]["DP-1"]["capability_limitations"],
+            json!(["scene.layer.sound"]),
+            "wallpaper.assignments must expose the persisted limitations: {assignments}"
+        );
+
+        // A second apply on the SAME output, this time fully compatible
+        // (no tolerated-missing capability at all), must REPLACE the
+        // stored list with an empty one -- never merge, never leave the
+        // prior apply's notice stale.
+        let compatible_inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector-compatible.py",
+            &["scene.layer.image"],
+        );
+        let handle = handle.with_inspect_config(sr1c_inspect_config(
+            &root,
+            Some(compatible_inspector),
+            Duration::from_secs(5),
+        ));
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "second apply must proceed: {result}");
+        assert!(
+            result.get("limitations").is_none(),
+            "a fully-compatible apply must not carry a limitations note: {result}"
+        );
+        let (ok, assignments) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(
+            assignments["outputs"]["DP-1"]["capability_limitations"],
+            json!([]),
+            "the second, fully-compatible apply must CLEAR the prior limitations, not leave them stale: {assignments}"
+        );
+        let status = supervisor.status().unwrap();
+        assert!(status.capability_limitations.is_empty());
     }
 
     #[test]
@@ -3410,6 +3510,15 @@ write_frame(1, payload)
         assert_eq!(
             status.capability_limitations,
             vec!["scene.layer.sound".to_string()]
+        );
+        // SR-1c3: the playlist lane persists it too -- complete_apply is
+        // shared by both lanes, so this is exercised by construction, not
+        // a lane-specific special case.
+        let assignments = handle.assignments().unwrap();
+        assert_eq!(
+            assignments["outputs"]["DP-1"]["capability_limitations"],
+            json!(["scene.layer.sound"]),
+            "the playlist lane must persist capability_limitations too: {assignments}"
         );
     }
 
@@ -4154,6 +4263,7 @@ args = parser.parse_args()
                         height: 180,
                         fps: 30,
                         scaling: ScalingMode::Aspect,
+                        capability_limitations: Vec::new(),
                         applied_at_unix_seconds: 1,
                         previous: None,
                     },
@@ -4454,6 +4564,7 @@ args = parser.parse_args()
                     height: 180,
                     fps: 30,
                     scaling: ScalingMode::Aspect,
+                    capability_limitations: Vec::new(),
                     applied_at_unix_seconds: 42,
                     previous: Some(apply::PreviousWallpaper {
                         wallpaper_plugin: "org.kde.image".into(),
@@ -4708,6 +4819,7 @@ args = parser.parse_args()
                     height: 180,
                     fps: 30,
                     scaling: ScalingMode::Aspect,
+                    capability_limitations: Vec::new(),
                     applied_at_unix_seconds: 1,
                     previous: None,
                 },

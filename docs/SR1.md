@@ -462,11 +462,17 @@ Commands run and results: cargo fmt --all -- clean.
                          ./scripts/smoke-scene-corpus.sh -- passed standalone.
                          ./scripts/check.sh -- green end-to-end, including the
                          C++/QML build and qml-typecheck.
-Open risks:              capability_limitations is transient (StartSpec/
+Open risks:              ~~capability_limitations is transient (StartSpec/
                          WorkerStatus only): a daemon restart loses it even
                          though the underlying scene is unchanged --
                          SR-1e/SR-11 territory (persist alongside the
-                         assignment).
+                         assignment).~~ RESOLVED by SR-1c3 (docs/SR1.md's
+                         SR-1c3 addendum) -- capability_limitations is now
+                         persisted into the assignment record itself and
+                         survives a restart via wallpaper.assignments (the
+                         daemon still does not auto-reapply a direct,
+                         non-playlist assignment on restart -- see SR-1c3
+                         for which of the two worlds this build is in).
                          No inspection cache (decision (c)): every scene
                          apply pays the inspection cost again, including a
                          plain retry -- acceptable at today's corpus timing
@@ -681,6 +687,184 @@ STOP findings:           None. The fold_apply_completions ordering bug
                          already owns self.inspect_config, self.
                          complete_apply, and old_assignment the same way
                          apply() does -- no new plumbing was needed).
+Commit(s):               d73934c
+```
+
+## SR-1c3 — persist capability_limitations into assignments
+
+A small follow-up slice closing SR-1's "limitations not persisted" open
+risk (restart visibility for the manager's limitations notice), filed
+after SR-1c2 merged (trunk `d73934c`).
+
+**Which world:** verified before writing any code (main.rs's `fn main()`
+has exactly one call site to `handle.apply(...)`, the `wallpaper.apply` RPC
+dispatch — nothing at daemon startup iterates the assignment store and
+re-applies anything). A direct, non-playlist `wallpaper.apply` assignment
+is **NOT auto-reapplied on daemon restart** — this slice does not change
+that and does not build one (the task's own explicit boundary). The
+PLAYLIST session is the one exception, and it already worked correctly
+before this slice: its own restart-restore mechanism (`playlist_session.rs`,
+unrelated to `AssignmentStore`, proven by the pre-existing
+`playlist_restart_restore_reapplies_the_entry_once` test) re-runs the REAL
+`apply_playlist` transaction on restore, which recomputes
+`capability_limitations` from a fresh gate call the normal way — so
+"persistence" in this slice is specifically about the DIRECT lane's
+assignment record: it makes `wallpaper.assignments` report the right
+notice for an output the daemon has not re-rendered since a restart, and
+lets a manual re-apply (or the playlist's own restore) re-derive it
+naturally, exactly as the task specified.
+
+```text
+Task:            Persist capability_limitations into the assignment record
+                 (mirroring F1's scaling/F2's fps precedent exactly:
+                 additive #[serde(default)] field, old records load with
+                 the type's default) so wallpaper.assignments survives a
+                 daemon restart with the notice intact.
+Milestone/Slice: SR-1c3
+Goal:            Close SR-1's recorded "limitations not persisted" open
+                 risk without building an auto-reapply mechanism this
+                 slice never asked for.
+Outcome:         crates/kwe-daemon/src/apply.rs: Assignment gains
+                 capability_limitations: Vec<String> (#[serde(default)],
+                 same additive pattern as F1's scaling field immediately
+                 above it in the struct -- doc comment cites it
+                 explicitly). complete_apply (the ONE construction site
+                 shared by both ApplyHandle::apply and PlaylistApplyLane::
+                 apply_playlist -- SR-1c2 already made this shared) sets
+                 it from spec.capability_limitations.clone(), which both
+                 lanes already populate from the shared
+                 scene_capability_gate outcome (SR-1c/SR-1c2) before
+                 complete_apply runs -- covers both lanes for free, no
+                 lane-specific code needed. Because complete_apply always
+                 constructs a FRESH Assignment on every successful apply
+                 (store.set replaces, never merges), a later
+                 fully-compatible apply on the same output naturally
+                 replaces a prior non-empty list with an empty one --
+                 also for free, no explicit "clear" step needed.
+                 wallpaper.assignments (apply.rs's assignments()) already
+                 serializes the whole Assignment via serde, so the new
+                 field appears in the RPC response with zero additional
+                 code.
+                 6 pre-existing Assignment{...} struct-literal test
+                 fixtures across apply.rs/main.rs mechanically updated
+                 (Rust requires every field; #[serde(default)] only
+                 affects deserialization, not struct literals) --
+                 seed_assignment (main.rs) split into
+                 seed_assignment/seed_assignment_with_limitations so a new
+                 test can seed a NON-empty prior list and prove it gets
+                 replaced.
+                 Manager: audited whether kwe-manager consumes
+                 wallpaper.assignments for detail-page UI state today. It
+                 does not: ApplyClient::m_assignments (populated by
+                 refreshAssignments()) is exposed as a QVariantMap
+                 property but grep across every .qml file shows it is
+                 NEVER read -- WallpaperDetail.qml's limitations
+                 InlineMessage (the exact UI the task named) reads only
+                 rendererStatus.capabilityLimitations (a LIVE
+                 renderer.status poll), and its own existing code comment
+                 already named this precise gap ("capability_limitations
+                 is not persisted into the assignment, so a restart clears
+                 this notice"). Per the task's explicit branching
+                 instruction ("if the manager does NOT consume assignments
+                 there today, leave the UI alone and record the gap"), NO
+                 QML/C++ changes were made -- building new
+                 assignments-consumption plumbing was out of scope for
+                 this slice by the task's own words, and is recorded as an
+                 open risk below instead.
+In scope:        crates/kwe-daemon/src/apply.rs (Assignment field +
+                 complete_apply + 2 new tests + 1 fixture update),
+                 crates/kwe-daemon/src/main.rs (4 fixture updates,
+                 seed_assignment split, 2 new tests: one persist/clear
+                 round trip through the direct lane's RPC surface, one
+                 confirming the playlist lane persists it too),
+                 docs/SUPERVISOR_API_V1.md (the assignment record's field
+                 list + the SR-1c gate section's persistence note),
+                 docs/SR1.md (this section + SR-1c's/the epic-close open
+                 risk lines annotated resolved, not deleted).
+Out of scope:    Any daemon-side auto-reapply of a direct (non-playlist)
+                 assignment on restart -- verified NOT how this build
+                 works (see "Which world" above) and explicitly excluded
+                 by the task. Manager UI changes (see Outcome above -- the
+                 manager does not consume assignments for UI state today,
+                 so none were made; docs/SR1.md's open risk below records
+                 this as the natural next step if a future slice wants the
+                 InlineMessage to survive a restart in the UI too, not
+                 just in the RPC response). docs/Scene-Rendering-Plan.md's
+                 status line (left to the conductor per the task).
+Acceptance tests:        crates/kwe-daemon: 2 new apply.rs tests --
+                         old_records_without_capability_limitations_load_
+                         with_an_empty_list (a hand-written pre-SR-1c3
+                         JSON record, neither scaling nor
+                         capability_limitations present, loads without
+                         quarantine and both default correctly) plus the
+                         existing a_corrupt_file_is_quarantined_and_the_
+                         store_starts_fresh fixtures (which already omit
+                         both fields and already passed, now doubling as
+                         an implicit backward-compat proof). 2 new main.rs
+                         tests -- scene_apply_persists_and_then_clears_
+                         capability_limitations_on_a_second_apply (a
+                         tolerated-limitation apply, wallpaper.assignments
+                         shows it; a second, fully-compatible apply on the
+                         SAME output, wallpaper.assignments shows an empty
+                         list -- REPLACED, not merged, not stale) and an
+                         extension of scene_apply_gate_proceeds_with_a_
+                         tolerated_limitation_through_the_playlist_lane
+                         (asserts handle.assignments() carries it after a
+                         playlist-lane apply too). 182 kwe-daemon tests
+                         (up from 180). Full workspace count in Commands
+                         below.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 878 passed, 0
+                         failed.
+                         ./scripts/check.sh -- exit 0, green end to end.
+Failure/recovery tests:  old_records_without_capability_limitations_load_
+                         with_an_empty_list IS the failure/recovery case
+                         for this slice's own field (a legacy record must
+                         load, never quarantine, on the missing key) --
+                         covered above, not duplicated here.
+Upstream/provenance:    Original; the additive #[serde(default)] pattern
+                         is a direct, cited mirror of F1's own scaling
+                         field (apply.rs's Assignment struct, same doc-
+                         comment convention) -- no third-party source
+                         consulted.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 878 passed, 0
+                         failed.
+                         ./scripts/check.sh -- exit 0, green end-to-end.
+Open risks:              The manager's detail-page limitations InlineMessage
+                         still reads only the LIVE rendererStatus.
+                         capabilityLimitations poll, not applyClient.
+                         assignments -- so a user reopening the manager
+                         after a daemon restart (before anything
+                         re-renders) still will not SEE the notice in the
+                         UI, even though wallpaper.assignments now carries
+                         the data needed to show it. Closing this needs
+                         the manager to actually start consuming
+                         wallpaper.assignments for UI state, which it does
+                         not do anywhere today (a bigger change than this
+                         slice's own scope) -- a natural SR-1c4-shaped
+                         follow-up.
+                         Direct (non-playlist) assignments are still never
+                         auto-reapplied on daemon restart (confirmed, not
+                         changed, by this slice) -- the persisted field
+                         only helps a client that reads
+                         wallpaper.assignments; the actual renderer stays
+                         down until a client re-applies or the playlist
+                         session's own restore kicks in.
+                         SR-1c's other still-open risk (no inspection
+                         cache) is unchanged by this slice.
+STOP findings:           None. The task's own two forks (which
+                         auto-reapply world we are in; whether the manager
+                         consumes assignments today) were both resolved by
+                         direct verification (grep + reading main.rs's
+                         startup path; grep across every manager .qml
+                         file) before any code was written, exactly as the
+                         task asked -- no code-level STOP condition was
+                         named for this slice and none was found.
 Commit(s):               (fill in after commit)
 ```
 
@@ -1014,15 +1198,21 @@ adapter matrix for the one-shot inspector path documented and tested
 (SR-1d). Recorded open risks carried forward past the epic boundary, none
 of them silently dropped: **no inspection cache** (SR-1c decision (c) —
 every scene apply re-pays the inspection; corpus timing keeps this inside
-the apply window today, but a cache design is still open); **limitations
-not persisted** (capability_limitations/`limitations` is transient
-daemon- and manager-side; a restart loses the notice until the next
-apply — SR-1c and SR-1e both flag this at the point it matters);
+the apply window today, but a cache design is still open);
+~~**limitations not persisted**~~ (capability_limitations/`limitations`
+was transient daemon- and manager-side; a restart lost the notice until
+the next apply — SR-1c and SR-1e both flagged this at the point it
+mattered) — **RESOLVED by SR-1c3** (above): capability_limitations is now
+persisted into the assignment record and survives a restart via
+`wallpaper.assignments`, though the manager's own detail-page UI does not
+yet read that field (SR-1c3's own recorded gap: it never consumed
+`wallpaper.assignments` for UI state to begin with, so this slice did not
+wire new plumbing onto it — see SR-1c3's addendum);
 ~~**playlist lane ungated**~~ (`PlaylistApplyLane::apply_playlist` did not
 run the SR-1c gate — a playlist-driven advance onto a scene requiring an
 unimplemented capability was not refused the way a direct
 `wallpaper.apply` is, SR-1c's recorded gap) — **RESOLVED by SR-1c2**
-(below): the playlist lane now runs the identical, single-sourced gate;
+(above): the playlist lane now runs the identical, single-sourced gate;
 only the refusal's handling differs (skip-and-advance instead of a hard
 failure); and **render-report kind 2
 reserved but unused** (`docs/REPORT_PROTOCOL_V1.md`'s `SceneRenderReportV1`
@@ -1031,7 +1221,8 @@ frame kind, and the renderer-worker's own report-FD stream generally —
 landed in SR-1; SR-1c and SR-1d both scoped themselves away from it
 explicitly rather than silently missing it). None of these four risks
 block using what SR-1 shipped; each is a named, findable next step rather
-than an undocumented gap. One of the four (playlist lane ungated) is now
-closed by SR-1c2 (the addendum immediately below); its history is
-annotated above, not deleted, per this doc's standing convention for a
-closed risk. The other three remain open.
+than an undocumented gap. Two of the four (playlist lane ungated,
+limitations not persisted) are now closed by follow-up addenda (SR-1c2,
+SR-1c3, both above); their history is annotated above, not deleted, per
+this doc's standing convention for a closed risk. The other two (no
+inspection cache, render-report kind 2) remain open.
