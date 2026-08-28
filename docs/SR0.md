@@ -535,5 +535,24 @@ Open risks:              shellcheck was not available to verify the two new shel
                          scene.inspect (conductor scope decision 1) — it must never be
                          pointed at untrusted content, only the maintainer's own local
                          corpus.
-Commit(s):               <filled after commit; same commit as this file>
+Commit(s):               41cdc97
 ```
+
+Real-corpus run (conductor, 2026-08-28, local lab, metadata only): 92 items,
+60 inspected, all 60 `inventoried:ok`, 0 timeouts, 0 invalid reports, no
+limits hit; wall_ms median 406.5 / max 8541 (a 180 MB pkg hash), 1.42 GB
+total source bytes. Required histogram: scene.package 60, scene.layer.image
+60 (685 objects), scene.effects 48 (541), scene.particle 33 (315),
+scene.layer.sound 19, scene.layer.text 14; scene.layer.video and
+scene.lighting absent from this corpus. unknown.keys=5234 — top paths:
+root `camera` (60 items — matches the S7 orthogonalprojection root cause),
+`parallaxDepth` (48), `copybackground` (46), `locktransforms` (46),
+`solid` (39); unknown objects 20. Records under
+`~/.local/share/kwe/corpus/20260828-013020/` (uncommitted).
+
+## SR-0 epic status
+
+Complete 2026-08-28: SR-0a cbffa67; SR-0b ea88e72/97268f9/95f7f97; SR-0c
+1783148/4304b25; SR-0d 41cdc97 + the corpus baseline above. Next: SR-1
+(report protocols + capability/schema freeze — the freeze itself is the
+§11.3 maintainer decision, informed by the corpus unknown-key data).

@@ -4,7 +4,10 @@
 §11.1–.7 accepted with the plan's recommendations; per-slice dependency and
 provenance gates in §11.4–.5 still require their named per-slice approvals
 before dependent code merges). Work order: SR-0 first; S7d visual expansion
-stays paused per gate 7. SR-0 decomposition: `docs/SR0.md`.
+stays paused per gate 7. SR-0 decomposition: `docs/SR0.md` — **SR-0 complete
+2026-08-28** (inspector + object-family inventory + corpus baseline: 60/60
+local scenes inventoried, unknown-key data confirms the root `camera` gap in
+all 60). Next: SR-1; its capability/schema freeze is the §11.3 decision.
 
 **Baseline:** repository HEAD `93bae3b284d6221a7dd3b328eb12569edfa12524`, 2026-08-23.
 
