@@ -88,6 +88,15 @@ pub const MAX_TEXTURE_PIXELS: u64 = 16_777_216;
 /// Maximum decoder allocation in bytes (mirrors the web worker).
 pub const MAX_TEXTURE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum raw source bytes for one image file / package entry read.
+/// SR-2d: production resolution now reads through `kwe_core::VfsCaps`
+/// (`AssetCategory::Texture`'s own cap, which mirrors this SAME value —
+/// see `kwe_core::vfs`'s own `VfsCaps::default` doc comment); this
+/// constant's only remaining consumer is `kwe-scene-renderer::main`'s
+/// legacy/resolution-trace-oracle code (`#[cfg(test)]`), kept for the
+/// SR-2d corpus parity test's own "today's exact cap" reference — hence
+/// `#[allow(dead_code)]` rather than deletion, since a plain (non-test)
+/// build no longer has a production reader for it.
+#[allow(dead_code)]
 pub const MAX_TEXTURE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 /// Total decoded RGBA budget across all layers (256 MiB), so a scene full
 /// of 8192×8192 textures cannot push the worker past a bounded footprint.

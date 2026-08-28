@@ -1154,5 +1154,5 @@ Open risks:              entry_point remains fixed/not wire-configurable
                          RLIMIT_NPROC and the PDEATHSIG-by-precedent gap
                          (SR-3b's own open risks) are unchanged.
 STOP findings:           None. No STOP condition was named for this task.
-Commit(s):               (fill in after commit)
+Commit(s):               a7b3c4c
 ```

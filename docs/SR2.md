@@ -72,7 +72,7 @@ fall-through-on-any-failure behavior** — see "Vfs deviations" below.
 | Family | Confinement | Cap | Priority chain | Citation |
 |---|---|---|---|---|
 | Layer image (file scene) | Relative path; absolute/`..`/prefix components rejected; `root.join(reference).canonicalize()` must `starts_with(root)`; regular file only. No componentwise symlink check — a symlink that resolves back INSIDE root is tolerated (untested either way; analysis, not a proven behavior — no existing test builds that case). | `MAX_TEXTURE_SOURCE_BYTES` = 64 MiB (`textures.rs:91`) | scene dir only (this function IS the scene-dir lane) | `main.rs:1337-1371` (`resolve_layer_image`), test `main.rs:4858` |
-| Layer image (pkg scene, model/particle-file lookups) | pkg entry table first (see "pkg entry matching" below), else `resolve_layer_image` against the pkg's own parent dir, else against the assets root — SAME function, SAME rules as the row above, just given two different roots in turn. | Same 64 MiB, checked per source | pkg → pkg-parent-dir → assets root | `main.rs:1246-1261` (pkg entries), `main.rs:1262-1304` (model layers, particle files) |
+| Layer image (pkg scene, model/particle-file lookups) | pkg entry table first (see "pkg entry matching" below), else `resolve_layer_image` against the pkg's own parent dir, else against the assets root — SAME function, SAME rules as the row above, just given two different roots in turn. **[SR-2d correction — this row conflated two DIFFERENT closures at SR-2a's own citation, an error in the original table, not a later regression]**: this pkg→pkg-dir→assets-root THREE-source chain is what `load_model_textures`/`load_particle_file_definitions`'s pkg-lane closures do (`main.rs`, current: the `if let Ok(index) = kwe_core::image_entry(...) {...} if let Some(dir) = &pkg_dir {...} assets_dir.and_then(...)` chain). The PLAIN image-layer family (`load_layer_textures`/`load_particle_textures`, pkg lane) does NOT: it is `kwe_core::image_entry` + `read_entry_bounded` with a bare `?`, pkg table ONLY, no directory fallback at all — confirmed by direct reading of the current source (SR-2d's own `legacy_trace_texture_pkg_lane`/`legacy_trace_model_asset_pkg_lane` functions, `kwe-scene-renderer/src/main.rs`, keep this distinction explicit for exactly this reason). SR-2d's migration to the shared `Vfs` therefore WIDENS the plain-image pkg-lane family's breadth to the full three-source chain — a THIRD divergence beyond the two SR-2a named below, evidence-gated the same way (SR-2d's own resolution-trace corpus test: 60/60 real items, zero observed difference). | Same 64 MiB, checked per source | pkg → pkg-parent-dir → assets root for model/particle-file; **pkg table ONLY** for the plain image-layer family (until SR-2d) | `main.rs:1246-1261` (pkg entries), `main.rs:1262-1304` (model layers, particle files) |
 | Layer video | Relative path; absolute/`..`/prefix rejected (`video_candidate`, shared by both functions below); **production path** opens the leaf with `O_NOFOLLOW` (rejects a symlinked LEAF outright, whether or not it would resolve inside root), then canonicalizes + `starts_with(root)` (catches an escaping INTERMEDIATE symlinked dir — still tolerates one that stays inside root), then re-`fstat`s the canonical path and compares `(dev, ino)` against the already-open fd (TOCTOU: a file swapped between the open and the canonicalize is caught). A `#[cfg(test)]`-only mirror function skips the O_NOFOLLOW-open/dev-ino step and just canonicalizes + `starts_with` (documented in its own comment as weaker than production, kept only for tests/diagnostics). | `MAX_VIDEO_SOURCE_BYTES` = 160 MiB (`video.rs:70`), checked from metadata — the file is never read (libmpv opens the path) | scene dir only for file scenes; a pkg video is fully READ and extracted to a private worker-owned file (`extract_video`, a different operation — no "resolve to a pkg path" exists) | `video_candidate` `main.rs:3384-3410`; production `open_video_source` `main.rs:3447-3484`; test-only `resolve_layer_video` `main.rs:3416-3440`, test `main.rs:5084` |
 | Shader source | The SAME pkg → pkg-parent-dir → assets-root chain as model textures, via `kwe_core::confined_read` for the two directory steps (see "confined_read" row) and `kwe_core::image_entry` for the pkg step — `resolve_shader_reference` itself does no confinement of its own; it is a pure reference-rewrite layer (`workshop/<id>/<file>` → try the `zcompat/scene/shaders/<id>/<file>` redirect first, else `shaders/<reference>`) sitting IN FRONT OF that shared lookup. | `MAX_SHADER_SOURCE_BYTES` = 256 KiB (`main.rs:1862`) for the raw read; `materialshader::MAX_SHADER_TEXT_BYTES` = 256 KiB (`materialshader.rs:17`) is a SEPARATE cap on the fully preprocessed text — the two are deliberately equal today (`main.rs:1860`'s own doc comment), not the same constant. | pkg → pkg-parent-dir → assets root | `resolve_shader_reference` `main.rs:1882-1900`; the actual lookup closure `main.rs:2859-2874` |
 | Model / material (`scenemodel::resolve_model`/`resolve_material`) | Confinement is entirely the CALLER-supplied `AssetLookup` closure's job (`kwe-core` has no filesystem/package specifics of its own here) — in practice callers always compose it from `confined_read` (dir steps) + `kwe_core::asset_entry` (pkg step), i.e. the same chain as the row above. `resolve_model`/`resolve_material` themselves only bound the JSON parse. | `MAX_MODEL_JSON_BYTES` = 1 MiB (`scenemodel.rs:33`) for the model.json/material.json descriptor read itself; `MODEL_ASSET_READ_CAP` = 64 MiB (`scenemodel.rs:42`) is the generic per-file cap the CALLER's lookup closure applies to every step (JSON and `.tex` texture reads alike) — deliberately equal to `MAX_PKG_ENTRY_BYTES`/`MAX_TEXTURE_SOURCE_BYTES` per its own doc comment. | pkg → pkg-parent-dir → assets root (composed by the caller) | `scenemodel.rs:247-473` (`resolve_material`/`resolve_model`) |
@@ -1242,4 +1242,350 @@ STOP findings:           The entire slice IS the STOP finding: no scene-
                          against the same scene/binaries, run several
                          times).
 Commit(s):               9271cbf
+```
+
+## SR-2d — model/material/layer-image resolution through the confined VFS
+
+Filed as "the first VFS CALLER migration" after SR-3c2 merged, trunk
+`a7b3c4c`.
+
+Conductor decisions (verbatim):
+
+- **(a)** Scope: the lookup closures feeding `scenemodel::resolve_material`/
+  `resolve_model` plus `resolve_layer_image` in `kwe-scene-renderer`
+  construct their reads from `Vfs::resolve` instead of the ad-hoc pkg/dir/
+  assets chain. Fonts, scripts, video, shader includes stay legacy (later
+  children).
+- **(b)** The VFS's two deliberate strengthenings (componentwise symlink
+  rejection; found-is-authoritative, no silent fallthrough past a
+  matched-but-failed source) SHIP with this migration — accepted risk,
+  gated on evidence: the resolution-trace diff and render checks must show
+  ZERO corpus-visible change. If the corpus exercises either difference,
+  STOP and report the item + trace line.
+- **(c)** Caps: the `VfsCaps` defaults for these categories were set in
+  SR-2a from the legacy caps — the migration must not change any effective
+  byte limit (verify against the SR-2a semantics table; mismatch → STOP).
+
+```text
+Task:            Migrate the model/material/layer-image resolution family
+                 (three call paths: the model/particle-file lookup
+                 closures, and resolve_layer_image's own call sites) from
+                 the ad-hoc pkg/dir/assets chain to kwe_core::Vfs, with a
+                 resolution-trace oracle proving zero corpus-visible
+                 difference from the two deliberate VFS strengthenings
+                 SR-2a already shipped (componentwise symlink rejection,
+                 found-is-authoritative).
+Milestone/Slice: SR-2d
+Goal:            Prove the SR-2a VFS is production-ready for its first
+                 real caller family, empirically, not by inspection alone
+                 -- a resolution-trace oracle comparing the OLD chain and
+                 the NEW Vfs over every reference a real corpus scene
+                 touches, plus the existing render-level oracles
+                 (smoke-scene.sh, ir_parity_corpus) as a second,
+                 independent line of evidence.
+Outcome:         crates/kwe-scene-renderer/src/main.rs: load_scene builds
+                 ONE kwe_core::Vfs per lane per scene load -- file lane:
+                 Vfs::new(None, &root, assets_dir, VfsCaps::default());
+                 pkg lane: a SECOND, independently-opened PkgReader over
+                 the SAME content path (PkgReader is not Clone; `reader`
+                 above is still needed for the scene.json/script entries
+                 the Vfs does not touch -- re-opening re-runs
+                 PkgReader::open's own TOCTOU-safe validation a second
+                 time against the identical file, one extra open+parse
+                 per scene load, negligible next to the render loop this
+                 precedes) wrapped with Vfs::new(Some(vfs_pkg), pkg_root,
+                 assets_dir, VfsCaps::default()), pkg_root = the pkg's own
+                 parent directory (falls back to Path::new(".") if
+                 content.parent() is None, essentially unreachable since
+                 content was already opened as a real file moments
+                 earlier). All 8 of load_scene's pre-migration closures
+                 (4 families x 2 lanes) replaced by 2 new production
+                 functions: vfs_resolve_texture(vfs, reference) ->
+                 Result<Vec<u8>, String> (load_layer_textures/
+                 load_particle_textures, always AssetCategory::Texture)
+                 and vfs_resolve_model_asset(vfs, reference, top_level)
+                 -> Option<Vec<u8>> (load_model_textures/
+                 load_particle_file_definitions, category inferred per
+                 reference via infer_model_asset_category: ".tex" ->
+                 Texture; "materials/"-prefixed ".json" -> Model
+                 (AssetCategory::Model's own doc already covers BOTH
+                 model.json and material.json); otherwise the caller's
+                 own top_level, Model for the model family / Particle for
+                 the particle-file family). vfs_error_to_image_detail
+                 maps each VfsError variant onto a string preserving
+                 resolve_layer_image's own event=renderer.scene.
+                 layer_skip/particle_skip detail= vocabulary as closely
+                 as the differently-shaped error type allows -- see
+                 "Preserved error strings" below for the exact list.
+                 resolve_layer_image itself is UNCHANGED, now #[cfg(test)]
+                 (decision (a)'s own allowance) -- no longer called from
+                 production, kept as the canonical legacy reference the
+                 resolution-trace oracle diffs against (also still backs
+                 its own pre-existing unit tests unchanged).
+                 Resolution-trace oracle (new, all #[cfg(test)]): a
+                 TraceOutcome enum (Found{source,bytes}/NotFound/
+                 Error(class)) with a trace_line() method producing the
+                 task's exact "family reference -> source|NOTFOUND|
+                 error-class bytes=<n>" format; classify_vfs_result maps a
+                 Vfs::resolve outcome onto it; vfs_trace_texture/
+                 vfs_trace_model_asset are the VFS side; 4 legacy_trace_*
+                 functions (texture x{file,pkg} lane, model_asset
+                 x{file,pkg} lane) reproduce TODAY's exact pre-migration
+                 chains as standalone, directly-callable functions (not
+                 just inline closures) so the oracle can call each side
+                 independently for the same reference and diff the
+                 result. An #[ignore]d corpus test,
+                 vfs_resolution_trace_parity_corpus
+                 (KWE_VFS_TRACE_PARITY_DIR=<dir>, KWE_VFS_TRACE=<file>
+                 optionally dumps every traced line prefixed legacy:/
+                 vfs:), walks every scene.json/scene.pkg under the
+                 corpus, and for each layer image / particle material /
+                 model_ref / particle file_ref reference, drives BOTH
+                 paths: the flat texture family is one direct call per
+                 side; the model/particle-file family drives
+                 kwe_core::resolve_model/resolve_particle_file with a
+                 DUAL-TRACING lookup closure that traces both legacy and
+                 vfs at EVERY reference the real walk touches (model.json
+                 -> material.json -> .tex) and continues the walk on the
+                 VFS's own answer (the same answer production actually
+                 uses) -- so nested references get full coverage
+                 automatically, not just the top-level one. assets_dir is
+                 deliberately None for this test (see the test's own doc
+                 comment: this corpus is self-contained Workshop content,
+                 not a WE install tree; exercising a real assets root
+                 would only prove more "both NotFound" agreements, not
+                 stronger coverage of where references actually resolve).
+                 Ran against the real local corpus
+                 (KWE_VFS_TRACE_PARITY_DIR=/media/crushinator/steamapps/
+                 workshop/content/431960): 60/60 item(s) parity-passed,
+                 EVERY layer/particle/model/material reference across the
+                 whole corpus, zero divergence -- see "Evidence" below.
+                 docs/SR2.md's own "Current resolver semantics" table
+                 gets one correction (not a new finding about the CODE,
+                 a finding about the DOCUMENT): the "Layer image (pkg
+                 scene, model/particle-file lookups)" row conflated two
+                 different closures at SR-2a's own citation -- see
+                 "Findings" below.
+In scope:        crates/kwe-scene-renderer/src/main.rs (load_scene's Vfs
+                 construction x2 lanes, 8 closures replaced by 2
+                 production functions, infer_model_asset_category,
+                 vfs_error_to_image_detail, the #[cfg(test)] resolution-
+                 trace oracle: TraceOutcome + 4 legacy_trace_* + 2
+                 vfs_trace_* functions, resolve_layer_image gated
+                 #[cfg(test)], 16 new unit tests + 1 new #[ignore]d
+                 corpus test), crates/kwe-scene-renderer/src/textures.rs
+                 (MAX_TEXTURE_SOURCE_BYTES gains #[allow(dead_code)] --
+                 its only consumer is now the cfg(test) legacy/trace
+                 code), docs/SR2.md (this section, plus the one table-row
+                 correction).
+Out of scope:    Fonts, scripts, video, shader includes (decision (a)'s
+                 own "stays legacy" list) -- confirmed NOT touched:
+                 resolve_shader_reference/the compile_material_layers
+                 shader_lookup closure (main.rs ~3216-3245) is a
+                 SEPARATE, independently-scoped resolution path (verified
+                 by reading it) untouched by this slice.
+                 PkgMatchMode (the task's own item 1 ask) -- investigated
+                 and NOT built; see "Findings" below for why.
+                 SR-2z's module split (deferred to the end of the SR-2
+                 epic per its own overview above).
+Acceptance tests:        kwe-scene-renderer: 386 tests passed (up from
+                         370), 2 ignored (up from 1 -- the new corpus
+                         oracle) -- 16 new: infer_model_asset_category
+                         (every reference shape); vfs_error_to_image_
+                         detail (bounded, names the reference, every
+                         VfsError variant); vfs_resolve_texture x5
+                         (pkg-hit, scene-dir-hit, assets-hit, not-found,
+                         oversize); vfs_resolve_model_asset x5 (same 5,
+                         through the real model.json -> material.json ->
+                         .tex walk, plus a dedicated oversize-json test
+                         proving decision (c)'s "effective limit
+                         unchanged" claim directly: an over-
+                         MAX_MODEL_JSON_BYTES model.json still fails
+                         resolution, just via the VFS's own earlier
+                         refusal instead of a later bounded_json check);
+                         trace_outcome_line_format_matches_the_task_spec
+                         (the exact wire format); 2 legacy-vs-vfs parity
+                         spot checks (texture scene-dir family, model-
+                         asset full-chain family); ONE test that proves
+                         (not just documents) the pkg-lane texture-family
+                         breadth-widening finding directly --
+                         migration_widens_the_pkg_lane_texture_family_
+                         breadth_beyond_pkg_entries_only constructs a
+                         reference present ONLY beside the pkg (not in
+                         its table), shows legacy_trace_texture_pkg_lane
+                         returns NotFound and vfs_trace_texture returns
+                         Found{SceneDir,...} for the IDENTICAL input --
+                         the widening is real, asserted, not assumed.
+                         933->386 corpus-scale coverage: the #[ignore]d
+                         vfs_resolution_trace_parity_corpus, run against
+                         the real local corpus (60 items,
+                         /media/crushinator/steamapps/workshop/content/
+                         431960) -- "60/60 item(s) parity-passed",
+                         EVERY layer image / particle material / model
+                         chain / particle-file chain reference in every
+                         corpus scene resolves identically between the
+                         legacy chain and the migrated VFS, INCLUDING
+                         through the widened pkg-lane texture-family
+                         breadth (decision (b)'s evidence gate: zero
+                         actual divergence observed against real content,
+                         despite the theoretical breadth difference).
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus>
+                         ir_parity_corpus -- 60/60 (unchanged, decision
+                         (c)/task's own "should be untouched" -- no
+                         scene-parsing code was touched this slice).
+                         963 workspace tests total, up from 947.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 963 passed, 0 failed.
+                         ./scripts/check.sh -- exit 0 (one retry needed:
+                         the first run hit a single unrelated flaky
+                         failure, kwe-cdp's transport::tests::
+                         drop_closes_the_fds -- an fd-number equality
+                         assertion racing against fd reuse from OTHER
+                         tests in the same parallel test process, in a
+                         crate this slice never touches; confirmed flaky
+                         by re-running it alone immediately after, which
+                         passed cleanly, then re-running the whole script
+                         for a clean end-to-end record).
+                         scripts/smoke-scene.sh -- exit 0, every case
+                         passed unchanged, INCLUDING every model-texture/
+                         layer-image/particle-file smoke case this
+                         migration's own production code path now serves
+                         (S1/S2/S3/S4/S4b/S5a/S5b/B2 and the M3c/M3f
+                         layer-image/particle-texture cases) -- the
+                         strongest available RENDER-level proof that
+                         decision (b)'s "zero corpus-visible change"
+                         claim holds in practice, on top of the
+                         resolution-trace oracle's own byte-level proof.
+Failure/recovery tests:  vfs_resolve_texture_not_found/oversize,
+                         vfs_resolve_model_asset_not_found/oversize --
+                         every failure mode load_layer_textures/
+                         load_model_textures already treat as a skip-not-
+                         reject event still degrades the same way through
+                         the VFS (proven directly, not just by the
+                         closures' own unchanged signatures).
+Upstream/provenance:    Original; the migration pattern (build one Vfs
+                         per scene load, replace closures, prove parity
+                         with a dual-path trace oracle before trusting
+                         the swap) is this slice's own design, following
+                         SR-2a's own explicit staging plan ("SR-2c/2d+
+                         establish/repeat the migration pattern... behind
+                         a differential test").
+Findings (STOP-heavy slice -- investigated and reported, not silently
+resolved either way):
+  1. **PkgMatchMode (task item 1's own ask) — NOT built, because the gap
+     it targets does not exist.** `Vfs::resolve`'s pkg-entry branch
+     already calls `kwe_core::pkg::resolve_pkg_entry` directly
+     (`crates/kwe-core/src/vfs.rs`'s own `resolve`/`resolve_path`
+     bodies) — the EXACT SAME function `image_entry`/`asset_entry`/
+     `video_entry`/`script_entry` all delegate to (`pkg.rs:684-717`,
+     `pkg.rs:754-779`). This was SR-2a's own explicit, ALREADY-SHIPPED
+     design (this document's own "pkg entry matching" table row, and
+     `vfs.rs`'s own pre-existing test
+     `pkg_lookup_is_case_insensitive_and_matches_by_tail_like_
+     resolve_pkg_entry`) — case-insensitive tail matching, not exact
+     normalized matching, on BOTH sides already. There is no pkg-
+     matching semantic gap to bridge for this family; a `PkgMatchMode`
+     toggle would be dead scaffolding for a divergence that does not
+     exist in the current codebase. Recorded here in case the task's
+     premise traces back to an earlier design draft that later changed
+     without this document being updated to match.
+  2. **Pkg tail-matching ambiguity (task's own STOP trigger) — checked,
+     not a STOP.** `resolve_pkg_entry`'s `entries: &[PkgEntry]` is
+     iterated as a plain slice in FILE (package table) order — never a
+     `HashMap` — and 2+ matches is an explicit `Err` ("matches N package
+     entries; exactly one is required"), never an undefined pick.
+     Deterministic on both the legacy and VFS sides (they share the one
+     function, per finding 1).
+  3. **A THIRD divergence beyond decision (b)'s named two, found while
+     migrating: the plain-image-layer family's pkg-lane breadth widens.**
+     `load_layer_textures`/`load_particle_textures`'s pkg-lane closure
+     tries ONLY pkg entries today (no directory fallback at all) — a
+     narrower chain than `load_model_textures`/
+     `load_particle_file_definitions`'s pkg-entries -> pkg-dir ->
+     assets-root chain. This document's own SR-2a table (the "Layer
+     image (pkg scene, model/particle-file lookups)" row) INCORRECTLY
+     described these as the SAME chain — a transcription error in the
+     ORIGINAL table (confirmed by reading the actual current source,
+     not a later regression this slice introduced) — corrected in that
+     row above. Migrating the plain-image pkg-lane family to the ONE
+     shared Vfs (decision (a)'s literal "one Vfs per scene load, used
+     for the model/material closures PLUS resolve_layer_image")
+     necessarily widens its breadth to match the full three-source
+     chain. This is real (proven directly by
+     `migration_widens_the_pkg_lane_texture_family_breadth_beyond_
+     pkg_entries_only`) but NOT a corpus-visible change: the resolution-
+     trace oracle's 60/60 real-corpus run shows zero actual divergence
+     — no corpus item has a plain image reference that resolves
+     differently once the wider breadth is available (the pkg's own
+     directory and the WE assets root essentially never contain a
+     same-named file the pkg table doesn't already have). Reported per
+     decision (b)'s own evidence-gating spirit, extended to this
+     additional finding rather than silently shipped or silently
+     reverted.
+  4. **Vfs::new's mandatory scene_root vs. the pkg lane's optional
+     pkg_dir.** `Vfs::new` requires a canonicalizable `scene_root`
+     unconditionally; the legacy pkg-lane chain instead treats
+     `content.parent().and_then(|p| p.canonicalize().ok())` as
+     `Option<PathBuf>`, gracefully SKIPPING the dir-fallback step (not
+     failing the whole resolution) when it is `None`. Since `content`
+     was already opened as a valid `PkgReader` moments earlier in the
+     SAME function, its parent directory is essentially guaranteed to
+     exist and canonicalize — this path is not reachable in practice
+     (confirmed: the 60-item corpus run never hit it) — but it IS a
+     real behavior difference in the theoretical case where the pkg's
+     own directory vanishes between the two opens: legacy would degrade
+     gracefully (pkg-entries-only resolution continues), the migrated
+     code hard-rejects the scene (`reject_pkg`). Documented rather than
+     silently accepted; not judged worth adding a parallel degraded-Vfs
+     construction path for a race this narrow.
+Open risks:              Finding 3 above (the pkg-lane texture-family
+                         breadth widening) is evidence-gated on the LOCAL
+                         60-item corpus, not the full Workshop catalog —
+                         a scene outside this local corpus with a
+                         same-named file in BOTH the pkg table and beside
+                         it on disk (or in a configured WE assets root)
+                         would now resolve to the assets-root/pkg-dir
+                         copy in a case where it previously could not
+                         have (pkg-lane images never checked those
+                         sources before). Considered unlikely (Workshop
+                         packaging convention keeps a scene's own assets
+                         inside its own pkg) but not exhaustively proven
+                         beyond this document's own evidence.
+                         Finding 4 above (Vfs::new's mandatory scene_root)
+                         is a real, if practically unreachable, behavior
+                         difference — noted for whoever eventually
+                         hardens `Vfs::new` to accept an optional
+                         scene_root, if that is ever judged worth doing.
+                         SR-2a's own already-recorded open items (the
+                         `video_probe` cap's inert placeholder status,
+                         the fall-through-vs-authoritative risk for the
+                         STILL-unmigrated families: shader includes,
+                         scripts, video, fonts) remain open, unaffected
+                         by this slice.
+STOP findings:           None of the task's own three named STOP
+                         triggers fired: (b)'s corpus-visible change --
+                         zero observed across 60/60 real items, including
+                         for the newly-identified THIRD divergence
+                         (finding 3); (c)'s cap mismatch -- verified
+                         exact (AssetCategory::Texture = 64 MiB =
+                         MAX_TEXTURE_SOURCE_BYTES = MAX_PKG_ENTRY_BYTES;
+                         AssetCategory::Model = AssetCategory::Particle =
+                         1 MiB = MAX_MODEL_JSON_BYTES =
+                         MAX_PARTICLE_FILE_BYTES exactly, and the model/
+                         material JSON reads' EFFECTIVE limit is
+                         unchanged even though the VFS now enforces it
+                         earlier than `bounded_json` used to -- proven by
+                         `vfs_resolve_model_asset_oversize_json_refuses_
+                         before_the_model_json_cap`); pkg tail-matching
+                         ambiguity -- deterministic, never HashMap-
+                         ordered (finding 2). Findings 1, 3, and 4 above
+                         are reported per the task's own "STOP-heavy...
+                         investigated and reported" framing even though
+                         none independently blocks the slice, since all
+                         three are genuine discoveries the coordinator
+                         did not already know about from the task text
+                         alone.
+Commit(s):               (fill in after commit)
 ```
