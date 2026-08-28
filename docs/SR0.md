@@ -368,7 +368,7 @@ Open risks:              The task's literal entry-point signature
                          was an oversight; `video` is now a discriminator, inserted
                          at the same priority position (between `image` and
                          `particle`) `classify_scene_object` gives it.
-Commit(s):               1783148, <filled after the R1/R2 review-fix commit>
+Commit(s):               1783148, 4304b25 (R1/R2 review fix)
 ```
 
 ## SR-0d — Private corpus metadata runner
