@@ -803,7 +803,7 @@ Open risks:              capabilityLimitations (and therefore the
 STOP findings:           None -- no bug was found in the daemon-side SR-1c
                          work this slice builds on; every change here is
                          additive manager-side UI/tests.
-Commit(s):               (fill in after commit)
+Commit(s):               13fd25a
 ```
 
 ## SR-1 epic — COMPLETE
@@ -812,7 +812,7 @@ All five children (SR-1a report protocol v1 doc + codec crate, SR-1b
 report-FD wiring inspector+daemon, SR-1c the scene apply gate, SR-1d the
 version-skew matrix, SR-1e the manager result-state flow) are merged:
 SR-1a `1c2b65e`, SR-1b `9b75367`, SR-1c `5069b0f`, SR-1d `abc29df`, SR-1e
-(this commit, filled below). Plan §5.3/§8's SR-1 acceptance bullets are
+`13fd25a`. Plan §5.3/§8's SR-1 acceptance bullets are
 met by the pieces that exist today: a real report-FD wire format and
 schema (SR-1a) actually carrying a `scene-inspection-v1` record between
 two real processes (SR-1b), a fail-closed apply-time decision built on it

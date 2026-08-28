@@ -7,7 +7,12 @@ before dependent code merges). Work order: SR-0 first; S7d visual expansion
 stays paused per gate 7. SR-0 decomposition: `docs/SR0.md` — **SR-0 complete
 2026-08-28** (inspector + object-family inventory + corpus baseline: 60/60
 local scenes inventoried, unknown-key data confirms the root `camera` gap in
-all 60). Next: SR-1; its capability/schema freeze is the §11.3 decision.
+all 60). **SR-1 complete 2026-08-28** (`docs/SR1.md`): taxonomy frozen v1
+(§11.3, maintainer go), report protocol v1 + report FD, scene apply gate
+(refuse-before-replace + apply-with-limitations), version-skew matrix,
+manager result states. Open risks carried: no inspection cache; limitations
+not persisted; playlist lane ungated; render-report kind 2 reserved.
+Next: SR-2 (asset VFS, typed IR, module split).
 
 **Baseline:** repository HEAD `93bae3b284d6221a7dd3b328eb12569edfa12524`, 2026-08-23.
 
