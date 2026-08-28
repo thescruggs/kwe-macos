@@ -513,31 +513,49 @@ slot is complete, so the previously acknowledged still survives an interrupted
 commit. These static files remain usable across daemon restart and do not
 depend on the live mmap.
 
-## Scene inspection *(draft, SR-0b/SR-0c)*
+## Scene inspection *(draft, SR-0b/SR-0c/SR-1a/SR-1b)*
 
-*(`docs/SR0.md` SR-0b/SR-0c: a one-shot, daemon-supervised scene inventory
-inspector. The record schema below is draft `scene-feature-inventory-v0`
-(`docs/SCENE_CAPABILITIES.md`), pending the SR-1 freeze — names, the schema
-version, the report's transport (currently stdout; SR-1 plans to move it to
-a dedicated report FD/envelope), and the known-key tables `inventory.rs`
-uses to tell an unrecognized `scene.json` field from a recognized one (SR-2's
-typed IR becomes the eventual authority) may all still change.)*
+*(`docs/SR0.md` SR-0b/SR-0c and `docs/SR1.md` SR-1a/SR-1b: a one-shot,
+daemon-supervised scene inventory inspector. Full wire format, stream caps,
+and the `scene-inspection-v1` schema are `docs/REPORT_PROTOCOL_V1.md`,
+frozen by SR-1a; this section covers only the `scene.inspect` RPC surface.
+Names/the schema version and the known-key tables `inventory.rs` uses to
+tell an unrecognized `scene.json` field from a recognized one (SR-2's typed
+IR becomes the eventual authority) may still change pre-SR-1 freeze of the
+RPC itself — see the breaking-change note below.)*
 
 - `scene.inspect` `{"path": "/absolute/path/to/scene"}` → the inspector's
-  JSON record verbatim. `path` must be a non-empty absolute path — a
-  relative or empty path fails `invalid_params` before the daemon touches
-  its inspector configuration.
-- The daemon spawns `kwe-scene-inspector --input <path> --max-wall-ms <ms>`
-  under the same containment `renderer.start` gives every renderer worker:
-  a private per-launch `HOME` (0700, removed on every exit path),
-  `env_clear()` plus the shared `{HOME, PATH}` allowlist, `setpgid(0, 0)`,
-  `PR_SET_PDEATHSIG` SIGKILL, a parent-pid check, `PR_SET_NO_NEW_PRIVS`, and
-  the scene renderer kind's resource limits (never less contained than the
-  renderer it stands in for). Unlike a renderer worker this is one bounded
-  blocking call, not a supervised long-lived process: stdin is closed,
-  stdout/stderr are drained under a wall-clock deadline (default 10 s,
+  validated `scene-inspection-v1` record verbatim. `path` must be a
+  non-empty absolute path — a relative or empty path fails `invalid_params`
+  before the daemon touches its inspector configuration.
+- **SR-1b breaking change of the draft RPC surface** (allowed pre-SR-1
+  freeze): the record's `"schema"` field is now `"scene-inspection-v1"`,
+  not SR-0c's `"scene-feature-inventory-v0"` — any RPC consumer matching on
+  the literal schema string must update. The record also gains
+  `"capabilities_schema"` and a nullable `"backend"` field (see
+  `docs/REPORT_PROTOCOL_V1.md`'s v0 → v1 mapping table). Every other field
+  is unchanged.
+- The daemon spawns `kwe-scene-inspector --input <path> --max-wall-ms <ms>
+  --report-fd 3` under the same containment `renderer.start` gives every
+  renderer worker: a private per-launch `HOME` (0700, removed on every exit
+  path), `env_clear()` plus the shared `{HOME, PATH}` allowlist,
+  `setpgid(0, 0)`, `PR_SET_PDEATHSIG` SIGKILL, a parent-pid check,
+  `PR_SET_NO_NEW_PRIVS`, and the scene renderer kind's resource limits
+  (never less contained than the renderer it stands in for). Unlike a
+  renderer worker this is one bounded blocking call, not a supervised
+  long-lived process: stdin is closed, stdout/stderr/the report FD are
+  drained under a wall-clock deadline (default 10 s,
   `--inspector-wall-timeout-ms`), and the child is always reaped before the
   RPC answers.
+- **The report itself now arrives over a dedicated report FD, not stdout**
+  (`docs/REPORT_PROTOCOL_V1.md`, SR-1b): the daemon creates a pipe, dup2's
+  the write end onto fd 3 in the child's `pre_exec` (before exec — see that
+  document's "Report FD convention" section for the full ownership/closing
+  rules), and reads exactly one `scene-inspection-v1` frame back through
+  `kwe-report-protocol`'s `FrameReader`. stdout is still piped and drained
+  (bounded, same cap as before) purely so a misbehaving or pre-SR-1b
+  inspector binary cannot deadlock on a full pipe — its content is never
+  parsed as the result anymore.
 - `scene.inspect` is single-in-flight: the daemon runs at most one
   inspection at a time, on a dedicated thread, so it never blocks the
   single-threaded accept loop or any other RPC (`renderer.status`,
@@ -552,17 +570,38 @@ typed IR becomes the eventual authority) may all still change.)*
   "..."}` result instead of an RPC-level error, so `scene.inspect` itself
   always succeeds (`"ok": true`) once its input validates — the record's own
   `outcome`/`reason` fields carry the result:
-  - `inspector-unavailable`: no inspector binary configured, or it failed to
-    spawn.
+  - `inspector-unavailable`: no inspector binary configured, it failed to
+    spawn, or the report pipe itself could not be created.
   - `inspector-busy`: another inspection is already in flight (see above).
   - `timeout`: the wall-clock deadline expired; the inspector's whole
     process group is SIGKILLed and reaped.
-  - `report-oversize`: the inspector's stdout exceeded 64 KiB (the
-    inspector itself is bounded to the same cap; a report this large means
-    the child misbehaved).
-  - `inspector-failed`: a nonzero exit, or stdout that fails to parse as
-    JSON tagged `"schema":"scene-feature-inventory-v0"`; carries a bounded
-    (512-byte, lossy-UTF8) `stderr_tail`.
+  - `report-oversize`: stdout OR the report FD exceeded its bound — the
+    report FD's bound is `kwe-report-protocol`'s own stream caps
+    (`MAX_TOTAL_PAYLOAD_BYTES` plus every frame's header bytes,
+    `docs/REPORT_PROTOCOL_V1.md`); a report this large means the child
+    misbehaved.
+  - `inspector-failed`: a nonzero exit (report bytes ignored entirely in
+    this case); carries a bounded (512-byte, lossy-UTF8) `stderr_tail`.
+    This is also how an inspector binary that predates `--report-fd`
+    resolves: it rejects the unknown flag with a clap usage error (exit 2,
+    message on stderr), landing here with that usage error visible in
+    `stderr_tail` (the version-skew window between an old inspector and a
+    new daemon — daemon and inspector ship in the same package, so this is
+    only a partial-upgrade window; SR-1d builds the fuller old/new matrix).
+  - `report-missing` (SR-1b): the child exited 0 but its report stream
+    contained zero `scene-inspection-v1` frames — either nothing at all, or
+    only frames of a kind this daemon does not act on (an `Unknown` kind, or
+    `scene-render-report-v1` before it has its own consumer).
+  - `report-duplicate` (SR-1b): two or more `scene-inspection-v1` frames
+    arrived in one stream — the codec itself does not adjudicate this
+    (`docs/REPORT_PROTOCOL_V1.md`: "duplicate-kind policy ... is daemon
+    policy, not codec"); this is that policy.
+  - `report-malformed` (SR-1b): the report stream failed a codec-level check
+    (bad magic/flags/reserved, a truncated frame, a stream-cap violation) or
+    its `scene-inspection-v1` payload failed `validate_inspection` (wrong
+    schema, a missing/wrong-typed field, or a digest mismatch); carries a
+    bounded (256-byte) `detail` naming the specific failure plus the
+    `stderr_tail`.
   - `parse-error` (SR-0c): the content hashed successfully but its
     `scene.json` (the file itself, or the package's `scene.json` entry) is
     not valid JSON, or — packages only — no `scene.json` entry could be

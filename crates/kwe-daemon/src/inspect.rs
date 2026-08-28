@@ -1,26 +1,54 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `scene.inspect` (SR-0b): one-shot bounded supervision of
-//! `kwe-scene-inspector`.
+//! `scene.inspect` (SR-0b, report FD wiring SR-1b): one-shot bounded
+//! supervision of `kwe-scene-inspector`.
 //!
 //! Containment mirrors `supervisor::spawn_worker` exactly (same private
 //! per-launch HOME, `env_clear()` + the shared allowlist, stdin null /
 //! stdout+stderr piped, the same `pre_exec` block: `setpgid(0, 0)`,
 //! `PR_SET_PDEATHSIG` SIGKILL, a parent-pid check, `PR_SET_NO_NEW_PRIVS`,
 //! `apply_resource_limits`) — but this is a single blocking call, not a
-//! supervised long-lived worker: it spawns, drains stdout/stderr under a
-//! wall-clock deadline, reaps the child, removes the HOME dir, and returns
-//! one JSON value. No renderer worker state is touched.
+//! supervised long-lived worker: it spawns, drains stdout/stderr/the report
+//! FD under a wall-clock deadline, reaps the child, removes the HOME dir,
+//! and returns one JSON value. No renderer worker state is touched.
+//!
+//! SR-1b adds the report FD itself (docs/REPORT_PROTOCOL_V1.md): this
+//! daemon creates a pipe with `libc::pipe2(..., O_CLOEXEC)`, and the
+//! child's `pre_exec` closure `dup2`s the write end onto fd 3 (`dup2`
+//! clears `O_CLOEXEC` on the TARGET fd, so fd 3 survives exec; the
+//! `pipe2(O_CLOEXEC)` source fd — whatever number it actually landed at —
+//! still closes automatically at exec regardless, so no explicit close of
+//! it is needed in the child). fd 3 is free at this point in every launch:
+//! `std::process::Command`'s own stdio setup (0/1/2) already ran before
+//! `pre_exec`, and every OTHER fd this daemon process holds open is
+//! `O_CLOEXEC` (every `OpenOptions::open` in this crate sets it; `std`'s
+//! own socket/pipe types default to it too), so nothing else could be
+//! sitting at fd 3 to collide with. The daemon (parent) closes its own
+//! copy of the write end immediately after spawn — the pipe only reports
+//! EOF once EVERY process's copy of the write end has closed, so if the
+//! parent kept a copy open, the child closing its own copy would never be
+//! visible as EOF on the read end the daemon retains and owns for the rest
+//! of this call.
+//!
+//! The old stdout-JSON parsing path is REMOVED: `--report-fd 3` is always
+//! passed, so a new inspector never writes its record to stdout at all.
+//! `stdout` is still piped and drained (bounded, same as before) purely to
+//! prevent a misbehaving/old-format child from deadlocking on a full pipe;
+//! its content no longer feeds the RPC result.
 
 use std::{
     fs,
-    io::Read,
-    os::unix::{fs::PermissionsExt, io::AsRawFd, process::CommandExt},
+    io::{Cursor, Read},
+    os::{
+        fd::OwnedFd,
+        unix::{fs::PermissionsExt, io::AsRawFd, io::FromRawFd, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdout, Command as ProcessCommand, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
+use kwe_report_protocol::{FrameKind, FrameReader, validate_inspection};
 use serde_json::{Value, json};
 
 use crate::supervisor::{
@@ -28,14 +56,29 @@ use crate::supervisor::{
     env_allowlist, set_nonblocking, signal_process_group,
 };
 
-/// The draft schema `run_inspection` requires on a successful inspector
-/// report before passing it through (docs/SCENE_CAPABILITIES.md). SR-1
-/// freezes the exact name; this stays a plain string compare until then.
-const EXPECTED_SCHEMA: &str = "scene-feature-inventory-v0";
-/// Same cap the inspector itself enforces on its own report
-/// (kwe-scene-inspector's `MAX_REPORT_BYTES`); read one byte past it so the
-/// "exactly at the cap" and "over the cap" cases are distinguishable.
+/// The report FD number the child is told about via `--report-fd`
+/// (docs/REPORT_PROTOCOL_V1.md). Fixed: see the module doc for why fd 3
+/// is always free at this point in a launch.
+const REPORT_FD: i32 = 3;
+/// Same cap the inspector itself enforces on its own stdout report before
+/// SR-1b (kwe-scene-inspector's `MAX_REPORT_BYTES`); stdout is still
+/// drained under this bound purely to prevent pipe backpressure from a
+/// misbehaving/old-format child — its content is never parsed as the
+/// result anymore. Read one byte past it so "exactly at the cap" and "over
+/// the cap" stay distinguishable.
 const MAX_REPORT_BYTES: usize = 65536;
+/// One byte past the theoretical maximum well-formed report-FD stream size
+/// (`kwe_report_protocol::MAX_TOTAL_PAYLOAD_BYTES` plus
+/// `MAX_FRAMES_PER_STREAM` headers), so "exactly at the cap" (a legitimate,
+/// maximally sized stream) and "over the cap" stay distinguishable —
+/// mirrors the `MAX_REPORT_BYTES`-vs-`report-oversize` contract above, now
+/// for the report FD specifically.
+const REPORT_STREAM_MAX_BYTES: usize = kwe_report_protocol::MAX_TOTAL_PAYLOAD_BYTES
+    + kwe_report_protocol::MAX_FRAMES_PER_STREAM * kwe_report_protocol::HEADER_BYTES
+    + 1;
+/// Bound on the `detail` string carried in a `report-malformed` result —
+/// the codec error's bounded `Display`, never raw report bytes.
+const MAX_DETAIL_BYTES: usize = 256;
 /// Bounded stderr diagnostic carried in a failed result, lossy-UTF8, tail
 /// only (mirrors the supervisor's `StderrRing` bound, scaled down for a
 /// one-shot report instead of a long-lived worker).
@@ -127,6 +170,26 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
         }
     };
 
+    // The report pipe (docs/REPORT_PROTOCOL_V1.md): both ends O_CLOEXEC so
+    // neither leaks into any OTHER child this daemon spawns; the write
+    // end's CLOEXEC is cleared (via dup2 onto REPORT_FD, not here) only
+    // inside THIS child's own pre_exec, right before its own exec.
+    let mut report_fds = [0_i32; 2];
+    // SAFETY: report_fds is a valid 2-element buffer for pipe2 to fill.
+    if unsafe { libc::pipe2(report_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        eprintln!(
+            "event=inspect.pipe_error detail={}",
+            std::io::Error::last_os_error()
+        );
+        cleanup_renderer_home(&home_dir);
+        return (
+            json!({"outcome": "unknown", "reason": "inspector-unavailable"}),
+            None,
+            home_dir,
+        );
+    }
+    let [report_read_fd, report_write_fd] = report_fds;
+
     let mut command = ProcessCommand::new(inspector_path);
     command
         .arg("--input")
@@ -139,6 +202,8 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
                 .min(u128::from(u64::MAX))
                 .to_string(),
         )
+        .arg("--report-fd")
+        .arg(REPORT_FD.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -150,8 +215,9 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
 
     let resource_limits = config.resource_limits;
     // SAFETY: this closure runs in the child after fork and before exec,
-    // mirroring supervisor::spawn_worker's pre_exec exactly. It calls only
-    // async-signal-safe libc functions and does not allocate.
+    // mirroring supervisor::spawn_worker's pre_exec exactly (plus the
+    // report-fd dup2, SR-1b). It calls only async-signal-safe libc
+    // functions and does not allocate.
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
@@ -169,15 +235,39 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // dup2 clears O_CLOEXEC on the TARGET fd (REPORT_FD), so it
+            // survives exec; report_write_fd's own O_CLOEXEC (from the
+            // pipe2 call above) still closes it automatically at exec
+            // regardless of its actual number, so no separate close is
+            // needed here. See the module doc for why REPORT_FD is free.
+            if libc::dup2(report_write_fd, REPORT_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             apply_resource_limits(resource_limits)?;
             Ok(())
         });
     }
 
-    let mut child = match command.spawn() {
+    let spawn_result = command.spawn();
+    // The daemon's own copy of the write end must close now regardless of
+    // spawn outcome: on success, only the child's copy may stay open (or
+    // the pipe would never report EOF once the child itself closes); on
+    // failure, this is simply releasing the fd that was already created.
+    // SAFETY: report_write_fd is a valid fd owned solely by this function,
+    // not used again after this point.
+    unsafe {
+        libc::close(report_write_fd);
+    }
+
+    let mut child = match spawn_result {
         Ok(child) => child,
         Err(error) => {
             eprintln!("event=inspect.spawn_error detail={error}");
+            // SAFETY: report_read_fd is a valid fd owned solely by this
+            // function; nothing else has touched it yet.
+            unsafe {
+                libc::close(report_read_fd);
+            }
             cleanup_renderer_home(&home_dir);
             return (
                 json!({"outcome": "unknown", "reason": "inspector-unavailable"}),
@@ -187,20 +277,26 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
         }
     };
     let pid = child.id();
-    let result = supervise(&mut child, config.wall_timeout);
+    // SAFETY: report_read_fd is a valid, open fd from the pipe2 call
+    // above, exclusively owned by this function up to this point;
+    // ownership transfers to this File, which closes it on drop.
+    let report = fs::File::from(unsafe { OwnedFd::from_raw_fd(report_read_fd) });
+    let result = supervise(&mut child, config.wall_timeout, report);
     cleanup_renderer_home(&home_dir);
     (result, Some(pid), home_dir)
 }
 
-/// Drain the child's stdout/stderr under `wall_timeout`, reap it, and
-/// classify the outcome. Every return path has already reaped `child`.
-fn supervise(child: &mut Child, wall_timeout: Duration) -> Value {
+/// Drain the child's stdout/stderr/report-FD under `wall_timeout`, reap it,
+/// and classify the outcome. Every return path has already reaped `child`.
+fn supervise(child: &mut Child, wall_timeout: Duration, mut report: fs::File) -> Value {
     let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         eprintln!("event=inspect.pipe_error detail=stdout or stderr not captured");
         kill_and_reap(child);
         return json!({"outcome": "unknown", "reason": "inspector-unavailable"});
     };
-    if set_nonblocking(stdout.as_raw_fd()).is_err() || set_nonblocking(stderr.as_raw_fd()).is_err()
+    if set_nonblocking(stdout.as_raw_fd()).is_err()
+        || set_nonblocking(stderr.as_raw_fd()).is_err()
+        || set_nonblocking(report.as_raw_fd()).is_err()
     {
         eprintln!("event=inspect.pipe_error detail=failed to set pipes non-blocking");
         kill_and_reap(child);
@@ -210,23 +306,29 @@ fn supervise(child: &mut Child, wall_timeout: Duration) -> Value {
     let deadline = Instant::now() + wall_timeout;
     let mut out_buffer: Vec<u8> = Vec::new();
     let mut err_tail: Vec<u8> = Vec::new();
+    let mut report_buffer: Vec<u8> = Vec::new();
     loop {
-        let oversize = drain_stdout(&mut stdout, &mut out_buffer);
+        // stdout is drained (and bounded the same way) purely to prevent
+        // pipe backpressure from a misbehaving/old-format child; only the
+        // report buffer feeds `finalize`.
+        let stdout_oversize = drain_stdout(&mut stdout, &mut out_buffer);
         drain_stderr_tail(&mut stderr, &mut err_tail);
-        if oversize {
+        let report_oversize = drain_report(&mut report, &mut report_buffer);
+        if stdout_oversize || report_oversize {
             kill_and_reap(child);
             return json!({"outcome": "unknown", "reason": "report-oversize"});
         }
         match child.try_wait() {
             Ok(Some(status)) => {
                 // One last drain: bytes written just before exit may still
-                // be sitting in the pipe.
-                let oversize = drain_stdout(&mut stdout, &mut out_buffer);
+                // be sitting in the pipes.
+                let stdout_oversize = drain_stdout(&mut stdout, &mut out_buffer);
                 drain_stderr_tail(&mut stderr, &mut err_tail);
-                if oversize {
+                let report_oversize = drain_report(&mut report, &mut report_buffer);
+                if stdout_oversize || report_oversize {
                     return json!({"outcome": "unknown", "reason": "report-oversize"});
                 }
-                return finalize(status, &out_buffer, &err_tail);
+                return finalize(status, &report_buffer, &err_tail);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -247,7 +349,10 @@ fn supervise(child: &mut Child, wall_timeout: Duration) -> Value {
 /// Read as much of `pipe` as is available without blocking, appending to
 /// `buffer`. Returns `true` once `buffer` has grown past
 /// `MAX_REPORT_BYTES` (the caller stops the child at that point; the exact
-/// byte where it happened does not matter, only that it did).
+/// byte where it happened does not matter, only that it did). stdout is no
+/// longer parsed as the result (SR-1b: the report FD is), but is still
+/// drained and bounded so a misbehaving/old-format child cannot deadlock on
+/// a full pipe.
 fn drain_stdout(pipe: &mut ChildStdout, buffer: &mut Vec<u8>) -> bool {
     if buffer.len() > MAX_REPORT_BYTES {
         return true;
@@ -259,6 +364,32 @@ fn drain_stdout(pipe: &mut ChildStdout, buffer: &mut Vec<u8>) -> bool {
             Ok(count) => {
                 buffer.extend_from_slice(&chunk[..count]);
                 if buffer.len() > MAX_REPORT_BYTES {
+                    return true;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+    false
+}
+
+/// Same shape as `drain_stdout`, for the report FD (SR-1b): bounded to
+/// `REPORT_STREAM_MAX_BYTES` rather than `MAX_REPORT_BYTES`, since a
+/// well-formed report stream can (legitimately, at the cap) be larger than
+/// one frame's payload — up to `MAX_FRAMES_PER_STREAM` frames, each with a
+/// 12-byte header, totalling `MAX_TOTAL_PAYLOAD_BYTES` of payload.
+fn drain_report(pipe: &mut fs::File, buffer: &mut Vec<u8>) -> bool {
+    if buffer.len() > REPORT_STREAM_MAX_BYTES {
+        return true;
+    }
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                buffer.extend_from_slice(&chunk[..count]);
+                if buffer.len() > REPORT_STREAM_MAX_BYTES {
                     return true;
                 }
             }
@@ -299,7 +430,15 @@ fn drain_stderr_tail(pipe: &mut ChildStderr, buffer: &mut Vec<u8>) {
     }
 }
 
-fn finalize(status: std::process::ExitStatus, stdout: &[u8], stderr_tail: &[u8]) -> Value {
+/// Classify a completed inspection from its exit status and accumulated
+/// report-FD bytes (SR-1b). Nonzero exit keeps the pre-SR-1b contract:
+/// `inspector-failed` + the stderr tail, report bytes ignored entirely —
+/// this is also how an old inspector binary that rejects the unknown
+/// `--report-fd` flag with a clap usage error (exit 2, message on stderr)
+/// resolves: as `inspector-failed` carrying that usage error in
+/// `stderr_tail` (docs/REPORT_PROTOCOL_V1.md's skew note; SR-1d builds the
+/// fuller old/new matrix).
+fn finalize(status: std::process::ExitStatus, report_bytes: &[u8], stderr_tail: &[u8]) -> Value {
     if !status.success() {
         return json!({
             "outcome": "unknown",
@@ -307,16 +446,67 @@ fn finalize(status: std::process::ExitStatus, stdout: &[u8], stderr_tail: &[u8])
             "stderr_tail": String::from_utf8_lossy(stderr_tail),
         });
     }
-    match serde_json::from_slice::<Value>(stdout) {
-        Ok(record) if record.get("schema").and_then(Value::as_str) == Some(EXPECTED_SCHEMA) => {
-            record
+
+    let mut reader = FrameReader::new(Cursor::new(report_bytes));
+    let mut inspection_payloads: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match reader.next_frame() {
+            Ok(Some(frame)) => {
+                // Unknown (and, until it has its own producer/validator,
+                // SceneRenderReportV1) frames are skipped and counted —
+                // FrameReader's own stream caps already counted them
+                // against the limits above; nothing more to do with them
+                // here. If ONLY such frames arrive, inspection_payloads
+                // stays empty and falls through to report-missing below,
+                // exactly like a stream with no frames at all.
+                if frame.kind == FrameKind::SceneInspectionV1 {
+                    inspection_payloads.push(frame.payload);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                return json!({
+                    "outcome": "unknown",
+                    "reason": "report-malformed",
+                    "detail": bounded_detail(&error.to_string()),
+                    "stderr_tail": String::from_utf8_lossy(stderr_tail),
+                });
+            }
         }
-        _ => json!({
+    }
+
+    match inspection_payloads.len() {
+        0 => json!({
             "outcome": "unknown",
-            "reason": "inspector-failed",
+            "reason": "report-missing",
             "stderr_tail": String::from_utf8_lossy(stderr_tail),
         }),
+        1 => match validate_inspection(&inspection_payloads[0]) {
+            Ok(record) => record,
+            Err(error) => json!({
+                "outcome": "unknown",
+                "reason": "report-malformed",
+                "detail": bounded_detail(&error.to_string()),
+                "stderr_tail": String::from_utf8_lossy(stderr_tail),
+            }),
+        },
+        _ => json!({"outcome": "unknown", "reason": "report-duplicate"}),
     }
+}
+
+/// Truncate `text` to at most `MAX_DETAIL_BYTES` bytes without splitting a
+/// UTF-8 character (mirrors `kwe-scene-inspector::inventory`'s
+/// `truncate_bytes`, independently — this crate has no dependency on that
+/// one).
+fn bounded_detail(text: &str) -> String {
+    if text.len() <= MAX_DETAIL_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_DETAIL_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 /// SIGKILL the child's whole process group and reap it. Safe to call on an
@@ -375,29 +565,71 @@ mod tests {
         }
     }
 
-    /// (a) A well-behaved fake inspector's report passes through verbatim.
+    /// Python source for a `write_frame(kind, payload)` helper, embedded in
+    /// every fake inspector script below that writes to fd 3 — mirrors
+    /// docs/REPORT_PROTOCOL_V1.md's wire format exactly (12-byte header:
+    /// magic `KWR1`, kind, flags=0, reserved=0 as a u16 LE, payload_len as
+    /// a u32 LE). Every fake declares `--report-fd` in its own argparse (so
+    /// it does not choke on the flag the daemon always passes) except the
+    /// one that deliberately mimics an old, pre-SR-1b inspector binary.
+    const PYTHON_WRITE_FRAME_HELPER: &str = r#"
+import os
+import struct
+
+def write_frame(kind, payload):
+    header = b"KWR1" + bytes([kind, 0]) + struct.pack("<H", 0) + struct.pack("<I", len(payload))
+    os.write(3, header + payload)
+"#;
+
+    /// (a) A well-behaved fake inspector's `scene-inspection-v1` report
+    /// passes through verbatim — digest-verified, proving the daemon's
+    /// `validate_inspection` call and this python fixture's digest
+    /// computation (sorted keys, compact `(",", ":")` separators) agree
+    /// byte-for-byte with `serde_json::to_vec`'s canonical form.
     #[test]
-    fn valid_report_passes_through_verbatim() {
+    fn valid_v1_report_passes_through_verbatim_digest_verified() {
         let root = temp_dir("valid");
         let script = write_script(
             &root,
             "fake-inspector.py",
-            r#"#!/usr/bin/env python3
+            &format!(
+                r#"#!/usr/bin/env python3
 import argparse
+import hashlib
+import json
+{PYTHON_WRITE_FRAME_HELPER}
 parser = argparse.ArgumentParser()
 parser.add_argument("--input", required=True)
 parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
 args = parser.parse_args()
-print('{"schema":"scene-feature-inventory-v0","outcome":"inventoried","reason":"ok",'
-      '"content":{"hash":"sha256:deadbeef","source_bytes":1,"kind":"json-dir"},'
-      '"inspector":{"build":"dev","abi":0},"required":[],"detected":[],'
-      '"unknown":{"keys":0,"types":0,"objects":0,"samples":[],"truncated":false},'
-      '"bounds":{"wall_ms":1,"peak_bytes":0,"limits_hit":[]},"digest":"abc"}')
-"#,
+
+record = {{
+    "schema": "scene-inspection-v1",
+    "capabilities_schema": "scene-capabilities-v1",
+    "content": {{"hash": "sha256:deadbeef", "source_bytes": 1, "kind": "json-dir"}},
+    "inspector": {{"build": "dev", "abi": 0}},
+    "outcome": "inventoried",
+    "reason": "ok",
+    "required": [],
+    "detected": [],
+    "unknown": {{"keys": 0, "types": 0, "objects": 0, "samples": [], "truncated": False}},
+    "bounds": {{"wall_ms": 1, "peak_bytes": 0, "limits_hit": []}},
+    "backend": None,
+    "digest": "",
+}}
+# Byte-for-byte the same canonicalization serde_json::to_vec produces for a
+# BTreeMap-backed Value: sorted keys, no whitespace.
+serialized = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+record["digest"] = hashlib.sha256(serialized).hexdigest()
+payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+write_frame(1, payload)
+"#
+            ),
         );
         let config = config_with(&root, Some(script), Duration::from_secs(5));
         let (result, pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
-        assert_eq!(result["schema"], "scene-feature-inventory-v0");
+        assert_eq!(result["schema"], "scene-inspection-v1", "{result}");
         assert_eq!(result["outcome"], "inventoried");
         assert_eq!(result["content"]["hash"], "sha256:deadbeef");
         assert!(pid.is_some());
@@ -432,15 +664,60 @@ print('{"schema":"scene-feature-inventory-v0","outcome":"inventoried","reason":"
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// (c) An inspector that floods stdout past the 64 KiB cap is refused
-    /// as report-oversize instead of being buffered without bound.
+    /// (c) An inspector that floods the report FD past the stream cap is
+    /// refused as report-oversize instead of being buffered without bound.
     #[test]
-    fn flooded_stdout_is_refused_as_report_oversize() {
-        let root = temp_dir("flood");
+    fn flooded_report_fd_is_refused_as_report_oversize() {
+        let root = temp_dir("flood-report");
         let script = write_script(
             &root,
             "fake-inspector.py",
-            "#!/usr/bin/env python3\nimport sys\nsys.stdout.write('x' * 200000)\nsys.stdout.flush()\n",
+            &format!(
+                r#"#!/usr/bin/env python3
+import argparse
+{PYTHON_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+# Well past REPORT_STREAM_MAX_BYTES; a single wildly-oversize payload_len
+# claim would already be a report-malformed case, so this instead sends
+# many small, individually well-formed frames.
+for _ in range(20000):
+    write_frame(1, b"x" * 100)
+"#
+            ),
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-oversize");
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// stdout is still drained and bounded defensively (pipe-backpressure
+    /// safety, not because its content is used) even though a well-behaved
+    /// new inspector never writes there — flooding it alone still resolves
+    /// the same way flooding the report FD does.
+    #[test]
+    fn flooded_stdout_is_also_refused_as_report_oversize() {
+        let root = temp_dir("flood-stdout");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            r#"#!/usr/bin/env python3
+import argparse
+import sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+sys.stdout.write("x" * 200000)
+sys.stdout.flush()
+"#,
         );
         let config = config_with(&root, Some(script), Duration::from_secs(5));
         let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
@@ -483,6 +760,197 @@ print('{"schema":"scene-feature-inventory-v0","outcome":"inventoried","reason":"
         assert_eq!(result["outcome"], "unknown");
         assert_eq!(result["reason"], "inspector-unavailable");
         assert!(pid.is_none());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A fake that writes its (otherwise well-formed v0-looking) report to
+    /// stdout instead of the report FD — the pre-SR-1b behavior — sends
+    /// zero frames on fd 3, so this resolves report-missing exactly like a
+    /// child that reports nothing at all.
+    #[test]
+    fn report_written_to_stdout_instead_of_fd_is_report_missing() {
+        let root = temp_dir("stdout-instead");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            r#"#!/usr/bin/env python3
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+print('{"schema":"scene-feature-inventory-v0","outcome":"inventoried","reason":"ok"}')
+"#,
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-missing");
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An unrecognized-kind frame, and nothing else, resolves report-missing
+    /// too: `FrameReader` yields it as `FrameKind::Unknown` (additive
+    /// evolution — docs/REPORT_PROTOCOL_V1.md), but zero `scene-inspection-v1`
+    /// frames ever arrived.
+    #[test]
+    fn unknown_kind_frame_then_nothing_is_report_missing() {
+        let root = temp_dir("unknown-kind");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            &format!(
+                r#"#!/usr/bin/env python3
+import argparse
+{PYTHON_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+write_frame(200, b"future schema this daemon does not know yet")
+"#
+            ),
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-missing");
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two kind-1 frames in one stream is a protocol violation the codec
+    /// itself does not adjudicate (docs/REPORT_PROTOCOL_V1.md: "duplicate-
+    /// kind policy ... is daemon policy, not codec") — this is that policy.
+    #[test]
+    fn duplicate_kind_one_frames_is_report_duplicate() {
+        let root = temp_dir("duplicate");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            &format!(
+                r#"#!/usr/bin/env python3
+import argparse
+{PYTHON_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+write_frame(1, b'{{"schema":"scene-inspection-v1"}}')
+write_frame(1, b'{{"schema":"scene-inspection-v1"}}')
+"#
+            ),
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-duplicate");
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Garbage bytes on the report FD (not a well-formed frame stream at
+    /// all — bad magic here) surfaces as report-malformed, carrying the
+    /// codec's own bounded error detail plus the stderr tail.
+    #[test]
+    fn garbage_bytes_on_report_fd_is_report_malformed() {
+        let root = temp_dir("garbage");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            r#"#!/usr/bin/env python3
+import argparse
+import os
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+os.write(3, b"not a frame at all, just garbage bytes")
+"#,
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-malformed");
+        assert!(result["detail"].as_str().unwrap().len() <= MAX_DETAIL_BYTES);
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A valid `scene-inspection-v1` frame whose JSON payload fails
+    /// `validate_inspection` (missing every required field here) is also
+    /// report-malformed — the frame itself was well-formed, its content
+    /// was not.
+    #[test]
+    fn invalid_inspection_payload_is_report_malformed() {
+        let root = temp_dir("invalid-payload");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            &format!(
+                r#"#!/usr/bin/env python3
+import argparse
+{PYTHON_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+write_frame(1, b'{{"not_a_real_field": true}}')
+"#
+            ),
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "report-malformed");
+        assert!(result["detail"].as_str().unwrap().contains("schema"));
+        assert!(!home_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Old-binary skew (docs/REPORT_PROTOCOL_V1.md): an inspector that
+    /// predates `--report-fd` rejects the unknown flag the way clap itself
+    /// does (a usage error printed to stderr, exit 2). The daemon resolves
+    /// this as inspector-failed with that usage error visible in
+    /// stderr_tail, never a crash and never a guess reconstructed from
+    /// stdout. This fake deliberately omits `--report-fd` from its own
+    /// argparse to reproduce that exact rejection.
+    #[test]
+    fn old_inspector_without_report_fd_support_is_inspector_failed() {
+        let root = temp_dir("old-binary");
+        let script = write_script(
+            &root,
+            "fake-inspector.py",
+            r#"#!/usr/bin/env python3
+import argparse
+parser = argparse.ArgumentParser(prog="fake-inspector.py")
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+# No --report-fd: argparse itself rejects the daemon's --report-fd 3 as an
+# unrecognized argument, prints a usage error to stderr, and exits 2 -- the
+# same shape a real clap-generated usage error takes.
+args = parser.parse_args()
+"#,
+        );
+        let config = config_with(&root, Some(script), Duration::from_secs(5));
+        let (result, _pid, home_dir) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(result["outcome"], "unknown", "{result}");
+        assert_eq!(result["reason"], "inspector-failed");
+        assert!(
+            result["stderr_tail"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("unrecognized"),
+            "{result}"
+        );
+        assert!(!home_dir.exists());
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -12,6 +12,7 @@ hex.workspace = true
 kwe-core = { path = "../kwe-core" }
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
+kwe-report-protocol = { path = "../kwe-report-protocol" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -124,32 +124,183 @@ Open risks:              scene-render-report-v1 (kind 2) has no schema yet --
                          forward-looking contract, not yet implemented or tested
                          against a real pipe/fd -- SR-1b/c must confirm the
                          documented behavior matches what actually gets built.
+Commit(s):               1c2b65e
+```
+
+## SR-1b — scene-inspection-v1 over the report FD
+
+```text
+Task:            Wire kwe-report-protocol's frame codec onto a real fd for the
+                 one-shot scene.inspect path: kwe-scene-inspector gains
+                 --report-fd, the daemon creates/owns the pipe and reads the
+                 result off it instead of stdout, and the report-policy reason
+                 codes docs/REPORT_PROTOCOL_V1.md named (report-malformed/
+                 -missing/-duplicate) become real daemon behavior for this path.
+Milestone/Slice: SR-1b
+Goal:            Prove the SR-1a wire format and schema actually work end to end
+                 over a real pipe between two real processes, for the one
+                 existing report producer/consumer pair (kwe-scene-inspector /
+                 crates/kwe-daemon/src/inspect.rs) — before SR-1c generalizes
+                 the policy layer to a long-lived renderer worker's own report
+                 stream and an apply-gate decision.
+Outcome:         crates/kwe-scene-inspector: new optional --report-fd <n> flag,
+                 validated (0/1/2 rejected as a usage error, exit 2, before
+                 inspection starts) up front. Absent: byte-identical to before
+                 -- the v0 record line on stdout (scripts/scene-corpus-
+                 inventory.sh and any manual invocation untouched). Present:
+                 NOTHING on stdout; the record is built in the
+                 scene-inspection-v1 shape (schema string, +capabilities_schema,
+                 +nullable backend:null) and written as exactly one kind-1 frame
+                 via kwe_report_protocol::write_frame to a File built from the
+                 raw fd (OwnedFd::from_raw_fd -- SAFETY documented: the daemon
+                 contract guarantees this fd is a pipe write end owned
+                 exclusively by this process), then flushed and dropped (closing
+                 it, which is what lets the daemon's reader see EOF). A write/
+                 flush failure exits 74, the same class as unwritable stdout
+                 (that constant's doc comment now covers both channels).
+                 build_record is parameterized by a new RecordFormat{V0,V1} enum
+                 threaded through the whole call chain (inspect_input ->
+                 json_dir_record/pkg_record -> inventoried_record ->
+                 build_record, and bound_report's own oversize fallback) rather
+                 than duplicated -- the digest is computed exactly once, over
+                 whichever shape was actually built.
+                 crates/kwe-daemon/src/inspect.rs: run_inspection now creates
+                 the report pipe with libc::pipe2(..., O_CLOEXEC); the child's
+                 pre_exec dup2's the write end onto a fixed fd 3 (inserted into
+                 the SAME closure that already runs setpgid/PR_SET_PDEATHSIG/
+                 the parent-pid check/PR_SET_NO_NEW_PRIVS/apply_resource_limits,
+                 mirroring supervisor::spawn_worker's pre_exec exactly) and
+                 --report-fd 3 is always passed. Verified before implementing:
+                 fd 3 is free at that point in every launch -- std's own stdio
+                 setup (0/1/2) runs before pre_exec, and every OTHER fd this
+                 daemon process holds open is O_CLOEXEC (grepped every
+                 OpenOptions::open in the crate; std sockets/pipes default to it
+                 too) -- so no STOP condition was hit. The daemon (parent)
+                 closes its own copy of the write end immediately after spawn,
+                 regardless of spawn outcome. supervise drains the report fd
+                 exactly like stdout was drained before (nonblocking, bounded
+                 accumulation) at a new cap (kwe_report_protocol's
+                 MAX_TOTAL_PAYLOAD_BYTES + MAX_FRAMES_PER_STREAM headers + 1);
+                 exceeding it -> report-oversize (the same reason stdout
+                 flooding already used -- stdout is STILL drained and bounded
+                 too, defensively, since a misbehaving/old-format child could
+                 otherwise deadlock on a full pipe, but its content is no
+                 longer parsed as the result). finalize is rewritten: nonzero
+                 exit keeps inspector-failed + stderr_tail UNCHANGED (report
+                 bytes ignored -- this is also how an old, pre---report-fd
+                 inspector resolves, since it rejects the unknown flag with a
+                 clap usage error, exit 2); on exit 0, the accumulated report
+                 bytes are parsed with FrameReader: zero scene-inspection-v1
+                 frames (including "only Unknown-kind frames arrived") ->
+                 report-missing; exactly one, validate_inspection-checked ->
+                 the validated record verbatim; two or more -> report-duplicate;
+                 any FrameError/ValidationError -> report-malformed with a
+                 bounded (256-byte) detail plus stderr_tail. The old stdout-
+                 JSON-parsing path is fully removed.
+In scope:        crates/kwe-scene-inspector/src/main.rs (RecordFormat, --report-fd,
+                 the report-FD write path), crates/kwe-scene-inspector/Cargo.toml
+                 (kwe-report-protocol dependency), crates/kwe-scene-inspector/
+                 tests/report_fd.rs (new integration test binary),
+                 crates/kwe-daemon/src/inspect.rs (pipe creation, pre_exec dup2,
+                 supervise/drain_report, finalize rewrite), crates/kwe-daemon/
+                 Cargo.toml (kwe-report-protocol dependency), docs/
+                 SUPERVISOR_API_V1.md, docs/REPORT_PROTOCOL_V1.md, docs/SR1.md.
+Out of scope:    The long-lived renderer worker's own report stream
+                 (supervisor::spawn_worker, renderer.start) -- untouched;
+                 report-late and the renderer-worker sense of report-unavailable
+                 (no apply-window deadline or renderer-worker report stream
+                 exists yet to make either concept real -- SR-1c); the fuller
+                 old/new upgrade/downgrade/canary matrix (SR-1d, one skew case
+                 covered here as a down payment); the manager UI (SR-1e).
+Acceptance tests:        crates/kwe-scene-inspector: 3 new unit tests
+                         (report_fd_aliasing_stdio_is_rejected;
+                         v1_record_adds_capabilities_schema_and_null_backend_and_validates,
+                         cross-checked against kwe_report_protocol::validate_inspection
+                         itself; v0_and_v1_builds_agree_on_every_field_except_the_
+                         documented_three) -- 23 total in the bin, up from 20.
+                         2 new integration tests in tests/report_fd.rs, spawning
+                         the REAL compiled binary via
+                         env!("CARGO_BIN_EXE_kwe-scene-inspector") (verified
+                         empirically that Cargo keeps the hyphen in that env var
+                         name, not underscore): --report-fd present -> stdout
+                         empty, exactly one kind-1 frame arrives over a real
+                         pipe (CLOEXEC cleared pre-spawn on the inherited write
+                         end), validate_inspection accepts it, outcome
+                         inventoried; no flag -> stdout carries the v0 line,
+                         schema v0, no capabilities_schema/backend fields.
+                         crates/kwe-daemon: inspect.rs tests grew from 5 to 12 --
+                         the original 5 kept (one repurposed: the fake that used
+                         to print a v0 record to stdout now proves
+                         report-missing, since fd 3 gets nothing), plus new:
+                         flooded_report_fd_is_refused_as_report_oversize;
+                         unknown_kind_frame_then_nothing_is_report_missing;
+                         duplicate_kind_one_frames_is_report_duplicate;
+                         garbage_bytes_on_report_fd_is_report_malformed;
+                         invalid_inspection_payload_is_report_malformed;
+                         old_inspector_without_report_fd_support_is_inspector_failed
+                         (argparse without --report-fd, reproducing a real clap
+                         usage-error rejection). The valid-report fake now
+                         constructs a v1 record and computes its digest in
+                         python (sort_keys=True, separators=(",", ":")) --
+                         empirically verified to match serde_json::to_vec's
+                         canonical form byte-for-byte (the daemon accepts it).
+                         165 kwe-daemon tests total (up from 158), including the
+                         unrelated scene.inspect RPC/concurrency tests unchanged.
+                         scripts/smoke-scene-corpus.sh (KWE_RUN_SCENE_CORPUS_SMOKE=1)
+                         still green -- it only exercises the no-flag stdout path.
+                         cargo fmt/clippy/test --workspace green (809 passed, 0
+                         failed, up from 797). ./scripts/check.sh green end to
+                         end including the C++/QML build and qml-typecheck.
+Failure/recovery tests:  Covered by Acceptance tests above -- every report-FD
+                         failure mode (oversize, missing, duplicate, malformed)
+                         and the old-binary skew case are typed, reaped, HOME-
+                         dir-cleaned outcomes, never a hang, crash, or
+                         reconstructed-from-stdout guess.
+Upstream/provenance:     Original; the pre_exec dup2 sequence mirrors
+                         supervisor::spawn_worker's existing containment exactly,
+                         just inserting one more libc call into the same closure.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D warnings --
+                         clean.
+                         cargo test --workspace -- 809 passed, 0 failed.
+                         KWE_RUN_SCENE_CORPUS_SMOKE=1 ./scripts/smoke-scene-corpus.sh
+                         -- passed standalone.
+                         ./scripts/check.sh -- green end-to-end, including the
+                         C++/QML build and qml-typecheck.
+Open risks:              report-late and the renderer-worker's report-unavailable
+                         remain unimplemented (docs/REPORT_PROTOCOL_V1.md's
+                         reason-code table now marks each row's status
+                         explicitly) -- neither has a real deadline/worker-report
+                         stream to attach to yet.
+                         SR-1b covers exactly one version-skew combination (old
+                         inspector binary + new daemon); SR-1d is the fuller
+                         matrix the plan's §5.3 closing sentence calls for
+                         (old/new daemon, worker, and display-bridge upgrade/
+                         downgrade/canary rollback).
+                         The report-FD wiring pattern (pipe2 + pre_exec dup2 to
+                         a fixed fd) now exists in exactly one place
+                         (inspect.rs); if/when a renderer-worker report stream
+                         lands (SR-1c+), it should reuse this same pattern
+                         rather than re-deriving it, but the two pre_exec
+                         closures are not (yet) factored into one shared helper
+                         -- a small duplication, deliberately not addressed here
+                         to keep this slice's diff to the one call site the task
+                         specified.
 Commit(s):               <filled after commit; same commit as this file>
 ```
 
-## SR-1b — inspector/daemon report-FD wiring
-
-- `kwe-scene-inspector` gains `--report-fd <n>` and emits its
-  `scene-inspection-v1` record as one `kwe-report-protocol` frame on that fd
-  instead of (or alongside, transitionally) stdout.
-- The daemon (`crates/kwe-daemon/src/inspect.rs`/`supervisor.rs`) creates the
-  pipe, dup2's the write end into the child before exec, owns the read end
-  exclusively, and closes both ends on generation change — mirroring the
-  existing stdin/stdout/stderr pipe wiring in `spawn_worker`.
-- No daemon-side policy decision yet (that is SR-1c): SR-1b's daemon just
-  reads frames off the fd with `kwe-report-protocol::FrameReader` and can log
-  what it received.
-
 ## SR-1c — daemon validation, policy, and the apply gate
 
-- Wires `report-malformed`/`report-missing`/`report-duplicate`/`report-late`/
-  `report-unavailable` (`docs/REPORT_PROTOCOL_V1.md`) into real daemon
-  behavior: a bounded read-with-timeout loop over the report fd,
-  `validate_inspection` on every `scene-inspection-v1` frame, and the policy
-  decisions the codec deliberately left out (duplicate-kind handling,
-  lateness relative to the daemon's own deadline).
-- Decides how (and whether) an inspection result gates `wallpaper.apply` —
-  the "typed failure/recovery action" plan §5.3 calls for.
+- Wires `report-late` (an apply-window deadline for a renderer worker's own
+  report) and the renderer-worker sense of `report-unavailable`
+  (`docs/REPORT_PROTOCOL_V1.md`) into real daemon behavior — SR-1b already
+  implemented `report-malformed`/`report-missing`/`report-duplicate` for the
+  one-shot `scene.inspect` path.
+- Extends the report-FD wiring pattern SR-1b established
+  (`crates/kwe-daemon/src/inspect.rs`) to the long-lived renderer worker
+  (`supervisor::spawn_worker`, `renderer.start`), which SR-1b left untouched.
+- Decides how (and whether) an inspection/render result gates
+  `wallpaper.apply` — the "typed failure/recovery action" plan §5.3 calls for.
 
 ## SR-1d — old/new version-skew matrix
 

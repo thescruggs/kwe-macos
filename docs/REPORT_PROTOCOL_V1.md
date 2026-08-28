@@ -11,9 +11,11 @@ uses for other things (stdout carries the v1 input-acknowledgement contract;
 stderr is a bounded diagnostic ring, never parsed as data). This document is
 that envelope's wire format, frozen for `kwe-report-protocol` (SR-1a). The
 containment/FD plumbing that gets a byte stream from a child process to this
-codec is SR-1b; the daemon-side policy that decides what a malformed,
-missing, duplicate, or late report MEANS for an apply/inspect decision is
-SR-1c.
+codec, and the malformed/missing/duplicate policy for the one-shot
+`scene.inspect` path specifically, is SR-1b (implemented); the broader
+daemon-side policy for what a malformed/missing/duplicate/late report means
+for an APPLY decision (a long-lived renderer worker, not the one-shot
+inspector) is SR-1c.
 
 Cross-references: `docs/SCENE_CAPABILITIES.md` (the frozen v1 capability ID
 taxonomy this record's `required`/`detected` arrays draw from) and
@@ -40,7 +42,7 @@ mirrors the rest of the workspace's protocol crates
 (`kwe-frame-protocol`/`kwe-input-protocol` codec bytes/shared-memory layout;
 the daemon and worker own what those bytes mean).
 
-## Report FD convention (SR-1b wiring; documented here for the whole picture)
+## Report FD convention
 
 - The daemon creates a pipe, keeps the read end, and passes the write end's
   fd number to the child as `--report-fd <n>` (the child `dup2`s its own
@@ -57,23 +59,58 @@ the daemon and worker own what those bytes mean).
   not travel there, and nothing about moving reports to a dedicated FD
   touches the stdout contract.
 
-SR-1c implements the daemon-side read loop, timeout, and the reason codes a
-malformed/missing/duplicate/late report resolves to (see below); SR-1b wires
-the fd itself into `spawn_worker`'s pre-exec plumbing (mirroring how the
-existing stdin/stdout/stderr pipes are wired in
-`crates/kwe-daemon/src/supervisor.rs`). Neither is implemented by this slice.
+**Implemented (SR-1b):** the one-shot `scene.inspect` path
+(`crates/kwe-daemon/src/inspect.rs`'s `run_inspection`/`supervise`).
+`kwe-scene-inspector` gained `--report-fd <n>` (absent: unchanged v0-on-
+stdout behavior; present: nothing on stdout, one `scene-inspection-v1` frame
+on `n`). The daemon creates the pipe with `libc::pipe2(..., O_CLOEXEC)` and,
+in the child's `pre_exec`, `dup2`s the write end onto a fixed fd 3 —
+inserted into the exact same closure that already runs
+`setpgid`/`PR_SET_PDEATHSIG`/the parent-pid check/`PR_SET_NO_NEW_PRIVS`/
+`apply_resource_limits` (mirroring `supervisor::spawn_worker`'s pre_exec
+block) — then reads the resulting stream with `FrameReader` once the child
+has exited 0. `docs/SUPERVISOR_API_V1.md`'s "Scene inspection" section is
+the RPC-facing description of the resulting reason codes.
 
-Reason codes SR-1c is expected to use once its daemon-side handling lands
+**Not yet implemented:** the long-lived RENDERER worker's own report stream
+(`supervisor::spawn_worker`, `renderer.start`) is a separate, still-future
+wiring untouched by SR-1b. `report-late` (only meaningful once there is an
+apply-window deadline to be late against, which the one-shot inspector call
+does not have — it has only its own wall-clock timeout, already `timeout`)
+and `report-unavailable` (defined below for a renderer WORKER predating the
+report FD; the one-shot inspector's own old-binary skew resolves
+differently — see "Version skew") remain unimplemented/unused by SR-1b.
+
+Reason codes SR-1c/a future renderer-worker report slice are expected to use
 (named here so this document is the single place a future reader learns the
-full intended vocabulary, even though only the codec exists today):
+full intended vocabulary, even where only the inspector path implements it
+today):
 
 | Reason code | Meaning |
 |---|---|
-| `report-malformed` | A frame or its payload failed a typed check (bad magic/flags/reserved, an oversize/truncated frame, a stream-cap violation, or a `scene-inspection-v1` payload that fails `validate_inspection`). |
-| `report-missing` | The child closed its report FD (or exited) without ever sending an expected frame kind. |
-| `report-duplicate` | A second frame of a kind that must appear at most once in a stream arrived (daemon policy, not a codec-level concept — see "Codec vs. policy"). |
-| `report-late` | A report arrived after the daemon's own deadline for it (a generation/apply-window boundary, not a wire-level timeout this crate knows about). |
-| `report-unavailable` | The worker predates the report FD entirely (an old binary that never gets `--report-fd`); the daemon must not reconstruct a policy decision from stdout/stderr in this case (plan §5.3). |
+| `report-malformed` | A frame or its payload failed a typed check (bad magic/flags/reserved, an oversize/truncated frame, a stream-cap violation, or a `scene-inspection-v1` payload that fails `validate_inspection`). Implemented (SR-1b, `scene.inspect`). |
+| `report-missing` | The child exited 0 but its report stream contained zero frames of the expected kind (either no frames at all, or only frames of a kind the daemon does not act on — e.g. `Unknown`). Implemented (SR-1b, `scene.inspect`). |
+| `report-duplicate` | A second frame of a kind that must appear at most once in a stream arrived (daemon policy, not a codec-level concept — see "Codec vs. policy"). Implemented (SR-1b, `scene.inspect`). |
+| `report-late` | A report arrived after the daemon's own deadline for it (a generation/apply-window boundary, not a wire-level timeout this crate knows about). Not yet implemented — no code path has an apply-window deadline to compare against yet. |
+| `report-unavailable` | A renderer WORKER predates the report FD entirely (an old binary that never gets `--report-fd`); the daemon must not reconstruct a policy decision from stdout/stderr in this case (plan §5.3). Not yet implemented (no renderer-worker report stream exists yet); the one-shot inspector's analogous old-binary case resolves as `inspector-failed` instead — see "Version skew". |
+
+### Version skew (SR-1b: one case implemented and tested; SR-1d builds the fuller matrix)
+
+An old `kwe-scene-inspector` binary that predates `--report-fd` rejects the
+daemon's `--report-fd 3` argument the way clap itself rejects any unknown
+flag: a usage error printed to stderr, exit 2. The daemon always passes
+`--report-fd` unconditionally — there is no daemon-side fallback to the old
+stdout contract — so this resolves as `inspector-failed`, with that usage
+error visible in `stderr_tail`, never a crash and never a decision
+reconstructed from stdout. This is the only skew combination SR-1b
+implements and tests
+(`crates/kwe-daemon/src/inspect.rs`'s
+`old_inspector_without_report_fd_support_is_inspector_failed`); daemon and
+inspector ship in the same package, so this is a partial-upgrade window
+(the package half-updated, or an operator pointing `--inspector` at a stray
+old binary), not a supported long-term compatibility mode. SR-1d is the
+fuller old/new daemon x worker x display-bridge upgrade/downgrade/
+canary-rollback matrix plan §5.3 calls for.
 
 ## Wire format
 

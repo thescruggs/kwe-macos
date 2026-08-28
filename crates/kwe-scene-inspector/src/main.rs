@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! SR-0b/SR-0c: one-shot, daemon-supervised scene inspector.
+//! SR-0b/SR-0c/SR-1b: one-shot, daemon-supervised scene inspector.
 //!
 //! Accepts one scene entry path, classifies it, hashes bounded bytes under a
 //! byte cap and a self-watchdog wall-clock cap, and emits exactly ONE JSON
-//! line on stdout conforming to the draft `scene-feature-inventory-v0`
-//! record (docs/SCENE_CAPABILITIES.md). SR-0c (`inventory.rs`) fills
-//! `required`/`detected`/`unknown` from a bounded raw walk of `scene.json`'s
-//! object family — objects only; materials require pkg/asset resolution of
-//! referenced files and are their own follow-up slice (docs/SR0.md SR-0c
-//! conductor scope note).
+//! record conforming to either the draft `scene-feature-inventory-v0`
+//! (docs/SCENE_CAPABILITIES.md) or SR-1's frozen `scene-inspection-v1`
+//! (docs/REPORT_PROTOCOL_V1.md), depending on whether `--report-fd` is
+//! given. SR-0c (`inventory.rs`) fills `required`/`detected`/`unknown` from
+//! a bounded raw walk of `scene.json`'s object family — objects only;
+//! materials require pkg/asset resolution of referenced files and are their
+//! own follow-up slice (docs/SR0.md SR-0c conductor scope note).
+//!
+//! ## SR-1b: two delivery modes
+//!
+//! - No `--report-fd`: unchanged from SR-0c — the v0 record, one JSON line,
+//!   on stdout. This is what `scripts/scene-corpus-inventory.sh` and any
+//!   manual invocation use.
+//! - `--report-fd <n>`: nothing on stdout at all. The record is built in
+//!   the v1 shape and written as exactly one `scene-inspection-v1`
+//!   (`kwe_report_protocol::FrameKind::SceneInspectionV1`) frame to fd `n`,
+//!   which the daemon (`crates/kwe-daemon/src/inspect.rs`) created as a pipe
+//!   and dup2'd into this process before exec. This is the production path.
 //!
 //! Containment (crates/kwe-daemon/src/inspect.rs) mirrors
 //! `supervisor::spawn_worker`: private HOME, process-group kill, PDEATHSIG,
@@ -21,7 +33,10 @@ mod inventory;
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        unix::fs::OpenOptionsExt,
+    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -31,6 +46,7 @@ use inventory::{
     DetectedCapability, Inventory, InventoryCaps, InventoryError, inventory_scene_json,
 };
 use kwe_core::{MAX_SCENE_JSON_BYTES, PkgReader, scene_json_entry};
+use kwe_report_protocol::{FrameKind, SCENE_CAPABILITIES_SCHEMA, SCENE_INSPECTION_SCHEMA};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -48,11 +64,30 @@ const INSPECTOR_BUILD: &str = "dev";
 const INSPECTOR_ABI: u64 = 0;
 /// Streamed read chunk size for hashing.
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
-/// Serialized record safety cap (docs/SCENE_CAPABILITIES.md: "<= 64 KiB").
+/// Serialized record safety cap (docs/SCENE_CAPABILITIES.md: "<= 64 KiB"),
+/// shared by both delivery modes: on stdout this bounds the JSON line
+/// (plus its trailing newline); on the report FD the same cap, minus that
+/// newline, equals `kwe_report_protocol::MAX_PAYLOAD_BYTES` exactly, so a
+/// bound-report record is always a valid single frame payload.
 const MAX_REPORT_BYTES: usize = 65536;
-/// `stdout` cannot be written at all; distinct from every other outcome,
-/// which is always a JSON record on exit 0.
+/// The record cannot be delivered at all — neither `stdout` (no
+/// `--report-fd`) nor the report FD (`--report-fd` given) could be
+/// written/flushed; distinct from every other outcome, which is always a
+/// JSON record successfully delivered (via whichever channel applies) on
+/// exit 0.
 const EXIT_STDOUT_UNWRITABLE: i32 = 74;
+
+/// Which record shape to build. The two differ by exactly three fields —
+/// docs/REPORT_PROTOCOL_V1.md's v0 -> v1 mapping table: the `schema`
+/// string, an added `capabilities_schema`, and an added nullable `backend`
+/// (always `null` here — this binary has no rendering backend of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordFormat {
+    /// SR-0's draft `scene-feature-inventory-v0`, delivered on stdout.
+    V0,
+    /// SR-1's frozen `scene-inspection-v1`, delivered as one report-FD frame.
+    V1,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -73,6 +108,13 @@ struct Arguments {
     /// bounded read chunks. The daemon owns the authoritative kill.
     #[arg(long, default_value_t = 10_000)]
     max_wall_ms: u64,
+    /// Emit the record as one `scene-inspection-v1` frame
+    /// (crates/kwe-report-protocol, docs/REPORT_PROTOCOL_V1.md) on this raw
+    /// fd instead of the v0 record on stdout. The daemon owns this fd's
+    /// lifecycle (crates/kwe-daemon/src/inspect.rs); it must not be 0, 1,
+    /// or 2 (stdin/stdout/stderr).
+    #[arg(long)]
+    report_fd: Option<i32>,
 }
 
 /// What the input classified as, and the single file whose bytes are
@@ -164,11 +206,14 @@ fn hash_bounded(path: &Path, max_bytes: u64, deadline: Instant) -> HashOutcome {
     }
 }
 
-/// Build one draft `scene-feature-inventory-v0` record from `inventory`
-/// (SR-0b's empty `Inventory::default()` for every outcome that never
-/// reaches a parsed scene; SR-0c's real object-family walk otherwise).
-/// `digest` is the hex SHA-256 over the record serialized with `digest`
-/// itself set to `""`.
+/// Build one record from `inventory` (SR-0b's empty `Inventory::default()`
+/// for every outcome that never reaches a parsed scene; SR-0c's real
+/// object-family walk otherwise), in the shape `format` names. `digest` is
+/// the hex SHA-256 over the record serialized with `digest` itself set to
+/// `""` — computed exactly once, over whichever shape was actually built,
+/// so this is the ONLY place either record format's digest is computed
+/// (SR-1b: "reuse the existing digest helper, parameterize build_record
+/// rather than duplicating it").
 #[allow(clippy::too_many_arguments)]
 fn build_record(
     outcome: &str,
@@ -179,6 +224,7 @@ fn build_record(
     wall_ms: u64,
     limits_hit: &[&str],
     inventory: &Inventory,
+    format: RecordFormat,
 ) -> Value {
     let detected: Vec<Value> = inventory
         .detected
@@ -192,8 +238,12 @@ fn build_record(
             })
         })
         .collect();
+    let schema = match format {
+        RecordFormat::V0 => SCHEMA,
+        RecordFormat::V1 => SCENE_INSPECTION_SCHEMA,
+    };
     let mut record = json!({
-        "schema": SCHEMA,
+        "schema": schema,
         "content": { "hash": hash, "source_bytes": source_bytes, "kind": kind },
         "inspector": { "build": INSPECTOR_BUILD, "abi": INSPECTOR_ABI },
         "outcome": outcome,
@@ -210,6 +260,12 @@ fn build_record(
         "bounds": { "wall_ms": wall_ms, "peak_bytes": 0, "limits_hit": limits_hit },
         "digest": "",
     });
+    if format == RecordFormat::V1 {
+        record["capabilities_schema"] = json!(SCENE_CAPABILITIES_SCHEMA);
+        // This binary is a pure classification/hash tool with no rendering
+        // backend of its own (docs/REPORT_PROTOCOL_V1.md's v1 field list).
+        record["backend"] = Value::Null;
+    }
     let serialized = serde_json::to_vec(&record).unwrap_or_default();
     let digest = hex::encode(Sha256::digest(&serialized));
     record["digest"] = json!(digest);
@@ -220,8 +276,15 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Classify + hash + (SR-0c) inventory one input into a full record.
-fn inspect_input(input: &Path, max_bytes: u64, deadline: Instant, start: Instant) -> Value {
+/// Classify + hash + (SR-0c) inventory one input into a full record, in the
+/// shape `format` names.
+fn inspect_input(
+    input: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+    start: Instant,
+    format: RecordFormat,
+) -> Value {
     match classify(input) {
         Classification::Unrecognized => build_record(
             "incompatible",
@@ -232,14 +295,23 @@ fn inspect_input(input: &Path, max_bytes: u64, deadline: Instant, start: Instant
             elapsed_ms(start),
             &[],
             &Inventory::default(),
+            format,
         ),
-        Classification::Pkg(target) => pkg_record(&target, max_bytes, deadline, start),
-        Classification::JsonDir(target) => json_dir_record(&target, max_bytes, deadline, start),
+        Classification::Pkg(target) => pkg_record(&target, max_bytes, deadline, start, format),
+        Classification::JsonDir(target) => {
+            json_dir_record(&target, max_bytes, deadline, start, format)
+        }
     }
 }
 
 /// JsonDir: the hashed file (`target`) already IS `scene.json`.
-fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) -> Value {
+fn json_dir_record(
+    target: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+    start: Instant,
+    format: RecordFormat,
+) -> Value {
     match hash_bounded(target, max_bytes, deadline) {
         HashOutcome::Ok { hash, bytes } => {
             // §2's JsonDir rule: re-open and bounded-read the same
@@ -258,6 +330,7 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
                     deadline,
                     start,
                     false,
+                    format,
                 ),
                 Err(()) => build_record(
                     "unknown",
@@ -268,6 +341,7 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
                     elapsed_ms(start),
                     &[],
                     &Inventory::default(),
+                    format,
                 ),
             }
         }
@@ -280,6 +354,7 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
             elapsed_ms(start),
             &["oversize"],
             &Inventory::default(),
+            format,
         ),
         HashOutcome::Timeout { bytes } => build_record(
             "unknown",
@@ -290,6 +365,7 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
             elapsed_ms(start),
             &["timeout"],
             &Inventory::default(),
+            format,
         ),
         HashOutcome::IoError => build_record(
             "unknown",
@@ -300,6 +376,7 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
             elapsed_ms(start),
             &[],
             &Inventory::default(),
+            format,
         ),
     }
 }
@@ -308,12 +385,25 @@ fn json_dir_record(target: &Path, max_bytes: u64, deadline: Instant, start: Inst
 /// bytes; the scene.json to inventory is a separate entry inside it,
 /// located and bounded-read through kwe-core's real `PkgReader` (never a
 /// second pkg parser).
-fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) -> Value {
+fn pkg_record(
+    target: &Path,
+    max_bytes: u64,
+    deadline: Instant,
+    start: Instant,
+    format: RecordFormat,
+) -> Value {
     match hash_bounded(target, max_bytes, deadline) {
         HashOutcome::Ok { hash, bytes } => match read_pkg_scene_json(target) {
-            PkgSceneJson::Bytes(scene_bytes) => {
-                inventoried_record("pkg", &hash, bytes, &scene_bytes, deadline, start, true)
-            }
+            PkgSceneJson::Bytes(scene_bytes) => inventoried_record(
+                "pkg",
+                &hash,
+                bytes,
+                &scene_bytes,
+                deadline,
+                start,
+                true,
+                format,
+            ),
             PkgSceneJson::Missing => build_record(
                 "incompatible",
                 "parse-error",
@@ -323,6 +413,7 @@ fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) 
                 elapsed_ms(start),
                 &["pkg-no-scene-json"],
                 &Inventory::default(),
+                format,
             ),
             PkgSceneJson::Oversize => build_record(
                 "incompatible",
@@ -333,6 +424,7 @@ fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) 
                 elapsed_ms(start),
                 &["pkg-scene-json-oversize"],
                 &Inventory::default(),
+                format,
             ),
         },
         HashOutcome::Oversize { bytes } => build_record(
@@ -344,6 +436,7 @@ fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) 
             elapsed_ms(start),
             &["oversize"],
             &Inventory::default(),
+            format,
         ),
         HashOutcome::Timeout { bytes } => build_record(
             "unknown",
@@ -354,6 +447,7 @@ fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) 
             elapsed_ms(start),
             &["timeout"],
             &Inventory::default(),
+            format,
         ),
         HashOutcome::IoError => build_record(
             "unknown",
@@ -364,6 +458,7 @@ fn pkg_record(target: &Path, max_bytes: u64, deadline: Instant, start: Instant) 
             elapsed_ms(start),
             &[],
             &Inventory::default(),
+            format,
         ),
     }
 }
@@ -435,6 +530,7 @@ fn inventoried_record(
     deadline: Instant,
     start: Instant,
     is_pkg: bool,
+    format: RecordFormat,
 ) -> Value {
     match inventory_scene_json(scene_bytes, &InventoryCaps::default(), deadline) {
         Err(InventoryError::Parse) => build_record(
@@ -446,6 +542,7 @@ fn inventoried_record(
             elapsed_ms(start),
             &[],
             &package_only_inventory(is_pkg),
+            format,
         ),
         Ok(mut inventory) => {
             if is_pkg {
@@ -466,6 +563,7 @@ fn inventoried_record(
                 elapsed_ms(start),
                 &limits_hit,
                 &inventory,
+                format,
             )
         }
     }
@@ -513,10 +611,13 @@ fn add_scene_package(inventory: &mut Inventory) {
     }
 }
 
-/// Serialize `record`, replacing it with a minimal `report-oversize` record
-/// when the serialized form would exceed `MAX_REPORT_BYTES`. Returns the
-/// bytes to write, newline-terminated.
-fn bound_report(record: &Value) -> Vec<u8> {
+/// Serialize `record` (built in `format`'s shape), replacing it with a
+/// minimal `report-oversize` record — in that same shape — when the
+/// serialized form would exceed `MAX_REPORT_BYTES`. Returns the bytes to
+/// write, newline-terminated (the stdout delivery path writes these bytes
+/// as-is; the report-FD path strips the trailing newline before framing
+/// it — see `main`).
+fn bound_report(record: &Value, format: RecordFormat) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(record).unwrap_or_default();
     if bytes.len() > MAX_REPORT_BYTES {
         eprintln!("event=inspector.report_oversize bytes={}", bytes.len());
@@ -529,6 +630,7 @@ fn bound_report(record: &Value) -> Vec<u8> {
             0,
             &[],
             &Inventory::default(),
+            format,
         );
         bytes = serde_json::to_vec(&minimal).unwrap_or_default();
     }
@@ -536,19 +638,72 @@ fn bound_report(record: &Value) -> Vec<u8> {
     bytes
 }
 
+/// Rejects an fd that would alias the child's own stdio — a usage error,
+/// checked before inspection ever starts (mirrors clap's own usage-error
+/// exit code, 2, for a flag value that parses fine as an integer but is
+/// semantically disallowed).
+fn validate_report_fd(raw: Option<i32>) -> Result<Option<i32>, String> {
+    match raw {
+        None => Ok(None),
+        Some(fd) if matches!(fd, 0..=2) => Err(format!(
+            "--report-fd {fd} would alias stdio (0, 1, or 2 are reserved)"
+        )),
+        Some(fd) => Ok(Some(fd)),
+    }
+}
+
+/// Exit code clap itself uses for a usage error (e.g. an unrecognized
+/// flag) — mirrored here for the one validation this binary does AFTER
+/// clap's own parsing succeeds (`--report-fd` aliasing stdio).
+const EXIT_USAGE_ERROR: i32 = 2;
+
 fn main() {
     let arguments = Arguments::parse();
+    let report_fd = match validate_report_fd(arguments.report_fd) {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("event=inspector.usage_error detail={message}");
+            std::process::exit(EXIT_USAGE_ERROR);
+        }
+    };
+    let format = if report_fd.is_some() {
+        RecordFormat::V1
+    } else {
+        RecordFormat::V0
+    };
+
     let start = Instant::now();
     let deadline = start + Duration::from_millis(arguments.max_wall_ms);
     let max_bytes = arguments.max_source_mib.saturating_mul(1024 * 1024);
 
-    let record = inspect_input(&arguments.input, max_bytes, deadline, start);
-    let bytes = bound_report(&record);
+    let record = inspect_input(&arguments.input, max_bytes, deadline, start, format);
+    let bytes = bound_report(&record, format);
 
-    let mut stdout = std::io::stdout().lock();
-    let write_result = stdout.write_all(&bytes).and_then(|()| stdout.flush());
+    let write_result = match report_fd {
+        None => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&bytes).and_then(|()| stdout.flush())
+        }
+        Some(fd) => {
+            // `bound_report` always appends exactly one trailing newline
+            // for the stdout line-delimited convention; the report FD's
+            // frame payload is the exact-length JSON with no delimiter.
+            let payload = &bytes[..bytes.len().saturating_sub(1)];
+            // SAFETY: the daemon contract (crates/kwe-daemon/src/inspect.rs,
+            // docs/REPORT_PROTOCOL_V1.md) guarantees fd `fd` is a pipe
+            // write end dup2'd into this process exclusively for this
+            // purpose before exec, and that nothing else in this process
+            // reads or writes it; this is the only place that takes
+            // ownership of it, via a fresh `OwnedFd` (closed on drop at
+            // the end of this match arm, which is what lets the daemon's
+            // reader see EOF once this process has nothing more to send).
+            let mut report = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            kwe_report_protocol::write_frame(&mut report, FrameKind::SceneInspectionV1, payload)
+                .and_then(|()| report.flush())
+        }
+    };
     if let Err(error) = write_result {
-        eprintln!("event=inspector.stdout_error detail={error}");
+        eprintln!("event=inspector.report_error detail={error}");
         std::process::exit(EXIT_STDOUT_UNWRITABLE);
     }
 }
@@ -580,7 +735,13 @@ mod tests {
         let dir = temp_dir("json-dir");
         fs::write(dir.join("scene.json"), br#"{"general":{}}"#).unwrap();
 
-        let record = inspect_input(&dir, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "inventoried");
         assert_eq!(record["reason"], "ok");
         assert_eq!(record["content"]["kind"], "json-dir");
@@ -588,7 +749,13 @@ mod tests {
         assert!(!hash.is_empty());
         assert!(hash.starts_with("sha256:"));
 
-        let record_again = inspect_input(&dir, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record_again = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record_again["content"]["hash"], hash);
 
         fs::remove_dir_all(&dir).unwrap();
@@ -601,7 +768,7 @@ mod tests {
         let dir = temp_dir("oversize");
         fs::write(dir.join("scene.json"), vec![b'x'; 4096]).unwrap();
 
-        let record = inspect_input(&dir, 0, far_deadline(), Instant::now());
+        let record = inspect_input(&dir, 0, far_deadline(), Instant::now(), RecordFormat::V0);
         assert_eq!(record["outcome"], "incompatible");
         assert_eq!(record["reason"], "oversize");
         assert_eq!(record["content"]["kind"], "json-dir");
@@ -616,7 +783,13 @@ mod tests {
     #[test]
     fn unrecognized_input_is_refused_typed() {
         let dir = temp_dir("unrecognized");
-        let record = inspect_input(&dir, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "incompatible");
         assert_eq!(record["reason"], "unrecognized-input");
         assert_eq!(record["content"]["hash"], "");
@@ -629,6 +802,7 @@ mod tests {
             512 * 1024 * 1024,
             far_deadline(),
             Instant::now(),
+            RecordFormat::V0,
         );
         assert_eq!(record["outcome"], "incompatible");
         assert_eq!(record["reason"], "unrecognized-input");
@@ -646,8 +820,9 @@ mod tests {
             512,
             far_deadline(),
             Instant::now(),
+            RecordFormat::V0,
         );
-        let bytes = bound_report(&record);
+        let bytes = bound_report(&record, RecordFormat::V0);
         assert!(bytes.len() <= MAX_REPORT_BYTES + 1);
 
         let huge_hash = format!("sha256:{}", "a".repeat(MAX_REPORT_BYTES));
@@ -660,8 +835,9 @@ mod tests {
             1,
             &[],
             &Inventory::default(),
+            RecordFormat::V0,
         );
-        let bytes = bound_report(&oversized);
+        let bytes = bound_report(&oversized, RecordFormat::V0);
         assert!(bytes.len() <= MAX_REPORT_BYTES + 1);
         let parsed: Value = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(parsed["outcome"], "unknown");
@@ -676,7 +852,13 @@ mod tests {
         fs::write(dir.join("scene.json"), br#"{"general":{}}"#).unwrap();
         let expired = Instant::now() - Duration::from_secs(1);
 
-        let record = inspect_input(&dir, 512 * 1024 * 1024, expired, Instant::now());
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            expired,
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "unknown");
         assert_eq!(record["reason"], "timeout");
         assert_eq!(record["bounds"]["limits_hit"][0], "timeout");
@@ -699,7 +881,13 @@ mod tests {
         )
         .unwrap();
 
-        let record = inspect_input(&dir, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "inventoried");
         assert_eq!(record["reason"], "ok");
         assert_eq!(record["required"], json!(["scene.layer.image"]));
@@ -725,7 +913,13 @@ mod tests {
         let dir = temp_dir("parse-error");
         fs::write(dir.join("scene.json"), b"{not json").unwrap();
 
-        let record = inspect_input(&dir, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "incompatible");
         assert_eq!(record["reason"], "parse-error");
         assert!(
@@ -761,6 +955,7 @@ mod tests {
             5,
             &[],
             &inventory_a,
+            RecordFormat::V0,
         );
         let record_b = build_record(
             "inventoried",
@@ -771,6 +966,7 @@ mod tests {
             5,
             &[],
             &inventory_b,
+            RecordFormat::V0,
         );
         assert_eq!(record_a, record_b);
         assert_eq!(record_a["digest"], record_b["digest"]);
@@ -810,7 +1006,13 @@ mod tests {
         let pkg_path = dir.join("scene.pkg");
         fs::write(&pkg_path, build_pkg(&[("scene.json", scene_json)])).unwrap();
 
-        let record = inspect_input(&pkg_path, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &pkg_path,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "inventoried", "{record}");
         assert_eq!(record["reason"], "ok");
         assert_eq!(record["content"]["kind"], "pkg");
@@ -844,7 +1046,13 @@ mod tests {
         let pkg_path = dir.join("scene.pkg");
         fs::write(&pkg_path, build_pkg(&[("scene.json", b"{not json")])).unwrap();
 
-        let record = inspect_input(&pkg_path, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &pkg_path,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "incompatible", "{record}");
         assert_eq!(record["reason"], "parse-error");
         assert_eq!(record["required"], json!(["scene.package"]));
@@ -867,7 +1075,13 @@ mod tests {
         let pkg_path = dir.join("scene.pkg");
         fs::write(&pkg_path, build_pkg(&[("readme.txt", b"hello")])).unwrap();
 
-        let record = inspect_input(&pkg_path, 512 * 1024 * 1024, far_deadline(), Instant::now());
+        let record = inspect_input(
+            &pkg_path,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V0,
+        );
         assert_eq!(record["outcome"], "incompatible", "{record}");
         assert_eq!(record["reason"], "parse-error");
         assert_eq!(record["bounds"]["limits_hit"], json!(["pkg-no-scene-json"]));
@@ -886,5 +1100,107 @@ mod tests {
         assert_eq!(record["detected"], json!([]));
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // SR-1b: --report-fd / scene-inspection-v1
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn report_fd_aliasing_stdio_is_rejected() {
+        for fd in [0, 1, 2] {
+            assert!(validate_report_fd(Some(fd)).is_err(), "fd={fd}");
+        }
+        assert_eq!(validate_report_fd(None), Ok(None));
+        assert_eq!(validate_report_fd(Some(3)), Ok(Some(3)));
+    }
+
+    /// `RecordFormat::V1` adds exactly the three fields
+    /// docs/REPORT_PROTOCOL_V1.md's v0 -> v1 mapping names, and the digest
+    /// is recomputed over that v1 shape (not reused from a v0 build) —
+    /// `kwe_report_protocol::validate_inspection` (the same crate the
+    /// daemon uses) accepts the result end to end.
+    #[test]
+    fn v1_record_adds_capabilities_schema_and_null_backend_and_validates() {
+        let dir = temp_dir("report-fd-v1-shape");
+        fs::write(
+            dir.join("scene.json"),
+            br#"{"objects":[{"id":1,"image":"a.png"}]}"#,
+        )
+        .unwrap();
+
+        let record = inspect_input(
+            &dir,
+            512 * 1024 * 1024,
+            far_deadline(),
+            Instant::now(),
+            RecordFormat::V1,
+        );
+        assert_eq!(record["schema"], SCENE_INSPECTION_SCHEMA);
+        assert_eq!(record["capabilities_schema"], SCENE_CAPABILITIES_SCHEMA);
+        assert_eq!(record["backend"], Value::Null);
+        assert_eq!(record["outcome"], "inventoried");
+
+        let payload = serde_json::to_vec(&record).unwrap();
+        let validated = kwe_report_protocol::validate_inspection(&payload).unwrap();
+        assert_eq!(validated, record);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The only difference between a V0 and a V1 build of the SAME
+    /// underlying outcome is the three mapped fields plus the digest that
+    /// covers them — proving `build_record` truly reuses one code path
+    /// rather than diverging in some other field.
+    #[test]
+    fn v0_and_v1_builds_agree_on_every_field_except_the_documented_three() {
+        let scene_bytes = br#"{"objects":[{"id":1,"image":"a.png"}]}"#;
+        let inventory =
+            inventory_scene_json(scene_bytes, &InventoryCaps::default(), far_deadline()).unwrap();
+        let v0 = build_record(
+            "inventoried",
+            "ok",
+            "json-dir",
+            "sha256:aaaa",
+            10,
+            5,
+            &[],
+            &inventory,
+            RecordFormat::V0,
+        );
+        let v1 = build_record(
+            "inventoried",
+            "ok",
+            "json-dir",
+            "sha256:aaaa",
+            10,
+            5,
+            &[],
+            &inventory,
+            RecordFormat::V1,
+        );
+        assert_eq!(v0["schema"], SCHEMA);
+        assert_eq!(v1["schema"], SCENE_INSPECTION_SCHEMA);
+        assert!(v0.get("capabilities_schema").is_none());
+        assert_eq!(v1["capabilities_schema"], SCENE_CAPABILITIES_SCHEMA);
+        assert!(v0.get("backend").is_none());
+        assert_eq!(v1["backend"], Value::Null);
+        // Every other field is byte-identical between the two shapes.
+        for field in [
+            "content",
+            "inspector",
+            "outcome",
+            "reason",
+            "required",
+            "detected",
+            "unknown",
+            "bounds",
+        ] {
+            assert_eq!(v0[field], v1[field], "field={field}");
+        }
+        assert_ne!(
+            v0["digest"], v1["digest"],
+            "the digest must cover the actual shape, not be reused across formats"
+        );
     }
 }
