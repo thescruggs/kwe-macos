@@ -513,6 +513,50 @@ slot is complete, so the previously acknowledged still survives an interrupted
 commit. These static files remain usable across daemon restart and do not
 depend on the live mmap.
 
+## Scene inspection *(draft, SR-0b)*
+
+*(`docs/SR0.md` SR-0b: a one-shot, daemon-supervised scene inventory
+inspector. The record schema below is draft `scene-feature-inventory-v0`
+(`docs/SCENE_CAPABILITIES.md`), pending the SR-1 freeze — names, the schema
+version, and the report's transport (currently stdout; SR-1 plans to move it
+to a dedicated report FD/envelope) may all still change.)*
+
+- `scene.inspect` `{"path": "/absolute/path/to/scene"}` → the inspector's
+  JSON record verbatim. `path` must be a non-empty absolute path — a
+  relative or empty path fails `invalid_params` before the daemon touches
+  its inspector configuration.
+- The daemon spawns `kwe-scene-inspector --input <path> --max-wall-ms <ms>`
+  under the same containment `renderer.start` gives every renderer worker:
+  a private per-launch `HOME` (0700, removed on every exit path),
+  `env_clear()` plus the shared `{HOME, PATH}` allowlist, `setpgid(0, 0)`,
+  `PR_SET_PDEATHSIG` SIGKILL, a parent-pid check, `PR_SET_NO_NEW_PRIVS`, and
+  the scene renderer kind's resource limits (never less contained than the
+  renderer it stands in for). Unlike a renderer worker this is one bounded
+  blocking call, not a supervised long-lived process: stdin is closed,
+  stdout/stderr are drained under a wall-clock deadline (default 10 s,
+  `--inspector-wall-timeout-ms`), and the child is always reaped before the
+  RPC answers.
+- Every non-success path answers a typed `{"outcome": "unknown", "reason":
+  "..."}` result instead of an RPC-level error, so `scene.inspect` itself
+  always succeeds (`"ok": true`) once its input validates — the record's own
+  `outcome`/`reason` fields carry the result:
+  - `inspector-unavailable`: no inspector binary configured, or it failed to
+    spawn.
+  - `timeout`: the wall-clock deadline expired; the inspector's whole
+    process group is SIGKILLed and reaped.
+  - `report-oversize`: the inspector's stdout exceeded 64 KiB (the
+    inspector itself is bounded to the same cap; a report this large means
+    the child misbehaved).
+  - `inspector-failed`: a nonzero exit, or stdout that fails to parse as
+    JSON tagged `"schema":"scene-feature-inventory-v0"`; carries a bounded
+    (512-byte, lossy-UTF8) `stderr_tail`.
+  - On success, the record's own `outcome` is `inventoried` (hashed
+    successfully — SR-0b never parses a scene, so `required`/`detected` stay
+    empty and `unknown` stays all zeros) or `incompatible` (unrecognized
+    input, or the input exceeded the inspector's own byte cap).
+- No renderer worker state is touched by `scene.inspect`; it shares nothing
+  with the active/candidate worker the rest of this document describes.
+
 ## Current limits
 
 - The generated and video renderers are the production-shaped workers

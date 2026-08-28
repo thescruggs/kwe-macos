@@ -5,6 +5,7 @@
 mod apply;
 mod audio;
 mod grants;
+mod inspect;
 mod persist;
 mod playlist_session;
 mod selfcheck;
@@ -31,6 +32,7 @@ use apply::{ApplyConfig, ApplyHandle, ApplyService, ApplyWallpaperParams, Restor
 use audio::{AudioCaptureConfig, AudioCaptureHandle, AudioCaptureService};
 use clap::Parser;
 use grants::GrantPatch;
+use inspect::InspectConfig;
 use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
 use kwe_input_protocol::{AudioFrame, MediaState, PointerButton, PointerPhase};
 use playlist_session::{
@@ -78,6 +80,17 @@ struct Arguments {
     /// Scene renderer executable (default: kwe-scene-renderer beside the daemon).
     #[arg(long)]
     renderer_scene: Option<PathBuf>,
+    /// Scene inspector executable for `scene.inspect` (SR-0b; default:
+    /// kwe-scene-inspector beside the daemon). Missing/unconfigured fails
+    /// the RPC closed with `inspector-unavailable` rather than falling back
+    /// to any other binary.
+    #[arg(long)]
+    inspector: Option<PathBuf>,
+    /// Wall-clock deadline for one `scene.inspect` call; on expiry the
+    /// inspector's process group is SIGKILLed and the RPC answers
+    /// `{"outcome":"unknown","reason":"timeout"}`.
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(100..=30_000))]
+    inspector_wall_timeout_ms: u64,
     /// Wallpaper Engine assets root (S1), passed to the scene worker and
     /// to scene preflight so model layers can resolve their material
     /// textures. Default: the first existing
@@ -368,6 +381,17 @@ fn main() -> Result<()> {
     };
     let resource_limits_by_kind =
         resource_limits_for_kinds(global_limits, video_limits, web_limits, scene_limits);
+    // SR-0b: scene.inspect's own containment config, built alongside the
+    // supervisor's. The inspector reuses the scene renderer kind's resource
+    // ceilings (never less contained than the renderer it stands in for)
+    // and the same runtime dir the supervisor creates per-worker HOME dirs
+    // under (distinct `inspect-home-*` naming avoids any collision).
+    let inspect_config = InspectConfig {
+        inspector_path: arguments.inspector.or_else(default_inspector_path),
+        runtime_dir: renderer_runtime_dir.clone(),
+        wall_timeout: Duration::from_millis(arguments.inspector_wall_timeout_ms),
+        resource_limits: scene_limits,
+    };
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_paths,
         runtime_dir: renderer_runtime_dir,
@@ -474,6 +498,7 @@ fn main() -> Result<()> {
                     &audio,
                     &worker_pid,
                     &apply,
+                    &inspect_config,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -564,6 +589,7 @@ fn handle_client(
     audio: &AudioCaptureHandle,
     worker_pid: &Arc<AtomicU32>,
     apply: &ApplyHandle,
+    inspect: &InspectConfig,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
@@ -592,6 +618,7 @@ fn handle_client(
         workshop_cache,
         Some(audio),
         Some(apply),
+        Some(inspect),
         peer,
         worker_pid,
         allow_test_faults,
@@ -620,6 +647,7 @@ fn process_request(
     workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
     audio: Option<&AudioCaptureHandle>,
     apply: Option<&ApplyHandle>,
+    inspect: Option<&InspectConfig>,
     peer: PeerCred,
     worker_pid: &Arc<AtomicU32>,
     allow_test_faults: bool,
@@ -924,6 +952,25 @@ fn process_request(
                 }
             }
             "wallpaper.assignments" => apply_call(apply, |handle| handle.assignments()),
+            "scene.inspect" => {
+                match serde_json::from_value::<SceneInspectParams>(request.params.clone()) {
+                    Ok(params)
+                        if params.path.is_empty() || !Path::new(&params.path).is_absolute() =>
+                    {
+                        json!({
+                            "error": "invalid_params",
+                            "detail": "path must be a non-empty absolute path"
+                        })
+                    }
+                    Ok(params) => match inspect {
+                        Some(config) => inspect::run_inspection(config, Path::new(&params.path)),
+                        None => json!({"error": "inspect_unavailable"}),
+                    },
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
             _ => json!({"error": "unknown_method"}),
         }
     };
@@ -1022,6 +1069,15 @@ struct PermissionsSetParams {
     network: Option<bool>,
     audio: Option<bool>,
     pointer: Option<bool>,
+}
+
+/// `scene.inspect` params (SR-0b): the daemon rejects a relative or empty
+/// `path` itself, the same way `permissions.get`/`permissions.set` reject a
+/// malformed `wallpaper_id` before it ever reaches the handle.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SceneInspectParams {
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1344,6 +1400,17 @@ fn default_audio_worker_path() -> Result<PathBuf> {
     Ok(directory.join("kwe-audio-worker"))
 }
 
+/// Default `kwe-scene-inspector` binary beside the daemon executable
+/// (SR-0b). Unlike the renderer paths, this is allowed to resolve to
+/// `None` — the inspector is optional/experimental, and a daemon that
+/// cannot resolve its own executable path should still start; `scene.inspect`
+/// then simply fails closed with `inspector-unavailable`.
+fn default_inspector_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-scene-inspector"))
+}
+
 fn default_state_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path).join("kwe"));
@@ -1588,6 +1655,7 @@ mod tests {
             &cache_for_tests(),
             None,
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             false,
@@ -1610,6 +1678,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             None,
             PeerCred::default(),
@@ -1635,6 +1704,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             None,
             PeerCred::default(),
@@ -1663,6 +1733,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             None,
             PeerCred::default(),
@@ -1749,6 +1820,23 @@ mod tests {
     }
 
     #[test]
+    fn scene_inspect_rejects_relative_and_empty_paths() {
+        // Mirrors permissions_reject_unknown_fields_and_invalid_wallpaper_ids:
+        // a malformed path is rejected before it ever reaches `inspect`, so
+        // `inspect: None` here still proves the daemon fails closed on the
+        // input, not merely on an absent inspector.
+        for bad in [
+            r#"{"version":1,"method":"scene.inspect","params":{"path":""}}"#,
+            r#"{"version":1,"method":"scene.inspect","params":{"path":"relative/scene.json"}}"#,
+            r#"{"version":1,"method":"scene.inspect","params":{"bogus":1}}"#,
+        ] {
+            let (ok, result) = process_with_inspect(bad, None);
+            assert!(!ok, "{bad}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+    }
+
+    #[test]
     fn permissions_are_bounded_to_256_records() {
         let service = supervisor_service();
         let handle = service.handle();
@@ -1790,6 +1878,7 @@ mod tests {
             &cache_for_tests(),
             None,
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             true,
@@ -1809,6 +1898,30 @@ mod tests {
             &cache_for_tests(),
             None,
             None,
+            None,
+            PeerCred::default(),
+            &empty_worker_pid(),
+            true,
+        )
+        .unwrap()
+    }
+
+    /// A `scene.inspect` RPC test helper (SR-0b): no supervisor/playlist/
+    /// apply handle is needed for the bad-input path validation this
+    /// exercises, so every other service stays `None` as in `process()`.
+    fn process_with_inspect(request_json: &str, inspect: Option<&InspectConfig>) -> (bool, Value) {
+        let catalog = empty_catalog();
+        let request: Request = serde_json::from_str(request_json).unwrap();
+        process_request(
+            &request,
+            &catalog,
+            &[],
+            None,
+            None,
+            &cache_for_tests(),
+            None,
+            None,
+            inspect,
             PeerCred::default(),
             &empty_worker_pid(),
             true,
@@ -1876,6 +1989,7 @@ mod tests {
             &cache_for_tests(),
             None,
             Some(handle),
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             true,
@@ -2003,6 +2117,7 @@ mod tests {
             None,
             Some(&handle),
             &cache_for_tests(),
+            None,
             None,
             None,
             PeerCred::default(),
@@ -2327,6 +2442,7 @@ mod tests {
             &cache_for_tests(),
             Some(&handle),
             None,
+            None,
             PeerCred::default(),
             &empty_worker_pid(),
             false,
@@ -2345,6 +2461,7 @@ mod tests {
             None,
             None,
             &cache_for_tests(),
+            None,
             None,
             None,
             PeerCred::default(),
@@ -3439,6 +3556,7 @@ with open(args.output, "wb") as frame:
                 None,
                 None,
                 &cache_for_tests(),
+                None,
                 None,
                 None,
                 PeerCred::default(),

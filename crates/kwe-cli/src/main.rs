@@ -104,6 +104,17 @@ enum Command {
     /// (~/.local/share/kwe/reports/*/report.md), newest first, with the
     /// note's first line — a quick index for the next debugging session.
     Reports,
+    /// Call the daemon's `scene.inspect` RPC (SR-0b) for one scene entry and
+    /// pretty-print the draft `scene-feature-inventory-v0` record.
+    SceneInspect {
+        #[arg(long)]
+        socket: PathBuf,
+        /// Scene entry to inspect: a `scene.pkg` file, or a directory
+        /// containing `scene.json`. Must be absolute — the daemon rejects a
+        /// relative or empty path itself.
+        #[arg(long)]
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -290,32 +301,15 @@ fn main() -> Result<()> {
             if !params.is_object() {
                 anyhow::bail!("--params must be a JSON object");
             }
-            let request = serde_json::json!({
-                "version": 1,
-                "id": "kwe-cli",
-                "method": method,
-                "params": params,
-            });
-            let mut stream = UnixStream::connect(&socket)
-                .with_context(|| format!("connect to daemon {}", socket.display()))?;
-            // The wallpaper.apply transaction waits (bounded) for the
-            // renderer to promote before answering, so the read deadline
-            // must cover the apply promotion window (BETA_M4a). The daemon
-            // allows the promotion wait up to --apply-promotion-timeout-ms
-            // = 60 s plus the bounded probes (enumerate x2 + switch), so
-            // the CLI deadline covers the configured maximum with margin.
-            stream.set_read_timeout(Some(Duration::from_secs(90)))?;
-            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-            serde_json::to_writer(&mut stream, &request)?;
-            stream.write_all(b"\n")?;
-            stream.flush()?;
-            let mut reader = BufReader::new(stream).take(1024 * 1024);
-            let mut response = Vec::new();
-            reader.read_until(b'\n', &mut response)?;
-            if response.is_empty() || response.len() >= 1024 * 1024 {
-                anyhow::bail!("daemon returned an empty or oversized response");
+            let response = call_daemon(&socket, &method, params)?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            if response.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                std::process::exit(2);
             }
-            let response: serde_json::Value = serde_json::from_slice(&response)?;
+        }
+        Command::SceneInspect { socket, path } => {
+            let params = serde_json::json!({ "path": path.to_string_lossy() });
+            let response = call_daemon(&socket, "scene.inspect", params)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             if response.get("ok") != Some(&serde_json::Value::Bool(true)) {
                 std::process::exit(2);
@@ -596,6 +590,43 @@ fn probe_web_backend(tasks_max: Option<u64>) -> WebProbeOutcome {
         ProbeRun::Failed { exit, reason } => WebProbeOutcome::Failed { exit, reason },
         ProbeRun::Hung => WebProbeOutcome::Hung,
     }
+}
+
+/// Bounded daemon RPC round trip over the local Unix socket, shared by
+/// `DaemonCall` and `SceneInspect` (and any future daemon-RPC subcommand):
+/// one newline-delimited JSON request out, one newline-delimited JSON
+/// response back.
+fn call_daemon(
+    socket: &PathBuf,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let request = serde_json::json!({
+        "version": 1,
+        "id": "kwe-cli",
+        "method": method,
+        "params": params,
+    });
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect to daemon {}", socket.display()))?;
+    // The wallpaper.apply transaction waits (bounded) for the renderer to
+    // promote before answering, so the read deadline must cover the apply
+    // promotion window (BETA_M4a). The daemon allows the promotion wait up
+    // to --apply-promotion-timeout-ms = 60 s plus the bounded probes
+    // (enumerate x2 + switch), so the CLI deadline covers the configured
+    // maximum with margin.
+    stream.set_read_timeout(Some(Duration::from_secs(90)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream).take(1024 * 1024);
+    let mut response = Vec::new();
+    reader.read_until(b'\n', &mut response)?;
+    if response.is_empty() || response.len() >= 1024 * 1024 {
+        anyhow::bail!("daemon returned an empty or oversized response");
+    }
+    Ok(serde_json::from_slice(&response)?)
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {

@@ -117,6 +117,9 @@ package() {
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-web-renderer" "${pkgdir}/usr/bin/kwe-web-renderer"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-audio-worker" "${pkgdir}/usr/bin/kwe-audio-worker"
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-scene-renderer" "${pkgdir}/usr/bin/kwe-scene-renderer"
+    # SR-0b: one-shot bounded scene inventory inspector, resolved by the
+    # daemon next to its own executable like every other worker binary.
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-scene-inspector" "${pkgdir}/usr/bin/kwe-scene-inspector"
 
     # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and
     # the staged org.kde.kwe.wallpaper Plasma wallpaper package.

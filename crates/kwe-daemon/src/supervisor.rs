@@ -2157,14 +2157,18 @@ fn flush_pending(
 /// profile — a harmless no-op today, kept so the value rides along once
 /// grants bind it in (M2c). It is deliberately not granted to the
 /// video/scene/test kinds.
-fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
+pub(crate) fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
     env_allowlist_with_runtime(kind, home, std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
 /// Every renderer HOME is a daemon-created 0700 directory. Remove it after
 /// reaping the child so scene VideoLayer staging is cleaned even when the
 /// worker exits through process::exit before Rust destructors can run.
-fn cleanup_renderer_home(home: &Path) {
+///
+/// Reused by `inspect::run_inspection` for the inspector's own per-launch
+/// HOME dir — same daemon-created-0700-dir, same must-remove-on-every-exit
+/// contract.
+pub(crate) fn cleanup_renderer_home(home: &Path) {
     match fs::symlink_metadata(home) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
             if let Err(error) = fs::remove_dir_all(home) {
@@ -2305,7 +2309,7 @@ fn drain_stderr(worker: &mut ActiveWorker, budget: usize) {
     }
 }
 
-fn set_nonblocking(descriptor: libc::c_int) -> io::Result<()> {
+pub(crate) fn set_nonblocking(descriptor: libc::c_int) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
@@ -2351,7 +2355,7 @@ pub(crate) fn build_identity(config: &SupervisorConfig) -> String {
     parts.join(";")
 }
 
-fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
+pub(crate) fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
     let mib = 1024_u64 * 1024;
     set_resource_limit(libc::RLIMIT_AS, limits.address_space_mib * mib)?;
     set_resource_limit(libc::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
@@ -2395,7 +2399,7 @@ fn terminate_and_reap(child: &mut Child, grace: Duration) -> bool {
     true
 }
 
-fn signal_process_group(pid: u32, signal: libc::c_int) {
+pub(crate) fn signal_process_group(pid: u32, signal: libc::c_int) {
     if let Ok(pid) = i32::try_from(pid) {
         // SAFETY: the child is placed in a process group whose id equals its
         // pid before exec. A negative pid restricts delivery to that group.

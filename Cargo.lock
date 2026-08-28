@@ -416,6 +416,17 @@ name = "kwe-mpv"
 version = "0.1.0-alpha.1"
 
 [[package]]
+name = "kwe-scene-inspector"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "clap",
+ "hex",
+ "libc",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "kwe-scene-renderer"
 version = "0.1.0-alpha.1"
 dependencies = [
