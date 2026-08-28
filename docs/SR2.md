@@ -926,9 +926,12 @@ Out of scope:    Model/material/effect FILE loading (decision (a) --
                  as_vector). Running ir_parity_corpus against a real
                  Workshop corpus (task text reserves this for the
                  coordinator after merge).
-Acceptance tests:        kwe-scene-renderer: 358 tests (up from 348),
-                         incl. the 10 new ir_parity_* differential tests +
-                         all 74 pre-existing scene.rs tests unchanged.
+Acceptance tests:        kwe-scene-renderer: 359 tests (up from 348),
+                         incl. the 11 ir_parity_* differential tests (10
+                         from the slice's own acceptance run + 1 minimized
+                         corpus-parity regression added post-merge, see the
+                         "Corpus-parity fix-forward" paragraph below) + all
+                         74 pre-existing scene.rs tests unchanged.
                          kwe-core: 30 ir:: tests (up from 29 in SR-2b) --
                          objects_missing_is_treated_as_empty_but_a_present_
                          non_array_is_rejected (renamed/split from the
@@ -937,11 +940,11 @@ Acceptance tests:        kwe-scene-renderer: 358 tests (up from 348),
                          particle_object_reads_known_fields_and_leaves_
                          speed_fields_in_unknown and round_trip_through_
                          to_raw_value_reproduces_an_equal_scene_ir.
-                         870 workspace tests total, up from 859.
+                         871 workspace tests total, up from 859.
                          cargo fmt --all -- clean.
                          cargo clippy --workspace --all-targets -- -D
                          warnings -- clean.
-                         cargo test --workspace -- 870 passed, 0 failed.
+                         cargo test --workspace -- 871 passed, 0 failed.
                          ./scripts/check.sh -- green end to end (its scene
                          lanes, incl. scripts/smoke-scene-corpus.sh, prove
                          the swap through the real build/qml-typecheck
@@ -950,6 +953,15 @@ Acceptance tests:        kwe-scene-renderer: 358 tests (up from 348),
                          unchanged (B2 a/b/d, S1-S5b, M3c-M3g, the
                          standalone llvmpipe lane), running THROUGH the new
                          production swap.
+                         CORPUS-PARITY (post-merge, coordinator run, then
+                         verified again here after the fix below):
+                         KWE_SCENE_IR_PARITY_DIR=<60-item real Workshop
+                         corpus> cargo test -p kwe-scene-renderer
+                         ir_parity_corpus -- --ignored --nocapture ->
+                         "ir_parity_corpus: 60/60 item(s) parity-passed".
+                         The coordinator's own first run found 2/60
+                         failures (see "Corpus-parity fix-forward" below);
+                         both are fixed and reverified 60/60 green.
 Failure/recovery tests:  ir_parity_general_block's malformed-JSON/non-
                          object-root/non-array-objects/non-object-entry
                          cases assert Err/Err parity with matching
@@ -964,42 +976,110 @@ Upstream/provenance:    Original; every reconstruction mirrors an existing
 Commands run and results: cargo fmt --all -- clean.
                          cargo clippy --workspace --all-targets -- -D
                          warnings -- clean.
-                         cargo test --workspace -- 870 passed, 0 failed.
+                         cargo test --workspace -- 871 passed, 0 failed.
                          ./scripts/check.sh -- exit 0, green end to end.
                          scripts/smoke-scene.sh -- all cases passed.
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> cargo test
+                         -p kwe-scene-renderer ir_parity_corpus --
+                         --ignored --nocapture -- "ir_parity_corpus: 60/60
+                         item(s) parity-passed".
+
+                         **Corpus-parity fix-forward (second commit,
+                         same branch, post-merge report):** the
+                         coordinator's own real-corpus run (60 items,
+                         /media/crushinator/steamapps/workshop/content/431960
+                         -- a real path on the coordinator's machine, never
+                         copied into this repo) found 2/60 failures, both
+                         `ParticleSpec` value mismatches. The FIRST version
+                         of `ir_parity_corpus` aborted (panicked) on the
+                         first divergence, so only 1 of the 2 failing items
+                         -- and none of the 58 passing ones -- were ever
+                         reported in one run; fixed first (harness-only,
+                         no behavior change): the test now runs through
+                         EVERY item, collects every divergence, and prints
+                         a final "P/N item(s) parity-passed" summary plus a
+                         per-item "basename -> diagnosis" list, so one bad
+                         item never hides the rest. `assert_ir_parity` and
+                         `ir_parity_corpus` also gained a shared
+                         `first_diff_field`/`bounded_debug` pair: on a
+                         values-differ failure they now name the first
+                         top-level `SceneConfig` field (or the first
+                         differing `layers[i]`/`particles[i]` index) that
+                         disagrees, with each side's `Debug` output bounded
+                         to ~200 bytes, instead of a bare "VALUES differ"
+                         with no location.
+                         ROOT CAUSE (found by reading the two real items'
+                         scene.json locally for diagnosis only -- their
+                         content was never copied into this repo or any
+                         commit): both failing items were a `ParticleFile`
+                         -kind particle system (a string `"particle"`
+                         file reference) whose `instanceoverride.alpha`
+                         was authored above legacy's 1.0 clamp ceiling
+                         (2.0 in both). `kwe_core::ir.rs`'s
+                         `parse_instance_override` deliberately does NOT
+                         clamp any of its 7 `instance_*` fields (SR-2b's
+                         "no range clamping" IR design, module doc
+                         departure (1)); `scene.rs`'s own
+                         `parse_particle_system` clamps each one
+                         (`particles::clamp_instance_factor`, max 1e6 for
+                         count/rate/size/lifetime/speed, max 1.0 for alpha;
+                         `colorn` via `.clamp(0.0, 1.0)`) before assigning
+                         into `ParticleSpec`. The Particle-kind path
+                         (`build_particle_system`) already applied this
+                         clamp; the TWO ParticleFile-kind builders
+                         (`particle_file_spec` and
+                         `build_particle_system_from_raw`, both added mid-
+                         slice to fix the wrong-object `instanceoverride`
+                         read reported in the original SR-2c acceptance
+                         run) read `ParticleFileIr`'s fields straight
+                         through UNCLAMPED -- an oversight in that same
+                         mid-slice fix, invisible to every in-repo fixture
+                         because none of them authored an out-of-range
+                         instanceoverride factor on a ParticleFile-kind
+                         system. Fixed with a shared
+                         `clamp_instance_overrides(&ParticleFileIr) ->
+                         (f32,...,f32)` helper (scene_ir_adapter.rs) that
+                         both builders now call, applying the exact same
+                         per-field clamps `build_particle_system` already
+                         used. MINIMIZED synthetic fixture added as
+                         `ir_parity_instanceoverride_clamps_on_particle_file_systems`
+                         (scene.rs, 4 cases): a string-file-ref particle
+                         with `instanceoverride.alpha: 2.0` (the exact real
+                         shape, reduced to one field), `.count` above
+                         1e6, the object-without-texture ParticleFile sub-
+                         case with the same out-of-range alpha, and
+                         `.colorn` above 1.0 -- no real corpus content in
+                         any of them. Re-verified against the real corpus:
+                         60/60 parity-passed.
 Open risks:              The 3 documented numeric-string/shape-tolerance
                          divergences (module doc, scene_ir_adapter.rs) --
                          narrow, verified harmless against every existing
                          fixture and real WE content, but real; closing
                          them needs per-field strictness modes added to
                          SR-2b's as_number/as_vector.
-                         ir_parity_corpus has not been run against a real
-                         Workshop corpus yet (task text reserves this for
-                         the coordinator after merge) -- it is compiled and
-                         discoverable (cargo test -p kwe-scene-renderer
-                         ir_parity_corpus -- --ignored, with
-                         KWE_SCENE_IR_PARITY_DIR set) but not exercised in
-                         this slice beyond the synthetic in-repo fixtures.
-                         This slice's differential process found 3 real
-                         bugs in SR-2b's ir.rs (see Outcome above) that its
-                         own hand-built fixtures did not catch, including
-                         two (instanceoverride's wrong-object read, the
-                         ParticleFile-object flat-field gap) that would
-                         have silently mis-rendered real Wallpaper Engine
-                         content authoring instanceoverride or a
-                         no-texture inline particle -- a reminder that
-                         SR-2b's remaining unswapped families (model/
-                         material/effect file loading) likely carry
-                         similar undiscovered gaps until their own
-                         differential slice exercises them the same way.
+                         This slice's differential process (both the
+                         original acceptance run and the corpus fix-
+                         forward above) found 5 real bugs across SR-2b's
+                         ir.rs and this slice's own adapter that hand-built
+                         fixtures alone did not catch until either a wider
+                         test-suite run or the real corpus exercised them
+                         -- a reminder that SR-2b's remaining unswapped
+                         families (model/material/effect file loading)
+                         likely carry similar undiscovered gaps until their
+                         own differential slice, INCLUDING a real-corpus
+                         run before declaring victory (not just after, as
+                         this slice originally did), exercises them the
+                         same way.
 STOP findings:           None that blocked the slice. Every candidate STOP
-                         case resolved to either a fixable bug (the 3 above,
-                         all fixed within this slice, in kwe-core/src/ir.rs
-                         since that is where each root cause actually
-                         lived) or a documented, narrow, verified-harmless
-                         divergence (the 3 above, listed under Open risks).
+                         case resolved to either a fixable bug (the 3 from
+                         the original acceptance run plus the corpus-fix-
+                         forward bug above, all fixed within this slice, in
+                         kwe-core/src/ir.rs or scene_ir_adapter.rs since
+                         that is where each root cause actually lived) or a
+                         documented, narrow, verified-harmless divergence
+                         (the 3 above, listed under Open risks).
                          No non-comparable struct member was found needing
                          a hand-written partial Eq. No external SceneError
                          message-text consumer was found.
-Commit(s):               (fill in after commit)
+Commit(s):               933b430, (fill in after commit)
 ```

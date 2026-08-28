@@ -3998,6 +3998,109 @@ mod tests {
     // for.
     // -----------------------------------------------------------------
 
+    /// A `Debug` rendering truncated to ~200 bytes (on a char boundary),
+    /// with the true length appended when it was cut — cheap, always
+    /// available (every compared type already derives `Debug`), and
+    /// enough to name what actually differs without dumping an entire
+    /// real-corpus `SceneConfig` (which can be large) into a panic
+    /// message or test log.
+    fn bounded_debug<T: std::fmt::Debug>(value: &T) -> String {
+        let rendered = format!("{value:?}");
+        let limit = 200;
+        if rendered.len() <= limit {
+            return rendered;
+        }
+        let cut = rendered
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= limit)
+            .last()
+            .unwrap_or(0);
+        format!("{}... [{} bytes total]", &rendered[..cut], rendered.len())
+    }
+
+    /// Locates the FIRST field two otherwise-unequal `SceneConfig`s
+    /// disagree on, at the granularity `SceneConfig` itself offers: a
+    /// top-level scalar field, `layers`/`particles`' own length, or — the
+    /// cheapest thing that still names a useful location — the first
+    /// differing element's INDEX within `layers`/`particles` (not a
+    /// further per-field walk inside `LayerSpec`/`ParticleSpec`; their
+    /// bounded `Debug` output is enough to spot the actual field by eye
+    /// once narrowed to one element). Returns a `"field=... legacy=...
+    /// via_ir=..."` string; both sides bounded via `bounded_debug`.
+    fn first_diff_field(legacy: &SceneConfig, via_ir: &SceneConfig) -> String {
+        macro_rules! field {
+            ($name:ident) => {
+                if legacy.$name != via_ir.$name {
+                    return format!(
+                        "field={} legacy={} via_ir={}",
+                        stringify!($name),
+                        bounded_debug(&legacy.$name),
+                        bounded_debug(&via_ir.$name)
+                    );
+                }
+            };
+        }
+        field!(clear_color);
+        field!(script_path);
+        field!(script_entry);
+        field!(script_reference);
+        field!(resolution);
+        field!(fps);
+        field!(drawable_objects);
+        field!(model_layer_skips);
+        field!(text_layer_skips);
+        field!(particle_system_skips);
+        field!(video_layer_skips);
+        field!(particle_file_refs);
+        field!(text_on_image_objects);
+        field!(text_size_ignored);
+        if legacy.layers.len() != via_ir.layers.len() {
+            return format!(
+                "field=layers.len legacy={} via_ir={}",
+                legacy.layers.len(),
+                via_ir.layers.len()
+            );
+        }
+        for (index, (legacy_layer, via_ir_layer)) in
+            legacy.layers.iter().zip(via_ir.layers.iter()).enumerate()
+        {
+            if legacy_layer != via_ir_layer {
+                return format!(
+                    "field=layers[{index}] legacy={} via_ir={}",
+                    bounded_debug(legacy_layer),
+                    bounded_debug(via_ir_layer)
+                );
+            }
+        }
+        if legacy.particles.len() != via_ir.particles.len() {
+            return format!(
+                "field=particles.len legacy={} via_ir={}",
+                legacy.particles.len(),
+                via_ir.particles.len()
+            );
+        }
+        for (index, (legacy_particle, via_ir_particle)) in legacy
+            .particles
+            .iter()
+            .zip(via_ir.particles.iter())
+            .enumerate()
+        {
+            if legacy_particle != via_ir_particle {
+                return format!(
+                    "field=particles[{index}] legacy={} via_ir={}",
+                    bounded_debug(legacy_particle),
+                    bounded_debug(via_ir_particle)
+                );
+            }
+        }
+        // Every field this function knows how to name matched, yet the
+        // caller's own `!=` said otherwise -- only reachable if
+        // `SceneConfig` grows a field this function has not been taught
+        // about yet.
+        "field=<unknown -- SceneConfig has a field first_diff_field does not compare>".to_string()
+    }
+
     /// `SceneError`'s message TEXT is deliberately NOT compared (SR-2c
     /// study: `grep -rn "SceneError"` across the whole repo turns up
     /// nothing outside this crate; the daemon classifies a renderer's
@@ -4008,7 +4111,11 @@ mod tests {
         let via_ir = crate::scene_ir_adapter::parse_scene_json_via_ir(bytes);
         match (legacy, via_ir) {
             (Ok(legacy), Ok(via_ir)) => {
-                assert_eq!(legacy, via_ir, "{label}: Ok values differ");
+                assert!(
+                    legacy == via_ir,
+                    "{label}: Ok values differ ({})",
+                    first_diff_field(&legacy, &via_ir)
+                );
             }
             (Err(legacy), Err(via_ir)) => {
                 assert_eq!(
@@ -4239,6 +4346,58 @@ mod tests {
         }
     }
 
+    /// Regression: a maintainer's post-slice real-corpus parity run
+    /// (`KWE_SCENE_IR_PARITY_DIR` against 60 real Workshop items) found 2
+    /// failures, both a `ParticleFile`-kind system (string `particle`
+    /// reference) whose `instanceoverride.alpha` was authored ABOVE
+    /// legacy's 1.0 clamp ceiling (2.0 in both real items) — legacy's
+    /// `parse_particle_system` clamps every `instanceoverride` factor via
+    /// `particles::clamp_instance_factor`/`.clamp(0.0, 1.0)` before
+    /// assigning into `ParticleSpec`; `kwe_core::ir.rs`'s
+    /// `parse_instance_override` deliberately does NOT clamp (SR-2b's "no
+    /// range clamping" IR design, module doc departure (1) — every numeric
+    /// field holds the coerced-but-unclamped authored value). The adapter
+    /// must apply the SAME clamp the Particle-kind path
+    /// (`build_particle_system`) already did; an earlier version of the
+    /// two ParticleFile-kind builders (`particle_file_spec` and
+    /// `build_particle_system_from_raw`, added mid-slice to fix the
+    /// wrong-object `instanceoverride` read) read `ParticleFileIr`'s
+    /// fields straight through unclamped instead. This is the minimized
+    /// synthetic shape that reproduces it: a string `particle` reference
+    /// (no real corpus content reproduced or committed) with a single
+    /// out-of-range `instanceoverride.alpha`.
+    #[test]
+    fn ir_parity_instanceoverride_clamps_on_particle_file_systems() {
+        for (label, bytes) in [
+            (
+                "string_file_ref_alpha_above_one_clamps",
+                &br#"{"objects":[{"name":"p","particle":"particles/p.json",
+                    "instanceoverride":{"alpha":2.0}}]}"#[..],
+            ),
+            (
+                "string_file_ref_count_above_1e6_clamps",
+                br#"{"objects":[{"name":"p","particle":"particles/p.json",
+                    "instanceoverride":{"count":5000000.0}}]}"#,
+            ),
+            (
+                // The OTHER ParticleFile sub-case (build_particle_system_
+                // from_raw): an object-valued `particle` with no texture/
+                // material, so classify_scene_object still routes it to
+                // ParticleFile — same clamp must apply here too.
+                "inline_object_without_texture_alpha_above_one_clamps",
+                br#"{"objects":[{"name":"p","particle":{"spawnRate":10},
+                    "instanceoverride":{"alpha":2.0}}]}"#,
+            ),
+            (
+                "colorn_mean_above_one_clamps",
+                br#"{"objects":[{"name":"p","particle":"particles/p.json",
+                    "instanceoverride":{"colorn":[2.0,2.0,2.0]}}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
     #[test]
     fn ir_parity_particle_object_classified_as_particle_file_still_parses_flat_fields() {
         // classify_scene_object routes an object-valued `particle` with no
@@ -4305,13 +4464,20 @@ mod tests {
     /// Iterates every `scene.pkg`/`scene.json` under
     /// `KWE_SCENE_IR_PARITY_DIR` (not set -> the test is a no-op skip, so
     /// CI/the default `cargo test` never needs the real corpus), asserting
-    /// `assert_ir_parity` for each one's extracted scene.json bytes.
+    /// parity for each one's extracted scene.json bytes.
     /// `#[ignore]`d: opt in explicitly —
     /// `KWE_SCENE_IR_PARITY_DIR=<corpus> cargo test -p kwe-scene-renderer
-    /// ir_parity_corpus -- --ignored`. Prints a running pass count and, on
-    /// the FIRST divergence, the item's basename and which side (legacy
-    /// Ok/IR Err, legacy Err/IR Ok, or both Ok-but-unequal) differed,
-    /// before panicking — actionable without re-running under a debugger.
+    /// ir_parity_corpus -- --ignored --nocapture`.
+    ///
+    /// Runs through EVERY item first (one bad item never hides the rest —
+    /// a maintainer report caught exactly this: the first version aborted
+    /// on the first divergence, so 59 of 60 real-corpus items were never
+    /// even reported), collecting `(basename, diagnosis)` for every
+    /// divergence into `failures`. Only after the whole corpus has been
+    /// checked does it print a final `N/M item(s) parity-passed` summary
+    /// line and — if `failures` is non-empty — panic listing every
+    /// `item -> first diff` pair, so a maintainer sees the whole picture
+    /// from one run's output, never a debugger.
     #[test]
     #[ignore = "opt-in: set KWE_SCENE_IR_PARITY_DIR to a corpus directory"]
     fn ir_parity_corpus() {
@@ -4320,39 +4486,57 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
-        let mut checked = 0usize;
         let mut items = Vec::new();
         collect_scene_json_bytes(&root, &mut items);
+        let total = items.len();
+        let mut failures: Vec<(String, String)> = Vec::new();
         for (basename, bytes) in &items {
             let legacy = parse_scene_json(bytes);
             let via_ir = crate::scene_ir_adapter::parse_scene_json_via_ir(bytes);
-            match (&legacy, &via_ir) {
-                (Ok(legacy_config), Ok(via_ir_config)) => {
-                    if legacy_config != via_ir_config {
-                        panic!("ir_parity_corpus: {basename}: both Ok but VALUES differ");
-                    }
+            let diagnosis = match (&legacy, &via_ir) {
+                (Ok(legacy_config), Ok(via_ir_config)) if legacy_config == via_ir_config => None,
+                (Ok(legacy_config), Ok(via_ir_config)) => Some(format!(
+                    "both Ok but VALUES differ ({})",
+                    first_diff_field(legacy_config, via_ir_config)
+                )),
+                (Err(legacy_error), Err(via_ir_error))
+                    if legacy_error.kind == via_ir_error.kind =>
+                {
+                    None
                 }
-                (Err(legacy_error), Err(via_ir_error)) => {
-                    if legacy_error.kind != via_ir_error.kind {
-                        panic!(
-                            "ir_parity_corpus: {basename}: both Err but kinds differ \
-                             (legacy={:?} via_ir={:?})",
-                            legacy_error.kind, via_ir_error.kind
-                        );
-                    }
+                (Err(legacy_error), Err(via_ir_error)) => Some(format!(
+                    "both Err but kinds differ (legacy={:?} via_ir={:?})",
+                    legacy_error.kind, via_ir_error.kind
+                )),
+                (Ok(_), Err(error)) => Some(format!(
+                    "legacy Ok, IR adapter Err ({:?} {:?})",
+                    error.kind, error.message
+                )),
+                (Err(error), Ok(_)) => Some(format!(
+                    "legacy Err ({:?} {:?}), IR adapter Ok",
+                    error.kind, error.message
+                )),
+            };
+            match diagnosis {
+                None => eprintln!("ir_parity_corpus: {basename}: ok"),
+                Some(diagnosis) => {
+                    eprintln!("ir_parity_corpus: {basename}: FAIL -- {diagnosis}");
+                    failures.push((basename.clone(), diagnosis));
                 }
-                (Ok(_), Err(error)) => panic!(
-                    "ir_parity_corpus: {basename}: legacy Ok, IR adapter Err ({:?} {:?})",
-                    error.kind, error.message
-                ),
-                (Err(error), Ok(_)) => panic!(
-                    "ir_parity_corpus: {basename}: legacy Err ({:?} {:?}), IR adapter Ok",
-                    error.kind, error.message
-                ),
             }
-            checked += 1;
         }
-        eprintln!("ir_parity_corpus: {checked} item(s) checked, all parity-passed");
+        let passed = total - failures.len();
+        eprintln!("ir_parity_corpus: {passed}/{total} item(s) parity-passed");
+        assert!(
+            failures.is_empty(),
+            "ir_parity_corpus: {}/{total} FAILED:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .map(|(basename, diagnosis)| format!("  {basename} -> {diagnosis}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// Collects every scene.json's bytes under `root`: a bare `scene.json`

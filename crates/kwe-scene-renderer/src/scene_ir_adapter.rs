@@ -817,6 +817,36 @@ fn build_text_layer(
     ))
 }
 
+/// `kwe_core::ir.rs`'s `parse_instance_override` does NOT clamp any of the
+/// 7 fields it types (SR-2b's "no range clamping" design departure, module
+/// doc departure (1) — every numeric field holds the coerced-but-unclamped
+/// authored value) — `ParticleIr`/`ParticleFileIr`'s own `instance_*`
+/// fields are therefore raw, same as every other IR numeric field.
+/// `scene.rs`'s own `parse_particle_system` clamps each one via
+/// `particles::clamp_instance_factor` (max 1e6 for count/rate/size/
+/// lifetime/speed, max 1.0 for alpha) and `colorn` via `.clamp(0.0, 1.0)`
+/// (its own inline `mean.clamp(0.0, 1.0)`) BEFORE assigning into
+/// `ParticleSpec`. `build_particle_system` (the Particle-kind path)
+/// already applies this; this shared helper does the same for the
+/// ParticleFile-kind paths (`particle_file_spec` and
+/// `build_particle_system_from_raw`) — an earlier version of both read
+/// `file_ir`'s fields straight through unclamped, a real-corpus-caught
+/// bug (an authored `instanceoverride.alpha` of 2.0 stayed 2.0 through the
+/// IR path instead of clamping to legacy's 1.0 ceiling).
+fn clamp_instance_overrides(
+    file_ir: &kwe_core::ParticleFileIr,
+) -> (f32, f32, f32, f32, f32, f32, f32) {
+    (
+        particles::clamp_instance_factor(f64::from(file_ir.instance_count), 1e6),
+        particles::clamp_instance_factor(f64::from(file_ir.instance_rate), 1e6),
+        particles::clamp_instance_factor(f64::from(file_ir.instance_size), 1e6),
+        particles::clamp_instance_factor(f64::from(file_ir.instance_lifetime), 1e6),
+        particles::clamp_instance_factor(f64::from(file_ir.instance_speed), 1e6),
+        particles::clamp_instance_factor(f64::from(file_ir.instance_alpha), 1.0),
+        file_ir.instance_colorn.clamp(0.0, 1.0),
+    )
+}
+
 /// `file_ir`'s `instance_*` fields ARE the object's `instanceoverride`
 /// (see `kwe_core::ParticleFileIr`'s doc comment — read unconditionally,
 /// the same way for a string file reference, an inline object, or neither)
@@ -828,6 +858,15 @@ fn particle_file_spec(
     file_ref: Option<String>,
     file_ir: &kwe_core::ParticleFileIr,
 ) -> ParticleSpec {
+    let (
+        instance_count,
+        instance_rate,
+        instance_size,
+        instance_lifetime,
+        instance_speed,
+        instance_alpha,
+        instance_colorn,
+    ) = clamp_instance_overrides(file_ir);
     ParticleSpec {
         name: common.name,
         scene_order: index,
@@ -854,13 +893,13 @@ fn particle_file_spec(
         texture: None,
         file_ref,
         component: None,
-        instance_count: file_ir.instance_count,
-        instance_rate: file_ir.instance_rate,
-        instance_size: file_ir.instance_size,
-        instance_lifetime: file_ir.instance_lifetime,
-        instance_speed: file_ir.instance_speed,
-        instance_alpha: file_ir.instance_alpha,
-        instance_colorn: file_ir.instance_colorn,
+        instance_count,
+        instance_rate,
+        instance_size,
+        instance_lifetime,
+        instance_speed,
+        instance_alpha,
+        instance_colorn,
         scale: common.scale,
     }
 }
@@ -1167,14 +1206,16 @@ fn build_particle_system_from_raw(
     // `instanceoverride` is a SIBLING of `particle` on the object, not a
     // key of `definition` — `file_ir` already carries it, typed, read the
     // same way for every shape of `particle` (see `ParticleFileIr`'s doc
-    // comment).
-    let instance_count = file_ir.instance_count;
-    let instance_rate = file_ir.instance_rate;
-    let instance_size = file_ir.instance_size;
-    let instance_lifetime = file_ir.instance_lifetime;
-    let instance_speed = file_ir.instance_speed;
-    let instance_alpha = file_ir.instance_alpha;
-    let instance_colorn = file_ir.instance_colorn;
+    // comment). Clamped here, not read raw — see `clamp_instance_overrides`.
+    let (
+        instance_count,
+        instance_rate,
+        instance_size,
+        instance_lifetime,
+        instance_speed,
+        instance_alpha,
+        instance_colorn,
+    ) = clamp_instance_overrides(file_ir);
 
     Ok(ParticleSpec {
         name: common.name,
