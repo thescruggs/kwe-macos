@@ -80,6 +80,29 @@ Outcome:         New crate crates/kwe-scene-inspector (binary): classifies a `sc
                  (no pkgrel bump — nothing is enabled by this change; the daemon still
                  answers scene.inspect only when a caller asks for it, and the record
                  schema is draft, not exposed anywhere else yet).
+                 Adversarial review (fix commit, same slice): R1 — the accept loop
+                 (`for connection in listener.incoming()`) calls handle_client inline with
+                 no per-connection thread, so scene.inspect's up-to-30 s wait was blocking
+                 every other RPC. handle_client now special-cases scene.inspect before the
+                 generic process_request call: params validate inline and fast
+                 (unchanged behavior, factored into a shared validate_scene_inspect_params
+                 used by both this path and process_request's own arm, which stays for the
+                 direct-call RPC unit tests); a static INSPECT_IN_FLIGHT AtomicBool bounds
+                 real inspection work to exactly one dedicated thread at a time — a second
+                 request while one is running answers inspector-busy immediately, inline,
+                 no second process; the winning request's thread runs run_inspection and
+                 writes the response itself (write_response factors the exact
+                 serialization handle_client always used), clearing the gate via an
+                 InspectInFlightGuard Drop impl (so a panic cannot leave it stuck) right
+                 after run_inspection finishes and before the response is sent, so the
+                 gate is provably clear by the time a caller can observe that response.
+                 R2 — inspect.rs's drain_stderr_tail read in an unbounded loop bounded
+                 only by WouldBlock/EOF, so a child continuously flooding stderr could
+                 starve supervise's try_wait/deadline check indefinitely (the tail-trim
+                 bounds memory, not time). Capped to STDERR_DRAIN_CHUNKS_PER_TICK (16)
+                 4 KiB chunks per call — at most 64 KiB of stderr read per supervise tick,
+                 always falling through to the deadline check; drain_stdout needed no
+                 change (its oversize cutoff already bounds it).
 In scope:        crates/kwe-scene-inspector (new crate + workspace member), crates/kwe-
                  daemon/src/inspect.rs (new) + main.rs (scene.inspect dispatch, CLI flags,
                  InspectConfig wiring) + supervisor.rs (visibility bumps only, no behavior
@@ -109,6 +132,20 @@ Acceptance tests:        kwe-scene-inspector (5): a small scene.json directory h
                          relative path, and with an unknown params field, all answer
                          invalid_params before touching the inspect config (mirrors the
                          permissions.get bad-input test).
+                         Review fix (R1) crates/kwe-daemon main.rs (1):
+                         concurrent_scene_inspect_calls_serialize_through_the_single_inspection_gate
+                         — two threads race a barrier into dispatch_scene_inspect against a
+                         hang fake over real UnixStream::pair() sockets; exactly one of the
+                         two responses is reason=timeout and the other is
+                         reason=inspector-busy (order not presumed, asserted as a sorted
+                         pair); a third call afterward gets timeout again, not busy,
+                         proving the gate clears. (The coordinator's request to also assert
+                         a cheap RPC like health completes while an inspection is in flight
+                         was not implemented: main.rs has no test harness that drives
+                         handle_client over a real UnixListener/accept loop — every existing
+                         test calls process_request/handle_client-adjacent helpers directly
+                         — so that variant was skipped per the "don't build a new harness"
+                         instruction; the barrier test above is the full R1 coverage.)
                          Full existing suites stay green: cargo test --workspace,
                          cargo clippy --workspace --all-targets -D warnings,
                          cargo fmt --all --check, ./scripts/check.sh.
@@ -121,8 +158,9 @@ Upstream/provenance:     Original; containment is the same design as
                          process-isolation goal's inspiration, not this code).
 Commands run and results: cargo fmt --all -- clean.
                          cargo clippy --workspace --all-targets -- -D warnings -- clean.
-                         cargo test --workspace -- 761 passed, 0 failed (kwe-scene-inspector
-                         5, kwe-daemon 157 including the 6 new scene.inspect tests).
+                         cargo test --workspace -- 762 passed, 0 failed (kwe-scene-inspector
+                         5, kwe-daemon 158 including the 6 scene.inspect tests from the
+                         first commit plus the R1 concurrency test from the fix commit).
                          ./scripts/check.sh -- green end-to-end, including the C++/QML
                          build, qml-typecheck, kwe diagnose, and kwe-vulkan --json.
 Open risks:              The report travels on stdout in this skeleton (a chatty child
@@ -141,7 +179,7 @@ Open risks:              The report travels on stdout in this skeleton (a chatty
                          SR-1. digest omits a "sha256:" prefix (unlike content.hash) since
                          the task spec's literal wording was "hex SHA-256 over the
                          serialized record" — SR-1 should confirm this is intended.
-Commit(s):               <filled after commit; same commit as this file>
+Commit(s):               ea88e72 (skeleton); <filled after the R1/R2 fix commit>
 ```
 
 ## SR-0c — One loader inventory adapter

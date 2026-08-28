@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -55,6 +55,19 @@ const MAX_IMPORT_REQUEST_BYTES: usize = 4 * 1024 * 1024 + 1024;
 /// Byte marker used to tell import requests from other methods before the
 /// full JSON parse. The post-parse method check stays authoritative.
 const IMPORT_MARKER: &[u8] = b"playlist.import";
+
+/// Review R1 (SR-0b): `scene.inspect` is the only RPC whose backing work can
+/// take up to `--inspector-wall-timeout-ms` (30 s max) — every other method
+/// answers off in-memory state inline on the single-threaded accept loop.
+/// `dispatch_scene_inspect` therefore runs the actual inspection on a
+/// dedicated thread instead of inline, so the accept loop keeps answering
+/// every other connection while an inspection is outstanding. This flag
+/// bounds that off-loop work to at most ONE thread at a time (single
+/// in-flight inspection, no thread-per-request growth): a second
+/// `scene.inspect` arriving while the flag is held answers
+/// `inspector-busy` immediately instead of spawning a second thread/process
+/// or queuing.
+static INSPECT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Crash-contained KDE Wallpaper Engine user service")]
@@ -603,6 +616,16 @@ fn handle_client(
     if line.len() > MAX_REQUEST_BYTES && request.method != "playlist.import" {
         bail!("request exceeded {MAX_REQUEST_BYTES} bytes");
     }
+    // R1 (SR-0b review): scene.inspect is the one RPC that can legitimately
+    // take up to 30 s, so it never reaches the generic process_request call
+    // below — that call is inline on the single-threaded accept loop, and
+    // every other connection (renderer.status, wallpaper.apply, the
+    // pointer/audio relays) would stall behind it otherwise. Param
+    // validation stays inline and fast; only a validated, non-busy request
+    // hands off to a dedicated thread. See `dispatch_scene_inspect`.
+    if request.method == "scene.inspect" {
+        return dispatch_scene_inspect(stream, request, inspect);
+    }
     // Peer credential identification: the daemon's own audio worker is
     // recognized by pid and uid so its no-active-renderer rejections can be
     // dropped silently instead of erroring the caller's connection.
@@ -629,10 +652,103 @@ fn handle_client(
         ok,
         result,
     };
-    serde_json::to_writer(&mut stream, &response)?;
+    write_response(&mut stream, &response)
+}
+
+/// Writes one response envelope exactly as `handle_client` always has:
+/// newline-delimited JSON, flushed. Shared by the normal inline path and
+/// `dispatch_scene_inspect`'s off-thread path so both produce an identical
+/// wire response.
+fn write_response(stream: &mut UnixStream, response: &Response) -> Result<()> {
+    serde_json::to_writer(&mut *stream, response)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+/// Clears `INSPECT_IN_FLIGHT` when dropped — including when the spawned
+/// thread's closure unwinds from a panic — so a bug in `run_inspection`
+/// can never leave the single-inspection gate stuck held forever.
+struct InspectInFlightGuard;
+
+impl Drop for InspectInFlightGuard {
+    fn drop(&mut self) {
+        INSPECT_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// `scene.inspect` params validation, shared by `dispatch_scene_inspect`'s
+/// fast inline path and `process_request`'s normal dispatch (used directly
+/// by the RPC unit tests): parse, then reject an empty or relative `path`
+/// exactly like `permissions.get`/`permissions.set` reject a malformed
+/// `wallpaper_id`. Returns the validated path, or the typed error value to
+/// answer with.
+fn validate_scene_inspect_params(params: &Value) -> Result<String, Value> {
+    match serde_json::from_value::<SceneInspectParams>(params.clone()) {
+        Ok(params) if params.path.is_empty() || !Path::new(&params.path).is_absolute() => {
+            Err(json!({
+                "error": "invalid_params",
+                "detail": "path must be a non-empty absolute path"
+            }))
+        }
+        Ok(params) => Ok(params.path),
+        Err(error) => Err(json!({"error": "invalid_params", "detail": error.to_string()})),
+    }
+}
+
+/// Off-loop handling for one `scene.inspect` request (R1, SR-0b review).
+/// Validation is inline and fast. A valid request either answers
+/// `inspector-busy` immediately (the single-in-flight gate is already
+/// held) or is handed to exactly one spawned thread that runs
+/// `inspect::run_inspection` and writes the response itself — bounding the
+/// daemon to at most one such thread at a time (see `INSPECT_IN_FLIGHT`).
+/// Every other error path (bad params, busy) answers synchronously here,
+/// on the accept-loop thread, since those are immediate and bounded.
+fn dispatch_scene_inspect(
+    mut stream: UnixStream,
+    request: Request,
+    inspect: &InspectConfig,
+) -> Result<()> {
+    let validated = validate_scene_inspect_params(&request.params);
+    let result = match validated {
+        Err(error) => error,
+        Ok(path) => {
+            if INSPECT_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+                json!({"outcome": "unknown", "reason": "inspector-busy"})
+            } else {
+                let inspect = inspect.clone();
+                let id = request.id;
+                std::thread::spawn(move || {
+                    // Cleared on every exit path, panic included — including
+                    // an explicit early drop right after the inspection
+                    // finishes, below, so the gate is provably clear before
+                    // the caller can observe the response.
+                    let guard = InspectInFlightGuard;
+                    let result = inspect::run_inspection(&inspect, Path::new(&path));
+                    drop(guard);
+                    let ok = result.get("error").is_none();
+                    let response = Response {
+                        version: API_VERSION,
+                        id: &id,
+                        ok,
+                        result,
+                    };
+                    if let Err(error) = write_response(&mut stream, &response) {
+                        eprintln!("event=inspect.response_error detail={error}");
+                    }
+                });
+                return Ok(());
+            }
+        }
+    };
+    let ok = result.get("error").is_none();
+    let response = Response {
+        version: API_VERSION,
+        id: &request.id,
+        ok,
+        result,
+    };
+    write_response(&mut stream, &response)
 }
 
 // See the note on handle_client: explicit context keeps the API layer
@@ -952,25 +1068,21 @@ fn process_request(
                 }
             }
             "wallpaper.assignments" => apply_call(apply, |handle| handle.assignments()),
-            "scene.inspect" => {
-                match serde_json::from_value::<SceneInspectParams>(request.params.clone()) {
-                    Ok(params)
-                        if params.path.is_empty() || !Path::new(&params.path).is_absolute() =>
-                    {
-                        json!({
-                            "error": "invalid_params",
-                            "detail": "path must be a non-empty absolute path"
-                        })
-                    }
-                    Ok(params) => match inspect {
-                        Some(config) => inspect::run_inspection(config, Path::new(&params.path)),
-                        None => json!({"error": "inspect_unavailable"}),
-                    },
-                    Err(error) => {
-                        json!({"error": "invalid_params", "detail": error.to_string()})
-                    }
-                }
-            }
+            // R1 (SR-0b review): production traffic never reaches this arm —
+            // handle_client special-cases scene.inspect onto a dedicated
+            // thread before process_request is ever called (see
+            // dispatch_scene_inspect) so one inspection cannot block every
+            // other RPC on the single-threaded accept loop. This arm stays
+            // for the RPC unit tests that drive process_request directly
+            // (process_with_inspect) and shares the same validation helper
+            // dispatch_scene_inspect uses, so both paths answer identically.
+            "scene.inspect" => match validate_scene_inspect_params(&request.params) {
+                Err(error) => error,
+                Ok(path) => match inspect {
+                    Some(config) => inspect::run_inspection(config, Path::new(&path)),
+                    None => json!({"error": "inspect_unavailable"}),
+                },
+            },
             _ => json!({"error": "unknown_method"}),
         }
     };
@@ -1834,6 +1946,103 @@ mod tests {
             assert!(!ok, "{bad}");
             assert_eq!(result["error"], "invalid_params", "{bad}");
         }
+    }
+
+    /// R1 (SR-0b review): `dispatch_scene_inspect`'s single in-flight gate
+    /// under real concurrency. Two threads race a barrier into
+    /// `dispatch_scene_inspect` against a hang fake; exactly one gets the
+    /// gate and runs the (slow) real inspection to `timeout`, the other
+    /// sees it already held and answers `inspector-busy` immediately.
+    /// Once the first finishes, the gate is clear: a third call proceeds to
+    /// another real (slow) inspection instead of `inspector-busy` again.
+    #[test]
+    fn concurrent_scene_inspect_calls_serialize_through_the_single_inspection_gate() {
+        let root = temp_dir("inspect-busy");
+        let hang = root.join("hang-inspector.py");
+        fs::write(
+            &hang,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Arc::new(InspectConfig {
+            inspector_path: Some(hang),
+            runtime_dir: root.join("runtime"),
+            wall_timeout: Duration::from_millis(500),
+            resource_limits: sample_limits(1024),
+        });
+
+        fn request(id: i64) -> Request {
+            Request {
+                version: 1,
+                id: json!(id),
+                method: "scene.inspect".to_string(),
+                params: json!({"path": "/nonexistent/scene.json"}),
+            }
+        }
+
+        fn read_response(stream: &mut UnixStream) -> Value {
+            use std::io::BufRead;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            reader.read_until(b'\n', &mut line).unwrap();
+            serde_json::from_slice(&line).unwrap()
+        }
+
+        let (a_write, mut a_read) = UnixStream::pair().unwrap();
+        let (b_write, mut b_read) = UnixStream::pair().unwrap();
+        // Race both calls into the gate at (as close to) the same instant,
+        // so the test exercises the atomic swap under real contention
+        // instead of one call always winning by construction order.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let thread_a = {
+            let config = config.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                dispatch_scene_inspect(a_write, request(1), &config).unwrap();
+            })
+        };
+        let thread_b = {
+            let config = config.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                dispatch_scene_inspect(b_write, request(2), &config).unwrap();
+            })
+        };
+        thread_a.join().unwrap();
+        thread_b.join().unwrap();
+
+        let response_a = read_response(&mut a_read);
+        let response_b = read_response(&mut b_read);
+        let mut reasons = [
+            response_a["result"]["reason"].as_str().unwrap().to_string(),
+            response_b["result"]["reason"].as_str().unwrap().to_string(),
+        ];
+        reasons.sort();
+        assert_eq!(
+            reasons,
+            ["inspector-busy", "timeout"],
+            "a={response_a} b={response_b}"
+        );
+
+        // The gate is clear again by the time either response is
+        // observable: dispatch_scene_inspect's spawned thread drops the
+        // InspectInFlightGuard right after run_inspection finishes, before
+        // it writes the response. So having read both responses above is
+        // proof enough that a third call now proceeds to a real
+        // inspection instead of `inspector-busy`.
+        let (c_write, mut c_read) = UnixStream::pair().unwrap();
+        dispatch_scene_inspect(c_write, request(3), &config).unwrap();
+        let response_c = read_response(&mut c_read);
+        assert_eq!(response_c["result"]["reason"], "timeout", "{response_c}");
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

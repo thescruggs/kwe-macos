@@ -269,11 +269,21 @@ fn drain_stdout(pipe: &mut ChildStdout, buffer: &mut Vec<u8>) -> bool {
     false
 }
 
-/// Read as much of `pipe` as is available without blocking, keeping only
-/// the most recent `STDERR_TAIL_BYTES` bytes.
+/// Chunks drained per `drain_stderr_tail` call. At 4096 bytes each this
+/// reads at most 64 KiB of stderr per `supervise` tick (review R2): without
+/// a cap, a child that floods stderr continuously would keep this loop's
+/// `Ok(count)` arm satisfied forever and starve the caller's `try_wait`/
+/// deadline check — the tail-trim bounds memory, not the time spent here.
+const STDERR_DRAIN_CHUNKS_PER_TICK: usize = 16;
+
+/// Read up to `STDERR_DRAIN_CHUNKS_PER_TICK` chunks of `pipe` without
+/// blocking, keeping only the most recent `STDERR_TAIL_BYTES` bytes.
+/// Bounded per call (R2) so a stderr flood cannot starve the caller's
+/// `try_wait`/deadline check: this always returns, and any remaining bytes
+/// are simply picked up on the next `supervise` tick.
 fn drain_stderr_tail(pipe: &mut ChildStderr, buffer: &mut Vec<u8>) {
     let mut chunk = [0_u8; 4096];
-    loop {
+    for _ in 0..STDERR_DRAIN_CHUNKS_PER_TICK {
         match pipe.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {

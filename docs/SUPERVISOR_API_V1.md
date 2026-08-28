@@ -536,12 +536,23 @@ to a dedicated report FD/envelope) may all still change.)*
   stdout/stderr are drained under a wall-clock deadline (default 10 s,
   `--inspector-wall-timeout-ms`), and the child is always reaped before the
   RPC answers.
+- `scene.inspect` is single-in-flight: the daemon runs at most one
+  inspection at a time, on a dedicated thread, so it never blocks the
+  single-threaded accept loop or any other RPC (`renderer.status`,
+  `wallpaper.apply`, the pointer/audio relays) for the up-to-30-s duration
+  a slow or hung inspection can take. Param validation (the `path` checks
+  above) still answers inline and immediately. A `scene.inspect` that
+  arrives while another is already running answers `inspector-busy`
+  immediately instead of queuing or running a second inspector process;
+  the gate clears as soon as the in-flight inspection's result is known,
+  so the next call after that runs a real inspection again.
 - Every non-success path answers a typed `{"outcome": "unknown", "reason":
   "..."}` result instead of an RPC-level error, so `scene.inspect` itself
   always succeeds (`"ok": true`) once its input validates — the record's own
   `outcome`/`reason` fields carry the result:
   - `inspector-unavailable`: no inspector binary configured, or it failed to
     spawn.
+  - `inspector-busy`: another inspection is already in flight (see above).
   - `timeout`: the wall-clock deadline expired; the inspector's whole
     process group is SIGKILLed and reaped.
   - `report-oversize`: the inspector's stdout exceeded 64 KiB (the
