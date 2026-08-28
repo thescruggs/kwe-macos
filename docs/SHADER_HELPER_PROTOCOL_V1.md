@@ -184,20 +184,38 @@ defaulting `includes`/`combos`/`defines` to "absent means empty," so a
 caller's request is always a complete, self-describing record).
 
 **`options` (SR-3c, additive — still schema `shader-compile-request-v1`):**
-OPTIONAL. Absent entirely means "use the compiling side's own defaults" —
-today, `kwe-core::shader_compile_spec`'s constants on both ends of this
-protocol (`kwe-scene-renderer` and `kwe-shader-compiler` each reference the
-SAME Rust constants independently rather than parsing this field back into
-`shaderc` types; see `docs/SR3.md`'s SR-3c section for why). When present,
-all three sub-fields (`target_env`, `target_env_version`,
-`optimization_level`) are required together — no partial object — each a
-string of at most `MAX_SHADER_OPTION_STRING_BYTES` (128). This crate only
-checks SHAPE here, never the specific values (which target env/
-optimization level a caller may ask for is policy for whichever crate
-actually calls `shaderc`, not this wire-format validator). `kwe-scene-
-renderer` always populates this field from `kwe-core::shader_compile_spec`
-(never omits it) so the wire request is self-describing/auditable even
-though the helper does not currently branch on it.
+OPTIONAL, and (SR-3c2) each of its three sub-fields (`target_env`,
+`target_env_version`, `optimization_level`) is INDEPENDENTLY optional too
+— absent, whether the whole object or one field within a present object,
+means "use the compiling side's own default for that field" — today,
+`kwe-core::shader_compile_spec`'s constants. Each present field is a
+string of at most `MAX_SHADER_OPTION_STRING_BYTES` (128). This crate
+(`kwe-report-protocol`) only checks SHAPE here (string, bounded length)
+— it has no opinion on which target env/optimization level a caller may
+ask for.
+
+**As of SR-3c2, the helper ACTUALLY COMPILES WITH these values** —
+`kwe-shader-compiler::resolve_wire_options` maps each present sub-field
+onto a real `shaderc::TargetEnv`/`EnvVersion`/`OptimizationLevel`, falling
+back per-field to `kwe-core::shader_compile_spec`'s constant for whatever
+is absent. The VALUE vocabulary this crate accepts (checked by the
+helper, not by `kwe-report-protocol`'s structural validator): `target_env`
+must be `"vulkan"` (the only target this codebase ever compiles for);
+`target_env_version` must be one of `"1.0"`/`"1.1"`/`"1.2"`/`"1.3"`/
+`"1.4"` (`shaderc::EnvVersion`'s own `Vulkan1_0..=Vulkan1_4` variants);
+`optimization_level` must be one of `"zero"`/`"size"`/`"performance"`
+(`shaderc::OptimizationLevel`'s three variants). A PRESENT value outside
+this vocabulary is `{"status": "protocol-error", "reason": "bad-options"}`
+— see the reason-code table below — checked BEFORE any `shaderc` call is
+attempted, and never silently defaulted: the caller asked for something
+specific, and answering with something else would be worse than an
+explicit refusal.
+
+`kwe-scene-renderer` always populates this field from `kwe-core::
+shader_compile_spec` (never omits it), which is exactly the helper's own
+default vocabulary — every request this renderer builds resolves
+successfully; `"bad-options"` can only fire for a caller sending a value
+outside this fixed vocabulary, which this renderer never does.
 
 ## `shader-compile-response-v1` schema (kind 17)
 
@@ -294,6 +312,7 @@ Emitted in a `status: "protocol-error"` response's `"reason"` field
 | `invalid-include:<name>` | An `"includes"` entry is not a string, or exceeds 64 KiB (name truncated to 128 bytes on a UTF-8 boundary in the diagnostic — never unbounded, never a panic on a multi-byte character). |
 | `too-many-combos` / `too-many-defines` | `"combos"`/`"defines"` has more than 128 entries. |
 | `option-oversize:<path>` | (SR-3c) An `"options"` sub-field (`options.target_env`/`options.target_env_version`/`options.optimization_level`) exceeds `MAX_SHADER_OPTION_STRING_BYTES` (128 bytes). |
+| `bad-options` | (SR-3c2) A PRESENT `"options"` sub-field's VALUE is outside the vocabulary `kwe-shader-compiler` supports (see the `options` field description above) — a structurally valid, in-bounds string that this crate still refuses to compile with. Checked by the helper itself, not `kwe-report-protocol`'s structural validator. |
 | `excess-request` | Bytes remained on stdin after the one request this process reads (decision (c)). |
 
 A `"compile-error"` response (SR-3c) is a SEPARATE status, not a

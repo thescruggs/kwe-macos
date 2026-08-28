@@ -923,13 +923,14 @@ Open risks:              The long-lived serial-loop question (decision
                          pinned), and this slice's own differential-oracle
                          tests -- but those tests only run in CI/dev, not
                          in production.
-                         The helper does not actually CONSUME the wire
-                         request's "options" field for its own compile
-                         behavior (documented above) -- it is populated
-                         for self-description/audit but currently
-                         advisory only; a future caller wanting genuinely
-                         different options than kwe-core's fixed defaults
-                         would need the helper to start honoring it.
+                         [RESOLVED — SR-3c2] The helper does not actually
+                         CONSUME the wire request's "options" field for
+                         its own compile behavior (documented above) -- it
+                         is populated for self-description/audit but
+                         currently advisory only; a future caller wanting
+                         genuinely different options than kwe-core's fixed
+                         defaults would need the helper to start honoring
+                         it.
                          RLIMIT_NPROC still left unset for the helper
                          (SR-3b's own open risk, unchanged this slice).
                          The PDEATHSIG mechanism remains proven by
@@ -947,4 +948,211 @@ STOP findings:           None. Neither STOP condition named for this task
                          by design, so no other crate's dependency graph
                          changed at all).
 Commit(s):               45b4b67
+```
+
+## SR-3c2 — the helper compiles with the wire options it receives (honesty-boundary close-out)
+
+Post-build slice (lands for pkgrel 22), filed after SR-3c merged and
+pkgrel 21 built, trunk `437863d`.
+
+Conductor decisions (verbatim):
+
+- Small slice: close the SR-3c honesty boundary. The helper must COMPILE
+  WITH the wire `options` it receives, not its own copy of the constants.
+- ABSENT options (or absent individual fields) keep today's behavior:
+  `kwe-core`'s `shader_compile_spec` constants as defaults — byte-
+  compatible with every existing caller/test.
+- An options VALUE outside the known vocabulary (unknown target env
+  string, unknown opt level) → `{"status":"protocol-error","reason":
+  "bad-options"}` exit 65, never a silent fallback to defaults.
+- Renderer side already sends the populated options (SR-3c) — verify, no
+  change expected.
+
+```text
+Task:            Make kwe-shader-compiler actually compile WITH the wire
+                 request's "options" object instead of its own hardcoded
+                 copy of kwe-core's constants (SR-3c's own documented
+                 honesty-boundary gap) — an out-of-vocabulary value
+                 refuses (protocol-error), never silently falls back.
+Milestone/Slice: SR-3c2
+Goal:            Close the exact gap SR-3c's own open risks section named:
+                 "the helper does not actually CONSUME the wire request's
+                 options field for its own compile behavior... it is
+                 populated for self-description/audit but currently
+                 advisory only." After this slice the wire field is no
+                 longer advisory.
+Outcome:         kwe-report-protocol: validate_shader_compile_request's
+                 "options" handling relaxes from "all three sub-fields
+                 required together when the object is present" to "each
+                 sub-field independently optional" -- a present-but-
+                 partial (or even empty {}) options object is now valid,
+                 matching the task's "absent individual fields keep
+                 today's behavior" requirement (this MUST be possible for
+                 per-field defaulting to ever be exercised by a real
+                 caller). Shape checking (string, bounded to
+                 MAX_SHADER_OPTION_STRING_BYTES) is unchanged for
+                 whichever fields ARE present; VALUE vocabulary is still
+                 not this crate's concern (unchanged from SR-3c).
+                 kwe-shader-compiler gains resolve_wire_options(wire_options:
+                 Option<&Value>) -> Result<ResolvedOptions, ()>: each of
+                 the 3 wire sub-fields independently defaults to
+                 kwe-core::shader_compile_spec's own constant when absent
+                 (TARGET_ENV="vulkan", TARGET_ENV_VERSION="1.2",
+                 OPTIMIZATION_LEVEL="zero"), then each resolved string is
+                 matched against the vocabulary this crate actually
+                 supports: target_env must be "vulkan" (the only target
+                 this codebase ever compiles for); target_env_version
+                 must be one of "1.0".."1.4" (shaderc::EnvVersion's own
+                 Vulkan1_0..=Vulkan1_4 variants); optimization_level must
+                 be one of "zero"/"size"/"performance" (shaderc::
+                 OptimizationLevel's three variants). Any present value
+                 outside this vocabulary is Err(()) -- run() turns this
+                 into respond_protocol_error("bad-options") (exit 65)
+                 BEFORE compile_source (and therefore before any shaderc::
+                 Compiler/CompileOptions call) is ever reached, keeping
+                 "bad-options" cleanly distinct from "compile-error"
+                 (reserved for a real GLSL/shaderc failure). compile_source
+                 now takes &ResolvedOptions instead of hardcoding
+                 kwe-core's constants directly -- entry_point stays fixed
+                 to kwe-core::ENTRY_POINT (not on the wire; nothing to
+                 negotiate, unchanged from SR-3c).
+                 kwe-scene-renderer: VERIFIED, no code change -- SR-3c
+                 already populates "options" from kwe-core::
+                 shader_compile_spec on every request (shader_helper.rs's
+                 compile_inner), which is exactly the helper's own default
+                 vocabulary, so every request this renderer builds
+                 resolves successfully; the renderer never sends a value
+                 outside the known vocabulary, so "bad-options" can never
+                 fire against it. The comment at the "options" JSON
+                 literal (previously: "the helper does not actually parse
+                 these back into shaderc types... not because the
+                 helper's compile behavior depends on it today") is
+                 updated to say the opposite, now true.
+In scope:        crates/kwe-report-protocol/src/lib.rs (the "options"
+                 per-field-optional relaxation, 2 test replacements),
+                 crates/kwe-shader-compiler/src/main.rs
+                 (ResolvedOptions/resolve_wire_options, compile_source's
+                 new parameter, run()'s new bad-options branch, 6 new
+                 unit tests), crates/kwe-shader-compiler/tests/protocol.rs
+                 (4 new integration tests), crates/kwe-scene-renderer/src/
+                 shader_helper.rs (comment-only, at the "options" JSON
+                 literal), docs/SHADER_HELPER_PROTOCOL_V1.md (the
+                 `options` field section rewritten: per-field-optional,
+                 the vocabulary table, "bad-options" in the reason-code
+                 table), docs/SR3.md (SR-3c's own open-risk line
+                 annotated RESOLVED, this section).
+Out of scope:    entry_point stays a fixed kwe-core constant, not added to
+                 the wire schema -- the task named "target env/version,
+                 optimization level, entry point" as the four kwe-core
+                 constants this slice is ABOUT, but only three of them
+                 have ever been wire fields (entry_point is a
+                 compile_into_spirv PARAMETER, not a shaderc::
+                 CompileOptions setting, and nothing in this codebase
+                 varies it) -- widening the wire schema to add a 4th
+                 negotiable field was not asked for and would be scope
+                 creep for a "small slice". The long-lived serial-loop
+                 question (SR-3a decision (c)) -- still unresolved, not
+                 touched. Reflection/cache (SR-3d/SR-3e) -- untouched. The
+                 env-gated double-compile diff in PRODUCTION code (SR-3c's
+                 other honesty-boundary item, tests-only) -- SR-3c2 closes
+                 the OPTIONS gap specifically; the double-compile-diff gap
+                 is a SEPARATE, still-open item (not this task's scope).
+Acceptance tests:        kwe-report-protocol: 47 tests (up from 46) -- the
+                         old "all three required together" test replaced
+                         by shader_request_options_partial_object_is_valid
+                         (each single field missing, AND an empty {}
+                         object, all valid) plus a new wrong-type-on-a-
+                         present-field test.
+                         kwe-shader-compiler: 30 tests (up from 21) -- 6
+                         new unit tests (no-options resolves to exactly
+                         kwe-core's defaults; a partial object defaults
+                         only the ABSENT fields; every documented
+                         vocabulary value for every field is accepted;
+                         an unknown value for ANY field is Err;
+                         optimization_level_actually_changes_the_compiled_spirv,
+                         the task's own "do not fake it" instruction taken
+                         literally -- a shader with an unused variable and
+                         a loop whose result is multiplied by a compile-
+                         time 0.0 (both dead code at higher optimization),
+                         compiled at "zero" vs "performance", empirically
+                         confirmed to produce DIFFERENT SPIR-V (1132 bytes
+                         vs 304 bytes on this shaderc build) BEFORE the
+                         test was written, not assumed); 4 new integration
+                         tests against the REAL binary: explicit options
+                         equal to kwe-core's constants byte-identical to
+                         no options at all (defaults-wiring proof); the
+                         SAME optimization-sensitive fixture through the
+                         real binary, default vs "performance", SPIR-V
+                         differs (the wire-consumption proof, at the
+                         actual protocol boundary, not just the Rust
+                         function); an unrecognized target_env ->
+                         protocol-error/bad-options/exit 65; an
+                         unrecognized optimization_level -> the same
+                         (covers more than one option field).
+                         kwe-scene-renderer: unchanged at 370 tests (1
+                         ignored) -- EVERY SR-3c differential/failure-
+                         injection test (the 4-shader byte-equality
+                         oracle, the compile-error/dies-mid-chunks/
+                         oversized-claim failure-injection tests) reran
+                         and stayed green UNTOUCHED, confirming the wire
+                         options now genuinely being consumed by the
+                         helper does not disturb byte-identity (expected:
+                         this renderer always sends kwe-core's own
+                         defaults, which is exactly what the helper used
+                         to hardcode -- SR-3c2 changes WHERE the values
+                         come from, not WHAT they are, for this caller).
+                         947 workspace tests total, up from 937.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 947 passed, 0 failed.
+                         ./scripts/check.sh -- exit 0 (one retry needed:
+                         the first run hit a single unrelated flaky
+                         failure, js::tests::soft_budget_skips_frame_then_recovers,
+                         a wall-clock script-execution-budget test with no
+                         connection to this slice's files; confirmed
+                         flaky by re-running it alone immediately after,
+                         which passed cleanly, then re-running the whole
+                         script for a clean end-to-end record).
+Failure/recovery tests:  bad_options_value_is_a_protocol_error_exit_65 and
+                         bad_optimization_level_is_also_a_protocol_error
+                         (kwe-shader-compiler/tests/protocol.rs) -- an
+                         out-of-vocabulary value never reaches shaderc,
+                         never becomes "compile-error", always exits 65
+                         with reason "bad-options". resolve_wire_options_
+                         rejects_an_unknown_value_for_any_field (unit
+                         level, all three fields covered independently).
+Upstream/provenance:    Original; the vocabulary (Vulkan-only target env,
+                         shaderc's own EnvVersion/OptimizationLevel
+                         variant sets) is read directly from the
+                         `shaderc` crate's own enum definitions
+                         (shaderc-0.10.1/src/lib.rs), not guessed or
+                         copied from elsewhere.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 947 passed, 0 failed.
+                         ./scripts/check.sh -- exit 0 (after the flaky-
+                         test retry described above).
+Open risks:              entry_point remains fixed/not wire-configurable
+                         (documented above as an explicit scope decision,
+                         not an oversight) -- if a future caller ever
+                         needs a different entry point, the wire schema
+                         would need a genuinely new field, not a reuse of
+                         this slice's plumbing.
+                         The env-gated double-compile diff in PRODUCTION
+                         code remains absent (SR-3c's OTHER honesty-
+                         boundary item, explicitly out of scope here) --
+                         a silent divergence between the renderer's
+                         in-thread fallback path and the helper's
+                         now-wire-driven compile would still go unnoticed
+                         in the field; mitigated the same way SR-3c
+                         recorded (identical options, identical shaderc
+                         version, CI-only differential-oracle tests).
+                         The long-lived serial-loop question (SR-3a
+                         decision (c)) is STILL unresolved.
+                         RLIMIT_NPROC and the PDEATHSIG-by-precedent gap
+                         (SR-3b's own open risks) are unchanged.
+STOP findings:           None. No STOP condition was named for this task.
+Commit(s):               (fill in after commit)
 ```

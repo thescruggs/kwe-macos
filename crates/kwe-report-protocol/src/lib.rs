@@ -530,12 +530,17 @@ pub enum ShaderRequestError {
 /// "version the schema additively, keep v1 name"): a payload with no
 /// `"options"` key at all remains valid (absent means "use the compiling
 /// side's own defaults" — `kwe-core::shader_compile_spec`'s constants on
-/// both ends of this protocol today). When present, all three sub-fields
-/// are required together (no partial object) and only their SHAPE is
-/// checked here — this crate has no opinion on which target env/
-/// optimization level a caller is allowed to ask for; that policy (today:
-/// always `kwe-core`'s own fixed values) lives in the two crates that
-/// actually call into `shaderc`.
+/// both ends of this protocol today). SR-3c2: EACH sub-field is
+/// independently optional too — a present-but-partial `"options"` object
+/// is valid (the compiling side fills in `kwe-core`'s own default
+/// per-field, not all-or-nothing; SR-3c2's own helper is the first real
+/// consumer of this). Only SHAPE is checked here for whichever sub-fields
+/// ARE present (string, bounded) — this crate has no opinion on which
+/// target env/optimization level a caller is allowed to ask for; that
+/// VALUE-vocabulary policy lives in whichever crate actually calls into
+/// `shaderc` (`kwe-shader-compiler`, as of SR-3c2 — an unrecognized value
+/// there is a `"bad-options"` protocol error, never a silent fallback to
+/// the default).
 ///
 /// Does not itself enforce [`MAX_PAYLOAD_BYTES`] — same caller-already-
 /// capped-it assumption `validate_inspection` documents.
@@ -583,9 +588,10 @@ pub fn validate_shader_compile_request(
     }
 
     // SR-3c: optional "options" object -- absent entirely is valid (see
-    // the doc comment above); when present, all three sub-fields are
-    // required and shape-checked (string, bounded length) but their
-    // VALUES are not otherwise interpreted by this crate.
+    // the doc comment above). SR-3c2: each sub-field is now independently
+    // optional too -- a present-but-partial object is valid; only
+    // WHICHEVER fields are present get shape-checked (string, bounded
+    // length), their VALUES not otherwise interpreted by this crate.
     if let Some(options_value) = object.get("options") {
         let options = match options_value {
             Value::Object(map) => map,
@@ -596,9 +602,14 @@ pub fn validate_shader_compile_request(
             ("target_env_version", "options.target_env_version"),
             ("optimization_level", "options.optimization_level"),
         ] {
-            let text = shader_require_str(options, field, path)?;
-            if text.len() > MAX_SHADER_OPTION_STRING_BYTES {
-                return Err(ShaderRequestError::OptionOversize(path));
+            match options.get(field) {
+                None => {} // SR-3c2: absent is valid -- per-field default.
+                Some(Value::String(text)) => {
+                    if text.len() > MAX_SHADER_OPTION_STRING_BYTES {
+                        return Err(ShaderRequestError::OptionOversize(path));
+                    }
+                }
+                Some(_) => return Err(ShaderRequestError::WrongType(path)),
             }
         }
     }
@@ -1753,8 +1764,12 @@ mod tests {
         ));
     }
 
+    /// SR-3c2: a present-but-PARTIAL "options" object is valid -- each
+    /// sub-field is independently optional (the compiling side fills in
+    /// its own per-field default for whichever is missing; SR-3a/SR-3c's
+    /// original "all three required together" rule is gone).
     #[test]
-    fn shader_request_options_requires_all_three_sub_fields_together() {
+    fn shader_request_options_partial_object_is_valid() {
         for missing in ["target_env", "target_env_version", "optimization_level"] {
             let mut record = golden_shader_request();
             let mut options = serde_json::Map::new();
@@ -1765,16 +1780,29 @@ mod tests {
             }
             record["options"] = Value::Object(options);
             let payload = serde_json::to_vec(&record).unwrap();
-            let expected_path = format!("options.{missing}");
             assert!(
-                matches!(
-                    validate_shader_compile_request(&payload, 256 * 1024),
-                    Err(ShaderRequestError::MissingField(reported)) if reported == expected_path
-                ),
+                validate_shader_compile_request(&payload, 256 * 1024).is_ok(),
                 "missing={missing}: {:?}",
                 validate_shader_compile_request(&payload, 256 * 1024)
             );
         }
+        // Zero sub-fields present -- an empty "options" object -- is also
+        // valid (every field independently defaults).
+        let mut record = golden_shader_request();
+        record["options"] = json!({});
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(validate_shader_compile_request(&payload, 256 * 1024).is_ok());
+    }
+
+    #[test]
+    fn shader_request_options_a_present_sub_field_with_the_wrong_type_is_rejected() {
+        let mut record = golden_shader_request();
+        record["options"] = json!({"target_env": 42});
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::WrongType("options.target_env"))
+        ));
     }
 
     #[test]

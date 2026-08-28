@@ -336,12 +336,13 @@ impl ShaderHelper {
             // SR-3c task item 2: populate `options` from the SAME values
             // `compile_stage` uses (decision (a)) — `kwe-core::
             // shader_compile_spec`'s constants, the single shared recipe.
-            // The helper does not actually parse these back into shaderc
-            // types (it always compiles with its OWN copy of the same
-            // constants — see `kwe-shader-compiler`'s own doc comment);
-            // this field exists so the wire request is self-describing/
-            // auditable, per the task's explicit ask, not because the
-            // helper's compile behavior depends on it today.
+            // SR-3c2: the helper now genuinely COMPILES WITH these values
+            // (`kwe-shader-compiler::resolve_wire_options`), not just
+            // echoes them back for audit — since this renderer always
+            // sends exactly `kwe-core`'s own constants, every request
+            // this module builds resolves successfully (never
+            // "bad-options": that only fires for a value outside the
+            // known vocabulary, which this renderer never sends).
             "options": {
                 "target_env": kwe_core::TARGET_ENV,
                 "target_env_version": kwe_core::TARGET_ENV_VERSION,

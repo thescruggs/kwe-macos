@@ -236,35 +236,104 @@ fn respond_protocol_error(reason: &str) -> i32 {
     exit_code::PROTOCOL_ERROR
 }
 
+/// SR-3c2: the wire `"options"` sub-fields resolved to REAL `shaderc`
+/// values -- `resolve_wire_options` builds this from the (already
+/// structurally-validated) request, falling back per-field to `kwe-core::
+/// shader_compile_spec`'s own constant for whatever is absent.
+struct ResolvedOptions {
+    target_env: shaderc::TargetEnv,
+    target_env_version: shaderc::EnvVersion,
+    optimization_level: shaderc::OptimizationLevel,
+}
+
+/// Resolves the wire request's optional `"options"` object (already
+/// shape-checked by `validate_shader_compile_request` -- each PRESENT
+/// sub-field is a bounded string, but its VALUE is unchecked coming in)
+/// against the vocabulary this crate actually supports. `wire_options` is
+/// `None` when the whole `"options"` key was absent from the request;
+/// `Some` may itself have any subset of the three sub-fields present
+/// (SR-3c2: no longer all-or-nothing). Each ABSENT field -- the whole
+/// object, or one field within a present object -- falls back to
+/// `kwe-core::shader_compile_spec`'s own constant, byte-compatible with
+/// every caller/test that predates this slice and never populated
+/// `"options"` at all (`compile_source_compiles_valid_glsl_to_spirv`
+/// below, and every SR-3c integration test). A PRESENT value outside the
+/// known vocabulary (this crate only ever targets Vulkan; the version
+/// must be one of `shaderc::EnvVersion`'s own `Vulkan1_0..=Vulkan1_4`
+/// variants; the optimization level must be one of `shaderc::
+/// OptimizationLevel`'s three) is `Err(())` -- `run` turns this into a
+/// `"bad-options"` protocol error BEFORE any `shaderc` call is attempted,
+/// never a silent fallback to the default (the caller asked for
+/// something specific; silently answering with something else would be
+/// worse than an explicit refusal).
+fn resolve_wire_options(wire_options: Option<&serde_json::Value>) -> Result<ResolvedOptions, ()> {
+    let target_env_str = wire_options
+        .and_then(|options| options.get("target_env"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(kwe_core::TARGET_ENV);
+    let target_env_version_str = wire_options
+        .and_then(|options| options.get("target_env_version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(kwe_core::TARGET_ENV_VERSION);
+    let optimization_level_str = wire_options
+        .and_then(|options| options.get("optimization_level"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(kwe_core::OPTIMIZATION_LEVEL);
+
+    let target_env = match target_env_str {
+        "vulkan" => shaderc::TargetEnv::Vulkan,
+        _ => return Err(()),
+    };
+    let target_env_version = match target_env_version_str {
+        "1.0" => shaderc::EnvVersion::Vulkan1_0,
+        "1.1" => shaderc::EnvVersion::Vulkan1_1,
+        "1.2" => shaderc::EnvVersion::Vulkan1_2,
+        "1.3" => shaderc::EnvVersion::Vulkan1_3,
+        "1.4" => shaderc::EnvVersion::Vulkan1_4,
+        _ => return Err(()),
+    };
+    let optimization_level = match optimization_level_str {
+        "zero" => shaderc::OptimizationLevel::Zero,
+        "size" => shaderc::OptimizationLevel::Size,
+        "performance" => shaderc::OptimizationLevel::Performance,
+        _ => return Err(()),
+    };
+    Ok(ResolvedOptions {
+        target_env,
+        target_env_version,
+        optimization_level,
+    })
+}
+
 /// Compiles `source` for `stage` (already validated to be `"vertex"` or
-/// `"fragment"` by `validate_shader_compile_request`) using `kwe-core::
-/// shader_compile_spec`'s fixed options — decision (a): the single shared
-/// recipe, not the wire request's own (informational-only) `"options"`
-/// object re-parsed back into `shaderc` types on this side. Returns the
-/// raw SPIR-V bytes (`shaderc::CompilationArtifact::as_binary_u8`'s own
-/// native-endian layout — both processes always run on the same host, so
-/// this matches `materialshader::compile_stage`'s `Vec<u32>` byte-for-byte
-/// once the renderer reassembles it, no endian conversion needed) on
-/// success, or a short diagnostic string (shaderc's own error text,
-/// UNBOUNDED at this point — the caller bounds it to
-/// `MAX_SHADER_COMPILE_ERROR_LOG_BYTES` before it reaches the wire) on a
-/// GLSL compile failure or a `shaderc` setup failure (compiler/options
-/// construction). Never panics on a compile FAILURE; `shaderc-rs`'s own
-/// `CString::new` on the source text can panic on an embedded NUL byte —
-/// the same latent risk `materialshader::compile_stage` already carries
-/// today, not a new one introduced here (this process's own isolation,
-/// not a `catch_unwind`, is what contains it: a panic here just exits
-/// this one-shot process, which the caller (`wait_and_read`) already
-/// classifies as `ProtocolError` — no response frame — and falls back
-/// in-thread).
-fn compile_source(source: &str, stage: &str) -> Result<Vec<u8>, String> {
+/// `"fragment"` by `validate_shader_compile_request`) using `resolved`
+/// (SR-3c2: the wire request's own options, defaulted/validated by
+/// `resolve_wire_options` -- decision (a)'s "the helper must compile WITH
+/// the wire options it receives"). Returns the raw SPIR-V bytes
+/// (`shaderc::CompilationArtifact::as_binary_u8`'s own native-endian
+/// layout — both processes always run on the same host, so this matches
+/// `materialshader::compile_stage`'s `Vec<u32>` byte-for-byte once the
+/// renderer reassembles it, no endian conversion needed) on success, or a
+/// short diagnostic string (shaderc's own error text, UNBOUNDED at this
+/// point — the caller bounds it to `MAX_SHADER_COMPILE_ERROR_LOG_BYTES`
+/// before it reaches the wire) on a GLSL compile failure or a `shaderc`
+/// setup failure (compiler/options construction). Never panics on a
+/// compile FAILURE; `shaderc-rs`'s own `CString::new` on the source text
+/// can panic on an embedded NUL byte — the same latent risk
+/// `materialshader::compile_stage` already carries today, not a new one
+/// introduced here (this process's own isolation, not a `catch_unwind`,
+/// is what contains it: a panic here just exits this one-shot process,
+/// which the caller (`wait_and_read`) already classifies as
+/// `ProtocolError` — no response frame — and falls back in-thread).
+fn compile_source(
+    source: &str,
+    stage: &str,
+    resolved: &ResolvedOptions,
+) -> Result<Vec<u8>, String> {
     let compiler = shaderc::Compiler::new().map_err(|error| error.to_string())?;
     let mut options = shaderc::CompileOptions::new().map_err(|error| error.to_string())?;
-    options.set_target_env(
-        shaderc::TargetEnv::Vulkan,
-        shaderc::EnvVersion::Vulkan1_2 as u32,
-    );
-    options.set_optimization_level(shaderc::OptimizationLevel::Zero);
+    options.set_target_env(resolved.target_env, resolved.target_env_version as u32);
+    options.set_optimization_level(resolved.optimization_level);
     let shader_kind = match stage {
         "vertex" => shaderc::ShaderKind::Vertex,
         "fragment" => shaderc::ShaderKind::Fragment,
@@ -382,7 +451,16 @@ fn run(arguments: &Arguments) -> i32 {
     // by `validate_shader_compile_request` above.
     let stage = request["stage"].as_str().unwrap_or_default();
     let source = request["source"].as_str().unwrap_or_default();
-    match compile_source(source, stage) {
+    // SR-3c2: resolve+validate the wire "options" vocabulary BEFORE
+    // attempting any shaderc call -- an out-of-vocabulary value is a
+    // caller-side request problem (protocol-error), never folded into a
+    // "compile-error" (which is reserved for a real shaderc/GLSL
+    // failure) and never silently defaulted.
+    let resolved = match resolve_wire_options(request.get("options")) {
+        Ok(resolved) => resolved,
+        Err(()) => return respond_protocol_error("bad-options"),
+    };
+    match compile_source(source, stage, &resolved) {
         Ok(spirv) => respond_ok(&spirv),
         Err(log) => respond_compile_error(&log),
     }
@@ -420,12 +498,21 @@ mod tests {
         false
     }
 
+    fn default_resolved_options() -> ResolvedOptions {
+        resolve_wire_options(None).expect("kwe-core's own defaults must always resolve")
+    }
+
     #[test]
     fn compile_source_compiles_valid_glsl_to_spirv() {
         if skip_if_shaderc_unavailable() {
             return;
         }
-        let spirv = compile_source(VALID_FRAGMENT_SOURCE, "fragment").unwrap();
+        let spirv = compile_source(
+            VALID_FRAGMENT_SOURCE,
+            "fragment",
+            &default_resolved_options(),
+        )
+        .unwrap();
         assert!(!spirv.is_empty());
         assert_eq!(spirv.len() % 4, 0);
         assert_eq!(&spirv[0..4], &0x0723_0203_u32.to_le_bytes());
@@ -436,8 +523,98 @@ mod tests {
         if skip_if_shaderc_unavailable() {
             return;
         }
-        let error = compile_source("#version 450\nvoid main() { !!! }", "fragment").unwrap_err();
+        let error = compile_source(
+            "#version 450\nvoid main() { !!! }",
+            "fragment",
+            &default_resolved_options(),
+        )
+        .unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3c2: resolve_wire_options
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_wire_options_with_no_options_at_all_matches_kwe_core_defaults() {
+        let resolved = resolve_wire_options(None).unwrap();
+        assert_eq!(resolved.target_env, shaderc::TargetEnv::Vulkan);
+        assert_eq!(resolved.target_env_version, shaderc::EnvVersion::Vulkan1_2);
+        assert_eq!(
+            resolved.optimization_level,
+            shaderc::OptimizationLevel::Zero
+        );
+    }
+
+    #[test]
+    fn resolve_wire_options_defaults_each_field_independently_when_absent() {
+        // Only optimization_level present -- target_env/target_env_version
+        // still default to kwe-core's own constants (SR-3c2: per-field,
+        // not all-or-nothing).
+        let wire = serde_json::json!({"optimization_level": "performance"});
+        let resolved = resolve_wire_options(Some(&wire)).unwrap();
+        assert_eq!(resolved.target_env, shaderc::TargetEnv::Vulkan);
+        assert_eq!(resolved.target_env_version, shaderc::EnvVersion::Vulkan1_2);
+        assert_eq!(
+            resolved.optimization_level,
+            shaderc::OptimizationLevel::Performance
+        );
+    }
+
+    #[test]
+    fn resolve_wire_options_accepts_every_documented_vocabulary_value() {
+        for version in ["1.0", "1.1", "1.2", "1.3", "1.4"] {
+            let wire = serde_json::json!({"target_env": "vulkan", "target_env_version": version});
+            assert!(
+                resolve_wire_options(Some(&wire)).is_ok(),
+                "version={version}"
+            );
+        }
+        for level in ["zero", "size", "performance"] {
+            let wire = serde_json::json!({"optimization_level": level});
+            assert!(resolve_wire_options(Some(&wire)).is_ok(), "level={level}");
+        }
+    }
+
+    #[test]
+    fn resolve_wire_options_rejects_an_unknown_value_for_any_field() {
+        for wire in [
+            serde_json::json!({"target_env": "opengl"}),
+            serde_json::json!({"target_env_version": "9.9"}),
+            serde_json::json!({"optimization_level": "maximum"}),
+        ] {
+            assert!(resolve_wire_options(Some(&wire)).is_err(), "wire={wire:?}");
+        }
+    }
+
+    /// SR-3c2 task item 3's own "do not fake it" instruction: proves the
+    /// optimization level is genuinely CONSUMED, not just accepted and
+    /// discarded, by compiling a shader with an obvious optimization
+    /// opportunity (an unused variable, and a loop whose result is
+    /// multiplied by a compile-time-constant 0.0, both dead at
+    /// Size/Performance) at "zero" vs "performance" and asserting the
+    /// SPIR-V differs -- empirically confirmed (not assumed) before this
+    /// test was written: zero=1132 bytes, performance=size=304 bytes on
+    /// this shaderc build.
+    #[test]
+    fn optimization_level_actually_changes_the_compiled_spirv() {
+        if skip_if_shaderc_unavailable() {
+            return;
+        }
+        let source = "#version 450\nlayout(location=0) out vec4 outColor;\nvoid main() {\n    float a = 1.0 + 2.0 - 3.0;\n    float unused = a * 42.0;\n    float b = 0.0;\n    for (int i = 0; i < 4; i++) { b += float(i); }\n    outColor = vec4(1.0, 0.0, 0.0, 1.0) + vec4(0.0) * unused * b;\n}\n";
+        let zero =
+            resolve_wire_options(Some(&serde_json::json!({"optimization_level": "zero"}))).unwrap();
+        let performance = resolve_wire_options(Some(
+            &serde_json::json!({"optimization_level": "performance"}),
+        ))
+        .unwrap();
+        let zero_spirv = compile_source(source, "fragment", &zero).unwrap();
+        let performance_spirv = compile_source(source, "fragment", &performance).unwrap();
+        assert_ne!(
+            zero_spirv, performance_spirv,
+            "optimization_level must actually affect the compiled output"
+        );
     }
 
     #[test]

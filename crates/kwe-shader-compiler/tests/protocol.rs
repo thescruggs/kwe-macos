@@ -300,3 +300,142 @@ fn the_watchdog_kills_an_already_expired_deadline_without_a_response() {
         "watchdog expiry must exit silently, no response frame: {stdout:?}"
     );
 }
+
+// -----------------------------------------------------------------
+// SR-3c2: the helper compiles WITH the wire "options" it receives
+// -----------------------------------------------------------------
+
+/// Explicit `"options"` equal to `kwe-core::shader_compile_spec`'s own
+/// constants must produce BYTE-IDENTICAL SPIR-V to a request with no
+/// `"options"` key at all -- proves the defaults-wiring path (absent
+/// options resolve to exactly the same values an explicit, matching
+/// request would) without needing to inspect `kwe-core` from this test
+/// crate directly.
+#[test]
+fn explicit_options_matching_the_defaults_are_byte_identical_to_no_options() {
+    let no_options = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": VALID_FRAGMENT_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+    }));
+    let explicit_defaults = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": VALID_FRAGMENT_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+        "options": {
+            "target_env": "vulkan",
+            "target_env_version": "1.2",
+            "optimization_level": "zero",
+        },
+    }));
+
+    let (code_a, stdout_a) = run_helper(&no_options, &[]);
+    assert_eq!(code_a, 0, "stdout={stdout_a:?}");
+    let (_, spirv_a) = ok_response_and_spirv(&stdout_a);
+
+    let (code_b, stdout_b) = run_helper(&explicit_defaults, &[]);
+    assert_eq!(code_b, 0, "stdout={stdout_b:?}");
+    let (_, spirv_b) = ok_response_and_spirv(&stdout_b);
+
+    assert_eq!(
+        spirv_a, spirv_b,
+        "explicit options matching the defaults must compile byte-identically to no options at all"
+    );
+}
+
+/// A shader with an obvious optimization opportunity (an unused
+/// variable, and a loop whose result is multiplied by a compile-time
+/// 0.0 -- both dead at `"performance"`, both retained at the default
+/// `"zero"`) compiled with a DIFFERENT-from-default optimization level
+/// must produce DIFFERENT SPIR-V than the same request with no options
+/// (which resolves to the default `"zero"`) -- proves the option is
+/// actually CONSUMED, not just accepted and silently ignored. Fixture
+/// picked empirically (`kwe-shader-compiler`'s own
+/// `optimization_level_actually_changes_the_compiled_spirv` unit test
+/// records the exact byte counts observed on this shaderc build): not
+/// asserted on faith.
+const OPTIMIZATION_SENSITIVE_SOURCE: &str = "#version 450\nlayout(location=0) out vec4 outColor;\nvoid main() {\n    float a = 1.0 + 2.0 - 3.0;\n    float unused = a * 42.0;\n    float b = 0.0;\n    for (int i = 0; i < 4; i++) { b += float(i); }\n    outColor = vec4(1.0, 0.0, 0.0, 1.0) + vec4(0.0) * unused * b;\n}\n";
+
+#[test]
+fn a_different_optimization_level_produces_different_spirv_than_the_default() {
+    let default_level = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": OPTIMIZATION_SENSITIVE_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+    }));
+    let performance_level = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": OPTIMIZATION_SENSITIVE_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+        "options": {"optimization_level": "performance"},
+    }));
+
+    let (code_a, stdout_a) = run_helper(&default_level, &[]);
+    assert_eq!(code_a, 0, "stdout={stdout_a:?}");
+    let (_, spirv_default) = ok_response_and_spirv(&stdout_a);
+
+    let (code_b, stdout_b) = run_helper(&performance_level, &[]);
+    assert_eq!(code_b, 0, "stdout={stdout_b:?}");
+    let (_, spirv_performance) = ok_response_and_spirv(&stdout_b);
+
+    assert_ne!(
+        spirv_default, spirv_performance,
+        "a different optimization_level must actually change the compiled SPIR-V, \
+         proving the wire option is consumed rather than ignored"
+    );
+}
+
+/// An `"options"` value outside the known vocabulary (an unrecognized
+/// target env) is a `"bad-options"` protocol error, exit 65 -- never a
+/// silent fallback to the default, and never folded into
+/// `"compile-error"` (that shape is reserved for a real shaderc/GLSL
+/// failure, checked only AFTER options resolve).
+#[test]
+fn bad_options_value_is_a_protocol_error_exit_65() {
+    let stdin = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": VALID_FRAGMENT_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+        "options": {"target_env": "opengl"},
+    }));
+    let (code, stdout) = run_helper(&stdin, &[]);
+    assert_eq!(code, 65, "stdout={stdout:?}");
+    let response = single_response_frame(&stdout);
+    assert_eq!(response["status"], "protocol-error");
+    assert_eq!(response["reason"], "bad-options");
+}
+
+/// Same as above, for an unrecognized `optimization_level` -- proves the
+/// vocabulary check covers every option field, not just `target_env`.
+#[test]
+fn bad_optimization_level_is_also_a_protocol_error() {
+    let stdin = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": VALID_FRAGMENT_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+        "options": {"optimization_level": "ludicrous-speed"},
+    }));
+    let (code, stdout) = run_helper(&stdin, &[]);
+    assert_eq!(code, 65, "stdout={stdout:?}");
+    let response = single_response_frame(&stdout);
+    assert_eq!(response["status"], "protocol-error");
+    assert_eq!(response["reason"], "bad-options");
+}
