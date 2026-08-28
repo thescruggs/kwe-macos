@@ -323,5 +323,319 @@ STOP findings:           None. The existing resolvers' semantics do not
                          requirement (stay inside root, bounded reads,
                          regular files only) is a strict SUBSET of what
                          Vfs enforces.
+Commit(s):               79992d0
+```
+
+## scene.json field table (the SR-2b differential baseline)
+
+Every field `kwe-scene-renderer/src/scene.rs` / `kwe-core/src/sceneobjects.rs`
+actually reads today, condensed from the SR-2b study, with JSON key(s),
+Rust type, default, alias precedence, and a file:line citation. Where
+`scene.rs` and `sceneobjects.rs` could disagree (classification), they do
+not: `scene.rs` calls `sceneobjects::classify_scene_object` directly
+rather than re-deriving the rule, so `ir.rs` reuses that same function too
+— by construction, the IR's object-family split can never drift from
+either file's own behavior.
+
+### Top level
+
+Only `"general"` and `"objects"` are ever read off the root object
+(`scene.rs:580,587,690`); any third root key is untouched by the real
+parser. `ir.rs::parse_scene_ir` mirrors this — everything else lands in
+`SceneIr::unknown`.
+
+### `general` (5 keys, `scene.rs:1926-2113`, `:603-612`)
+
+| Key | Type | Default | Alias | Citation |
+|---|---|---|---|---|
+| `clearcolor` | `[f32;4]` array, or `"r g b"` string (alpha forced 1.0) | `[0,0,0,1]` | — | `scene.rs:1926-2004` |
+| `resolution` | 2-int array | falls through to `orthogonalprojection` | wins over it | `scene.rs:2023-2063` |
+| `orthogonalprojection` | `{"width":W,"height":H}` | `None` | loses to `resolution` — **when `resolution` is present, `orthogonalprojection`'s bytes are never even read** | `scene.rs:2072-2094` |
+| `fps` | finite float | `None` | — | `scene.rs:2096-2113` |
+| `script` | string | `None` | — | `scene.rs:603-612` |
+
+No `"camera"` key exists in the parser (a plausible-sounding guess that
+turned out wrong during the study — recorded here so it is not
+re-guessed later).
+
+### `parse_common_props` (every family, `scene.rs:853-1033`)
+
+| Field | Key(s) / precedence | Type | Default | Citation |
+|---|---|---|---|---|
+| `name` | `name` | `String`, REQUIRED (renderer rejects if absent/non-string) | — | `scene.rs:858-872` |
+| `id` | `id` | `Option<i64>` (no unwrap) | `None` | `scene.rs:873` |
+| `origin` | `origin` | `[f32;2]` (2-or-3, z dropped) | `[0,0]` | `scene.rs:882-893` |
+| `angles` | `angles` | `[f32;3]` (2-or-3) | `[0,0,0]` | `scene.rs:897-915` |
+| `scale` | `scale` | `[f32;2]` | `[1,1]` | `scene.rs:917-928` |
+| `alpha` | `alpha` | `f32`, renderer REJECTS out-of-`0..=1` | `1.0` | `scene.rs:930-950` |
+| `visible` | `visible` | renderer: `bool`, REJECTS any other post-unwrap shape | `true` | `scene.rs:952-966` |
+| `blend_mode` | `blendMode` wins, `colorBlendMode` loses (the corpus key — every real scene.json observed uses this spelling) | `u32` | `0` | `scene.rs:973-984` |
+| `brightness` | `brightness` | `f32` | `1.0` | `scene.rs:993-1020` |
+
+### Per-family (classification: `sceneobjects.rs:92-130`)
+
+| Family | Discriminator | Fields | Citation |
+|---|---|---|---|
+| Model | `image` unwraps to a `.json`-suffixed string | `model_ref` (=`image`), `size`/`tint` (`parse_size_and_tint`) | `scene.rs:1091-1142` |
+| Image / TexvImage | `image` unwraps to a string ending `.tex` (TexvImage) or anything else (Image) | `image`, `size`/`tint` | `scene.rs:1147-1190` |
+| TexturelessImage | `image` key present, unwraps to a NON-string | `size`/`tint` only — no typed slot for the non-string `image` itself | `scene.rs:1147-1190`; `sceneobjects.rs:113-116` |
+| `size`/`tint` (shared) | `size` (2-comp), `tint` wins / `color` loses (3-or-4 comp) | `[f32;2]`/`[f32;4]` | `[0,0]`/`[1,1,1,1]` | `scene.rs:1038-1076` |
+| Video | `"video"` key present at ALL (no type check) | `source` (unwrapped `video`), `size`/`tint`, `loop` (tolerant bool, default `true`), `rate` (default `1.0`) | `scene.rs:1318-1416` |
+| Text | `"text"` key present at all | `text`, `font`, `pointsize` (default `12.0*4.0=48.0`px), `horizontalalign`/`verticalalign` (falling back to `alignment`'s polarity word), `color` (**`color` only — no `tint` alias for text**), `has_size` (presence only, value never read) | `scene.rs:1200-1305`, `:1740-1790` |
+| Particle | `particle` unwraps to an object naming a `texture`/`material` | spawnRate/life/direction/spread/sizeStart/sizeEnd/alphaStart/alphaEnd (scalars), gravity (1-2-3 comp), colorStart/colorEnd, maxCount, `texture` wins/`material` loses, `instanceoverride.{count,rate,size,lifetime,speed,alpha}`, `instanceoverride.colorn` wins/`.color` loses (mean of 3 components) | `scene.rs:1421-1708` |
+| ParticleFile | `particle` present, any OTHER shape (string or object without a resolvable material) | `file_ref` (unwrapped string; a non-string shape here is possible and untyped) | `scene.rs:1471-1489`; `sceneobjects.rs:107-121` |
+| Other (sound, lights, anything else) | none of the above | **zero family-specific fields anywhere in the codebase** — no `Sound`/`Light` split exists | `sceneobjects.rs:122-129` |
+
+**Genuine STOP case (task's own instruction, not guessed around):**
+`speed`/`speedMin`/`speedMax` (particle, `scene.rs:1598-1611`) —
+`speedMin`'s default is `speed`'s own resolved value, `speedMax`'s default
+is `speedMin`'s, with a final min/max swap. A field whose default depends
+on a SIBLING field's resolved value cannot be represented as a static
+typed default without baking rendering-time derivation into the IR
+(decision (b) rules this out). Per instruction: left untyped, all three
+keys land in the particle's own residue inside `ObjectIr::unknown`
+(`unknown.get("particle")`), byte-preserved, for a later slice to decide.
+
+### `effects[]` entries (`sceneeffect.rs:596-643`, `ObjectEffect` @ `:196-201`)
+
+`id` (`i64`, default `0`), `name` (`String`, default `""`), `visible`
+(`bool`, default `true`) — **none of these three go through the
+`scene_property_value` unwrap**, unlike almost everything else in this
+table. `file` (`String`, REQUIRED — the renderer skips the whole entry
+when absent/non-string). `passes` (raw `Vec<Value>`, default `[]`,
+structure unvalidated at this level). This function also does real file
+I/O (resolving `file` against the pkg/dir/assets chain) — out of scope
+for a pure scene.json IR; `ir.rs::EffectRefIr` stops at the 5 authored
+fields above, `file: Option<String>` rather than required.
+
+**Asymmetry inherited, not fixed, by the IR:** `scene.rs` only reads an
+object's OWN `effects` array at parse time for Model layers
+(`scene.rs:1107-1117`); Image/Text/Video layers unconditionally get
+`effects_raw: Vec::new()` (`scene.rs:1187,1302,1413`) even though nothing
+stops an author from writing `effects` on any of them. `ir.rs` populates
+`ObjectIr::effects` uniformly for every kind whenever the JSON has an
+`effects` key — capturing MORE than three of four kinds' worth of
+today's renderer, which is correct per decision (b) (authored state, not
+runtime behavior) but is flagged here since it is not a "mirror exactly"
+case.
+
+### Bounds actually enforced at scene LOAD (not the SR-0c inspector's own, separate, sampling-only 4096)
+
+`MAX_LAYERS`=256 (`layers.rs:27`, checked post-loop, `scene.rs:816-824`,
+REJECTS the scene), `MAX_TEXT_LAYERS`=16 (`text.rs:37`, skip-not-reject,
+`scene.rs:802-806`), `MAX_PARTICLE_SYSTEMS`=64 (`particles.rs:53`,
+skip-not-reject, `scene.rs:791-794`), `MAX_EFFECTS_PER_OBJECT`=32
+(`sceneeffect.rs:63`, truncates via `.take()` both at Model parse time
+and at resolve time). **The raw `objects` array itself has NO length cap
+in the real load path** — `Other`-kind objects (sound, etc.) accumulate
+into nothing bounded at all; only the whole-file 16 MiB
+`MAX_SCENE_JSON_BYTES` cap indirectly limits this. `ir.rs::MAX_OBJECTS`
+(4096, `IrError::ObjectsCap`) is therefore a NEW cap this slice
+introduces for the IR specifically (never-truncate, always-refuse — see
+`ir.rs`'s own doc comment for why), reusing the SR-0c inspector's
+`max_objects_walked` NUMBER as a convenient, already-corpus-vetted value —
+not evidence the renderer enforces one.
+
+## SR-2b — typed scene IR with unknown-field bags
+
+Conductor decisions (verbatim):
+
+- **(a)** The IR lives in kwe-core (`crates/kwe-core/src/ir.rs`) so both
+  the renderer and the inspector can consume it later.
+- **(b)** IR captures AUTHORED state only (what scene.json says), never
+  runtime state — plan §4.2's authored/runtime split starts here.
+- **(c)** The IR's known-field coverage for this slice is exactly the
+  object families the renderer parses today (the scene.rs/sceneobjects.rs
+  raw-Value reads found in SR-0c/2a) — not the full WE vocabulary.
+  Everything else lands in unknown bags, preserved byte-faithfully.
+  Coverage grows family-by-family in later children.
+
+```text
+Task:            A typed scene.json IR (crates/kwe-core/src/ir.rs) whose
+                 known fields mirror exactly what scene.rs/sceneobjects.rs
+                 parse today (same keys, types, defaults, alias
+                 precedence), with an explicit unknown-field bag at every
+                 JSON object level so nothing an author wrote is ever
+                 silently dropped -- type + parser + tests ONLY, no
+                 renderer/inspector caller migrates in this slice.
+Milestone/Slice: SR-2b
+Goal:            Give SR-2c+'s differential migration a typed structure to
+                 migrate ONTO that is provably faithful to today's actual
+                 parser (this doc's field table), not a fresh design that
+                 might quietly diverge from it -- and prove the "unknown
+                 fields survive a load/report round trip" acceptance the
+                 plan's typed-IR goal depends on.
+Outcome:         crates/kwe-core/src/ir.rs (new, ~950 lines + a
+                 crates/kwe-core/src/ir/tests.rs test module, 29 tests):
+                 SceneIr{schema_version, general: GeneralIr, objects:
+                 Vec<ObjectIr>, unknown: UnknownBag, duplicate_ids:
+                 Vec<String>}; GeneralIr mirrors the 5 general-block keys
+                 exactly (clearcolor/resolution+orthogonalprojection-alias/
+                 fps/script); ObjectIr{stable_id: StableId, authored_id:
+                 Option<i64>, name: Option<String>, common: CommonPropsIr,
+                 kind: ObjectKindIr, effects: Vec<EffectRefIr>, unknown};
+                 CommonPropsIr mirrors parse_common_props's 7 remaining
+                 fields (origin/angles/scale/alpha/visible/blend_mode/
+                 brightness) with the renderer's exact defaults;
+                 VisibleIr{Bool, PropertyBound(Value), Absent} -- a
+                 genuine tri-state the renderer's own flat bool collapses
+                 away (SR-0c/SR-11 semantics), never rejecting the way the
+                 renderer does on a non-bool post-unwrap value;
+                 ObjectKindIr mirrors SceneObjectKind's 8 discriminators
+                 exactly by REUSING kwe_core::sceneobjects::
+                 classify_scene_object directly (not a re-derived rule --
+                 cannot drift), one deliberate departure from the task's
+                 literal enum sketch: no separate Sound/Light variants --
+                 neither exists as a distinct parse path anywhere in the
+                 codebase (both are SceneObjectKind::Other), so both fold
+                 into ObjectKindIr::Unknown rather than typing structure
+                 the renderer does not have (decision (c)). StableId{
+                 Authored(i64), Index(usize)} assigned first-authored-wins,
+                 later duplicates demoted to Index and recorded in
+                 SceneIr::duplicate_ids as "id {n} reused at index {i}".
+                 EffectRefIr{id, name, visible, file: Option<String>,
+                 passes: Vec<Value>, unknown} -- every authored entry is
+                 KEPT even when `file` is missing (module doc departure:
+                 the renderer skips a fileless entry because resolving it
+                 needs file I/O this pure parse does not have; the IR
+                 still records that the entry was authored).
+                 Two documented, deliberate departures from "mirror
+                 exactly" (both required by decision (b), spelled out in
+                 ir.rs's own module doc): (1) no range clamping/rejection
+                 anywhere -- every numeric field holds the
+                 coerced-but-unclamped authored value; a shape a typed
+                 field genuinely cannot represent (wrong JSON type, not
+                 just an out-of-range number) defaults AND the raw value
+                 survives in the nearest UnknownBag under its original key
+                 -- applied systematically: a key is marked "consumed"
+                 (excluded from the unknown bag) ONLY when its value was
+                 actually read into the field it represents, never merely
+                 "attempted"; (2) speed/speedMin/speedMax left entirely
+                 untyped (this slice's STOP case, per the task's own
+                 instruction) -- see the field table above.
+                 An alias pair (blendMode/colorBlendMode,
+                 resolution/orthogonalprojection, tint/color,
+                 texture/material, colorn/color) consumes only the WINNING
+                 spelling; a present LOSING spelling lands in the nearest
+                 unknown bag under its own key -- resolving an apparent
+                 contradiction between the task's type-spec sentence
+                 ("consumes both, neither lands in unknown" -- describing
+                 the alias PAIR's intent) and its test-list instruction
+                 ("the ignored spelling still must not be lost: it goes in
+                 the unknown bag" -- the concrete per-instance rule
+                 actually implemented, since the renderer's `.or_else()`
+                 genuinely never reads the loser's bytes).
+                 SceneIr::to_raw_value() (+ private per-substructure
+                 helpers) reconstructs a semantically-equal Value: typed
+                 defaults are always re-emitted explicitly (even when the
+                 original omitted the key), which is lossless for SceneIr
+                 EQUALITY on re-parse even though the intermediate JSON
+                 differs from the original bytes; the Particle kind's
+                 residue (its own unknown-bag "particle" entry) is MERGED
+                 back into the freshly-built "particle" object rather than
+                 overwriting it. One real bug caught by the round-trip
+                 test itself: instanceoverride.colorn must re-serialize as
+                 a 3-vector (the authored WE shape), not the reduced
+                 scalar instance_colorn holds -- a bare number fails
+                 as_vector's shape check on re-parse and silently resets
+                 to the 1.0 default; fixed before this slice's acceptance
+                 run, not left for a later one to find.
+                 crates/kwe-core/src/lib.rs: `mod ir;` (alphabetically
+                 between capabilities and keyvalues) + a `pub use ir::{...}`
+                 re-export of every public type.
+                 docs/SR2.md (this section): the field table above.
+In scope:        crates/kwe-core/src/ir.rs (new), crates/kwe-core/src/
+                 ir/tests.rs (new), crates/kwe-core/src/lib.rs (module +
+                 re-export), docs/SR2.md.
+Out of scope:    Migrating ANY existing scene-loading call site (decision
+                 mirrors SR-2a's own (a)). Effect-FILE resolution (needs
+                 I/O this pure scene.json parse does not have --
+                 EffectRefIr stops at the 5 authored fields scene.json
+                 itself carries). Range clamping/validation (module doc
+                 departure (1) -- explicitly renderer policy, not IR
+                 scope). speed/speedMin/speedMax typing (this slice's STOP
+                 case). docs/Scene-Rendering-Plan.md (conductor-
+                 maintained). THIRD_PARTY.yml (original code; no upstream
+                 source consulted for this slice -- every citation above
+                 is to THIS repository's own existing parser).
+Acceptance tests:        crates/kwe-core: 29 new tests in ir/tests.rs --
+                         general block (defaults, authored values, the
+                         resolution/orthogonalprojection alias both
+                         directions, unknown general/root keys); per-family
+                         (image tint/color alias, blendMode/colorBlendMode
+                         alias both directions, model/texv/textureless
+                         classification with the textureless raw `image`
+                         preserved, video source/loop-tolerance/rate,
+                         text alignment exact-word/alignment-fallback/
+                         default plus has_size raw-value preservation,
+                         particle known-fields incl. texture/material and
+                         colorn/color aliases with speed/speedMin/speedMax
+                         landing in the particle residue, particle
+                         defaults, particle-file, an unclassifiable
+                         "Other" object's common props still parsing);
+                         visible's 3-state (Bool/PropertyBound/Absent);
+                         minimal-object defaults matching the renderer
+                         exactly; effects[] known fields + unknown +
+                         the fileless-entry-kept departure; StableId
+                         assignment + duplicate recording; bounds
+                         (exactly MAX_OBJECTS ok, MAX_OBJECTS+1 ->
+                         ObjectsCap, a non-object entry -> typed error
+                         naming its index, invalid JSON -> Parse, a
+                         non-object root -> NotAnObject, a missing/
+                         non-array "objects" treated as empty);
+                         determinism (same bytes parsed twice are equal);
+                         one comprehensive round-trip test exercising
+                         every family, every alias, duplicate ids, and
+                         nested unknown bags at once, asserting SceneIr
+                         equality after parse -> to_raw_value -> parse.
+                         859 workspace tests total, up from 830.
+                         cargo fmt/clippy/test --workspace green.
+                         ./scripts/check.sh green end to end, including the
+                         C++/QML build and qml-typecheck.
+Failure/recovery tests:  Covered by Acceptance tests above -- every
+                         structural failure (objects-cap, non-object
+                         entry, invalid JSON, non-object root) is a typed,
+                         total IrError; no partial IR is ever returned on
+                         any of them.
+Upstream/provenance:    Original; every typed field/default/alias mirrors
+                         an existing in-repo parser (cited in the field
+                         table above and in ir.rs's own doc comments) or
+                         is an explicitly documented, decision-(b)-required
+                         departure from it -- no third-party source
+                         consulted or adapted.
+Commands run and results: cargo fmt --all -- --check -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 859 passed, 0 failed.
+                         ./scripts/check.sh -- green end-to-end, including
+                         the C++/QML build and qml-typecheck.
+Open risks:              The "consumed only on success" rule (departure
+                         (1)) was applied by hand across ~20 extraction
+                         sites; SR-2c's differential test against real
+                         corpus fixtures is the first time this gets
+                         checked against actual authored content at scale
+                         rather than this slice's hand-built fixtures.
+                         has_size's real `size` value and a non-string
+                         image/video/particle/text discriminator's raw
+                         value are captured in the unknown bag rather than
+                         a typed field -- correct for round-trip fidelity,
+                         but a family migration (2c+) that wants the
+                         ACTUAL size number for a text layer (today's
+                         renderer never needs it) will need to read it out
+                         of the unknown bag explicitly rather than a typed
+                         field.
+                         effects[] entries with no `file` are kept by the
+                         IR but skipped by the renderer -- a later
+                         migration must decide whether to filter these at
+                         the adapter boundary or change the renderer to
+                         accept them; this slice deliberately did not
+                         decide that (decision (b) scope boundary).
+STOP findings:           speed/speedMin/speedMax (particle) -- see the
+                         field table's "Genuine STOP case" entry above.
+                         Left untyped in the particle's unknown-bag
+                         residue per the task's own instruction; no other
+                         field required stopping (the study found exactly
+                         one cross-field-dependent default in the whole
+                         parser).
 Commit(s):               (fill in after commit)
 ```

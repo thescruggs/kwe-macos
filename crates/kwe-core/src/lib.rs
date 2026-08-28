@@ -7,6 +7,7 @@
 
 mod audio;
 mod capabilities;
+mod ir;
 mod keyvalues;
 mod mpris;
 mod particlefile;
@@ -28,6 +29,11 @@ mod websandbox;
 
 pub use audio::analyze_stereo;
 pub use capabilities::{SCENE_CAPABILITIES_IMPLEMENTED, SCENE_CAPABILITIES_LIMITATION_TOLERATED};
+pub use ir::{
+    CommonPropsIr, EffectRefIr, GeneralIr, HorizontalAlignIr, ImageIr, IrError, MAX_OBJECTS,
+    ModelIr, ObjectIr, ObjectKindIr, ParticleFileIr, ParticleIr, SCHEMA_VERSION, SceneIr, StableId,
+    TextIr, TexturelessImageIr, UnknownBag, VerticalAlignIr, VideoIr, VisibleIr, parse_scene_ir,
+};
 pub use keyvalues::{KvError, KvValue, parse_key_values};
 pub use mpris::{MprisStatus, probe_mpris};
 pub use particlefile::{MAX_PARTICLE_FILE_BYTES, ResolvedParticleFile, resolve_particle_file};
