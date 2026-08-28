@@ -1,10 +1,23 @@
-# Scene capability taxonomy — draft v0 (SR-0a)
+# Scene capability taxonomy — v1 (frozen)
 
-**Status:** draft for SR-1 approval. No ID in this file is a support claim;
-every row starts `planned` or `experimental`. Exact names and the schema
-version are frozen in SR-1 before any code emits or consumes them
-(`docs/Scene-Rendering-Plan.md` §5.1). Rows advance only through the six-step
+**Status:** **v1, frozen 2026-08-28** under plan gate §11.3 (maintainer go
+2026-08-27: "continue on and proceed through all steps"). The ID set and
+naming rules below are stable; additions are allowed (additive, new rows
+start `planned`), renames/removals require a v2 with an alias table. No ID
+in this file is a support claim; rows advance only through the six-step
 parity ladder (`docs/FEATURE_COMPATIBILITY.md` §"Parity ladder").
+
+Corpus-informed freeze decisions (SR-0d baseline, 60 local scenes):
+
+- root-level `camera` (unread in all 60 items — the S7 orthogonalprojection
+  root cause) maps to the existing `scene.camera` row, which covers the 2D
+  orthographic projection use as well as true 3D cameras; no new ID.
+- `parallaxDepth`/`copybackground`/`locktransforms`/`solid` are object
+  composition/hit-test facets of `scene.layer.image` and
+  `scene.input.hit-test`, not new IDs (SR-5/SR-9 scope).
+- `scene.texture.compressed` stays a separate row (SR-0a's fold-into-`.texv`
+  question resolved: keep, since compressed payloads have their own decode
+  path and failure modes).
 
 ## Naming and stability rules
 
@@ -111,8 +124,11 @@ failure fixture.
 
 ## Inventory record — draft schema `scene-feature-inventory-v0`
 
-Emitted per inspected item by SR-0b/c/d; ≤ 64 KiB; deterministic. Draft only —
-SR-1 freezes the version. Mirrors the projection rules of plan §5.3.
+Emitted per inspected item by SR-0b/c/d; ≤ 64 KiB; deterministic. This v0
+shape is what the current binary emits on stdout; SR-1 freezes its successor
+`scene-inspection-v1` (same fields plus provenance/backend identity) in
+`docs/REPORT_PROTOCOL_V1.md` and moves it onto the dedicated report FD.
+Mirrors the projection rules of plan §5.3.
 
 ```json
 {
