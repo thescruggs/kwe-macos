@@ -13,9 +13,18 @@ all 60). **SR-1 complete 2026-08-28** (`docs/SR1.md`): taxonomy frozen v1
 manager result states. Open risks carried: no inspection cache; limitations
 not persisted; ~~playlist lane ungated~~ (resolved 2026-08-28, SR-1c2:
 `docs/SR1.md`); render-report kind 2 reserved.
-Next: SR-2 (asset VFS, typed IR, module split) — SR-2a/2b/2c merged
-2026-08-27/28 (`docs/SR2.md`); SR-1c2 (small follow-up, playlist gate
-parity) merged 2026-08-28 (`docs/SR1.md`).
+**SR-2a–c complete 2026-08-28** (`docs/SR2.md`): confined VFS (no callers
+yet), typed SceneIr + unknown bags, scene.json loading through the IR with
+the legacy parser kept as a compiled differential oracle — 60/60 corpus
+parse parity; corpus frame sweep clean modulo documented wall-clock sim
+jitter (SR-2c2 STOP report). **SR-3a–c complete 2026-08-28**
+(`docs/SR3.md`): helper protocol (kinds 16/17/18), `kwe-shader-compiler`
+binary, renderer wiring with in-thread fallback, material-shader family
+compiling in the killable helper with byte-identical SPIR-V. SR-1 risks
+further closed by SR-1c3 (limitations persisted on assignments).
+Shipped for testing as pkgrel 21 (built 2026-08-28 ~05:00).
+Next: SR-3d reflection spike (blocked on the §11.4 dependency decision),
+remaining SR-2 family migrations, SR-1 inspection cache.
 
 **Baseline:** repository HEAD `93bae3b284d6221a7dd3b328eb12569edfa12524`, 2026-08-23.
 

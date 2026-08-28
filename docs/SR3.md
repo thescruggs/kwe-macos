@@ -946,5 +946,5 @@ STOP findings:           None. Neither STOP condition named for this task
                          everything else depends on, stayed shaderc-free
                          by design, so no other crate's dependency graph
                          changed at all).
-Commit(s):               (fill in after commit)
+Commit(s):               45b4b67
 ```
