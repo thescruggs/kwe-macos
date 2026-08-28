@@ -1,18 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! SR-3a: the killable shader-compile helper's PROTOCOL SKELETON (plan
-//! §4.3/§8 SR-3). This binary reads exactly ONE `shader-compile-request-v1`
-//! frame (kind 16) off stdin, writes exactly one `shader-compile-response-v1`
-//! frame (kind 17) to stdout, and exits — decision (c): "one serial request
-//! per helper PROCESS" for this skeleton. A long-lived serial-loop mode
-//! (reusing one process for many requests) is an explicit OPEN QUESTION for
-//! a later slice once SR-3c measures real spawn cost against real
-//! compilation latency (`docs/SR3.md`); this skeleton does not build it.
+//! SR-3a built this binary's PROTOCOL SKELETON; SR-3c makes it actually
+//! compile (plan §4.3/§8 SR-3). This binary reads exactly ONE
+//! `shader-compile-request-v1` frame (kind 16) off stdin, writes exactly
+//! one `shader-compile-response-v1` frame (kind 17) — followed, for an
+//! `"ok"` result, by that many `spirv-chunk-v1` (kind 18) raw-binary
+//! frames — to stdout, and exits: decision (c) (SR-3a), still true:
+//! "one serial request per helper PROCESS". A long-lived serial-loop mode
+//! (reusing one process for many requests) remains an explicit OPEN
+//! QUESTION, now for whenever a later slice actually MEASURES real spawn
+//! cost against real compilation latency (`docs/SR3.md`'s SR-3c open
+//! risks) — SR-3c itself does not build it, only makes the per-process
+//! work real.
 //!
-//! No `shaderc` dependency here yet — SR-3c decides how/whether shaderc
-//! reaches this crate (this skeleton stays dependency-light:
-//! `kwe-report-protocol` + `serde_json` only, per the task). Every
-//! STRUCTURALLY VALID request gets `{"status":"unimplemented",
-//! "reason":"skeleton"}` and exit 0; nothing is ever compiled.
+//! SR-3c decision (a): compiles with the SAME `shaderc` crate/version
+//! `kwe-scene-renderer` uses (workspace-pinned), invoked with the exact
+//! same `CompileOptions` recipe — shared via `kwe-core::
+//! shader_compile_spec`'s plain constants (no `shaderc` type lives in
+//! `kwe-core` itself; see that module's own doc comment for why). Decision
+//! (b)'s payoff: unlike `materialshader::compile_stage`'s own in-thread
+//! path, THIS process needs no internal timeout/thread-spawn wrapper
+//! around the `shaderc` call — a compile that hangs or otherwise
+//! misbehaves is bounded by the CALLER's own process-level kill
+//! (`kwe-scene-renderer::shader_helper`'s `--shader-helper-timeout-ms`),
+//! not by anything this binary does to itself. A GLSL compile FAILURE
+//! (bad shader source) is a normal, expected outcome — `status:
+//! "compile-error"`, exit 0 — never treated as a helper/protocol failure
+//! (task text: "a compile error is a RESULT, not a helper failure").
 //!
 //! Wire contract: `docs/SHADER_HELPER_PROTOCOL_V1.md`. Containment/bounds
 //! model (deadline, byte caps) deliberately mirrors
@@ -23,8 +36,9 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 use kwe_report_protocol::{
-    FrameError, FrameKind, FrameReader, SHADER_COMPILE_RESPONSE_SCHEMA, ShaderRequestError,
-    StreamCaps, validate_shader_compile_request, write_frame,
+    FrameError, FrameKind, FrameReader, MAX_PAYLOAD_BYTES, MAX_SHADER_COMPILE_ERROR_LOG_BYTES,
+    SHADER_COMPILE_RESPONSE_SCHEMA, ShaderRequestError, StreamCaps,
+    validate_shader_compile_request, write_frame,
 };
 
 /// Process exit codes. Distinct from each other (and from a plain
@@ -37,10 +51,11 @@ mod exit_code {
     /// this is a defensive/test-only path, not a wire-protocol outcome).
     pub const BAD_ARGUMENTS: i32 = 2;
     /// Self-watchdog deadline expired while waiting for/reading a frame.
-    /// Exits SILENTLY — no response frame is attempted. The daemon-side
-    /// kill is the AUTHORITATIVE bound (SR-3b, not built yet); this
-    /// watchdog is a soft backstop only — see `DeadlineReader`'s doc
-    /// comment for exactly what it can and cannot preempt.
+    /// Exits SILENTLY — no response frame is attempted. The CALLER-side
+    /// kill (`kwe-scene-renderer::shader_helper`, SR-3b) is the
+    /// AUTHORITATIVE bound; this watchdog is a soft backstop only — see
+    /// `DeadlineReader`'s doc comment for exactly what it can and cannot
+    /// preempt.
     pub const WATCHDOG_EXPIRED: i32 = 64;
     /// A protocol violation: the first frame is not kind 16, a frame is
     /// malformed/oversize/exceeds the stream caps, the request JSON fails
@@ -193,6 +208,7 @@ fn reason_for_request_error(error: &ShaderRequestError) -> String {
         }
         ShaderRequestError::TooManyCombos => "too-many-combos".to_string(),
         ShaderRequestError::TooManyDefines => "too-many-defines".to_string(),
+        ShaderRequestError::OptionOversize(field) => format!("option-oversize:{field}"),
     }
 }
 
@@ -220,11 +236,94 @@ fn respond_protocol_error(reason: &str) -> i32 {
     exit_code::PROTOCOL_ERROR
 }
 
-fn respond_unimplemented() {
+/// Compiles `source` for `stage` (already validated to be `"vertex"` or
+/// `"fragment"` by `validate_shader_compile_request`) using `kwe-core::
+/// shader_compile_spec`'s fixed options — decision (a): the single shared
+/// recipe, not the wire request's own (informational-only) `"options"`
+/// object re-parsed back into `shaderc` types on this side. Returns the
+/// raw SPIR-V bytes (`shaderc::CompilationArtifact::as_binary_u8`'s own
+/// native-endian layout — both processes always run on the same host, so
+/// this matches `materialshader::compile_stage`'s `Vec<u32>` byte-for-byte
+/// once the renderer reassembles it, no endian conversion needed) on
+/// success, or a short diagnostic string (shaderc's own error text,
+/// UNBOUNDED at this point — the caller bounds it to
+/// `MAX_SHADER_COMPILE_ERROR_LOG_BYTES` before it reaches the wire) on a
+/// GLSL compile failure or a `shaderc` setup failure (compiler/options
+/// construction). Never panics on a compile FAILURE; `shaderc-rs`'s own
+/// `CString::new` on the source text can panic on an embedded NUL byte —
+/// the same latent risk `materialshader::compile_stage` already carries
+/// today, not a new one introduced here (this process's own isolation,
+/// not a `catch_unwind`, is what contains it: a panic here just exits
+/// this one-shot process, which the caller (`wait_and_read`) already
+/// classifies as `ProtocolError` — no response frame — and falls back
+/// in-thread).
+fn compile_source(source: &str, stage: &str) -> Result<Vec<u8>, String> {
+    let compiler = shaderc::Compiler::new().map_err(|error| error.to_string())?;
+    let mut options = shaderc::CompileOptions::new().map_err(|error| error.to_string())?;
+    options.set_target_env(
+        shaderc::TargetEnv::Vulkan,
+        shaderc::EnvVersion::Vulkan1_2 as u32,
+    );
+    options.set_optimization_level(shaderc::OptimizationLevel::Zero);
+    let shader_kind = match stage {
+        "vertex" => shaderc::ShaderKind::Vertex,
+        "fragment" => shaderc::ShaderKind::Fragment,
+        // validate_shader_compile_request already restricts "stage" to
+        // exactly these two values before this function is ever called.
+        _ => return Err(format!("unreachable stage {stage:?}")),
+    };
+    let artifact = compiler
+        .compile_into_spirv(
+            source,
+            shader_kind,
+            "shader-helper-input",
+            kwe_core::ENTRY_POINT,
+            Some(&options),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(artifact.as_binary_u8().to_vec())
+}
+
+/// Writes the `"ok"` kind-17 header (schema/status/`spirv_chunks`/
+/// `spirv_total_bytes`) then that many kind-18 raw-binary chunks, each at
+/// most [`MAX_PAYLOAD_BYTES`] (64 KiB) — the per-frame cap every frame on
+/// this wire already obeys, so `.chunks(MAX_PAYLOAD_BYTES)` alone is
+/// sufficient, no extra bound needed. Best-effort throughout: a write
+/// failure partway through (the caller's read side already gone) stops
+/// silently — this process is exiting either way.
+fn respond_ok(spirv: &[u8]) {
+    let chunks: Vec<&[u8]> = if spirv.is_empty() {
+        Vec::new()
+    } else {
+        spirv.chunks(MAX_PAYLOAD_BYTES).collect()
+    };
     write_response_best_effort(&serde_json::json!({
         "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
-        "status": "unimplemented",
-        "reason": "skeleton",
+        "status": "ok",
+        "spirv_chunks": chunks.len() as u64,
+        "spirv_total_bytes": spirv.len() as u64,
+    }));
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    for chunk in chunks {
+        if write_frame(&mut handle, FrameKind::SpirvChunkV1, chunk).is_err() {
+            return;
+        }
+    }
+    let _ = handle.flush();
+}
+
+/// Writes a `"compile-error"` kind-17 response — a compile error is a
+/// RESULT, not a helper failure (task text), so this is a normal, non-
+/// protocol-error response shape with its own `"log"` field, bounded to
+/// [`MAX_SHADER_COMPILE_ERROR_LOG_BYTES`] on a UTF-8 char boundary (never
+/// panics on a multi-byte character at the cut point, same discipline
+/// `bounded` already uses for protocol-error reason codes).
+fn respond_compile_error(log: &str) {
+    write_response_best_effort(&serde_json::json!({
+        "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+        "status": "compile-error",
+        "log": bounded(log, MAX_SHADER_COMPILE_ERROR_LOG_BYTES),
     }));
 }
 
@@ -256,10 +355,11 @@ fn run(arguments: &Arguments) -> i32 {
         return respond_protocol_error("wrong-kind");
     }
 
-    if let Err(error) = validate_shader_compile_request(&first.payload, arguments.max_source_bytes)
+    let request = match validate_shader_compile_request(&first.payload, arguments.max_source_bytes)
     {
-        return respond_protocol_error(&reason_for_request_error(&error));
-    }
+        Ok(request) => request,
+        Err(error) => return respond_protocol_error(&reason_for_request_error(&error)),
+    };
 
     // Decision (c): exactly one request per process. ANY trailing bytes on
     // stdin after the one request — whether they form another valid
@@ -278,7 +378,17 @@ fn run(arguments: &Arguments) -> i32 {
         Err(_) => return respond_protocol_error("excess-request"),
     }
 
-    respond_unimplemented();
+    // Both already validated to be present strings of the expected shape
+    // by `validate_shader_compile_request` above.
+    let stage = request["stage"].as_str().unwrap_or_default();
+    let source = request["source"].as_str().unwrap_or_default();
+    match compile_source(source, stage) {
+        Ok(spirv) => respond_ok(&spirv),
+        Err(log) => respond_compile_error(&log),
+    }
+    // SR-3c task text: "a compile error is a RESULT, not a helper
+    // failure" — exit 0 either way, same as the "ok"/"unimplemented"
+    // shapes before it.
     exit_code::OK
 }
 
@@ -296,6 +406,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_FRAGMENT_SOURCE: &str = "#version 450\nlayout(location = 0) out vec4 outColor;\nvoid main() { outColor = vec4(1.0); }\n";
+
+    /// Skips (rather than fails) when the system `libshaderc` is not
+    /// present in this build environment -- same "checked at runtime"
+    /// convention `materialshader.rs`'s own shaderc-dependent tests use.
+    fn skip_if_shaderc_unavailable() -> bool {
+        if shaderc::Compiler::new().is_err() {
+            eprintln!("skipping: libshaderc unavailable");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn compile_source_compiles_valid_glsl_to_spirv() {
+        if skip_if_shaderc_unavailable() {
+            return;
+        }
+        let spirv = compile_source(VALID_FRAGMENT_SOURCE, "fragment").unwrap();
+        assert!(!spirv.is_empty());
+        assert_eq!(spirv.len() % 4, 0);
+        assert_eq!(&spirv[0..4], &0x0723_0203_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn compile_source_reports_a_glsl_error_as_err_not_a_panic() {
+        if skip_if_shaderc_unavailable() {
+            return;
+        }
+        let error = compile_source("#version 450\nvoid main() { !!! }", "fragment").unwrap_err();
+        assert!(!error.is_empty());
+    }
 
     #[test]
     fn default_arguments_match_the_documented_defaults() {

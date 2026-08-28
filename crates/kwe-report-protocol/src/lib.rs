@@ -113,6 +113,35 @@ pub const MAX_SHADER_INCLUDE_BYTES: usize = 64 * 1024;
 pub const MAX_SHADER_COMBOS: usize = 128;
 /// SR-3a: a shader-compile request's `"defines"` map's entry-count cap.
 pub const MAX_SHADER_DEFINES: usize = 128;
+/// SR-3c: a shader-compile request's optional `"options"` object's own
+/// string fields (`target_env`/`target_env_version`/`optimization_level`)
+/// — bounded well above any real value (`kwe-core::shader_compile_spec`'s
+/// own constants are a handful of bytes each) purely so a hostile/crafted
+/// request cannot make a diagnostic line unbounded.
+pub const MAX_SHADER_OPTION_STRING_BYTES: usize = 128;
+
+/// SR-3c: a `shader-compile-response-v1` "ok" response's declared
+/// `"spirv_chunks"` — one less than [`SHADER_RESPONSE_MAX_FRAMES`] (the
+/// response channel's own [`StreamCaps::SHADER_RESPONSE`] frame budget)
+/// since that budget also has to cover the kind-17 header frame itself.
+/// Refusing an over-claim HERE, at header-validation time, means a
+/// dishonest/buggy helper that declares e.g. 200 chunks is rejected before
+/// a single kind-18 frame is even read, rather than only being caught once
+/// [`FrameReader`] itself hits the same cap partway through actually
+/// reading that many frames.
+pub const MAX_SPIRV_CHUNKS: usize = SHADER_RESPONSE_MAX_FRAMES - 1;
+/// SR-3c: a `shader-compile-response-v1` "ok" response's declared
+/// `"spirv_total_bytes"` — the same total-payload budget
+/// [`StreamCaps::SHADER_RESPONSE`] enforces stream-wide, so an over-claim
+/// is refused up front rather than discovered mid-reassembly.
+pub const MAX_SPIRV_TOTAL_BYTES: usize = SHADER_RESPONSE_MAX_TOTAL_PAYLOAD_BYTES;
+/// SR-3c: a `shader-compile-response-v1` "compile-error" response's
+/// `"log"` field — bounded so a pathological/hostile GLSL compile error
+/// (shaderc's own diagnostic text is not otherwise length-limited) cannot
+/// make the response channel's own byte budget the limiting factor, and so
+/// the eventual caller-side diagnostic line stays bounded without a
+/// separate truncation step.
+pub const MAX_SHADER_COMPILE_ERROR_LOG_BYTES: usize = 4 * 1024;
 
 /// One frame's kind (header byte 4). `Unknown` carries the raw byte so a
 /// reader built against this version never has to reject a stream just
@@ -481,6 +510,8 @@ pub enum ShaderRequestError {
     TooManyCombos,
     #[error("\"defines\" has more than {MAX_SHADER_DEFINES} entries")]
     TooManyDefines,
+    #[error("field {0:?} exceeds {MAX_SHADER_OPTION_STRING_BYTES} bytes")]
+    OptionOversize(&'static str),
 }
 
 /// Validates one `shader-compile-request-v1` payload (kind 16): schema tag,
@@ -491,6 +522,20 @@ pub enum ShaderRequestError {
 /// are), and `includes`/`combos`/`defines`'s own fixed shape bounds
 /// ([`MAX_SHADER_INCLUDES`]/[`MAX_SHADER_INCLUDE_BYTES`]/
 /// [`MAX_SHADER_COMBOS`]/[`MAX_SHADER_DEFINES`]).
+///
+/// SR-3c: an OPTIONAL top-level `"options"` object — `{"target_env": ...,
+/// "target_env_version": ..., "optimization_level": ...}`, each a string
+/// no longer than [`MAX_SHADER_OPTION_STRING_BYTES`]. Additive to the
+/// SR-3a schema (still named `shader-compile-request-v1`, per the task's
+/// "version the schema additively, keep v1 name"): a payload with no
+/// `"options"` key at all remains valid (absent means "use the compiling
+/// side's own defaults" — `kwe-core::shader_compile_spec`'s constants on
+/// both ends of this protocol today). When present, all three sub-fields
+/// are required together (no partial object) and only their SHAPE is
+/// checked here — this crate has no opinion on which target env/
+/// optimization level a caller is allowed to ask for; that policy (today:
+/// always `kwe-core`'s own fixed values) lives in the two crates that
+/// actually call into `shaderc`.
 ///
 /// Does not itself enforce [`MAX_PAYLOAD_BYTES`] — same caller-already-
 /// capped-it assumption `validate_inspection` documents.
@@ -537,6 +582,27 @@ pub fn validate_shader_compile_request(
         return Err(ShaderRequestError::TooManyDefines);
     }
 
+    // SR-3c: optional "options" object -- absent entirely is valid (see
+    // the doc comment above); when present, all three sub-fields are
+    // required and shape-checked (string, bounded length) but their
+    // VALUES are not otherwise interpreted by this crate.
+    if let Some(options_value) = object.get("options") {
+        let options = match options_value {
+            Value::Object(map) => map,
+            _ => return Err(ShaderRequestError::WrongType("options")),
+        };
+        for (field, path) in [
+            ("target_env", "options.target_env"),
+            ("target_env_version", "options.target_env_version"),
+            ("optimization_level", "options.optimization_level"),
+        ] {
+            let text = shader_require_str(options, field, path)?;
+            if text.len() > MAX_SHADER_OPTION_STRING_BYTES {
+                return Err(ShaderRequestError::OptionOversize(path));
+            }
+        }
+    }
+
     Ok(value)
 }
 
@@ -553,16 +619,32 @@ pub enum ShaderResponseError {
     MissingField(&'static str),
     #[error("field {0:?} has the wrong JSON type")]
     WrongType(&'static str),
+    #[error("\"spirv_chunks\" is {0}; maximum is {MAX_SPIRV_CHUNKS}")]
+    TooManySpirvChunks(u64),
+    #[error("\"spirv_total_bytes\" is {0}; maximum is {MAX_SPIRV_TOTAL_BYTES}")]
+    SpirvTotalBytesTooLarge(u64),
+    #[error("\"log\" is {len} bytes; maximum is {MAX_SHADER_COMPILE_ERROR_LOG_BYTES}")]
+    LogOversize { len: usize },
 }
 
 /// Validates one `shader-compile-response-v1` payload (kind 17): schema
-/// tag, `"status"`/`"reason"` presence and type. This skeleton's own
-/// producer (`kwe-shader-compiler`) only ever emits `status`
-/// `"unimplemented"` or `"protocol-error"`; the status enum itself is not
-/// closed here (a LATER helper's `"ok"`/`"compile-error"`/... are additive,
-/// same "don't retroactively break an older reader" principle as
-/// `FrameKind::Unknown`) — this function only checks shape, never the
-/// specific string value.
+/// tag, `"status"` presence/type, then STATUS-DEPENDENT required fields —
+/// the status enum itself is still not CLOSED here (an unrecognized status
+/// falls back to the original SR-3a shape, `"reason"` required — the same
+/// "don't retroactively break an older reader" principle `FrameKind::
+/// Unknown` follows, now applied per-status rather than uniformly):
+///
+/// - `"unimplemented"` / `"protocol-error"` / any other/future status:
+///   `"reason"` required (SR-3a's original shape, unchanged).
+/// - `"ok"` (SR-3c, first compiling helper): `"spirv_chunks"` and
+///   `"spirv_total_bytes"` required, both non-negative integers, bounded
+///   by [`MAX_SPIRV_CHUNKS`]/[`MAX_SPIRV_TOTAL_BYTES`] — refusing an
+///   over-claim HERE means a dishonest/buggy helper never gets as far as
+///   the caller trying to read that many kind-18 frames.
+/// - `"compile-error"` (SR-3c): `"log"` required, a string of at most
+///   [`MAX_SHADER_COMPILE_ERROR_LOG_BYTES`] — a compile error is a
+///   RESULT, not a protocol failure (SR-3c task text), so it gets its own
+///   shape rather than being shoehorned into `"reason"`.
 pub fn validate_shader_compile_response(payload: &[u8]) -> Result<Value, ShaderResponseError> {
     let value: Value = serde_json::from_slice(payload)?;
     let object = value.as_object().ok_or(ShaderResponseError::NotAnObject)?;
@@ -575,18 +657,57 @@ pub fn validate_shader_compile_response(payload: &[u8]) -> Result<Value, ShaderR
     if schema != SHADER_COMPILE_RESPONSE_SCHEMA {
         return Err(ShaderResponseError::WrongSchema);
     }
-    match object.get("status") {
+    let status = match object.get("status") {
         None => return Err(ShaderResponseError::MissingField("status")),
-        Some(Value::String(_)) => {}
+        Some(Value::String(status)) => status.as_str(),
         Some(_) => return Err(ShaderResponseError::WrongType("status")),
-    }
-    match object.get("reason") {
-        None => return Err(ShaderResponseError::MissingField("reason")),
-        Some(Value::String(_)) => {}
-        Some(_) => return Err(ShaderResponseError::WrongType("reason")),
+    };
+
+    match status {
+        "ok" => {
+            let spirv_chunks = response_require_u64(object, "spirv_chunks")?;
+            if spirv_chunks > MAX_SPIRV_CHUNKS as u64 {
+                return Err(ShaderResponseError::TooManySpirvChunks(spirv_chunks));
+            }
+            let spirv_total_bytes = response_require_u64(object, "spirv_total_bytes")?;
+            if spirv_total_bytes > MAX_SPIRV_TOTAL_BYTES as u64 {
+                return Err(ShaderResponseError::SpirvTotalBytesTooLarge(
+                    spirv_total_bytes,
+                ));
+            }
+        }
+        "compile-error" => match object.get("log") {
+            None => return Err(ShaderResponseError::MissingField("log")),
+            Some(Value::String(log)) => {
+                if log.len() > MAX_SHADER_COMPILE_ERROR_LOG_BYTES {
+                    return Err(ShaderResponseError::LogOversize { len: log.len() });
+                }
+            }
+            Some(_) => return Err(ShaderResponseError::WrongType("log")),
+        },
+        _ => match object.get("reason") {
+            None => return Err(ShaderResponseError::MissingField("reason")),
+            Some(Value::String(_)) => {}
+            Some(_) => return Err(ShaderResponseError::WrongType("reason")),
+        },
     }
 
     Ok(value)
+}
+
+/// Like `shader_require_str`, for a required non-negative integer response
+/// field (`"spirv_chunks"`/`"spirv_total_bytes"`) — a negative number or a
+/// non-integer JSON number is `WrongType`, same as any other shape
+/// mismatch here.
+fn response_require_u64(
+    map: &Map<String, Value>,
+    path: &'static str,
+) -> Result<u64, ShaderResponseError> {
+    match map.get(path) {
+        None => Err(ShaderResponseError::MissingField(path)),
+        Some(Value::Number(number)) => number.as_u64().ok_or(ShaderResponseError::WrongType(path)),
+        Some(_) => Err(ShaderResponseError::WrongType(path)),
+    }
 }
 
 fn shader_require_str<'a>(
@@ -1595,6 +1716,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // SR-3c: shader-compile-request-v1's optional "options" object
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shader_request_options_absent_entirely_is_still_valid() {
+        // golden_shader_request() has no "options" key at all -- SR-3c
+        // additive: absent means "use the compiling side's own defaults".
+        let record = golden_shader_request();
+        assert!(!record.as_object().unwrap().contains_key("options"));
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(validate_shader_compile_request(&payload, 256 * 1024).is_ok());
+    }
+
+    #[test]
+    fn shader_request_options_present_and_complete_is_valid() {
+        let mut record = golden_shader_request();
+        record["options"] = json!({
+            "target_env": "vulkan",
+            "target_env_version": "1.2",
+            "optimization_level": "zero",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        let validated = validate_shader_compile_request(&payload, 256 * 1024).unwrap();
+        assert_eq!(validated, record);
+    }
+
+    #[test]
+    fn shader_request_options_wrong_type_is_rejected() {
+        let mut record = golden_shader_request();
+        record["options"] = json!("not an object");
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::WrongType("options"))
+        ));
+    }
+
+    #[test]
+    fn shader_request_options_requires_all_three_sub_fields_together() {
+        for missing in ["target_env", "target_env_version", "optimization_level"] {
+            let mut record = golden_shader_request();
+            let mut options = serde_json::Map::new();
+            for field in ["target_env", "target_env_version", "optimization_level"] {
+                if field != missing {
+                    options.insert(field.to_string(), json!("x"));
+                }
+            }
+            record["options"] = Value::Object(options);
+            let payload = serde_json::to_vec(&record).unwrap();
+            let expected_path = format!("options.{missing}");
+            assert!(
+                matches!(
+                    validate_shader_compile_request(&payload, 256 * 1024),
+                    Err(ShaderRequestError::MissingField(reported)) if reported == expected_path
+                ),
+                "missing={missing}: {:?}",
+                validate_shader_compile_request(&payload, 256 * 1024)
+            );
+        }
+    }
+
+    #[test]
+    fn shader_request_options_sub_fields_are_bounded() {
+        let mut record = golden_shader_request();
+        record["options"] = json!({
+            "target_env": "x".repeat(MAX_SHADER_OPTION_STRING_BYTES + 1),
+            "target_env_version": "1.2",
+            "optimization_level": "zero",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::OptionOversize("options.target_env"))
+        ));
+
+        // Exactly at the bound is fine.
+        let mut record = golden_shader_request();
+        record["options"] = json!({
+            "target_env": "x".repeat(MAX_SHADER_OPTION_STRING_BYTES),
+            "target_env_version": "1.2",
+            "optimization_level": "zero",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(validate_shader_compile_request(&payload, 256 * 1024).is_ok());
+    }
+
+    // -----------------------------------------------------------------
     // SR-3a: validate_shader_compile_response
     // -----------------------------------------------------------------
 
@@ -1652,5 +1860,109 @@ mod tests {
             validate_shader_compile_response(&payload),
             Err(ShaderResponseError::WrongType("status"))
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3c: "ok" / "compile-error" response shapes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shader_response_ok_status_requires_spirv_chunks_and_total_bytes() {
+        let record = json!({
+            "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+            "status": "ok",
+            "spirv_chunks": 3,
+            "spirv_total_bytes": 12_345,
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert_eq!(validate_shader_compile_response(&payload).unwrap(), record);
+
+        for missing in ["spirv_chunks", "spirv_total_bytes"] {
+            let mut record = record.clone();
+            record.as_object_mut().unwrap().remove(missing);
+            let payload = serde_json::to_vec(&record).unwrap();
+            assert!(
+                matches!(
+                    validate_shader_compile_response(&payload),
+                    Err(ShaderResponseError::MissingField(reported)) if reported == missing
+                ),
+                "missing={missing}: {:?}",
+                validate_shader_compile_response(&payload)
+            );
+        }
+
+        // An "ok" response has no "reason" field at all -- unlike
+        // unimplemented/protocol-error, it is not required here.
+        assert!(!record.as_object().unwrap().contains_key("reason"));
+    }
+
+    #[test]
+    fn shader_response_ok_spirv_chunks_is_bounded_by_the_response_channel_cap() {
+        for (chunks, expect_ok) in [
+            (MAX_SPIRV_CHUNKS as u64, true),
+            (MAX_SPIRV_CHUNKS as u64 + 1, false),
+        ] {
+            let record = json!({
+                "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+                "status": "ok",
+                "spirv_chunks": chunks,
+                "spirv_total_bytes": 4,
+            });
+            let payload = serde_json::to_vec(&record).unwrap();
+            let result = validate_shader_compile_response(&payload);
+            assert_eq!(result.is_ok(), expect_ok, "chunks={chunks}: {result:?}");
+            if !expect_ok {
+                assert!(matches!(
+                    result,
+                    Err(ShaderResponseError::TooManySpirvChunks(reported)) if reported == chunks
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn shader_response_ok_spirv_total_bytes_is_bounded() {
+        let record = json!({
+            "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+            "status": "ok",
+            "spirv_chunks": 1,
+            "spirv_total_bytes": MAX_SPIRV_TOTAL_BYTES as u64 + 1,
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_response(&payload),
+            Err(ShaderResponseError::SpirvTotalBytesTooLarge(reported))
+                if reported == MAX_SPIRV_TOTAL_BYTES as u64 + 1
+        ));
+    }
+
+    #[test]
+    fn shader_response_compile_error_status_requires_a_bounded_log() {
+        let record = json!({
+            "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+            "status": "compile-error",
+            "log": "ERROR: 0:1: 'foo' : undeclared identifier",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert_eq!(validate_shader_compile_response(&payload).unwrap(), record);
+
+        let mut missing = record.clone();
+        missing.as_object_mut().unwrap().remove("log");
+        let payload = serde_json::to_vec(&missing).unwrap();
+        assert!(matches!(
+            validate_shader_compile_response(&payload),
+            Err(ShaderResponseError::MissingField("log"))
+        ));
+
+        let mut oversize = record.clone();
+        oversize["log"] = json!("x".repeat(MAX_SHADER_COMPILE_ERROR_LOG_BYTES + 1));
+        let payload = serde_json::to_vec(&oversize).unwrap();
+        assert!(matches!(
+            validate_shader_compile_response(&payload),
+            Err(ShaderResponseError::LogOversize { .. })
+        ));
+
+        // A "compile-error" response has no "reason" field either.
+        assert!(!record.as_object().unwrap().contains_key("reason"));
     }
 }

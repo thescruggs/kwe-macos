@@ -543,5 +543,408 @@ STOP findings:           None -- the task's own STOP condition (no single
                          `shaderc::Compiler` is a lazily-initialized,
                          stateless-per-call OnceLock the helper call sits
                          cleanly beside rather than inside.
+Commit(s):               6cd7e76
+```
+
+## SR-3c — material shaders compile in the killable helper (byte-identical SPIR-V, in-thread fallback)
+
+Filed after SR-3b merged, trunk `6cd7e76`.
+
+Conductor decisions (verbatim):
+
+- **(a)** The helper links the SAME `shaderc` crate/system `libshaderc`
+  the renderer uses, invoked with EXACTLY the options
+  `materialshader::compile_stage` passes (same target env/version, same
+  optimization level, same everything — factor the option-building into a
+  shared `kwe-core` or duplicated-with-lockstep-comment location; prefer
+  sharing via `kwe-core` only if that doesn't drag `shaderc` into
+  `kwe-core`'s dependency set — otherwise duplicate the option list with a
+  lockstep comment both sides, and a test in the RENDERER asserting
+  in-thread vs helper SPIR-V byte-equality keeps them honest).
+- **(b)** Payoff being bought: a compile that hangs/explodes now dies with
+  the killable helper process instead of detaching a compiler thread
+  inside the renderer (the SR-3 headline). The in-thread path REMAINS as
+  automatic fallback (still has the detach flaw — later SR-3 children
+  remove in-thread entirely; noted below).
+- **(c)** Rollout: helper path ON by default when the binary resolves
+  (SR-3b already passes the flag); ANY failure/mismatch-capable condition
+  falls back in-thread per SR-3b's policy, so worst case equals today.
+
+```text
+Task:            Route the FIRST shader-preprocessing family
+                 (materialshader.rs's in-thread shaderc calls) through
+                 SR-3b's helper client end to end: a real shaderc compile
+                 in kwe-shader-compiler, real kind-18 SPIR-V chunks, the
+                 renderer consuming a real Compiled result. Oracle:
+                 byte-identical SPIR-V vs. the in-thread path.
+Milestone/Slice: SR-3c
+Goal:            Prove the killable-helper payoff (decision (b)) for real:
+                 a GLSL compile that would have detached an unjoined
+                 thread inside the renderer (materialshader.rs's own
+                 documented flaw) now runs inside a process the caller can
+                 kill outright, with ZERO observable difference in what
+                 gets drawn -- the same "prove, don't assume" byte-
+                 equality discipline this session already used for SR-2c's
+                 corpus parity and SR-3b's fallback-equivalence claim.
+Outcome:         kwe-core gains a new module, shader_compile_spec.rs (3
+                 plain string consts: TARGET_ENV="vulkan",
+                 TARGET_ENV_VERSION="1.2", OPTIMIZATION_LEVEL="zero", plus
+                 ENTRY_POINT="main") -- decision (a)'s "prefer kwe-core
+                 only if that doesn't drag shaderc into kwe-core's
+                 dependency set" resolved by NOT putting any shaderc TYPE
+                 in kwe-core (it is depended on by kwe-daemon/kwe-cli/
+                 kwe-audio-worker/kwe-web-renderer/kwe-scene-inspector --
+                 nearly every workspace binary): each shaderc-linking
+                 crate (kwe-scene-renderer, kwe-shader-compiler) maps
+                 these plain values onto its OWN shaderc::CompileOptions
+                 locally. The byte-equality oracle test (below) is what
+                 actually keeps the two mappings honest, not the shared
+                 constants alone (the task's own fallback for exactly this
+                 case).
+                 kwe-shader-compiler gains a shaderc.workspace=true
+                 dependency (SAME version/source the renderer already
+                 pins in the root Cargo.toml -- no new external dependency)
+                 and kwe-core (for the spec constants). compile_source
+                 (new, src/main.rs): builds shaderc::CompileOptions from
+                 kwe-core's constants, calls compile_into_spirv SYNCHRONOUSLY
+                 on the helper's own main thread -- unlike
+                 materialshader::compile_stage's own with_timeout
+                 thread-spawn wrapper, no internal timeout machinery is
+                 needed here (decision (b)'s payoff: the CALLER's
+                 process-level kill, SR-3b's shader_helper.rs, is now the
+                 bound, not a detached thread inside this process). A
+                 shaderc CompileOptions/Compiler construction failure is
+                 folded into the SAME "compile-error" result as a GLSL
+                 failure (documented, not a new wire status). On success:
+                 kind-17 {"schema":...,"status":"ok","spirv_chunks":<n>,
+                 "spirv_total_bytes":<n>} followed by exactly <n> kind-18
+                 spirv-chunk-v1 frames, each at most MAX_PAYLOAD_BYTES (64
+                 KiB, .chunks(MAX_PAYLOAD_BYTES) -- no extra bound needed
+                 since that cap is already universal on this wire), raw
+                 shaderc::CompilationArtifact::as_binary_u8 bytes
+                 (native-endian u32 words -- the helper is always a CHILD
+                 of its caller, same host/architecture, so no conversion
+                 is ever needed on either side). On a compile failure:
+                 kind-17 {"status":"compile-error","log":"<bounded to
+                 kwe-report-protocol::MAX_SHADER_COMPILE_ERROR_LOG_BYTES,
+                 4 KiB>"} -- exit 0 either way (task text: "a compile
+                 error is a RESULT, not a helper failure").
+                 kwe-report-protocol: validate_shader_compile_request
+                 gains an OPTIONAL top-level "options" object
+                 ({"target_env","target_env_version","optimization_level"},
+                 each a bounded string, MAX_SHADER_OPTION_STRING_BYTES=128
+                 -- additive, schema stays "shader-compile-request-v1" per
+                 the task's "version the schema additively, keep v1 name";
+                 absent means "use the compiling side's own defaults",
+                 kwe-core's constants on both ends). validate_shader_
+                 compile_response's single uniform shape (schema/status/
+                 reason) becomes STATUS-DEPENDENT: "unimplemented"/
+                 "protocol-error"/any other status keeps the original
+                 reason-required shape; "ok" requires spirv_chunks/
+                 spirv_total_bytes (both bounded -- MAX_SPIRV_CHUNKS=131,
+                 one less than StreamCaps::SHADER_RESPONSE's 132-frame
+                 budget since that budget also covers the kind-17 header
+                 itself; MAX_SPIRV_TOTAL_BYTES=StreamCaps::SHADER_RESPONSE's
+                 own 8 MiB total, refusing an over-claim BEFORE the caller
+                 ever tries reading that many kind-18 frames -- this is
+                 what makes the "header says 200 chunks" failure-injection
+                 test refuse immediately rather than only failing once a
+                 malicious helper actually streams 200 real frames);
+                 "compile-error" requires a bounded "log". New
+                 ShaderRequestError::OptionOversize and 3 new
+                 ShaderResponseError variants (TooManySpirvChunks/
+                 SpirvTotalBytesTooLarge/LogOversize).
+                 kwe-scene-renderer/src/shader_helper.rs: HelperOutcome
+                 gains CompileError(String) (no longer reserved/unused)
+                 and Compiled{spirv,response} is now actually constructed
+                 (finalize's "ok"/"compile-error" match arms; a new
+                 reassemble_ok function reads exactly spirv_chunks kind-18
+                 frames, validates the ACTUAL count/total read back
+                 against the header's claim -- task item 2's "validate
+                 count/total vs the kind-17 header; mismatch ->
+                 ProtocolError -> fallback" -- before converting bytes to
+                 Vec<u32> via chunks_exact(4).map(u32::from_ne_bytes)). A
+                 new ShaderHelper::compile_stage_or_fallback(request,
+                 label) -> Result<Vec<u32>, materialshader::CompileError>
+                 is the new call-site entry point: Compiled -> Ok(spirv)
+                 directly (skip in-thread); CompileError(log) ->
+                 Err(CompileError::Failed(log)) WITHOUT retrying in-thread
+                 (the same GLSL fails identically a second time -- task
+                 item 4's "the SAME error path the in-thread compile error
+                 takes"); every other outcome -> calls materialshader::
+                 compile_stage in-thread, unchanged from SR-3b. main.rs's
+                 two call sites (compile_one_material, vertex+fragment)
+                 collapse from "call compile() and discard, then always
+                 call compile_stage()" to one compile_stage_or_fallback
+                 call each -- the Err-arm handling (fallback_reasons bump,
+                 bounded diagnostic, return None) is UNCHANGED text,
+                 proving it does not care which path produced the error.
+                 The request's "options" is now always populated from
+                 kwe-core's constants (task item 2's "populate the
+                 request's options from the same values compile_stage
+                 uses") -- the helper does NOT parse this field back into
+                 its own compile behavior (it always uses its own copy of
+                 the same kwe-core constants instead); documented as a
+                 deliberate simplicity choice, not an oversight, since
+                 parsing untrusted wire JSON back into shaderc enum
+                 selection would be one more place the two sides could
+                 silently diverge, and the byte-equality oracle test is
+                 what actually proves the two sides agree, not the wire
+                 field. A new compiled_count: AtomicU64 field plus a
+                 Drop impl on ShaderHelper prints one bounded
+                 "event=shader_helper.compiled count=<n>" line at process
+                 teardown, only when count > 0 (task item 3's smoke
+                 evidence line) -- KEPT permanently past this slice
+                 (decision recorded below), not removed after verifying.
+                 docs/SHADER_HELPER_PROTOCOL_V1.md: the request/response
+                 schema sections rewritten for the "options" field and the
+                 4 response shapes (was 2); the reason-code table gains
+                 option-oversize; the "SR-3a skeleton scope" section
+                 becomes "Implementation status by slice" (SR-3a/3b/3c
+                 summarized in order, matching this document's own
+                 evolving style). packaging/PKGBUILD: comment-only updates
+                 (the shaderc depends/makedepends entries already covered
+                 kwe-shader-compiler once it started linking it -- no new
+                 entry, no pkgrel bump, confirmed by reading the arrays
+                 back).
+In scope:        crates/kwe-core/src/{lib.rs,shader_compile_spec.rs} (new
+                 module, 4 consts, no shaderc dependency), crates/
+                 kwe-shader-compiler/{Cargo.toml,src/main.rs} (shaderc +
+                 kwe-core dependencies, compile_source/respond_ok/
+                 respond_compile_error, 2 new unit tests), crates/
+                 kwe-shader-compiler/tests/protocol.rs (a realistic
+                 #version-carrying fixture replacing SR-3a's bare `void
+                 main(){}`, 2 new integration tests: ok+real-spirv,
+                 compile-error), crates/kwe-report-protocol/src/lib.rs
+                 (options validation, status-dependent response
+                 validation, 4 new bound constants, 4 new error variants,
+                 9 new tests), crates/kwe-scene-renderer/src/
+                 shader_helper.rs (Compiled/CompileError consumption,
+                 compile_stage_or_fallback, reassemble_ok, the options
+                 payload field, the compiled_count Drop line, 5 test
+                 replacements/additions: the real-binary differential
+                 oracle across 4 representative shaders, a compile-error
+                 fallback test, a dies-mid-chunks test, an oversized-claim
+                 test -- replacing SR-3b's now-stale "real binary answers
+                 unimplemented" test), crates/kwe-scene-renderer/src/
+                 main.rs (the two compile_one_material call sites
+                 collapsed to compile_stage_or_fallback), docs/
+                 SHADER_HELPER_PROTOCOL_V1.md, packaging/PKGBUILD
+                 (comments only), docs/SR3.md (this section).
+Out of scope:    The long-lived serial-loop question (decision (c), SR-3a)
+                 -- STILL not resolved: this slice makes the per-request
+                 compile real but does not measure spawn cost against
+                 compile latency in production and does not build a
+                 serial-loop mode; recorded again as an open risk below,
+                 now with no more excuses left to defer it behind ("no
+                 real compile to measure yet" is no longer true).
+                 SPIR-V reflection (SR-3d) and the bounded cache (SR-3e) --
+                 both still untouched, their reserved response fields
+                 (reflection, cache_key) still absent from every response
+                 this helper emits. An env-gated double-compile diff in
+                 PRODUCTION code (decision recorded in-line: tests carry
+                 the differential, production carries fallback only -- see
+                 Open risks for the honesty-boundary this leaves).
+                 Removing the in-thread compile_stage path entirely --
+                 decision (b) explicitly keeps it as fallback; a LATER
+                 SR-3 slice removes it once the helper path is trusted
+                 enough (still has the with_timeout detached-thread flaw
+                 materialshader.rs's own doc comment names).
+Acceptance tests:        kwe-report-protocol: 46 tests (up from 37) -- 5
+                         new "options" tests (absent is valid, present-
+                         and-complete round-trips, wrong type, all-3-
+                         required-together at every single-field-missing
+                         combination, bounded-at-the-byte-boundary); 4 new
+                         response tests ("ok" requires both fields (with
+                         each individually missing) and has no "reason";
+                         spirv_chunks bounded at MAX_SPIRV_CHUNKS/+1;
+                         spirv_total_bytes bounded; "compile-error"
+                         requires a bounded "log" and has no "reason").
+                         kwe-shader-compiler: 21 tests (up from 18) -- 2
+                         new unit (compile_source compiles valid GLSL to
+                         SPIR-V starting with the correct magic number,
+                         skip-if-libshaderc-unavailable; a GLSL syntax
+                         error is Err not a panic); integration tests
+                         updated for realistic #version-carrying sources
+                         (SR-3a's bare "void main(){}" fixture doesn't
+                         compile under a Vulkan target -- Desktop GLSL
+                         needs #version >= 140 -- discovered by running
+                         the OLD fixture through the new real compile
+                         path and reading the actual shaderc error, not
+                         guessed), plus 2 new integration tests: a valid
+                         request now gets "ok" + real SPIR-V (magic-number-
+                         checked, chunk-count/total-bytes cross-checked
+                         against the header) rather than "unimplemented";
+                         bad GLSL gets "compile-error" + exit 0, not
+                         protocol-error/non-zero.
+                         kwe-scene-renderer: 370 tests (up from 367, 1
+                         ignored unchanged) -- the differential oracle
+                         (real_helper_binary_produces_byte_identical_
+                         spirv_to_in_thread_compile) runs 4 representative
+                         shaders (task item 3's own list) THROUGH THE REAL
+                         shaderpre::preprocess pipeline first (a raw,
+                         un-preprocessed source lacks the #version
+                         shaderpre injects, so this is what compile_stage
+                         actually ever sees in production) then through
+                         BOTH the real helper binary and the in-thread
+                         path, asserting byte-identical Vec<u32> SPIR-V:
+                         (1) plain_quad.frag (materialshader::tests::
+                         compile_round_trip_produces_spirv's own source),
+                         (2) combo.frag (a [COMBO] LIGHTING=1 override
+                         that changes which #if branch compiles --
+                         shaderpre::tests::
+                         material_combo_override_wins_over_shader_
+                         default's pattern), (3) include.frag (a real
+                         #include splice whose function is actually
+                         CALLED, not just present -- shaderpre::tests::
+                         include_resolves_and_inlines's pattern made
+                         load-bearing), (4) plain_quad.vert (shaderpre::
+                         tests::
+                         vertex_shader_is_not_wrapped_for_premultiplication's
+                         source) -- all 4 pass, skip-with-note if
+                         kwe-shader-compiler is not already built (the
+                         SR-3b convention) or if libshaderc is
+                         unavailable. 3 new failure-injection tests (task
+                         item 4): helper_compile_error_surfaces_as_the_
+                         same_compile_stage_error_shape (bad GLSL through
+                         the REAL helper -> compile_stage_or_fallback's
+                         Err arm is CompileError::Failed, same as an
+                         in-thread failure); helper_that_dies_mid_chunks_
+                         is_a_protocol_error_and_falls_back_in_thread (a
+                         fake helper declares 2 spirv_chunks, writes zero
+                         -> ProtocolError, then the FULL compile_stage_or_
+                         fallback pipeline still produces a real compile
+                         via fallback -- "the layer still draws"
+                         literally proven, not just asserted);
+                         oversized_spirv_chunk_claim_is_refused_by_the_
+                         response_cap (a fake helper claims 200 chunks in
+                         its header -> ProtocolError from kwe-report-
+                         protocol's own MAX_SPIRV_CHUNKS check, refused
+                         BEFORE any kind-18 frame is read -> fallback
+                         still compiles). The stale SR-3b test asserting
+                         the real binary answers "unimplemented" was
+                         REMOVED (no longer true: the real binary now
+                         compiles) rather than left to bit-rot.
+                         937 workspace tests total, up from 922.
+                         cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 937 passed, 0 failed.
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> ir_parity_
+                         corpus -- 60/60 item(s) parity-passed (unaffected
+                         -- this slice touches no scene-parsing code).
+                         ./scripts/check.sh -- exit 0, green end-to-end.
+                         scripts/smoke-scene.sh -- exit 0, every case
+                         passes unchanged INCLUDING the pixel-exact
+                         material-shader oracles (S2/S3/S4/S5a/S5b) --
+                         and, verified directly (a scratch copy of the
+                         script with its cleanup trap disabled, run once
+                         to inspect the preserved per-case renderer logs
+                         before they were deleted -- smoke-scene.sh
+                         redirects each standalone renderer's OWN stderr
+                         to a per-case log file inside its own mktemp
+                         root, not to the script's own stdout/stderr, so
+                         "eyeball it in the smoke output" required
+                         looking at those files specifically): the
+                         teardown line actually fired in every one of the
+                         5 material-shader cases -- standalone-s2-
+                         material.log count=2, standalone-s3-effects.log
+                         count=4, standalone-s4-material.log count=2,
+                         standalone-s5a-effects.log count=4, standalone-
+                         s5b-ffb.log count=4 -- and zero non-success
+                         shader_helper_outcome diagnostic lines appeared
+                         anywhere (every compile in every case succeeded
+                         via the real helper, none fell back). Remove-or-
+                         keep decision: KEEP the teardown line permanently
+                         (not a one-off verification aid) -- a standing,
+                         bounded, opt-in-cost (only prints when count>0)
+                         signal that the helper path is actually being
+                         used in the field is worth more than the
+                         negligible log-line cost.
+Failure/recovery tests:  helper_compile_error_surfaces_as_the_same_
+                         compile_stage_error_shape (bad GLSL -> identical
+                         caller-visible Err shape, no in-thread retry);
+                         helper_that_dies_mid_chunks_is_a_protocol_error_
+                         and_falls_back_in_thread (a crashed/truncated
+                         helper mid-response -> ProtocolError -> the FULL
+                         pipeline still compiles via fallback, not just
+                         the raw HelperOutcome classified correctly);
+                         oversized_spirv_chunk_claim_is_refused_by_the_
+                         response_cap (a dishonest chunk-count claim ->
+                         refused by kwe-report-protocol's own cap ->
+                         fallback); the compile_source unit test proving a
+                         GLSL syntax error is Err, never a panic.
+Upstream/provenance:    Original; the option-sharing design (plain consts
+                         in kwe-core, no shaderc type there) and the
+                         synchronous-compile-no-internal-timeout choice
+                         (decision (b)'s payoff, contrasted explicitly
+                         against materialshader::compile_stage's own
+                         documented with_timeout/detached-thread flaw) are
+                         both original engineering judgment calls for this
+                         slice, not copied from any external source.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 937 passed, 0 failed
+                         (an unrelated environment issue surfaced first:
+                         /tmp had filled to 100% with ~76,500 leftover
+                         per-test scratch directories accumulated across
+                         many past sessions' cargo test runs, causing 60
+                         StorageFull failures in kwe-core's pkg/scan/vfs/
+                         preflight/playlist tests -- confirmed via the
+                         exact panic messages (Os { code: 28, kind:
+                         StorageFull }) and the directory-name patterns
+                         (kwe-daemon-cache-*, kwe-scene-test-*, etc. --
+                         this project's own test fixtures, not third-party
+                         or another user's data); cleared, then a clean
+                         rerun passed 0 failed -- unrelated to this
+                         slice's own changes, noted here for the record
+                         since it briefly looked like a regression).
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> ir_parity_
+                         corpus -- 60/60 parity-passed.
+                         ./scripts/check.sh -- exit 0.
+                         scripts/smoke-scene.sh -- exit 0, all cases
+                         passed, helper-active evidence confirmed (above).
+Open risks:              The long-lived serial-loop question (decision
+                         (c), first recorded SR-3a) is STILL unresolved --
+                         this slice had a real compile to measure spawn
+                         cost against and did not use the opportunity;
+                         genuinely deferred again, not forgotten.
+                         Honesty boundary (recorded per the task's own
+                         instruction): no env-gated double-compile diff
+                         exists in PRODUCTION code -- a silent helper/
+                         in-thread divergence introduced later (e.g. a
+                         shaderc version drift between the two crates'
+                         Cargo.lock resolutions, or a future edit to one
+                         side's option-building that forgets the other)
+                         would go UNNOTICED in the field. Mitigated by:
+                         identical options (kwe-core's shared constants),
+                         identical shaderc version/source (workspace-
+                         pinned), and this slice's own differential-oracle
+                         tests -- but those tests only run in CI/dev, not
+                         in production.
+                         The helper does not actually CONSUME the wire
+                         request's "options" field for its own compile
+                         behavior (documented above) -- it is populated
+                         for self-description/audit but currently
+                         advisory only; a future caller wanting genuinely
+                         different options than kwe-core's fixed defaults
+                         would need the helper to start honoring it.
+                         RLIMIT_NPROC still left unset for the helper
+                         (SR-3b's own open risk, unchanged this slice).
+                         The PDEATHSIG mechanism remains proven by
+                         precedent rather than a direct test in this
+                         module (SR-3b's own open risk, unchanged).
+STOP findings:           None. Neither STOP condition named for this task
+                         triggered: in-thread vs. helper SPIR-V IS byte-
+                         identical for all 4 representative fixtures
+                         (asserted, not just visually spot-checked), and
+                         adding shaderc to the kwe-shader-compiler crate
+                         did NOT break the workspace build graph (verified
+                         by a clean cargo build/test/clippy across the
+                         whole workspace -- kwe-core, the crate nearly
+                         everything else depends on, stayed shaderc-free
+                         by design, so no other crate's dependency graph
+                         changed at all).
 Commit(s):               (fill in after commit)
 ```

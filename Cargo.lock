@@ -465,8 +465,10 @@ dependencies = [
 name = "kwe-shader-compiler"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "kwe-core",
  "kwe-report-protocol",
  "serde_json",
+ "shaderc",
 ]
 
 [[package]]

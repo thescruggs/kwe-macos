@@ -150,8 +150,13 @@ skeleton does).
   "stage": "vertex | fragment",
   "source": "...GLSL source, <= --max-source-bytes (default 262144, today's 256 KiB shader cap)",
   "includes": { "name.glsl": "...file contents, <= 64 KiB each, <= 32 entries" },
-  "combos": { "COMBO_NAME": "...shape not yet interpreted by this skeleton, <= 128 entries" },
-  "defines": { "DEFINE_NAME": "...shape not yet interpreted by this skeleton, <= 128 entries" }
+  "combos": { "COMBO_NAME": "...shape not yet interpreted by this crate, <= 128 entries" },
+  "defines": { "DEFINE_NAME": "...shape not yet interpreted by this crate, <= 128 entries" },
+  "options": {
+    "target_env": "vulkan",
+    "target_env_version": "1.2",
+    "optimization_level": "zero"
+  }
 }
 ```
 
@@ -166,54 +171,105 @@ unlike the bounds below); `includes` is an object with at most
 `MAX_SHADER_INCLUDES` (32) entries, each value a string of at most
 `MAX_SHADER_INCLUDE_BYTES` (64 KiB, 65,536); `combos` and `defines` are each
 an object with at most `MAX_SHADER_COMBOS`/`MAX_SHADER_DEFINES` (128)
-entries — their VALUES are not otherwise interpreted by this skeleton (a
+entries — their VALUES are not otherwise interpreted by this crate (a
 later slice, once it defines what a combo/define actually configures,
 decides the value shape and adds that check here rather than to a new
 function, keeping this validator the single source of truth for the
-request schema). A missing field and a present-but-wrong-type field are
-always distinguished (`MissingField`/`WrongType`), the same convention
-`validate_inspection` established.
+request schema).
 
-All 6 top-level fields are REQUIRED (unlike `scene-inspection-v1`, which
+All 6 SR-3a fields are REQUIRED (unlike `scene-inspection-v1`, which
 inherited its shape from an existing v0 record with its own history, this
 schema is new in SR-3a — every field is spelled out explicitly rather than
 defaulting `includes`/`combos`/`defines` to "absent means empty," so a
 caller's request is always a complete, self-describing record).
 
+**`options` (SR-3c, additive — still schema `shader-compile-request-v1`):**
+OPTIONAL. Absent entirely means "use the compiling side's own defaults" —
+today, `kwe-core::shader_compile_spec`'s constants on both ends of this
+protocol (`kwe-scene-renderer` and `kwe-shader-compiler` each reference the
+SAME Rust constants independently rather than parsing this field back into
+`shaderc` types; see `docs/SR3.md`'s SR-3c section for why). When present,
+all three sub-fields (`target_env`, `target_env_version`,
+`optimization_level`) are required together — no partial object — each a
+string of at most `MAX_SHADER_OPTION_STRING_BYTES` (128). This crate only
+checks SHAPE here, never the specific values (which target env/
+optimization level a caller may ask for is policy for whichever crate
+actually calls `shaderc`, not this wire-format validator). `kwe-scene-
+renderer` always populates this field from `kwe-core::shader_compile_spec`
+(never omits it) so the wire request is self-describing/auditable even
+though the helper does not currently branch on it.
+
 ## `shader-compile-response-v1` schema (kind 17)
 
+Four shapes, all still schema `shader-compile-response-v1` (status-
+dependent fields, per `validate_shader_compile_response`'s own status
+branch — see below):
+
 ```json
-{
-  "schema": "shader-compile-response-v1",
-  "status": "unimplemented | protocol-error | ...more statuses land with a real compiler (SR-3c+)",
-  "reason": "...short bounded diagnostic code, see below"
-}
+{"schema": "shader-compile-response-v1", "status": "unimplemented", "reason": "skeleton"}
+{"schema": "shader-compile-response-v1", "status": "protocol-error", "reason": "<code>"}
+{"schema": "shader-compile-response-v1", "status": "ok", "spirv_chunks": 1, "spirv_total_bytes": 512}
+{"schema": "shader-compile-response-v1", "status": "compile-error", "log": "...bounded to 4 KiB, see below"}
 ```
 
 `validate_shader_compile_response(payload)` checks `schema` equals
-`SHADER_COMPILE_RESPONSE_SCHEMA` and that `status`/`reason` are both
-present strings — it does NOT close the `status` enum (the same "additive,
-don't retroactively break an older reader" principle `FrameKind::Unknown`
-follows): a future compiling helper's `"ok"`/`"compile-error"`/... statuses
-validate against this same function without a code change here.
+`SHADER_COMPILE_RESPONSE_SCHEMA`, that `status` is a present string, and
+then STATUS-DEPENDENT required fields — the `status` enum itself is still
+not CLOSED (the same "additive, don't retroactively break an older
+reader" principle `FrameKind::Unknown` follows, now applied per-status: an
+unrecognized status falls back to the original `"unimplemented"`/
+`"protocol-error"` shape, `"reason"` required):
 
-SR-3a's own `kwe-shader-compiler` skeleton only ever emits two shapes:
+- `"unimplemented"` / `"protocol-error"` / any other/future status:
+  `"reason"` required (SR-3a's original shape, unchanged).
+- `"ok"` (SR-3c, first compiling helper): `"spirv_chunks"` (SR-3a's own
+  reservation named this field `spirv_chunk_count`; SR-3c uses the
+  shorter `spirv_chunks` instead — a deliberate rename, not an oversight,
+  matching `spirv_total_bytes`'s own naming) and `"spirv_total_bytes"`
+  required, both non-negative integers, bounded by
+  `MAX_SPIRV_CHUNKS` (131, one less than `StreamCaps::SHADER_RESPONSE`'s
+  132-frame budget — that budget also covers this kind-17 header frame
+  itself) and `MAX_SPIRV_TOTAL_BYTES` (`StreamCaps::SHADER_RESPONSE`'s own
+  8 MiB total-payload budget). An over-claim on EITHER field is refused
+  right here, at header-validation time — a dishonest/buggy helper
+  declaring e.g. 200 chunks is rejected before the caller ever tries to
+  read that many kind-18 frames. No `"reason"` field.
+- `"compile-error"` (SR-3c): `"log"` required, a string of at most
+  `MAX_SHADER_COMPILE_ERROR_LOG_BYTES` (4 KiB) — `shaderc`'s own error
+  text is not otherwise length-bounded, so this keeps the eventual
+  caller-side diagnostic bounded without a separate truncation step at
+  the call site. A compile error is a RESULT, not a protocol failure
+  (SR-3c task text) — it gets its own shape rather than being shoehorned
+  into `"reason"`. No `"reason"` field.
 
-- `{"status": "unimplemented", "reason": "skeleton"}` — every
-  structurally valid request gets exactly this; nothing is ever compiled in
-  this slice (no `shaderc` dependency yet — SR-3c decides how/whether
-  shaderc reaches this crate).
-- `{"status": "protocol-error", "reason": "<code>"}` — see "Protocol error
-  reason codes" below.
+`kwe-shader-compiler`'s own producer, by build:
 
-### Reserved response fields (SR-3c/SR-3d, not implemented here)
+- SR-3a's skeleton only ever emitted `unimplemented`/`protocol-error` —
+  no `shaderc` dependency existed yet.
+- SR-3c (current): every structurally valid request actually compiles.
+  `"ok"` on success — the kind-17 header is followed by exactly
+  `spirv_chunks` kind-18 `spirv-chunk-v1` frames (raw binary, each at
+  most `MAX_PAYLOAD_BYTES`/64 KiB, in order — SPIR-V is a stream of
+  native-endian 32-bit words, and both the helper and its caller always
+  run on the same host/architecture, since the helper is a child of its
+  caller, so no endian conversion happens anywhere on this path),
+  concatenating back to exactly `spirv_total_bytes` bytes. `"compile-
+  error"` on a `shaderc` failure (bad GLSL, or `shaderc`/`libshaderc`
+  itself unavailable in the helper process) — the helper's `compile_
+  source` function, not this validator, decides `"ok"` vs `"compile-
+  error"`; see `kwe-shader-compiler/src/main.rs`'s own doc comment.
+  `"unimplemented"` remains a real POSSIBLE outcome (not removed) since
+  an older helper binary — `--shader-helper` can point at any binary on
+  disk — would still answer that way.
+
+### Reserved response fields (SR-3d/SR-3e, not implemented here)
 
 Named now so a later slice's addition is additive against a frozen shape,
-not a redesign — none of these exist in any response this skeleton emits:
+not a redesign — neither of these exist in any response `kwe-shader-
+compiler` emits today:
 
 | Field | For | Reserved meaning |
 |---|---|---|
-| `spirv_chunk_count` | SR-3c (first compiling helper) | How many kind-18 frames follow this response, so a caller can size a receive buffer ahead of reading them (0 for a non-`"ok"` status). |
 | `reflection` | SR-3d (reflection/validation spike) | An object describing the compiled module's resource bindings/push-constant layout/etc. — the shape SR-3d's own spike defines; `null` or absent until then. |
 | `cache_key` | SR-3e (bounded cache) | A stable digest identifying this EXACT request (source + stage + includes + combos + defines, canonicalized) — lets a caller key its own cache without re-deriving the digest rule itself. Reserved; SR-3e's own contract fixes the exact canonicalization (expected to mirror `scene-inspection-v1`'s digest rule: serialize with a placeholder, SHA-256, hex). |
 
@@ -237,13 +293,18 @@ Emitted in a `status: "protocol-error"` response's `"reason"` field
 | `too-many-includes` | `"includes"` has more than 32 entries. |
 | `invalid-include:<name>` | An `"includes"` entry is not a string, or exceeds 64 KiB (name truncated to 128 bytes on a UTF-8 boundary in the diagnostic — never unbounded, never a panic on a multi-byte character). |
 | `too-many-combos` / `too-many-defines` | `"combos"`/`"defines"` has more than 128 entries. |
+| `option-oversize:<path>` | (SR-3c) An `"options"` sub-field (`options.target_env`/`options.target_env_version`/`options.optimization_level`) exceeds `MAX_SHADER_OPTION_STRING_BYTES` (128 bytes). |
 | `excess-request` | Bytes remained on stdin after the one request this process reads (decision (c)). |
+
+A `"compile-error"` response (SR-3c) is a SEPARATE status, not a
+`protocol-error` reason code — see the response schema section above; it
+carries its own `"log"` field, never a `"reason"`.
 
 ## Exit codes
 
 | Code | Meaning | Response frame? |
 |---|---|---|
-| 0 | One valid request answered. | Yes — `status: "unimplemented"` (this skeleton; a later slice adds real statuses). |
+| 0 | One valid request answered. | Yes — `status: "ok"` or `"compile-error"` (SR-3c, the real compile outcomes) or `"unimplemented"` (an older helper binary still answering the SR-3a way). |
 | 2 | Malformed command-line invocation (`--max-wall-ms`/`--max-source-bytes` missing a value, a non-numeric value, or an unrecognized flag). Defensive/test-only in practice — the daemon controls argv. | No. |
 | 64 | Self-watchdog deadline expired (see below). | **No — silent.** |
 | 65 | A protocol violation (see the reason-code table above). | Yes, when possible — `status: "protocol-error"`. |
@@ -284,30 +345,49 @@ timeout regardless — SR-3b's client classifies this as `HelperOutcome::
 Timeout` either way, whether the watchdog fires first or the caller's own
 deadline does).
 
-## SR-3a skeleton scope
+## Implementation status by slice
 
 This document describes the FULL protocol surface `kwe-shader-compiler`
-implements today, but the helper itself does no compilation: every
-structurally valid request gets `{"status": "unimplemented", "reason":
-"skeleton"}`. No `shaderc` dependency exists in `kwe-shader-compiler` yet —
-SR-3c is the slice that decides how (and whether) `shaderc` reaches this
-crate, migrates the first real preprocessing family through it, and starts
-actually emitting kind-18 SPIR-V chunks. SR-3b (built) is the first real
-caller: `kwe-scene-renderer`'s own `shader_helper.rs` spawns this binary
-per material-shader compile, contained the way a renderer worker can
-contain its own child (no `setpgid` — the helper stays in the renderer's
-process group so the daemon's existing group-kill already covers it; see
-`docs/SR3.md`'s SR-3b section for the full containment writeup), and
-FALLS BACK to the existing in-thread `shaderc` compile on every outcome
-this slice can produce (`unimplemented` included) — so trunk still
-renders byte-identically until SR-3c starts consuming a real `Compiled`
-response. The daemon itself never calls this binary directly; it only
-resolves `kwe-scene-renderer`'s sibling path and passes it down via
-`--shader-helper` for `RendererKind::Scene` workers, the same way it
-hands the renderer its other binary paths. Tests in THIS crate (SR-3a)
-still drive the compiled binary directly via
+implements as of SR-3c:
+
+- **SR-3a** built the skeleton: every structurally valid request got
+  `{"status": "unimplemented", "reason": "skeleton"}`, no `shaderc`
+  dependency existed in the crate, nothing was ever compiled.
+- **SR-3b** wired the first real caller: `kwe-scene-renderer`'s own
+  `shader_helper.rs` spawns this binary per material-shader compile,
+  contained the way a renderer worker can contain its own child (no
+  `setpgid` — the helper stays in the renderer's process group so the
+  daemon's existing group-kill already covers it; see `docs/SR3.md`'s
+  SR-3b section for the full containment writeup) — but FELL BACK to the
+  existing in-thread `shaderc` compile on every outcome (`unimplemented`
+  included), so trunk still rendered byte-identically. The daemon itself
+  never calls this binary directly; it only resolves `kwe-scene-
+  renderer`'s sibling path and passes it down via `--shader-helper` for
+  `RendererKind::Scene` workers, the same way it hands the renderer its
+  other binary paths.
+- **SR-3c (current)** makes the compile real: the helper links the SAME
+  `shaderc` crate/version `kwe-scene-renderer` does (workspace-pinned),
+  invoked with options shared via `kwe-core::shader_compile_spec`'s plain
+  constants (see `docs/SR3.md`'s SR-3c section) so the two compile paths
+  are provably byte-identical, not just assumed to be. A GLSL failure is
+  `"compile-error"` (a RESULT, not a helper failure — exit 0 either way);
+  a `shaderc`/`libshaderc` setup failure in the helper process ALSO
+  surfaces as `"compile-error"` (documented above), not a new status. The
+  renderer's `ShaderHelper::compile_stage_or_fallback` consumes `"ok"`
+  directly (skip the in-thread compile) and surfaces `"compile-error"`
+  through the SAME `Err` path an in-thread compile failure already takes
+  (no retry in-thread — the same GLSL fails identically a second time);
+  every OTHER outcome (`Unimplemented`/`ProtocolError`/`Unavailable`/
+  `Timeout`) still falls back in-thread, unchanged from SR-3b. The
+  long-lived serial-loop question (decision (c), SR-3a) remains
+  explicitly UNRESOLVED — SR-3c did not measure spawn cost against real
+  compile latency in production; see `docs/SR3.md`'s SR-3c open risks.
+
+Tests in THIS crate still drive the compiled binary directly via
 `CARGO_BIN_EXE_kwe-shader-compiler`, the same pattern `kwe-daemon`'s own
 tests use to drive a real `kwe-scene-inspector` subprocess;
 `kwe-scene-renderer`'s own tests additionally exercise the real binary
 cross-crate via a target-dir path convention (skip-with-note if not
-already built).
+already built), including a differential oracle comparing the helper's
+SPIR-V against the in-thread path's for several representative shaders
+(plain quad, combo/define, `#include`-spliced, vertex+fragment).

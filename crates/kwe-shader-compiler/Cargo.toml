@@ -6,5 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+kwe-core = { path = "../kwe-core" }
 kwe-report-protocol = { path = "../kwe-report-protocol" }
 serde_json.workspace = true
+# SR-3c: the SAME shaderc crate/version/source kwe-scene-renderer already
+# depends on (workspace-pinned in the root Cargo.toml) -- reuse, not a new
+# external dependency. Links the SYSTEM libshaderc via pkg-config, same as
+# the renderer's own comment there explains; packaging already lists
+# `shaderc` in both PKGBUILD arrays for the renderer, and covers this
+# binary too (packaging/PKGBUILD).
+shaderc.workspace = true

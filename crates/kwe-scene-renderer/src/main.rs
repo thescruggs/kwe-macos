@@ -2659,20 +2659,21 @@ fn compile_one_material(
         blend_mode.variant_index(),
     );
 
-    // SR-3b decision (a): ask the helper first, but its outcome changes
-    // NOTHING about what happens next -- every path (including the
-    // reserved, not-yet-constructed `Compiled` variant) falls through to
-    // the SAME in-thread `compile_stage` call unconditionally. `compile`
-    // itself already logs its own outcome (bounded, once per class); this
-    // slice does nothing else with the result. SR-3c consumes `Compiled`
-    // here instead of ignoring it.
-    let _ = shader_helper.compile(&shader_helper::ShaderCompileRequest {
-        stage: materialshader::Stage::Vertex,
-        source: &vertex_pre.source,
-    });
-    let vertex_spirv = match materialshader::compile_stage(
-        &vertex_pre.source,
-        materialshader::Stage::Vertex,
+    // SR-3c decision (a)/(b): ask the helper first via
+    // `compile_stage_or_fallback` -- a real `Compiled` result is used
+    // directly (skip the in-thread compile), a `CompileError` result
+    // surfaces through this SAME `Err` arm without retrying in-thread
+    // (module doc), and every other helper outcome
+    // (Unimplemented/ProtocolError/Unavailable/Timeout) falls through to
+    // the in-thread `materialshader::compile_stage`, unchanged from
+    // SR-3b. This `Err` arm's own handling (fallback-reason bump, bounded
+    // diagnostic, `return None`) is unchanged either way -- it does not
+    // know or care whether the error came from the helper or in-thread.
+    let vertex_spirv = match shader_helper.compile_stage_or_fallback(
+        &shader_helper::ShaderCompileRequest {
+            stage: materialshader::Stage::Vertex,
+            source: &vertex_pre.source,
+        },
         &vertex_label,
     ) {
         Ok(spirv) => spirv,
@@ -2691,14 +2692,11 @@ fn compile_one_material(
             return None;
         }
     };
-    // SR-3c consumes Compiled here instead of ignoring it.
-    let _ = shader_helper.compile(&shader_helper::ShaderCompileRequest {
-        stage: materialshader::Stage::Fragment,
-        source: &fragment_pre.source,
-    });
-    let fragment_spirv = match materialshader::compile_stage(
-        &fragment_pre.source,
-        materialshader::Stage::Fragment,
+    let fragment_spirv = match shader_helper.compile_stage_or_fallback(
+        &shader_helper::ShaderCompileRequest {
+            stage: materialshader::Stage::Fragment,
+            source: &fragment_pre.source,
+        },
         &fragment_label,
     ) {
         Ok(spirv) => spirv,

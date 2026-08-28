@@ -22,6 +22,7 @@ mod scan;
 mod sceneeffect;
 mod scenemodel;
 mod sceneobjects;
+mod shader_compile_spec;
 mod texvheader;
 mod vfs;
 mod webpreflight;
@@ -71,6 +72,7 @@ pub use sceneobjects::{
     classify_scene_object, scene_property_value, summarize_scene_objects,
     summarize_scene_objects_resolved,
 };
+pub use shader_compile_spec::{ENTRY_POINT, OPTIMIZATION_LEVEL, TARGET_ENV, TARGET_ENV_VERSION};
 pub use vfs::{AssetCategory, ResolvedAsset, ResolvedPath, Vfs, VfsCaps, VfsError, VfsSource};
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{

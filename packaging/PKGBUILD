@@ -53,7 +53,8 @@ depends=(
     # S2: kwe-scene-renderer dlopens libshaderc_shared.so.1 at runtime for
     # the material-shader GLSL -> SPIR-V compile (crates/kwe-scene-renderer,
     # the `shaderc` crate, default features — no vendored glslang build;
-    # see THIRD_PARTY.yml's rust-shaderc entry).
+    # see THIRD_PARTY.yml's rust-shaderc entry). SR-3c: kwe-shader-compiler
+    # links the SAME shaderc/libshaderc — no separate depends entry needed.
     'shaderc'
 )
 makedepends=(
@@ -66,7 +67,9 @@ makedepends=(
     'kirigami'
     # S2: pkg-config discovers the system libshaderc at build time
     # (shaderc.pc); the same 'shaderc' package provides both that and the
-    # runtime .so, so it is listed in both arrays.
+    # runtime .so, so it is listed in both arrays. SR-3c: kwe-shader-
+    # compiler's own build also links against it -- same package, no
+    # separate makedepends entry.
     'shaderc'
 )
 
@@ -120,9 +123,11 @@ package() {
     # SR-0b: one-shot bounded scene inventory inspector, resolved by the
     # daemon next to its own executable like every other worker binary.
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-scene-inspector" "${pkgdir}/usr/bin/kwe-scene-inspector"
-    # SR-3a: the killable shader-compile helper's protocol skeleton (no
-    # shaderc migration yet, SR-3b wires the daemon-side spawn/containment
-    # -- packaged now so upgrades land the binary ahead of that wiring).
+    # SR-3a: the killable shader-compile helper's protocol skeleton;
+    # SR-3b wired kwe-scene-renderer to spawn it (fallback-only); SR-3c
+    # gave it its own `shaderc` dependency so it actually compiles --
+    # resolved by the RENDERER (not the daemon) next to the renderer's
+    # own executable, same as every other worker-adjacent binary.
     install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-shader-compiler" "${pkgdir}/usr/bin/kwe-shader-compiler"
 
     # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and

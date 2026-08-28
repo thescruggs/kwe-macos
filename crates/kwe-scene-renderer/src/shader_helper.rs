@@ -1,16 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! SR-3b: the renderer-side client for the killable shader-compile helper
-//! (`kwe-shader-compiler`, SR-3a's protocol skeleton,
-//! `docs/SHADER_HELPER_PROTOCOL_V1.md`).
+//! SR-3b built the renderer-side client for the killable shader-compile
+//! helper (`kwe-shader-compiler`); SR-3c makes it real
+//! (`docs/SHADER_HELPER_PROTOCOL_V1.md`).
 //!
-//! **Zero behavior change in this slice (decision (a)):** `compile` is
-//! called, its outcome is logged (bounded, once per outcome class), and
-//! the caller (`main.rs`'s `compile_one_material`) falls through to
-//! today's in-thread `materialshader::compile_stage` unconditionally,
-//! regardless of what `compile` returned — including a (not-yet-possible
-//! in this slice) `HelperOutcome::Compiled`. Every scene renders
-//! byte-identically to trunk. SR-3c is the slice that starts consuming a
-//! real `Compiled` result instead of always falling through.
+//! **SR-3b (zero behavior change):** `compile` was called, its outcome
+//! logged, and the caller fell through to the in-thread
+//! `materialshader::compile_stage` UNCONDITIONALLY — the helper's own
+//! skeleton never emitted anything but `unimplemented`/`protocol-error`,
+//! so there was nothing else to consume.
+//!
+//! **SR-3c (this slice): the helper now really compiles.** `ShaderHelper::
+//! compile_stage_or_fallback` is the new entry point `main.rs`'s
+//! `compile_one_material` calls instead of `compile` directly — it
+//! consumes `HelperOutcome::Compiled` (use the helper's SPIR-V, skip the
+//! in-thread compile entirely: decision (b)'s payoff, a killable process
+//! bounds the compile instead of a detached thread inside the renderer)
+//! and `HelperOutcome::CompileError` (surface it through the SAME error
+//! path `compile_stage`'s own `Err` already takes — task text: "a compile
+//! error is a RESULT, not a helper failure", so this does NOT retry
+//! in-thread; the GLSL is the GLSL, a second compile of the identical
+//! source would fail identically). Every OTHER outcome
+//! (`Unimplemented`/`ProtocolError`/`Unavailable`/`Timeout` — helper not
+//! configured, helper crashed, protocol violated, deadline blown) still
+//! falls through to the in-thread `compile_stage`, unchanged from SR-3b.
+//!
+//! Byte-identity between the two compile paths (decision (a): same
+//! `shaderc`, same `kwe-core::shader_compile_spec` options recipe on both
+//! ends) is proven directly by this module's own differential-oracle
+//! tests against the REAL helper binary, not assumed.
 //!
 //! Containment mirrors `kwe-daemon::inspect`'s one-shot supervision
 //! (`setpgid`, `PR_SET_PDEATHSIG`, a parent-pid check,
@@ -104,7 +121,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kwe_report_protocol::{
@@ -142,20 +159,20 @@ pub struct ShaderCompileRequest<'a> {
     pub source: &'a str,
 }
 
-/// The result of one helper exchange. `Compiled` is RESERVED for SR-3c —
-/// never constructed by this slice's `compile` (the helper skeleton itself
-/// never emits a compiled response either — see `kwe-shader-compiler`'s
-/// own SR-3a scope note) — kept here now so SR-3c's own change is additive
-/// to this enum rather than a redesign of it.
+/// The result of one helper exchange.
 #[derive(Debug)]
 pub enum HelperOutcome {
     /// The helper answered with `status: "unimplemented"` — SR-3a's
-    /// skeleton always does this for a structurally valid request.
+    /// skeleton always does this for a structurally valid request; kept
+    /// as a real possible outcome (not removed in SR-3c) since an OLDER
+    /// helper binary lagging a renderer upgrade would still answer this
+    /// way, and `--shader-helper` can point at any binary on disk.
     Unimplemented,
     /// The exchange completed, but the response was not a well-formed
-    /// `shader-compile-response-v1` frame the helper claims success/
-    /// unimplemented through, OR the helper itself reported
-    /// `status: "protocol-error"`. Bounded diagnostic detail.
+    /// `shader-compile-response-v1` frame, OR the helper itself reported
+    /// `status: "protocol-error"`, OR (SR-3c) an `"ok"` response's
+    /// declared kind-18 chunk count/total bytes did not match what was
+    /// actually read back. Bounded diagnostic detail.
     ProtocolError(String),
     /// The helper could not be reached at all: not configured (no path
     /// resolved), spawn failed (missing binary, permission), or the
@@ -164,9 +181,27 @@ pub enum HelperOutcome {
     /// No response arrived within `--shader-helper-timeout-ms`; the child
     /// was killed (SIGTERM then, after a short grace, SIGKILL) and reaped.
     Timeout,
-    /// SR-3c consumes this — reserved, never constructed in this slice.
-    #[allow(dead_code)]
-    Compiled { spirv: Vec<u32>, response: Value },
+    /// SR-3c: `status: "ok"` — the helper compiled the requested stage.
+    /// `spirv` is the reassembled SPIR-V, byte-identical (differential-
+    /// oracle tests below) to what `materialshader::compile_stage` would
+    /// have produced for the same source. `response` is the validated
+    /// kind-17 header JSON (`spirv_chunks`/`spirv_total_bytes`), kept for
+    /// a future caller that wants it; `compile_stage_or_fallback` itself
+    /// only needs `spirv`.
+    Compiled {
+        spirv: Vec<u32>,
+        #[allow(dead_code)]
+        response: Value,
+    },
+    /// SR-3c: `status: "compile-error"` — the helper's `shaderc` call
+    /// itself failed (bad GLSL). A compile error is a RESULT, not a
+    /// helper failure (task text): `compile_stage_or_fallback` surfaces
+    /// this through the exact same error path an in-thread
+    /// `CompileError::Failed` already takes, WITHOUT retrying in-thread —
+    /// the same source recompiled a second time fails identically.
+    /// Bounded diagnostic detail (the helper's own `"log"`, already
+    /// truncated to `MAX_SHADER_COMPILE_ERROR_LOG_BYTES` on the wire).
+    CompileError(String),
 }
 
 impl HelperOutcome {
@@ -180,6 +215,7 @@ impl HelperOutcome {
             Self::Unavailable(_) => "unavailable",
             Self::Timeout => "timeout",
             Self::Compiled { .. } => "compiled",
+            Self::CompileError(_) => "compile_error",
         }
     }
 }
@@ -202,6 +238,16 @@ pub struct ShaderHelper {
     logged_protocol_error: AtomicBool,
     logged_unavailable: AtomicBool,
     logged_timeout: AtomicBool,
+    // SR-3c task item 3: a grep-able `event=shader_helper.compiled
+    // count=<n>` line emitted ONCE at process teardown (`Drop`, below),
+    // only when count > 0 — evidence smoke-scene.sh actually exercised
+    // the real compile path, not just the fallback. A per-process running
+    // total, not per-material, so it costs one line regardless of scene
+    // size (kept permanently past this slice: a standing signal of
+    // helper effectiveness is worth more than the log-storm risk a
+    // per-compile line would have, and there is exactly one of these per
+    // renderer process lifetime).
+    compiled_count: AtomicU64,
 }
 
 impl ShaderHelper {
@@ -223,6 +269,36 @@ impl ShaderHelper {
             logged_protocol_error: AtomicBool::new(false),
             logged_unavailable: AtomicBool::new(false),
             logged_timeout: AtomicBool::new(false),
+            compiled_count: AtomicU64::new(0),
+        }
+    }
+
+    /// SR-3c: the entry point `main.rs`'s `compile_one_material` calls
+    /// instead of `compile_stage` directly. Tries the helper first
+    /// (`compile`); `Compiled`/`CompileError` are CONSUMED here (skip or
+    /// short-circuit the in-thread path — see the module doc); every
+    /// other outcome falls through to the in-thread `materialshader::
+    /// compile_stage`, unchanged from SR-3b. Returns the exact same
+    /// `Result<Vec<u32>, materialshader::CompileError>` shape
+    /// `compile_stage` itself returns, so the call site's own error
+    /// handling (fallback-reason bump, bounded diagnostic, `return None`)
+    /// needs no change beyond calling this instead.
+    pub fn compile_stage_or_fallback(
+        &self,
+        request: &ShaderCompileRequest<'_>,
+        label: &str,
+    ) -> Result<Vec<u32>, crate::materialshader::CompileError> {
+        match self.compile(request) {
+            HelperOutcome::Compiled { spirv, .. } => Ok(spirv),
+            HelperOutcome::CompileError(log) => {
+                Err(crate::materialshader::CompileError::Failed(log))
+            }
+            HelperOutcome::Unimplemented
+            | HelperOutcome::ProtocolError(_)
+            | HelperOutcome::Unavailable(_)
+            | HelperOutcome::Timeout => {
+                crate::materialshader::compile_stage(request.source, request.stage, label)
+            }
         }
     }
 
@@ -257,6 +333,20 @@ impl ShaderHelper {
             "includes": {},
             "combos": {},
             "defines": {},
+            // SR-3c task item 2: populate `options` from the SAME values
+            // `compile_stage` uses (decision (a)) — `kwe-core::
+            // shader_compile_spec`'s constants, the single shared recipe.
+            // The helper does not actually parse these back into shaderc
+            // types (it always compiles with its OWN copy of the same
+            // constants — see `kwe-shader-compiler`'s own doc comment);
+            // this field exists so the wire request is self-describing/
+            // auditable, per the task's explicit ask, not because the
+            // helper's compile behavior depends on it today.
+            "options": {
+                "target_env": kwe_core::TARGET_ENV,
+                "target_env_version": kwe_core::TARGET_ENV_VERSION,
+                "optimization_level": kwe_core::OPTIMIZATION_LEVEL,
+            },
         })) {
             Ok(bytes) => bytes,
             Err(error) => return HelperOutcome::Unavailable(bounded(&error.to_string())),
@@ -395,8 +485,20 @@ impl ShaderHelper {
             }
             HelperOutcome::Unavailable(detail) => (&self.logged_unavailable, Some(detail.as_str())),
             HelperOutcome::Timeout => (&self.logged_timeout, None),
-            // Never constructed this slice; nothing to (de-)dup or log.
-            HelperOutcome::Compiled { .. } => return,
+            // A success needs no diagnostic of its own (the teardown
+            // `compiled_count` summary below covers it, once per
+            // process). A compile error already gets its OWN per-
+            // material diagnostic at the call site
+            // (`event=renderer.scene.shader_compile_error`, main.rs) once
+            // `compile_stage_or_fallback` maps it to `CompileError::
+            // Failed` — logging it AGAIN here would be a duplicate line
+            // per material, not a dedup.
+            HelperOutcome::Compiled { .. } | HelperOutcome::CompileError(_) => {
+                if matches!(outcome, HelperOutcome::Compiled { .. }) {
+                    self.compiled_count.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
         };
         if flag.swap(true, Ordering::Relaxed) {
             return; // already logged this class once this process
@@ -410,6 +512,21 @@ impl ShaderHelper {
                 "event=renderer.scene.shader_helper_outcome class={}",
                 outcome.class()
             ),
+        }
+    }
+}
+
+/// SR-3c task item 3's teardown evidence line: `event=shader_helper.
+/// compiled count=<n>`, emitted once when this `ShaderHelper` (one per
+/// renderer process, constructed once in `main()`) is dropped, and only
+/// when `count > 0` — a scene with no material shaders, or one where the
+/// helper never actually succeeded, prints nothing. Bounded (one line,
+/// one integer) regardless of scene size.
+impl Drop for ShaderHelper {
+    fn drop(&mut self) {
+        let count = self.compiled_count.load(Ordering::Relaxed);
+        if count > 0 {
+            eprintln!("event=shader_helper.compiled count={count}");
         }
     }
 }
@@ -522,6 +639,12 @@ fn finalize(out_buffer: &[u8]) -> HelperOutcome {
     }
     let response = match validate_shader_compile_response(&frame.payload) {
         Ok(value) => value,
+        // `validate_shader_compile_response` already rejects an "ok"
+        // response's over-claimed `spirv_chunks`/`spirv_total_bytes`
+        // (`MAX_SPIRV_CHUNKS`/`MAX_SPIRV_TOTAL_BYTES`) right here, before
+        // this function ever tries to read that many kind-18 frames — a
+        // dishonest/buggy helper claiming e.g. 200 chunks is refused at
+        // this point, not discovered partway through reassembly below.
         Err(error) => return HelperOutcome::ProtocolError(bounded(&error.to_string())),
     };
     match response.get("status").and_then(Value::as_str) {
@@ -533,13 +656,93 @@ fn finalize(out_buffer: &[u8]) -> HelperOutcome {
                 .unwrap_or("protocol-error");
             HelperOutcome::ProtocolError(bounded(reason))
         }
-        // Reserved for SR-3c ("ok"/"compiled"/...) — this slice's own
-        // helper never emits anything but "unimplemented"/"protocol-
-        // error", so any OTHER status here is itself unexpected from a
-        // client this old; treated as a protocol error rather than
-        // guessed at.
+        Some("compile-error") => {
+            let log = response
+                .get("log")
+                .and_then(Value::as_str)
+                .unwrap_or("compile-error");
+            HelperOutcome::CompileError(bounded(log))
+        }
+        Some("ok") => reassemble_ok(&mut reader, response),
         other => HelperOutcome::ProtocolError(format!("unrecognized response status {other:?}")),
     }
+}
+
+/// SR-3c: reads the `spirv_chunks` kind-18 frames the "ok" header
+/// declared, reassembles the raw SPIR-V bytes, and validates BOTH the
+/// count and total length actually read back against what the header
+/// claimed (task item 2) — a mismatch either way (fewer chunks than
+/// declared because the helper died mid-stream, a wrong total, or extra
+/// trailing frames) is `ProtocolError`, never a panic and never a
+/// silently-wrong SPIR-V blob.
+fn reassemble_ok(
+    reader: &mut FrameReader<std::io::Cursor<&[u8]>>,
+    response: Value,
+) -> HelperOutcome {
+    let declared_chunks = response.get("spirv_chunks").and_then(Value::as_u64);
+    let declared_total = response.get("spirv_total_bytes").and_then(Value::as_u64);
+    let (Some(declared_chunks), Some(declared_total)) = (declared_chunks, declared_total) else {
+        // Already validated present/typed by `validate_shader_compile_response`
+        // -- unreachable in practice, kept as a typed fallback rather than
+        // an `unwrap`/panic.
+        return HelperOutcome::ProtocolError("ok response missing spirv fields".to_string());
+    };
+
+    let mut spirv_bytes: Vec<u8> = Vec::new();
+    for index in 0..declared_chunks {
+        match reader.next_frame() {
+            Ok(Some(frame)) if frame.kind == FrameKind::SpirvChunkV1 => {
+                spirv_bytes.extend_from_slice(&frame.payload);
+            }
+            Ok(Some(frame)) => {
+                return HelperOutcome::ProtocolError(format!(
+                    "expected a spirv chunk frame, got kind {:?} at index {index}",
+                    frame.kind
+                ));
+            }
+            Ok(None) => {
+                return HelperOutcome::ProtocolError(format!(
+                    "helper declared {declared_chunks} spirv chunks but stopped after {index}"
+                ));
+            }
+            Err(error) => return HelperOutcome::ProtocolError(bounded(&error.to_string())),
+        }
+    }
+    // No trailing frames beyond exactly the declared chunk count.
+    match reader.next_frame() {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return HelperOutcome::ProtocolError(
+                "trailing frame(s) after the declared spirv chunk count".to_string(),
+            );
+        }
+        Err(error) => return HelperOutcome::ProtocolError(bounded(&error.to_string())),
+    }
+
+    if spirv_bytes.len() as u64 != declared_total {
+        return HelperOutcome::ProtocolError(format!(
+            "spirv_total_bytes header said {declared_total}, reassembled {} bytes",
+            spirv_bytes.len()
+        ));
+    }
+    if !spirv_bytes.len().is_multiple_of(4) {
+        return HelperOutcome::ProtocolError(
+            "reassembled spirv byte length is not a multiple of 4".to_string(),
+        );
+    }
+
+    // Native-endian: both processes always run on the same host/
+    // architecture (the helper is a child of THIS renderer process), so
+    // this matches `shaderc::CompilationArtifact::as_binary_u8`'s own
+    // native layout byte-for-byte, the same as
+    // `materialshader::compile_stage`'s own `Vec<u32>` — no conversion
+    // needed, see the module doc.
+    let spirv: Vec<u32> = spirv_bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+
+    HelperOutcome::Compiled { spirv, response }
 }
 
 /// SIGTERM, a short grace period, then SIGKILL — always `kill(pid, ...)`,
@@ -773,6 +976,7 @@ write_frame(17, payload)
             logged_protocol_error: AtomicBool::new(false),
             logged_unavailable: AtomicBool::new(false),
             logged_timeout: AtomicBool::new(false),
+            compiled_count: AtomicU64::new(0),
         };
         let outcome = helper.compile(&sample_request("void main() {}"));
         assert!(
@@ -824,6 +1028,7 @@ write_frame(17, payload)
             logged_protocol_error: AtomicBool::new(false),
             logged_unavailable: AtomicBool::new(false),
             logged_timeout: AtomicBool::new(false),
+            compiled_count: AtomicU64::new(0),
         };
         let outcome_b = unconfigured.compile(&request);
         assert!(matches!(outcome_b, HelperOutcome::Unavailable(_)));
@@ -853,19 +1058,13 @@ write_frame(17, payload)
             .join("target")
     }
 
-    /// (f) The real-binary path: spawns the ACTUAL compiled
-    /// `kwe-shader-compiler` (SR-3a) if it has already been built (a
-    /// normal `cargo build`/`cargo test --workspace` produces it as a
-    /// sibling workspace binary), proving this module's wire-level client
-    /// and SR-3a's own binary genuinely agree on the protocol, not just
-    /// against fake python scripts. Skips gracefully (does not fail the
-    /// suite), with a printed note, if the binary has not been built yet
-    /// (e.g. `cargo test -p kwe-scene-renderer` run in isolation without a
-    /// prior workspace build) — mirroring this repo's other opt-in/
-    /// skip-if-prerequisite-missing tests (`ir_parity_corpus`,
-    /// `scripts/smoke-scene-corpus.sh`).
-    #[test]
-    fn real_shader_compiler_binary_answers_unimplemented() {
+    /// The real, built `kwe-shader-compiler` binary path, or `None` with a
+    /// printed skip note if it has not been built yet (e.g. `cargo test -p
+    /// kwe-scene-renderer` run in isolation without a prior workspace
+    /// build) — mirroring this repo's other opt-in/skip-if-prerequisite-
+    /// missing tests (`ir_parity_corpus`, `scripts/smoke-scene-corpus.sh`).
+    /// `caller`: the test's own name, for the skip message.
+    fn resolve_real_helper_binary(caller: &str) -> Option<PathBuf> {
         let candidates: Vec<PathBuf> = ["debug", "release"]
             .iter()
             .map(|profile| {
@@ -874,22 +1073,276 @@ write_frame(17, payload)
                     .join("kwe-shader-compiler")
             })
             .collect();
-        let Some(binary) = candidates.iter().find(|path| path.is_file()).cloned() else {
+        let found = candidates.iter().find(|path| path.is_file()).cloned();
+        if found.is_none() {
             let checked: Vec<String> = candidates
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect();
             eprintln!(
-                "skipping real_shader_compiler_binary_answers_unimplemented: kwe-shader-compiler not built (checked {})",
+                "skipping {caller}: kwe-shader-compiler not built (checked {})",
                 checked.join(", ")
             );
+        }
+        found
+    }
+
+    /// SR-3c task item 3: for each representative shader below, compile
+    /// the SAME preprocessed source through BOTH paths — the REAL helper
+    /// binary (proving the wire round trip, not just `compile_source`'s
+    /// own Rust function in isolation) and the in-thread
+    /// `materialshader::compile_stage` — and assert byte-identical
+    /// SPIR-V. This is decision (a)'s central claim, proven directly:
+    /// same `shaderc`, same `kwe-core::shader_compile_spec` options
+    /// recipe on both ends, not assumed from reading the code.
+    ///
+    /// Each source is run through the REAL `shaderpre::preprocess`
+    /// pipeline first (like `materialshader::tests::
+    /// compile_round_trip_produces_spirv` and the S2-era shaderpre tests
+    /// this reuses the shape of) — a raw, un-preprocessed source (e.g.
+    /// bare `void main() {}`) lacks the `#version` directive `shaderpre`
+    /// injects via `SHADER_HEADER`, which a Vulkan-targeted `shaderc`
+    /// compile requires; preprocessed sources are what `compile_stage`
+    /// (and now the helper) actually ever see in production.
+    #[test]
+    fn real_helper_binary_produces_byte_identical_spirv_to_in_thread_compile() {
+        let Some(binary) = resolve_real_helper_binary(
+            "real_helper_binary_produces_byte_identical_spirv_to_in_thread_compile",
+        ) else {
+            return;
+        };
+        if crate::materialshader::compile_stage(
+            "void main() { gl_FragColor = vec4(1.0); }",
+            Stage::Fragment,
+            "probe.frag",
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping real_helper_binary_produces_byte_identical_spirv_to_in_thread_compile: libshaderc unavailable"
+            );
+            return;
+        }
+        let helper = ShaderHelper::new(Some(binary), 5000);
+
+        for (label, stage, source, combos, include_lookup) in representative_shaders() {
+            let mut include = include_lookup;
+            let mut locs = std::collections::BTreeMap::new();
+            let shaderpre_stage = match stage {
+                Stage::Vertex => crate::shaderpre::Stage::Vertex,
+                Stage::Fragment => crate::shaderpre::Stage::Fragment,
+            };
+            let preprocessed = crate::shaderpre::preprocess(
+                shaderpre_stage,
+                label,
+                source,
+                &combos,
+                &[],
+                &mut locs,
+                &mut include,
+            )
+            .unwrap_or_else(|error| panic!("{label}: preprocess failed: {error:?}"));
+
+            let request = ShaderCompileRequest {
+                stage,
+                source: &preprocessed.source,
+            };
+            let outcome = helper.compile(&request);
+            let HelperOutcome::Compiled {
+                spirv: helper_spirv,
+                ..
+            } = outcome
+            else {
+                panic!("{label}: expected Compiled from the real helper, got {outcome:?}");
+            };
+            let in_thread_spirv =
+                crate::materialshader::compile_stage(&preprocessed.source, stage, label)
+                    .unwrap_or_else(|error| panic!("{label}: in-thread compile failed: {error:?}"));
+            assert_eq!(
+                helper_spirv, in_thread_spirv,
+                "{label}: helper and in-thread SPIR-V diverged"
+            );
+        }
+    }
+
+    /// The four representative shaders task item 3 names, each as
+    /// `(label, stage, raw_source, material_combos, include_lookup)`
+    /// ready for `shaderpre::preprocess`: (1) a plain quad fragment
+    /// shader (`materialshader::tests::compile_round_trip_produces_spirv`'s
+    /// own source), (2) one with a combo/define that changes which branch
+    /// compiles (`shaderpre::tests::
+    /// material_combo_override_wins_over_shader_default`'s pattern), (3)
+    /// one with an `#include` spliced in (`shaderpre::tests::
+    /// include_resolves_and_inlines`'s pattern, made load-bearing: the
+    /// included function is actually called), (4) a vertex-stage shader
+    /// (`shaderpre::tests::vertex_shader_is_not_wrapped_for_premultiplication`'s
+    /// source).
+    #[allow(clippy::type_complexity)]
+    fn representative_shaders() -> Vec<(
+        &'static str,
+        Stage,
+        &'static str,
+        std::collections::BTreeMap<String, i64>,
+        Box<crate::shaderpre::IncludeLookup<'static>>,
+    )> {
+        vec![
+            (
+                "plain_quad.frag",
+                Stage::Fragment,
+                "void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n",
+                std::collections::BTreeMap::new(),
+                Box::new(|_: &str| None),
+            ),
+            (
+                "combo.frag",
+                Stage::Fragment,
+                "// [COMBO] {\"combo\":\"LIGHTING\",\"default\":0}\n#if LIGHTING\nvoid main() { gl_FragColor = vec4(1.0, 1.0, 0.0, 1.0); }\n#else\nvoid main() { gl_FragColor = vec4(0.0, 0.0, 1.0, 1.0); }\n#endif\n",
+                {
+                    let mut combos = std::collections::BTreeMap::new();
+                    combos.insert("LIGHTING".to_string(), 1);
+                    combos
+                },
+                Box::new(|_: &str| None),
+            ),
+            (
+                "include.frag",
+                Stage::Fragment,
+                "#include \"common.h\"\nvoid main() { gl_FragColor = helper(); }\n",
+                std::collections::BTreeMap::new(),
+                Box::new(|name: &str| {
+                    if name == "common.h" {
+                        Some(b"vec4 helper() { return vec4(0.5, 0.5, 0.5, 1.0); }\n".to_vec())
+                    } else {
+                        None
+                    }
+                }),
+            ),
+            (
+                "plain_quad.vert",
+                Stage::Vertex,
+                "void main() { gl_Position = vec4(0.0); }\n",
+                std::collections::BTreeMap::new(),
+                Box::new(|_: &str| None),
+            ),
+        ]
+    }
+
+    /// SR-3c task item 4: bad GLSL through the REAL helper produces
+    /// `HelperOutcome::CompileError`, and `compile_stage_or_fallback`
+    /// surfaces it through the exact same `Err` path an in-thread
+    /// `CompileError::Failed` already takes — same fallback_reasons bump/
+    /// bounded-diagnostic/`return None` at the `main.rs` call site,
+    /// proven here at the level this module owns: the `Result` shape
+    /// itself, both variants classified the same way by the caller.
+    #[test]
+    fn helper_compile_error_surfaces_as_the_same_compile_stage_error_shape() {
+        let Some(binary) = resolve_real_helper_binary(
+            "helper_compile_error_surfaces_as_the_same_compile_stage_error_shape",
+        ) else {
             return;
         };
         let helper = ShaderHelper::new(Some(binary), 5000);
-        let outcome = helper.compile(&sample_request("void main() { gl_FragColor = vec4(1.0); }"));
+        let request = ShaderCompileRequest {
+            stage: Stage::Fragment,
+            source: "#version 450\nvoid main() { this is not valid glsl !!! }\n",
+        };
+        let result = helper.compile_stage_or_fallback(&request, "bad.frag");
         assert!(
-            matches!(outcome, HelperOutcome::Unimplemented),
+            matches!(result, Err(crate::materialshader::CompileError::Failed(_))),
+            "{result:?}"
+        );
+    }
+
+    /// SR-3c task item 4: a helper that answers with a well-formed "ok"
+    /// header but is KILLED before writing its declared kind-18 chunks
+    /// (simulated here: a fake helper that writes the header then exits
+    /// without ever writing the chunk) is a `ProtocolError`, and
+    /// `compile_stage_or_fallback` falls back in-thread — the layer still
+    /// draws (a real compile succeeds), it just did not come from the
+    /// helper this time.
+    #[test]
+    fn helper_that_dies_mid_chunks_is_a_protocol_error_and_falls_back_in_thread() {
+        if crate::materialshader::compile_stage(
+            "void main() { gl_FragColor = vec4(1.0); }",
+            Stage::Fragment,
+            "probe.frag",
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping helper_that_dies_mid_chunks_is_a_protocol_error_and_falls_back_in_thread: libshaderc unavailable"
+            );
+            return;
+        }
+        let root = temp_dir("dies-mid-chunks");
+        let script = write_script(
+            &root,
+            "fake-helper.py",
+            &format!(
+                r#"#!/usr/bin/env python3
+{PYTHON_FRAME_HELPERS}
+read_frame()
+# Declares 2 spirv chunks but writes none -- a helper that died partway
+# through streaming its own response.
+payload = b'{{"schema":"shader-compile-response-v1","status":"ok","spirv_chunks":2,"spirv_total_bytes":16}}'
+write_frame(17, payload)
+"#
+            ),
+        );
+        let helper = ShaderHelper::new(Some(script), 5000);
+        let source = "void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        let outcome = helper.compile(&sample_request(source));
+        assert!(
+            matches!(outcome, HelperOutcome::ProtocolError(_)),
             "{outcome:?}"
         );
+        // The full pipeline still produces a real compile via fallback.
+        let result = helper.compile_stage_or_fallback(&sample_request(source), "fallback.frag");
+        assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// SR-3c task item 4: an "ok" header that claims an oversized SPIR-V
+    /// (e.g. 200 chunks, past `MAX_SPIRV_CHUNKS`) is refused by
+    /// `validate_shader_compile_response`'s own cap BEFORE this module
+    /// tries to read that many kind-18 frames — `ProtocolError`, and the
+    /// full pipeline still falls back in-thread.
+    #[test]
+    fn oversized_spirv_chunk_claim_is_refused_by_the_response_cap() {
+        if crate::materialshader::compile_stage(
+            "void main() { gl_FragColor = vec4(1.0); }",
+            Stage::Fragment,
+            "probe.frag",
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping oversized_spirv_chunk_claim_is_refused_by_the_response_cap: libshaderc unavailable"
+            );
+            return;
+        }
+        let root = temp_dir("oversized-chunks");
+        let script = write_script(
+            &root,
+            "fake-helper.py",
+            &format!(
+                r#"#!/usr/bin/env python3
+{PYTHON_FRAME_HELPERS}
+read_frame()
+payload = b'{{"schema":"shader-compile-response-v1","status":"ok","spirv_chunks":200,"spirv_total_bytes":1000000}}'
+write_frame(17, payload)
+"#
+            ),
+        );
+        let helper = ShaderHelper::new(Some(script), 5000);
+        let source = "void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+        let outcome = helper.compile(&sample_request(source));
+        assert!(
+            matches!(outcome, HelperOutcome::ProtocolError(_)),
+            "{outcome:?}"
+        );
+        let result = helper.compile_stage_or_fallback(&sample_request(source), "fallback.frag");
+        assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -45,28 +45,42 @@ fn run_helper(stdin_bytes: &[u8], extra_args: &[&str]) -> (i32, Vec<u8>) {
     )
 }
 
-fn valid_request_bytes() -> Vec<u8> {
-    let payload = serde_json::json!({
-        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
-        "stage": "fragment",
-        "source": "void main() {}",
-        "includes": {},
-        "combos": {},
-        "defines": {},
-    });
+/// A minimal but genuinely valid Vulkan-targeted GLSL fragment shader —
+/// SR-3c's helper actually compiles requests now (SR-3a's own bare `void
+/// main() {}` lacks a `#version` directive, which `shaderc` rejects for a
+/// Vulkan SPIR-V target: "Desktop shaders for Vulkan SPIR-V require
+/// version 140 or higher" — real material shaders always carry one via
+/// `shaderpre::preprocess`'s own header, so this is the realistic shape).
+const VALID_FRAGMENT_SOURCE: &str = "#version 450\nlayout(location = 0) out vec4 outColor;\nvoid main() { outColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+
+fn framed_request(payload: &serde_json::Value) -> Vec<u8> {
     let mut framed = Vec::new();
     write_frame(
         &mut framed,
         FrameKind::ShaderCompileRequestV1,
-        &serde_json::to_vec(&payload).unwrap(),
+        &serde_json::to_vec(payload).unwrap(),
     )
     .unwrap();
     framed
 }
 
+fn valid_request_bytes() -> Vec<u8> {
+    framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": VALID_FRAGMENT_SOURCE,
+        "includes": {},
+        "combos": {},
+        "defines": {},
+    }))
+}
+
 /// Decodes exactly the frames present in `stdout_bytes` under the
 /// response channel's own caps, asserting there is exactly one and that
 /// it validates as `shader-compile-response-v1`. Returns the parsed JSON.
+/// Only valid for a response with NO following kind-18 chunks
+/// (`"unimplemented"`/`"protocol-error"`/`"compile-error"`) — an `"ok"`
+/// response uses `ok_response_and_spirv` below instead.
 fn single_response_frame(stdout_bytes: &[u8]) -> serde_json::Value {
     let mut reader = FrameReader::with_caps(Cursor::new(stdout_bytes), StreamCaps::SHADER_RESPONSE);
     let frame = reader
@@ -81,13 +95,81 @@ fn single_response_frame(stdout_bytes: &[u8]) -> serde_json::Value {
     validate_shader_compile_response(&frame.payload).expect("response validates")
 }
 
+/// For an `"ok"` response: the kind-17 header (validated) plus the
+/// reassembled raw SPIR-V bytes from every kind-18 chunk that follows,
+/// asserting the chunk COUNT and TOTAL BYTES the caller reads back match
+/// exactly what the header declared, and that no further frames remain.
+fn ok_response_and_spirv(stdout_bytes: &[u8]) -> (serde_json::Value, Vec<u8>) {
+    let mut reader = FrameReader::with_caps(Cursor::new(stdout_bytes), StreamCaps::SHADER_RESPONSE);
+    let header_frame = reader
+        .next_frame()
+        .expect("a well-formed frame")
+        .expect("a response frame");
+    assert_eq!(header_frame.kind, FrameKind::ShaderCompileResponseV1);
+    let response =
+        validate_shader_compile_response(&header_frame.payload).expect("response validates");
+    assert_eq!(response["status"], "ok");
+    let declared_chunks = response["spirv_chunks"].as_u64().unwrap();
+    let declared_total = response["spirv_total_bytes"].as_u64().unwrap();
+
+    let mut spirv = Vec::new();
+    let mut actual_chunks = 0_u64;
+    while let Some(frame) = reader.next_frame().expect("a well-formed chunk frame") {
+        assert_eq!(frame.kind, FrameKind::SpirvChunkV1);
+        spirv.extend_from_slice(&frame.payload);
+        actual_chunks += 1;
+    }
+    assert_eq!(
+        actual_chunks, declared_chunks,
+        "chunk count must match the header"
+    );
+    assert_eq!(
+        spirv.len() as u64,
+        declared_total,
+        "total bytes must match the header"
+    );
+    (response, spirv)
+}
+
+/// SR-3c: a structurally AND semantically valid request now actually
+/// compiles — `"ok"`, real SPIR-V bytes reassembled from the kind-18
+/// chunks, starting with the SPIR-V magic number.
 #[test]
-fn a_valid_request_gets_an_unimplemented_response_and_exits_ok() {
+fn a_valid_request_compiles_and_returns_ok_with_real_spirv() {
     let (code, stdout) = run_helper(&valid_request_bytes(), &[]);
     assert_eq!(code, 0, "stdout={stdout:?}");
+    let (response, spirv) = ok_response_and_spirv(&stdout);
+    assert_eq!(response["status"], "ok");
+    assert!(!spirv.is_empty());
+    assert_eq!(spirv.len() % 4, 0, "SPIR-V is a stream of 32-bit words");
+    // SPIR-V magic number, little-endian: 0x07230203.
+    assert_eq!(&spirv[0..4], &0x0723_0203_u32.to_le_bytes());
+}
+
+/// SR-3c task text: "a compile error is a RESULT, not a helper failure" —
+/// bad GLSL gets `status: "compile-error"` and exit 0, never a
+/// `protocol-error` and never a non-zero exit.
+#[test]
+fn bad_glsl_is_a_compile_error_result_not_a_protocol_error() {
+    let stdin = framed_request(&serde_json::json!({
+        "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+        "stage": "fragment",
+        "source": "#version 450\nvoid main() { this is not valid glsl !!! }\n",
+        "includes": {},
+        "combos": {},
+        "defines": {},
+    }));
+    let (code, stdout) = run_helper(&stdin, &[]);
+    assert_eq!(
+        code, 0,
+        "a compile error is a RESULT, exit 0: stdout={stdout:?}"
+    );
     let response = single_response_frame(&stdout);
-    assert_eq!(response["status"], "unimplemented");
-    assert_eq!(response["reason"], "skeleton");
+    assert_eq!(response["status"], "compile-error");
+    assert!(
+        response["log"].as_str().unwrap().contains("error"),
+        "{response:?}"
+    );
 }
 
 #[test]
