@@ -183,14 +183,163 @@ Commit(s):               ea88e72 (skeleton), 97268f9 (R1/R2 review fix), 95f7f97
                          (review: in-flight guard created before the thread spawn)
 ```
 
-## SR-0c — One loader inventory adapter
+## SR-0c — scene.json object-family inventory in the isolated inspector
 
-- Reuse existing `kwe-core` scene/model/effect parsing read-only to emit the
-  feature inventory for one family (scene.json objects + materials first):
-  detected features → required capability IDs, unknown keys/types counted,
-  never dropped silently.
-- Deterministic output; golden JSON test; boundary fixtures (malformed,
-  oversized, deep nesting) yield Unknown/Incompatible, no hang.
+```text
+Task:            Fill required/detected/unknown in the scene-feature-inventory-v0
+                 record from a bounded raw walk of scene.json, entirely inside
+                 kwe-scene-inspector's isolated process.
+Milestone/Slice: SR-0c
+Goal:            Turn the SR-0b skeleton's always-empty inventory into a real one for
+                 the object family (layers/particles/effects), so the record starts
+                 answering "what does this scene actually declare" instead of only
+                 "does it hash and parse" — without touching the daemon, the CLI, or
+                 the record schema itself.
+Conductor scope decision: SR0.md's original SR-0c line named "scene.json objects +
+                 materials first". Narrowed at kickoff to the OBJECTS family only:
+                 materials require resolving referenced files (model -> material ->
+                 texture) through the pkg/scene-dir/assets-root lookup chain, which
+                 this slice's isolated-process, no-asset-resolution design does not
+                 have — it is its own follow-up slice.
+Outcome:         New crates/kwe-scene-inspector/src/inventory.rs: parses scene.json
+                 with serde_json, then walks exactly two levels (root, then
+                 objects[i]) against two static known-key tables (ROOT_KEYS =
+                 {general, objects}; OBJECT_KEYS = the field-name literals every
+                 parser in this workspace already reads on an objects[i] entry, plus
+                 sound/light/model — this SR-0c task's own named discriminators,
+                 not yet read by any parser elsewhere). Classifies each object by a
+                 discriminating field in kwe_core::sceneobjects's priority order
+                 (image/model > particle > text > sound > light), independently adds
+                 scene.effects for any object with a non-empty effects array, and
+                 counts an object with none of those as unknown.objects. `required`
+                 collects capabilities from active objects only (no visible field, or
+                 visible:true; a property-bound (object-valued) visible counts as
+                 active per WE's user-property convention, deferring resolution of
+                 the bound value to SR-11). Unknown root/object keys and type
+                 mismatches (root not an object, objects not an array, a non-object
+                 entry) are counted, never dropped, with a bounded top-K-smallest
+                 sample-path list (max_samples 16, max_sample_path_bytes 128) kept
+                 memory-bounded regardless of how many candidates are offered.
+                 max_objects_walked (4096) and a wall-clock deadline (checked every
+                 256 objects) both stop the walk early and mark every affected list
+                 truncated, adding "objects-cap"/"timeout" to limits_hit.
+                 main.rs wiring: after a successful hash, JsonDir re-reads the same
+                 scene.json file bounded to max_bytes (simplest-correct, per the
+                 task); Pkg locates and bounded-reads the scene.json entry through
+                 kwe-core's real PkgReader/scene_json_entry/MAX_SCENE_JSON_BYTES (the
+                 exact sequence kwe-scene-renderer's load_scene and kwe-core's
+                 preflight_pkg both already use — no new pkg parser), adding
+                 scene.package to detected on a successful entry read (even when the
+                 bytes then fail to parse as JSON) and answering
+                 incompatible/parse-error with limits_hit "pkg-no-scene-json" when
+                 the entry is missing/unreadable, or "pkg-scene-json-oversize" when
+                 it exceeds the 16 MiB cap. A JSON syntax failure is the one error
+                 inventory_scene_json reports itself (parse-error); every other
+                 malformed shape is counted, never rejected.
+In scope:        crates/kwe-scene-inspector/src/inventory.rs (new),
+                 crates/kwe-scene-inspector/src/main.rs (wiring),
+                 crates/kwe-scene-inspector/Cargo.toml (new kwe-core path
+                 dependency — internal, not an external crate), docs/SR0.md,
+                 docs/SUPERVISOR_API_V1.md.
+Out of scope:    Materials (deferred, see the conductor note above); any reference
+                 resolution (image/model/particle-file paths against pkg/scene-dir/
+                 assets-root); the daemon (crates/kwe-daemon) and CLI
+                 (crates/kwe-cli) — neither changed, and none of their existing
+                 tests changed either (the daemon's passthrough test already only
+                 checks the schema tag on a fake record); any SCENE_CAPABILITIES.md
+                 status change (inventory detection is not a support claim).
+Acceptance tests:        crates/kwe-scene-inspector/src/inventory.rs (9): golden
+                         (one visible image object with id, one visible:false text
+                         object, one particle object with a non-empty effects array,
+                         one unclassifiable object, one unknown root key — exact
+                         detected counts/ids; required has scene.layer.image,
+                         scene.particle, scene.effects but NOT scene.layer.text);
+                         same input twice is byte-identical (Inventory PartialEq);
+                         objects-not-an-array is an unknown type, not a parse
+                         failure; 4096+50 objects stops the walk at the cap with
+                         every detected list truncated; invalid JSON syntax is the
+                         one Err(Parse); a 10_000-deep nested array under a known key
+                         never reaches this module's own walk and — measured
+                         directly on this workspace's serde_json 1.0.151 — already
+                         fails to parse at all ("recursion limit exceeded", no stack
+                         growth), so the test asserts that actual outcome rather than
+                         the task's literal "parses via serde_json" expectation (see
+                         Open risks); an expired deadline stops the walk exactly like
+                         the objects cap; sound/light classify and are never
+                         double-counted as unknown keys; a non-object objects[]
+                         entry is skipped and counted, never a parse failure.
+                         crates/kwe-scene-inspector/src/main.rs (+5, 19 total in the
+                         crate): a JsonDir scene populates required/detected/unknown
+                         in the actual emitted record; malformed scene.json is
+                         incompatible/parse-error with content.hash still populated
+                         (hashing ran before the inventory parse did); build_record
+                         given identical inputs (including two independently-run
+                         Inventory walks) produces byte-identical records including
+                         the digest, isolated from bounds.wall_ms's real run-to-run
+                         variance; a pkg carrying scene.json with one image object
+                         detects both scene.package and scene.layer.image; a pkg
+                         with no scene.json entry is incompatible/parse-error with
+                         limits_hit ["pkg-no-scene-json"].
+                         Full existing suites stay green: cargo test --workspace,
+                         cargo clippy --workspace --all-targets -D warnings,
+                         cargo fmt --all --check, ./scripts/check.sh. The daemon's
+                         existing scene.inspect passthrough test is unchanged and
+                         still passes (its fake inspector emits its own
+                         schema-tagged record; it never runs the real binary).
+Failure/recovery tests:  Covered by the acceptance tests above: parse-error,
+                         objects-cap, timeout, and the two pkg-scene-json failure
+                         modes are all typed, bounded outcomes, never a hang or a
+                         panic.
+Upstream/provenance:     Original; the object-classification priority order mirrors
+                         `kwe_core::sceneobjects::classify_scene_object` (itself
+                         original, researched from the WE object model — see that
+                         module's own docs).
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D warnings --
+                         clean.
+                         cargo test --workspace -- 776 passed, 0 failed
+                         (kwe-scene-inspector 19, up from 5; kwe-daemon 158,
+                         unchanged).
+                         ./scripts/check.sh -- green end-to-end, including the
+                         C++/QML build, qml-typecheck, kwe diagnose, and
+                         kwe-vulkan --json.
+Open risks:              The task's literal entry-point signature
+                         (`fn inventory_scene_json(bytes, caps) -> Inventory`) cannot
+                         represent a JSON parse failure distinctly from a
+                         successfully-parsed empty scene, nor take a deadline —
+                         implemented as `Result<Inventory, InventoryError>` with an
+                         added `deadline: Instant` parameter instead; see the
+                         module's own "Deviation" doc section.
+                         The task's derivation method ("enumerate the serde field
+                         names of the existing scene structs") does not apply
+                         mechanically: no file in this workspace parses scene.json
+                         through `#[derive(Deserialize)]` structs — every field is
+                         read via raw `serde_json::Value::get("...")` navigation.
+                         ROOT_KEYS/OBJECT_KEYS instead enumerate the actual
+                         string-literal keys the existing code reads (documented in
+                         inventory.rs next to each table); SR-2's typed IR is still
+                         the eventual authority either way.
+                         `kwe_core::pkg::testutil::PkgWriter` (the pkg fixture
+                         builder the task asked to reuse) is `#[cfg(test)]
+                         pub(crate)` inside kwe-core, so it is not visible to this
+                         crate's own tests; a small local `build_pkg` mirroring its
+                         exact byte layout was written for fixture-building only —
+                         every fixture is still read exclusively through the real
+                         `kwe_core::PkgReader`.
+                         The task's hostile fixture (d) expected a 10_000-deep
+                         nested array to "parse via serde_json"; measured directly,
+                         it does not (serde_json's built-in recursion guard rejects
+                         it before this module ever sees it). The test asserts the
+                         actual, safer-than-expected behavior instead.
+                         `video` is not a classification discriminator in this
+                         slice (the task's §1 list omits it, unlike
+                         `kwe_core::sceneobjects`'s own classifier, which does
+                         detect video objects) — an object with only a `video` field
+                         currently falls to unknown.objects here. Left as specified;
+                         flagged in case this was an oversight rather than an
+                         intentional narrowing alongside materials.
+Commit(s):               <filled after commit; same commit as this file>
+```
 
 ## SR-0d — Private corpus metadata runner
 

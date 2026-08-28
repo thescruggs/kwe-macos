@@ -513,13 +513,15 @@ slot is complete, so the previously acknowledged still survives an interrupted
 commit. These static files remain usable across daemon restart and do not
 depend on the live mmap.
 
-## Scene inspection *(draft, SR-0b)*
+## Scene inspection *(draft, SR-0b/SR-0c)*
 
-*(`docs/SR0.md` SR-0b: a one-shot, daemon-supervised scene inventory
+*(`docs/SR0.md` SR-0b/SR-0c: a one-shot, daemon-supervised scene inventory
 inspector. The record schema below is draft `scene-feature-inventory-v0`
 (`docs/SCENE_CAPABILITIES.md`), pending the SR-1 freeze — names, the schema
-version, and the report's transport (currently stdout; SR-1 plans to move it
-to a dedicated report FD/envelope) may all still change.)*
+version, the report's transport (currently stdout; SR-1 plans to move it to
+a dedicated report FD/envelope), and the known-key tables `inventory.rs`
+uses to tell an unrecognized `scene.json` field from a recognized one (SR-2's
+typed IR becomes the eventual authority) may all still change.)*
 
 - `scene.inspect` `{"path": "/absolute/path/to/scene"}` → the inspector's
   JSON record verbatim. `path` must be a non-empty absolute path — a
@@ -561,10 +563,32 @@ to a dedicated report FD/envelope) may all still change.)*
   - `inspector-failed`: a nonzero exit, or stdout that fails to parse as
     JSON tagged `"schema":"scene-feature-inventory-v0"`; carries a bounded
     (512-byte, lossy-UTF8) `stderr_tail`.
-  - On success, the record's own `outcome` is `inventoried` (hashed
-    successfully — SR-0b never parses a scene, so `required`/`detected` stay
-    empty and `unknown` stays all zeros) or `incompatible` (unrecognized
-    input, or the input exceeded the inspector's own byte cap).
+  - `parse-error` (SR-0c): the content hashed successfully but its
+    `scene.json` (the file itself, or the package's `scene.json` entry) is
+    not valid JSON, or — packages only — no `scene.json` entry could be
+    located or read at all (`bounds.limits_hit` then also carries
+    `pkg-no-scene-json`), or the entry exceeds the 16 MiB descriptor cap
+    (`pkg-scene-json-oversize`).
+  - On success, the record's own `outcome` is `inventoried` (hashed and
+    inventoried successfully) or `incompatible` (unrecognized input, the
+    input exceeded the inspector's own byte cap, or `parse-error` above).
+    SR-0c (object-family only — see `docs/SR0.md`; materials are a
+    follow-up slice) fills an `inventoried` record's `required`/`detected`/
+    `unknown` from a bounded raw walk of `scene.json`'s `objects[]` array:
+    `detected` names each capability found (`scene.layer.image`,
+    `scene.layer.text`, `scene.particle`, `scene.layer.sound`,
+    `scene.lighting`, `scene.effects`, plus `scene.package` for a package
+    whose `scene.json` entry read successfully) with a count and a bounded,
+    sorted sample of logical object ids; `required` is the subset of those
+    capabilities carried by at least one *active* object (no `visible`
+    field, `visible: true`, or a property-bound `visible` value — WE's
+    user-property convention, resolved later by SR-11); `unknown` counts
+    every root/object key and shape this pass does not recognize, never
+    silently dropping one, with its own bounded sample list. Every list has
+    a `truncated` flag and the walk itself is bounded (4096 objects, a
+    wall-clock deadline checked periodically), both surfaced through
+    `bounds.limits_hit` (`objects-cap`, `timeout`) exactly like the other
+    caps above.
 - No renderer worker state is touched by `scene.inspect`; it shares nothing
   with the active/candidate worker the rest of this document describes.
 

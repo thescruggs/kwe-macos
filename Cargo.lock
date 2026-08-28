@@ -421,6 +421,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "hex",
+ "kwe-core",
  "libc",
  "serde_json",
  "sha2",
