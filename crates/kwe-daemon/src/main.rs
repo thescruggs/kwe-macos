@@ -718,12 +718,17 @@ fn dispatch_scene_inspect(
             } else {
                 let inspect = inspect.clone();
                 let id = request.id;
+                // Created before the spawn and moved into the closure:
+                // if thread creation itself panics (pthread_create EAGAIN
+                // under NPROC/TasksMax pressure), the unwound closure drops
+                // the guard and the gate still clears.
+                let guard = InspectInFlightGuard;
                 std::thread::spawn(move || {
                     // Cleared on every exit path, panic included — including
                     // an explicit early drop right after the inspection
                     // finishes, below, so the gate is provably clear before
                     // the caller can observe the response.
-                    let guard = InspectInFlightGuard;
+                    let guard = guard;
                     let result = inspect::run_inspection(&inspect, Path::new(&path));
                     drop(guard);
                     let ok = result.get("error").is_none();
