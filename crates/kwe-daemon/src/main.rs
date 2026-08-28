@@ -450,6 +450,10 @@ fn main() -> Result<()> {
             probe_timeout: Duration::from_millis(arguments.apply_probe_timeout_ms),
             promotion_timeout: Duration::from_millis(arguments.apply_promotion_timeout_ms),
             scene_assets_dir: scene_assets_dir.clone(),
+            // SR-1c: the identical `scene.inspect` containment config used
+            // below for direct `scene.inspect` calls — the apply gate's
+            // inspection is the same inspection, not a second copy of it.
+            inspect_config: inspect_config.clone(),
         },
         catalog.clone(),
         supervisor.clone(),
@@ -1267,6 +1271,7 @@ impl TryFrom<RendererStartParams> for StartSpec {
             test_fault,
             stderr_lines: params.stderr_lines,
             scaling: params.scaling,
+            capability_limitations: Vec::new(),
         };
         // Field mapping only — NOT validated here (S1 review #5): the
         // caller (the "renderer.start"/"renderer.retry" RPC arm) calls
@@ -1380,10 +1385,22 @@ fn apply_call(
     };
     match call(apply) {
         Ok(value) => value,
-        Err(error) => match error.detail() {
-            Some(detail) => json!({"error": error.code(), "detail": detail}),
-            None => json!({"error": error.code()}),
-        },
+        Err(error) => {
+            let mut response = match error.detail() {
+                Some(detail) => json!({"error": error.code(), "detail": detail}),
+                None => json!({"error": error.code()}),
+            };
+            // SR-1c: `CapabilityGate`'s structured `missing`/
+            // `inspection_reason` fields ride along as top-level siblings
+            // of `error`/`detail` (`extra_fields` is `None` for every other
+            // variant, so this is a no-op for them).
+            if let (Some(object), Some(Value::Object(extra))) =
+                (response.as_object_mut(), error.extra_fields())
+            {
+                object.extend(extra);
+            }
+            response
+        }
     }
 }
 
@@ -2846,6 +2863,470 @@ with open(args.output, "wb") as frame:
         }
     }
 
+    // -------------------------------------------------------------------
+    // SR-1c: the scene apply gate (staged preflight inspection before any
+    // renderer/wallpaper touch, apply.rs's `apply()`).
+    // -------------------------------------------------------------------
+
+    /// Python source for a `write_frame(kind, payload)` helper writing to
+    /// fd 3, mirroring `inspect.rs`'s private test-module copy exactly
+    /// (docs/REPORT_PROTOCOL_V1.md's wire format: 12-byte header — magic
+    /// `KWR1`, kind, flags=0, reserved=0 as a u16 LE, payload_len as a u32
+    /// LE). Duplicated here because that module's copy is private to its
+    /// own test module.
+    const SR1C_WRITE_FRAME_HELPER: &str = r#"
+import os
+import struct
+
+def write_frame(kind, payload):
+    header = b"KWR1" + bytes([kind, 0]) + struct.pack("<H", 0) + struct.pack("<I", len(payload))
+    os.write(3, header + payload)
+"#;
+
+    fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn sr1c_inspect_config(
+        root: &Path,
+        inspector_path: Option<PathBuf>,
+        wall_timeout: Duration,
+    ) -> InspectConfig {
+        InspectConfig {
+            inspector_path,
+            runtime_dir: root.join("inspect-runtime"),
+            wall_timeout,
+            resource_limits: sample_limits(1024),
+        }
+    }
+
+    /// A fake `kwe-scene-inspector` reporting `outcome: "inventoried"` with
+    /// the given `required` capability ids (a well-formed `scene-inspection-v1`
+    /// record, digest-verified, mirroring `inspect.rs`'s own fake-inspector
+    /// fixture).
+    fn fake_inspector_inventoried(root: &Path, name: &str, required: &[&str]) -> PathBuf {
+        let required_json = serde_json::to_string(required).unwrap();
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+{SR1C_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+
+record = {{
+    "schema": "scene-inspection-v1",
+    "capabilities_schema": "scene-capabilities-v1",
+    "content": {{"hash": "sha256:deadbeef", "source_bytes": 1, "kind": "json-dir"}},
+    "inspector": {{"build": "dev", "abi": 0}},
+    "outcome": "inventoried",
+    "reason": "ok",
+    "required": {required_json},
+    "detected": [],
+    "unknown": {{"keys": 0, "types": 0, "objects": 0, "samples": [], "truncated": False}},
+    "bounds": {{"wall_ms": 1, "peak_bytes": 0, "limits_hit": []}},
+    "backend": None,
+    "digest": "",
+}}
+serialized = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+record["digest"] = hashlib.sha256(serialized).hexdigest()
+payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+write_frame(1, payload)
+"#
+        );
+        write_script(root, name, &script)
+    }
+
+    /// A fake `kwe-scene-inspector` reporting `outcome: "incompatible"`
+    /// (the content itself is refused, e.g. parse-error/oversize/
+    /// unrecognized-input) with the given `reason`.
+    fn fake_inspector_incompatible(root: &Path, name: &str, reason: &str) -> PathBuf {
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+{SR1C_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+
+record = {{
+    "schema": "scene-inspection-v1",
+    "capabilities_schema": "scene-capabilities-v1",
+    "content": {{"hash": "sha256:deadbeef", "source_bytes": 1, "kind": "json-dir"}},
+    "inspector": {{"build": "dev", "abi": 0}},
+    "outcome": "incompatible",
+    "reason": {reason:?},
+    "required": [],
+    "detected": [],
+    "unknown": {{"keys": 0, "types": 0, "objects": 0, "samples": [], "truncated": False}},
+    "bounds": {{"wall_ms": 1, "peak_bytes": 0, "limits_hit": []}},
+    "backend": None,
+    "digest": "",
+}}
+serialized = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+record["digest"] = hashlib.sha256(serialized).hexdigest()
+payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+write_frame(1, payload)
+"#
+        );
+        write_script(root, name, &script)
+    }
+
+    /// A fake inspector that hangs forever (times out under a short wall
+    /// clock, mirroring `inspect.rs`'s own hang fixture).
+    fn fake_inspector_hang(root: &Path, name: &str) -> PathBuf {
+        write_script(
+            root,
+            name,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(600)\n",
+        )
+    }
+
+    /// A fake inspector that would prove it ran, if invoked, by writing a
+    /// marker file — then exits nonzero. Used to assert a video-kind apply
+    /// never runs an inspection at all (decision: non-scene kinds are
+    /// untouched).
+    fn fake_inspector_marker(root: &Path, name: &str, marker: &Path) -> PathBuf {
+        let script = format!(
+            "#!/usr/bin/env python3\nimport pathlib\npathlib.Path({marker:?}).write_text('ran')\nraise SystemExit(99)\n",
+        );
+        write_script(root, name, &script)
+    }
+
+    /// Seeds `store` with an assignment for `output_name` so a test can
+    /// assert a refused apply leaves it untouched.
+    fn seed_assignment(store: &mut apply::AssignmentStore, output_name: &str, wallpaper_id: &str) {
+        store
+            .set(
+                output_name,
+                apply::Assignment {
+                    wallpaper_id: wallpaper_id.to_string(),
+                    kind: RendererKind::Scene,
+                    content: "/tmp/prior-scene.json".into(),
+                    width: 320,
+                    height: 180,
+                    fps: 30,
+                    scaling: ScalingMode::Aspect,
+                    applied_at_unix_seconds: 1,
+                    previous: None,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn scene_apply_gate_refuses_a_missing_required_capability() {
+        let root = temp_dir("gate-blocking");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector.py",
+            &["scene.layer.image", "scene.future-thing"],
+        );
+        let store_dir = temp_dir("gate-blocking-store");
+        let mut store = apply::AssignmentStore::open(&store_dir).unwrap();
+        seed_assignment(&mut store, "DP-1", "prior");
+        let handle = apply_handle_with_store(probe.clone(), &catalog, supervisor.clone(), store)
+            .with_inspect_config(sr1c_inspect_config(
+                &root,
+                Some(inspector),
+                Duration::from_secs(5),
+            ));
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok, "gate must refuse: {result}");
+        assert_eq!(result["error"], "apply_incompatible");
+        assert_eq!(result["missing"], json!(["scene.future-thing"]));
+        // Output enumeration (screenForConnector/desktops(), which also
+        // reads a generic `wallpaperPlugin` JS property) always runs at
+        // step 3, before the gate; what must NEVER run before the gate
+        // decides is the Plasma wallpaper SWITCH script (step 6) — the one
+        // that assigns OUR plugin identity to a desktop.
+        assert!(
+            !probe
+                .scripts()
+                .iter()
+                .any(|script| script.contains("org.kde.kwe.wallpaper")),
+            "no switch script may run before the gate decides: {:?}",
+            probe.scripts()
+        );
+        let status = supervisor.status().unwrap();
+        assert_eq!(
+            status.phase,
+            WorkerPhase::Idle,
+            "no renderer may be spawned when the gate refuses"
+        );
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(result["outputs"]["DP-1"]["wallpaper_id"], "prior");
+    }
+
+    #[test]
+    fn scene_apply_gate_proceeds_with_a_tolerated_limitation() {
+        let root = temp_dir("gate-tolerated");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector.py",
+            &["scene.layer.image", "scene.layer.sound"],
+        );
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply must proceed: {result}");
+        assert_eq!(result["limitations"], json!(["scene.layer.sound"]));
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+        assert_eq!(
+            status.capability_limitations,
+            vec!["scene.layer.sound".to_string()]
+        );
+    }
+
+    #[test]
+    fn scene_apply_gate_refuses_content_the_inspector_itself_rejects() {
+        let root = temp_dir("gate-incompatible");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_incompatible(&root, "fake-inspector.py", "parse-error");
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok, "gate must refuse: {result}");
+        assert_eq!(result["error"], "apply_incompatible");
+        assert_eq!(result["missing"], json!([]));
+        assert_eq!(result["inspection_reason"], "parse-error");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Idle);
+    }
+
+    #[test]
+    fn scene_apply_gate_proceeds_when_the_inspector_hangs() {
+        let root = temp_dir("gate-hang");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_hang(&root, "fake-inspector.py");
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_millis(300)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let started = Instant::now();
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        // Decision (b): the gate never blocks on an infrastructure failure.
+        // The wall clock stays bounded (inspection timeout + the normal
+        // apply, no double-wait) — well under the promotion timeout used
+        // elsewhere in this module (1500 ms) plus the 300 ms inspection cap.
+        assert!(started.elapsed() < Duration::from_secs(5), "no double-wait");
+        assert!(ok, "apply must proceed: {result}");
+        assert_eq!(result["inspection"], "unavailable");
+        assert_eq!(result["inspection_reason"], "timeout");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+    }
+
+    #[test]
+    fn scene_apply_gate_proceeds_with_an_unconfigured_inspector() {
+        let root = temp_dir("gate-unconfigured");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone())
+            .with_inspect_config(sr1c_inspect_config(&root, None, Duration::from_secs(5)));
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply must proceed: {result}");
+        assert_eq!(result["inspection"], "unavailable");
+        assert_eq!(result["inspection_reason"], "inspector-unavailable");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+    }
+
+    /// A video-kind apply runs the video (not scene) renderer kind, whose
+    /// supervisor config here has no renderer path at all — proving apply
+    /// succeeding is unrelated to this test's point, which is narrower:
+    /// the fake inspector configured on the handle must never be invoked
+    /// for a non-scene kind (SR-1c decision: non-scene kinds are
+    /// untouched, zero inspection run). Asserted via a marker file the
+    /// fake would have written if the gate had (wrongly) run it.
+    /// Fake steam root with one subscribed VIDEO project (workshop id
+    /// `id`), a real (garbage-content but correctly-extensioned) `.mp4`
+    /// entry so `StartSpec::validate`'s video preflight passes.
+    fn video_catalog_with_content(root: &Path, id: &str) -> Arc<RwLock<Catalog>> {
+        let content_dir = root.join(format!("steamapps/workshop/content/431960/{id}"));
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("clip.mp4"), b"not a real video").unwrap();
+        std::fs::write(
+            content_dir.join("project.json"),
+            format!(
+                r#"{{"title":"Synthetic video {id}","type":"video","file":"clip.mp4","tags":[]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            "\"LibraryFolders\" { }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/appworkshop_431960.acf"),
+            format!("\"AppWorkshop\" {{ \"WorkshopItems\" {{ \"{id}\" \"1\" }} }}\n"),
+        )
+        .unwrap();
+        Arc::new(RwLock::new(scan_installed(
+            &[root.to_path_buf()],
+            &ScanLimits::default(),
+        )))
+    }
+
+    #[test]
+    fn scene_apply_gate_runs_no_inspection_for_a_video_kind_apply() {
+        let root = temp_dir("gate-video-skip");
+        let catalog = video_catalog_with_content(&root, "1");
+        let script = root.join("fake-video-renderer.py");
+        fs::write(&script, FAKE_SCENE_RENDERER).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = fast_scene_supervisor_config(&root);
+        config
+            .renderer_paths
+            .insert(RendererKind::Video, script.clone());
+        let supervisor_service = SupervisorService::start(config).unwrap();
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let marker = root.join("inspector-ran.marker");
+        let inspector = fake_inspector_marker(&root, "fake-inspector.py", &marker);
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"video"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "video apply must be unaffected by the gate: {result}");
+        assert!(
+            !marker.exists(),
+            "the scene inspector must never run for a video-kind apply"
+        );
+    }
+
+    #[test]
+    fn scene_apply_gate_retry_re_runs_the_gate_no_negative_caching() {
+        let root = temp_dir("gate-retry");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let blocking_inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector-blocking.py",
+            &["scene.layer.image", "scene.future-thing"],
+        );
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(blocking_inspector), Duration::from_secs(5)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(!ok, "first apply must be refused: {result}");
+        assert_eq!(result["error"], "apply_incompatible");
+
+        // Swap in a NEW, now-compatible fake and retry: no cache means the
+        // gate re-runs against the new inspector and this time proceeds —
+        // proving the first refusal was not negatively cached.
+        let compatible_inspector = fake_inspector_inventoried(
+            &root,
+            "fake-inspector-compatible.py",
+            &["scene.layer.image"],
+        );
+        let handle = handle.with_inspect_config(sr1c_inspect_config(
+            &root,
+            Some(compatible_inspector),
+            Duration::from_secs(5),
+        ));
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}","retry":true}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "retry after a fixed inspector must apply: {result}");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+    }
+
     #[test]
     fn apply_quarantined_names_the_reason_and_retry_clears_it() {
         // B4: a quarantined identity answers `apply_quarantined` with the
@@ -3545,6 +4026,7 @@ with open(args.output, "wb") as frame:
                 test_fault: None,
                 stderr_lines: None,
                 scaling: ScalingMode::Aspect,
+                capability_limitations: Vec::new(),
             })
             .unwrap();
         assert_eq!(foreign.requested_wallpaper_id.as_deref(), Some("other"));

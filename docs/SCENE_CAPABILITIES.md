@@ -7,6 +7,15 @@ start `planned`), renames/removals require a v2 with an alias table. No ID
 in this file is a support claim; rows advance only through the six-step
 parity ladder (`docs/FEATURE_COMPATIBILITY.md` §"Parity ladder").
 
+**SR-1c:** `kwe-core`'s `SCENE_CAPABILITIES_IMPLEMENTED` (every row this file
+marks `experimental`) and `SCENE_CAPABILITIES_LIMITATION_TOLERATED`
+(`crates/kwe-core/src/capabilities.rs`) are a mechanical projection of this
+file's status column — the daemon's scene apply gate
+(`wallpaper.apply`, `docs/SUPERVISOR_API_V1.md`) classifies a scene's
+`required` capabilities against them. Every status change here must update
+those consts in lockstep (SR-16's evidence DB is planned to replace both
+with a real database).
+
 Corpus-informed freeze decisions (SR-0d baseline, 60 local scenes):
 
 - root-level `camera` (unread in all 60 items — the S7 orthogonalprojection

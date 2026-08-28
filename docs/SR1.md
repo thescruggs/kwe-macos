@@ -286,21 +286,210 @@ Open risks:              report-late and the renderer-worker's report-unavailabl
                          -- a small duplication, deliberately not addressed here
                          to keep this slice's diff to the one call site the task
                          specified.
-Commit(s):               <filled after commit; same commit as this file>
+Commit(s):               9b75367
 ```
 
-## SR-1c — daemon validation, policy, and the apply gate
+## SR-1c — daemon validation policy + the scene apply gate
 
-- Wires `report-late` (an apply-window deadline for a renderer worker's own
-  report) and the renderer-worker sense of `report-unavailable`
-  (`docs/REPORT_PROTOCOL_V1.md`) into real daemon behavior — SR-1b already
-  implemented `report-malformed`/`report-missing`/`report-duplicate` for the
-  one-shot `scene.inspect` path.
-- Extends the report-FD wiring pattern SR-1b established
-  (`crates/kwe-daemon/src/inspect.rs`) to the long-lived renderer worker
-  (`supervisor::spawn_worker`, `renderer.start`), which SR-1b left untouched.
-- Decides how (and whether) an inspection/render result gates
-  `wallpaper.apply` — the "typed failure/recovery action" plan §5.3 calls for.
+**Scope note:** the conductor narrowed this slice to the apply-gate half of
+the preview below — deciding how an inspection result gates
+`wallpaper.apply` (plan §5.2/§5.3's "Apply refuses required missing
+features before replacing the live wallpaper"). The renderer-worker's own
+report-FD stream (`report-late`, the renderer-worker sense of
+`report-unavailable`, extending SR-1b's pipe2/pre_exec pattern to
+`supervisor::spawn_worker`) is explicitly OUT of scope here and remains
+open (see Open risks) — it was previewed as part of "SR-1c" before this
+slice's conductor decisions were made; a later slice picks it up.
+
+Conductor policy decisions (verbatim):
+
+- **(a)** Two capability sets gate Apply, single-sourced in kwe-core.
+  Missing-and-blocking → refuse before any renderer starts;
+  missing-but-tolerated → apply proceeds and the status carries the
+  limitation list. With today's sets, every one of the 60 local corpus
+  scenes keeps applying — this slice is behavior-neutral on the current
+  corpus and only refuses genuinely unrepresentable content.
+- **(b)** Inspection outcome `unknown` (timeout, report-*,
+  inspector-unavailable) NEVER blocks Apply in SR-1c — proceed exactly as
+  today, attaching the detail. Blocking on infrastructure failure would
+  regress applies when the inspector is missing; plan §5.2's Unknown state
+  maps to "proceed with note" at this stage.
+- **(c)** No inspection caching in SR-1c (each scene apply pays the
+  inspection, corpus median 406 ms / max 8.5 s, within the 60 s apply
+  window). Cache + invalidation is a recorded open risk for a later SR-1/
+  SR-2 slice.
+
+```text
+Task:            Daemon validation policy + the scene apply gate (staged
+                 preflight): decide how (and whether) an SR-1b scene
+                 inspection gates wallpaper.apply, and implement it as a
+                 fail-closed refusal before any renderer/canary starts or
+                 the current wallpaper is touched.
+Milestone/Slice: SR-1c
+Goal:            Turn SR-0's frozen capability taxonomy and SR-1b's working
+                 inspection pipe into an actual apply-time decision, without
+                 regressing any of the 60 local corpus scenes and without
+                 blocking applies on inspector infrastructure failures.
+Outcome:         crates/kwe-core/src/capabilities.rs (new module, declared/
+                 re-exported in lib.rs next to the other scene-concept
+                 modules): SCENE_CAPABILITIES_IMPLEMENTED (the 21 taxonomy
+                 rows docs/SCENE_CAPABILITIES.md marks experimental,
+                 cross-checked against the doc -- exact match, no
+                 discrepancy) and SCENE_CAPABILITIES_LIMITATION_TOLERATED
+                 (["scene.layer.sound", "scene.lighting"]), both sorted and
+                 disjoint (unit-tested), plus a corpus-neutrality test
+                 hardcoding the SR-0d 2026-08-28 corpus's required-capability
+                 histogram ids.
+                 crates/kwe-daemon/src/apply.rs: ApplyConfig/ApplyHandle/
+                 ApplyService::new gain an inspect_config: InspectConfig
+                 field, threaded exactly like scene_assets_dir already is
+                 (main.rs builds one InspectConfig and clones it into both
+                 the direct scene.inspect path and this new field -- the
+                 apply gate's inspection is the SAME inspection, not a
+                 second copy of the containment config). ApplyHandle::apply
+                 gains a new stage, RendererKind::Scene only, inserted after
+                 old_assignment is captured (the last point before any
+                 renderer/wallpaper touch) and before complete_apply (where
+                 renderer.start actually happens) -- no reordering of any
+                 existing step was needed, so the task's STOP condition did
+                 not trigger. The stage runs inspect::run_inspection and
+                 branches on outcome: inventoried computes
+                 missing = required - IMPLEMENTED, blocking = missing -
+                 TOLERATED, limitations = missing (intersect) TOLERATED;
+                 blocking non-empty returns a new ApplyError::CapabilityGate
+                 immediately (nothing touched yet); otherwise limitations
+                 (possibly empty) is threaded into a new StartSpec/
+                 WorkerStatus field, capability_limitations: Vec<String>
+                 (added the same way scaling/fps already ride from StartSpec
+                 through ActiveWorker.spec into the status() builder), and
+                 merged into the success JSON as "limitations". incompatible
+                 also returns CapabilityGate, with missing: [] and
+                 inspection_reason: Some(reason). unknown (any reason)
+                 proceeds exactly as before the gate existed, merging
+                 {"inspection": "unavailable", "inspection_reason": reason}
+                 into the success result. ApplyError::CapabilityGate's
+                 .code() deliberately returns the SAME wire string
+                 "apply_incompatible" the pre-existing Incompatible(String)
+                 variant already used for catalog-kind mismatches -- two
+                 different Rust variants/detail shapes, one wire category
+                 from an API consumer's point of view (documented in both
+                 the variant's doc comment and SUPERVISOR_API_V1.md). A new
+                 ApplyError::extra_fields() -> Option<Value> method (None
+                 for every other variant) carries the structured missing/
+                 inspection_reason payload; main.rs's apply_call() merges it
+                 as top-level siblings of "error"/"detail" -- mirroring
+                 apply_quarantined's flat response shape/mechanism rather
+                 than nesting an object inside "detail". Non-scene kinds
+                 (video, web) take zero code path through the new stage.
+In scope:        crates/kwe-core/src/capabilities.rs (new), crates/kwe-core/
+                 src/lib.rs (module + re-export), crates/kwe-daemon/src/
+                 apply.rs (ApplyError::CapabilityGate + extra_fields, the
+                 gate stage in apply(), InspectConfig plumbing,
+                 with_inspect_config test hook), crates/kwe-daemon/src/
+                 main.rs (apply_call() extra-fields merge, InspectConfig
+                 cloned into ApplyConfig, the StartSpec/RendererStartParams
+                 TryFrom site, 7 new gate tests), crates/kwe-daemon/src/
+                 supervisor.rs (StartSpec.capability_limitations,
+                 WorkerStatus.capability_limitations, the status() builder
+                 line -- and every existing StartSpec test-fixture literal,
+                 mechanically updated), crates/kwe-daemon/src/
+                 playlist_session.rs (one fabricated_status test fixture),
+                 docs/SUPERVISOR_API_V1.md, docs/SR1.md, docs/
+                 SCENE_CAPABILITIES.md.
+Out of scope:    The renderer-worker's own report-FD stream (report-late,
+                 renderer-worker report-unavailable, supervisor::
+                 spawn_worker/renderer.start) -- previewed under "SR-1c"
+                 before this slice's conductor decisions narrowed it; still
+                 open, a later slice's territory. Persisting
+                 capability_limitations into the assignment (assignments-v1.
+                 json) so it survives a daemon restart -- transient/status-
+                 only in this slice (open risk below). Gating the PLAYLIST
+                 apply lane's own transaction (apply.rs's
+                 PlaylistApplyLane::apply_playlist impl, a separate method
+                 from ApplyHandle::apply) -- the task named "wallpaper.apply"
+                 specifically; a playlist-driven advance onto a scene wallpaper
+                 does not go through this gate in this slice (open risk
+                 below). Inspection caching (decision (c), explicit open
+                 risk). scene.inspect's own RPC behavior -- unchanged; the
+                 gate calls the same run_inspection function scene.inspect
+                 already used, it does not touch that RPC path.
+Acceptance tests:        crates/kwe-core: 2 new unit tests in capabilities.rs
+                         (implemented_and_tolerated_are_sorted_and_disjoint;
+                         every_capability_the_local_corpus_actually_
+                         required_is_covered, hardcoding the SR-0d
+                         2026-08-28 corpus's required histogram ids) -- 160
+                         total, up from 158.
+                         crates/kwe-daemon: 7 new tests in main.rs's test
+                         module (scene_apply_gate_refuses_a_missing_required_
+                         capability; scene_apply_gate_proceeds_with_a_
+                         tolerated_limitation;
+                         scene_apply_gate_refuses_content_the_inspector_
+                         itself_rejects; scene_apply_gate_proceeds_when_the_
+                         inspector_hangs; scene_apply_gate_proceeds_with_an_
+                         unconfigured_inspector;
+                         scene_apply_gate_runs_no_inspection_for_a_video_
+                         kind_apply (asserted via a marker file the fake
+                         inspector would have written if wrongly invoked);
+                         scene_apply_gate_retry_re_runs_the_gate_no_negative_
+                         caching) -- 172 total, up from 165. Fake inspectors
+                         reuse the report-FD wire-format helper SR-1b's
+                         inspect.rs test module established (duplicated, not
+                         imported -- that module's copy is private to its own
+                         test module).
+                         818 workspace tests total, up from 809 (158+2 =
+                         160 kwe-core, 165+7 = 172 kwe-daemon, the rest
+                         unchanged).
+                         cargo fmt/clippy/test --workspace green.
+                         ./scripts/check.sh green end to end, including the
+                         C++/QML build and qml-typecheck.
+                         scripts/smoke-scene-corpus.sh (the synthetic 4-item
+                         smoke) still green, unaffected -- this slice touches
+                         nothing on that path.
+Failure/recovery tests:  Covered by Acceptance tests above -- missing-
+                         blocking, inspector-refused-content, inspector-hang-
+                         under-a-short-wall-timeout, unconfigured-inspector,
+                         and the negative-caching check (a fixed inspector on
+                         retry actually applies) are all typed, bounded
+                         outcomes, never a hang or a silent pass-through.
+Upstream/provenance:     Original; the gate reuses SR-1b's run_inspection/
+                         InspectConfig verbatim (no new containment code) and
+                         mirrors apply_quarantined's existing wire-response
+                         construction for the new CapabilityGate variant.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D warnings
+                         -- clean.
+                         cargo test --workspace -- 818 passed, 0 failed.
+                         ./scripts/smoke-scene-corpus.sh -- passed standalone.
+                         ./scripts/check.sh -- green end-to-end, including the
+                         C++/QML build and qml-typecheck.
+Open risks:              capability_limitations is transient (StartSpec/
+                         WorkerStatus only): a daemon restart loses it even
+                         though the underlying scene is unchanged --
+                         SR-1e/SR-11 territory (persist alongside the
+                         assignment).
+                         No inspection cache (decision (c)): every scene
+                         apply pays the inspection cost again, including a
+                         plain retry -- acceptable at today's corpus timing
+                         (median 406 ms / max 8.5 s inside a 60 s apply
+                         window) but a cache + invalidation design is
+                         deferred to a later SR-1/SR-2 slice.
+                         The playlist apply lane (PlaylistApplyLane::
+                         apply_playlist) does not run the gate -- a
+                         playlist-driven advance onto a scene wallpaper that
+                         requires an unimplemented capability is not refused
+                         the way a direct wallpaper.apply call is. Narrow
+                         and deliberate (the task scoped this slice to
+                         "wallpaper.apply" specifically), but worth closing
+                         in a follow-up so the gate is not bypassable via the
+                         playlist.
+                         The renderer-worker's own report-FD stream
+                         (report-late/report-unavailable, extending SR-1b's
+                         pattern to spawn_worker) remains unimplemented --
+                         previewed under "SR-1c" before this slice's
+                         narrower conductor decisions; still a later slice's
+                         territory.
+Commit(s):               (fill in after commit)
+```
 
 ## SR-1d — old/new version-skew matrix
 

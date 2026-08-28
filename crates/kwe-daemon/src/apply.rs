@@ -59,8 +59,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use kwe_core::{Catalog, CatalogItem, ProjectKind};
+use kwe_core::{
+    Catalog, CatalogItem, ProjectKind, SCENE_CAPABILITIES_IMPLEMENTED,
+    SCENE_CAPABILITIES_LIMITATION_TOLERATED,
+};
 
+use crate::inspect::{self, InspectConfig};
 use crate::persist::{atomic_write, ensure_private_dir, quarantine_invalid_state, unix_seconds};
 use crate::playlist_session::{PlaylistApplyLane, foreign_renderer_live};
 use crate::supervisor::{
@@ -1250,6 +1254,12 @@ pub struct ApplyConfig {
     /// (`StartSpec::into_validated`) so a scene's model layers can resolve
     /// their material textures before the apply transaction runs.
     pub scene_assets_dir: Option<PathBuf>,
+    /// SR-1c: the same `scene.inspect` containment config `main.rs` builds
+    /// alongside the supervisor's own config — reused verbatim (not
+    /// rebuilt) so the apply gate's inspection is identical to a direct
+    /// `scene.inspect` call (same inspector binary, timeout, resource
+    /// limits).
+    pub inspect_config: InspectConfig,
 }
 
 /// The `wallpaper.*` API errors. Codes are the wire contract
@@ -1287,6 +1297,22 @@ pub enum ApplyError {
     Quarantined(String),
     /// The restore script could not be executed.
     RestoreFailed(String),
+    /// SR-1c: the scene apply gate refused before anything was touched —
+    /// either the inventoried scene `required`s a capability id that is
+    /// neither implemented nor tolerated-missing (`missing` non-empty,
+    /// `inspection_reason: None`), or the inspector itself refused the
+    /// content (`incompatible` outcome: `missing` empty,
+    /// `inspection_reason: Some(reason)`). Deliberately reuses the
+    /// `apply_incompatible` wire code that `ApplyError::Incompatible`
+    /// already uses for catalog-kind mismatches — both are the same
+    /// "this content is incompatible" category from an API consumer's
+    /// point of view, just reached by different Rust variants/detail
+    /// shapes (see `docs/SUPERVISOR_API_V1.md`).
+    CapabilityGate {
+        detail: String,
+        missing: Vec<String>,
+        inspection_reason: Option<String>,
+    },
 }
 
 /// Enumeration failures are `shell_unreachable` as they always were, with
@@ -1313,6 +1339,9 @@ impl ApplyError {
             ApplyError::Transaction(_) => "apply_failed",
             ApplyError::Quarantined(_) => "apply_quarantined",
             ApplyError::RestoreFailed(_) => "restore_failed",
+            // Deliberately the same wire code as `Incompatible` above (see
+            // the variant doc comment).
+            ApplyError::CapabilityGate { .. } => "apply_incompatible",
         }
     }
 
@@ -1328,7 +1357,33 @@ impl ApplyError {
             | ApplyError::Transaction(detail)
             | ApplyError::Quarantined(detail)
             | ApplyError::RestoreFailed(detail) => Some(detail),
+            ApplyError::CapabilityGate { detail, .. } => Some(detail),
             ApplyError::Busy => None,
+        }
+    }
+
+    /// SR-1c: structured fields merged as top-level siblings of
+    /// `"error"`/`"detail"` in the RPC response (`apply_call` in main.rs) —
+    /// `None` for every variant except `CapabilityGate`, so no other error
+    /// shape changes. Mirrors `apply_quarantined`'s flat
+    /// `{"error", "detail", ...}` response shape/mechanism; the literal
+    /// `{"missing": [...]}` requirement is satisfied via additional flat
+    /// sibling fields rather than nesting an object inside `"detail"`.
+    pub fn extra_fields(&self) -> Option<Value> {
+        match self {
+            ApplyError::CapabilityGate {
+                missing,
+                inspection_reason,
+                ..
+            } => {
+                let mut fields = serde_json::Map::new();
+                fields.insert("missing".into(), json!(missing));
+                if let Some(reason) = inspection_reason {
+                    fields.insert("inspection_reason".into(), json!(reason));
+                }
+                Some(Value::Object(fields))
+            }
+            _ => None,
         }
     }
 }
@@ -1449,6 +1504,7 @@ pub struct ApplyHandle {
     apply_lock: Arc<Mutex<()>>,
     promotion_timeout: Duration,
     scene_assets_dir: Option<PathBuf>,
+    inspect_config: InspectConfig,
 }
 
 /// Output enumeration cache: fresh for `OUTPUT_CACHE_TTL` after a probe,
@@ -1501,6 +1557,7 @@ impl ApplyService {
                 apply_lock: Arc::new(Mutex::new(())),
                 promotion_timeout: config.promotion_timeout,
                 scene_assets_dir: config.scene_assets_dir,
+                inspect_config: config.inspect_config,
             },
         })
     }
@@ -1544,7 +1601,30 @@ impl ApplyHandle {
             apply_lock: Arc::new(Mutex::new(())),
             promotion_timeout,
             scene_assets_dir: None,
+            // No inspector configured: SR-1c tests that need the gate to
+            // actually run a fake inspector use `with_inspect_config`.
+            inspect_config: InspectConfig {
+                inspector_path: None,
+                runtime_dir: std::env::temp_dir(),
+                wall_timeout: Duration::from_secs(5),
+                resource_limits: crate::supervisor::RendererResourceLimits {
+                    address_space_mib: 4096,
+                    file_size_mib: 160,
+                    open_files: 256,
+                    processes: 1024,
+                    core_dump_bytes: 0,
+                },
+            },
         }
+    }
+
+    /// SR-1c test hook: swap in a configured inspector (a fake python
+    /// script) after `for_test`, without widening `for_test`'s own
+    /// parameter list for the common (non-scene, non-gate) test case.
+    #[cfg(test)]
+    pub(crate) fn with_inspect_config(mut self, inspect_config: InspectConfig) -> Self {
+        self.inspect_config = inspect_config;
+        self
     }
 
     /// The transaction lock: one apply at a time. Returns the guard so a
@@ -1664,6 +1744,89 @@ impl ApplyHandle {
         // post-start, so this is the rollback target).
         let old_assignment = self.stored_assignment(&output.name)?;
 
+        // SR-1c: the scene apply gate — staged preflight inspection, scene
+        // kind only, run here because this is the last point before ANY
+        // renderer/wallpaper touch (old_assignment above is the rollback
+        // target; complete_apply below is where renderer.start actually
+        // happens). No cache (conductor decision (c)): a `retry: true`
+        // apply re-runs this exactly like a fresh one.
+        let mut gate_notes = serde_json::Map::new();
+        if spec.kind == RendererKind::Scene {
+            let inspection = inspect::run_inspection(&self.inspect_config, &content);
+            match inspection.get("outcome").and_then(Value::as_str) {
+                Some("inventoried") => {
+                    let required: BTreeSet<String> = inspection
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect();
+                    let implemented: BTreeSet<&str> =
+                        SCENE_CAPABILITIES_IMPLEMENTED.iter().copied().collect();
+                    let tolerated: BTreeSet<&str> = SCENE_CAPABILITIES_LIMITATION_TOLERATED
+                        .iter()
+                        .copied()
+                        .collect();
+                    let missing: BTreeSet<&str> = required
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|id| !implemented.contains(id))
+                        .collect();
+                    let blocking: Vec<String> = missing
+                        .iter()
+                        .filter(|id| !tolerated.contains(*id))
+                        .map(|id| id.to_string())
+                        .collect();
+                    if !blocking.is_empty() {
+                        return Err(ApplyError::CapabilityGate {
+                            detail: format!(
+                                "scene requires capabilities this build does not implement: {}",
+                                blocking.join(", ")
+                            ),
+                            missing: blocking,
+                            inspection_reason: None,
+                        });
+                    }
+                    let limitations: Vec<String> = missing
+                        .iter()
+                        .filter(|id| tolerated.contains(*id))
+                        .map(|id| id.to_string())
+                        .collect();
+                    if !limitations.is_empty() {
+                        spec.capability_limitations = limitations.clone();
+                        gate_notes.insert("limitations".into(), json!(limitations));
+                    }
+                }
+                Some("incompatible") => {
+                    let reason = inspection
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("incompatible")
+                        .to_string();
+                    return Err(ApplyError::CapabilityGate {
+                        detail: format!("scene inspection refused the content: {reason}"),
+                        missing: Vec::new(),
+                        inspection_reason: Some(reason),
+                    });
+                }
+                // "unknown" (any reason: timeout, report-*, inspector
+                // unavailable/failed) or an unrecognized outcome shape:
+                // decision (b) — proceed exactly as today, never block on
+                // an infrastructure failure. The reason rides along on the
+                // success result for diagnosability.
+                _ => {
+                    let reason = inspection
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unavailable")
+                        .to_string();
+                    gate_notes.insert("inspection".into(), json!("unavailable"));
+                    gate_notes.insert("inspection_reason".into(), json!(reason));
+                }
+            }
+        }
+
         // 4+. Start the renderer; EVERY failure from here on rolls back.
         let result = self.complete_apply(
             &spec,
@@ -1673,11 +1836,20 @@ impl ApplyHandle {
             previous,
             params.retry,
         );
-        if let Err(error) = result {
-            self.rollback_after_failure(&spec, &output.name, old_assignment);
-            return Err(error);
+        match result {
+            Ok(mut value) => {
+                if !gate_notes.is_empty()
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.extend(gate_notes);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                self.rollback_after_failure(&spec, &output.name, old_assignment);
+                Err(error)
+            }
         }
-        result
     }
 
     /// Rolls back a failed transaction after the renderer started: stop
@@ -2142,6 +2314,7 @@ impl PlaylistApplyLane for ApplyHandle {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         }
         .into_validated(self.scene_assets_dir.as_deref())
         .map_err(|error| ApplyError::Invalid(error.to_string()))?;
@@ -2268,6 +2441,7 @@ fn build_apply_spec(
             test_fault: None,
             stderr_lines: None,
             scaling: params.scaling,
+            capability_limitations: Vec::new(),
         });
     };
     let content = match params.kind {
@@ -2293,6 +2467,7 @@ fn build_apply_spec(
         test_fault: None,
         stderr_lines: None,
         scaling: params.scaling,
+        capability_limitations: Vec::new(),
     }
     .into_validated(assets_dir)
     .map_err(|error| ApplyError::Invalid(error.to_string()))

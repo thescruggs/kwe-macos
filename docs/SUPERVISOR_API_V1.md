@@ -397,6 +397,47 @@ session, which cannot enumerate outputs and reports so with an actionable
 detail rather than an empty list. The daemon first tries to recover a display
 environment from the systemd user manager; this code means that failed too.
 
+**SR-1c: the scene apply gate.** For `RendererKind::Scene` only, `wallpaper.apply`
+runs a staged preflight inspection (the same bounded `scene.inspect`
+containment `inspect.rs` uses, `InspectConfig` reused verbatim) before
+touching the current wallpaper or starting any renderer/canary. Two
+capability sets, single-sourced in kwe-core
+(`SCENE_CAPABILITIES_IMPLEMENTED`, `SCENE_CAPABILITIES_LIMITATION_TOLERATED`
+— see `docs/SCENE_CAPABILITIES.md`), classify the scene's `required`
+capability ids:
+
+- Inspection outcome `inventoried`: `missing = required − IMPLEMENTED`,
+  split into `blocking = missing − TOLERATED` and
+  `limitations = missing ∩ TOLERATED`.
+  - `blocking` non-empty → the apply fails CLOSED before anything is
+    touched (no renderer starts, the previous wallpaper/assignment is
+    untouched) with `apply_incompatible` and `{"missing": [sorted
+    blocking ids]}`. This deliberately reuses the same `apply_incompatible`
+    wire code the catalog-kind-mismatch case already used (a different
+    Rust-level cause, same "this content is incompatible" category from an
+    API consumer's point of view).
+  - Otherwise the apply proceeds; `limitations` (possibly empty when
+    non-empty) rides along on the success result as `"limitations":
+    [...]` and is mirrored into that apply's `renderer.status` as
+    `capability_limitations` — the same "transient per-slot field"
+    mechanism `scaling`/`fps` already use. Not persisted into the
+    assignment in this slice (open risk: invisible again after a daemon
+    restart until a later slice).
+- Inspection outcome `incompatible` (the inspector itself refuses the
+  content: parse-error/oversize/unrecognized-input) → also
+  `apply_incompatible`, with `{"missing": [], "inspection_reason":
+  "<reason>"}`.
+- Inspection outcome `unknown` (any reason: timeout, `report-*`,
+  inspector unavailable/failed) → the apply **proceeds exactly as
+  today** — an infrastructure failure never blocks an apply — with
+  `{"inspection": "unavailable", "inspection_reason": "<reason>"}`
+  attached to the success result for diagnosability.
+
+Non-scene kinds (`video`, `web`) are entirely untouched: zero behavior
+change, no inspection run. There is no inspection cache: a `retry: true`
+apply re-runs the gate exactly like a fresh one (a scene's required set
+never blanks or degrades because the daemon remembered a prior verdict).
+
 The switch/restore/probe scripts are executed with
 `qdbus <service> /PlasmaShell evaluateScript <script>` — no shell, argv
 only, bounded 5 s deadline, 64 KiB output caps; the daemon never embeds

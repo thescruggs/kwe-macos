@@ -1990,6 +1990,7 @@ mod tests {
             media_coalesced: 0,
             stderr_tail: Vec::new(),
             stderr_dropped_bytes: 0,
+            capability_limitations: Vec::new(),
         }
     }
 

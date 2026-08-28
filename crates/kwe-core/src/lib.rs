@@ -6,6 +6,7 @@
 //! was copied. See `docs/PROVENANCE.md` and `THIRD_PARTY.yml`.
 
 mod audio;
+mod capabilities;
 mod keyvalues;
 mod mpris;
 mod particlefile;
@@ -25,6 +26,7 @@ mod webpreflight;
 mod websandbox;
 
 pub use audio::analyze_stereo;
+pub use capabilities::{SCENE_CAPABILITIES_IMPLEMENTED, SCENE_CAPABILITIES_LIMITATION_TOLERATED};
 pub use keyvalues::{KvError, KvValue, parse_key_values};
 pub use mpris::{MprisStatus, probe_mpris};
 pub use particlefile::{MAX_PARTICLE_FILE_BYTES, ResolvedParticleFile, resolve_particle_file};

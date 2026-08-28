@@ -305,6 +305,13 @@ pub struct StartSpec {
     /// F1: passed to every renderer as `--scaling`; not part of the
     /// failure-record identity (a mode change never earns a new budget).
     pub scaling: ScalingMode,
+    /// SR-1c: capability ids the apply gate found `required` but only
+    /// tolerated-missing (`kwe_core::SCENE_CAPABILITIES_LIMITATION_TOLERATED`),
+    /// so the apply proceeded with a degraded scene. Diagnostic only — never
+    /// forwarded as a renderer CLI arg, not part of the failure-record
+    /// identity, and not persisted into the assignment (SR-1c open risk:
+    /// invisible again after a daemon restart until a later slice).
+    pub capability_limitations: Vec<String>,
 }
 
 impl StartSpec {
@@ -514,6 +521,10 @@ pub struct WorkerStatus {
     /// is never parsed as a command.
     pub stderr_tail: Vec<String>,
     pub stderr_dropped_bytes: u64,
+    /// SR-1c: mirrors the active (else requested) spec's
+    /// `capability_limitations` — capabilities the apply gate tolerated as
+    /// missing rather than refusing the apply over.
+    pub capability_limitations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -1893,6 +1904,10 @@ impl SupervisorRuntime {
             media_coalesced: active.map_or(0, |worker| worker.media_coalesced),
             stderr_tail: active.map_or_else(Vec::new, |worker| worker.stderr_ring.tail.clone()),
             stderr_dropped_bytes: active.map_or(0, |worker| worker.stderr_ring.dropped_bytes),
+            capability_limitations: active
+                .map(|worker| worker.spec.capability_limitations.clone())
+                .or_else(|| requested.map(|spec| spec.capability_limitations.clone()))
+                .unwrap_or_default(),
         }
     }
 }
@@ -2474,6 +2489,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         assert!(valid.validate(None).is_ok());
         let mut invalid = valid.clone();
@@ -2499,6 +2515,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         assert!(invalid_scene.validate(None).is_err());
         invalid_scene.kind = RendererKind::Test;
@@ -2519,6 +2536,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         // Test takes no content.
         let mut mismatched = base.clone();
@@ -2812,6 +2830,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         let mut worker = runtime.spawn_worker(spec).unwrap();
         // Each launch gets its own 0700 HOME under the daemon runtime dir.
@@ -2869,6 +2888,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         let video = StartSpec {
             kind: RendererKind::Video,
@@ -2930,6 +2950,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         let validated = spec.into_validated(None).unwrap();
         let path = match validated.content.expect("video content kept") {
@@ -3034,6 +3055,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         let error = runtime
             .spawn_worker(spec)
@@ -3142,6 +3164,7 @@ mod tests {
                 test_fault: None,
                 stderr_lines: None,
                 scaling: ScalingMode::Aspect,
+                capability_limitations: Vec::new(),
             },
             child,
             home_path: PathBuf::new(),
@@ -3249,6 +3272,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         };
         // The fake renderer records its argv asynchronously; poll for it
         // within a bounded window (the script writes before it exits).
@@ -3341,6 +3365,7 @@ mod tests {
                 test_fault: None,
                 stderr_lines: None,
                 scaling: ScalingMode::Aspect,
+                capability_limitations: Vec::new(),
             },
             child,
             home_path: PathBuf::new(),
@@ -3446,6 +3471,7 @@ mod tests {
             test_fault: None,
             stderr_lines: None,
             scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
         }
     }
 
