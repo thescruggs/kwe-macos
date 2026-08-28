@@ -179,7 +179,8 @@ Open risks:              The report travels on stdout in this skeleton (a chatty
                          SR-1. digest omits a "sha256:" prefix (unlike content.hash) since
                          the task spec's literal wording was "hex SHA-256 over the
                          serialized record" — SR-1 should confirm this is intended.
-Commit(s):               ea88e72 (skeleton); <filled after the R1/R2 fix commit>
+Commit(s):               ea88e72 (skeleton), 97268f9 (R1/R2 review fix), 95f7f97
+                         (review: in-flight guard created before the thread spawn)
 ```
 
 ## SR-0c — One loader inventory adapter
