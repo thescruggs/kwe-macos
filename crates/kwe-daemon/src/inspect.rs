@@ -953,4 +953,71 @@ args = parser.parse_args()
         assert!(!home_dir.exists());
         fs::remove_dir_all(&root).unwrap();
     }
+
+    /// SR-1d version-skew matrix: "inspector binary replaced on disk
+    /// mid-uptime" (a package upgrade landing while the daemon keeps
+    /// running, no restart). `run_inspection` spawns whatever is at
+    /// `inspector_path` at call time -- there is no binary caching or
+    /// stale handle anywhere in this module (no `File`/fd to the binary is
+    /// held between calls, only the `PathBuf`) -- so overwriting the same
+    /// path between two calls must be picked up by the second call with no
+    /// daemon-side action at all.
+    #[test]
+    fn replaced_binary_on_disk_is_picked_up_without_caching() {
+        let root = temp_dir("binary-replaced");
+        let fake_with_marker = |marker: &str| -> String {
+            format!(
+                r#"#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+{PYTHON_WRITE_FRAME_HELPER}
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+parser.add_argument("--report-fd", type=int, required=True)
+args = parser.parse_args()
+
+record = {{
+    "schema": "scene-inspection-v1",
+    "capabilities_schema": "scene-capabilities-v1",
+    "content": {{"hash": "sha256:deadbeef", "source_bytes": 1, "kind": "json-dir"}},
+    "inspector": {{"build": "{marker}", "abi": 0}},
+    "outcome": "inventoried",
+    "reason": "ok",
+    "required": [],
+    "detected": [],
+    "unknown": {{"keys": 0, "types": 0, "objects": 0, "samples": [], "truncated": False}},
+    "bounds": {{"wall_ms": 1, "peak_bytes": 0, "limits_hit": []}},
+    "backend": None,
+    "digest": "",
+}}
+serialized = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+record["digest"] = hashlib.sha256(serialized).hexdigest()
+payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+write_frame(1, payload)
+"#
+            )
+        };
+        let script = write_script(&root, "fake-inspector.py", &fake_with_marker("build-a"));
+        let config = config_with(&root, Some(script.clone()), Duration::from_secs(5));
+
+        let (first, _pid, _home) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(first["outcome"], "inventoried", "{first}");
+        assert_eq!(first["inspector"]["build"], "build-a");
+
+        // The package upgrade: SAME path, new content, daemon not
+        // restarted. write_script rewrites the file at the same path and
+        // re-sets it executable.
+        write_script(&root, "fake-inspector.py", &fake_with_marker("build-b"));
+
+        let (second, _pid, _home) = run_inspection_traced(&config, Path::new("/tmp/scene"));
+        assert_eq!(second["outcome"], "inventoried", "{second}");
+        assert_eq!(
+            second["inspector"]["build"], "build-b",
+            "the daemon must spawn whatever is at the configured path NOW, \
+             not a binary it cached from an earlier call: {second}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

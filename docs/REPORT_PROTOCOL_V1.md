@@ -79,12 +79,14 @@ apply-window deadline to be late against, which the one-shot inspector call
 does not have — it has only its own wall-clock timeout, already `timeout`)
 and `report-unavailable` (defined below for a renderer WORKER predating the
 report FD; the one-shot inspector's own old-binary skew resolves
-differently — see "Version skew") remain unimplemented/unused by SR-1b.
+differently — see "Version-skew matrix") remain unimplemented/unused by
+SR-1b.
 
-Reason codes SR-1c/a future renderer-worker report slice are expected to use
+Reason codes a future renderer-worker report slice is expected to use
 (named here so this document is the single place a future reader learns the
 full intended vocabulary, even where only the inspector path implements it
-today):
+today — SR-1c scoped itself to the apply gate, not this wiring; see
+`docs/SR1.md`'s SR-1c entry):
 
 | Reason code | Meaning |
 |---|---|
@@ -92,25 +94,34 @@ today):
 | `report-missing` | The child exited 0 but its report stream contained zero frames of the expected kind (either no frames at all, or only frames of a kind the daemon does not act on — e.g. `Unknown`). Implemented (SR-1b, `scene.inspect`). |
 | `report-duplicate` | A second frame of a kind that must appear at most once in a stream arrived (daemon policy, not a codec-level concept — see "Codec vs. policy"). Implemented (SR-1b, `scene.inspect`). |
 | `report-late` | A report arrived after the daemon's own deadline for it (a generation/apply-window boundary, not a wire-level timeout this crate knows about). Not yet implemented — no code path has an apply-window deadline to compare against yet. |
-| `report-unavailable` | A renderer WORKER predates the report FD entirely (an old binary that never gets `--report-fd`); the daemon must not reconstruct a policy decision from stdout/stderr in this case (plan §5.3). Not yet implemented (no renderer-worker report stream exists yet); the one-shot inspector's analogous old-binary case resolves as `inspector-failed` instead — see "Version skew". |
+| `report-unavailable` | A renderer WORKER predates the report FD entirely (an old binary that never gets `--report-fd`); the daemon must not reconstruct a policy decision from stdout/stderr in this case (plan §5.3). Not yet implemented (no renderer-worker report stream exists yet); the one-shot inspector's analogous old-binary case resolves as `inspector-failed` instead — see "Version-skew matrix". |
 
-### Version skew (SR-1b: one case implemented and tested; SR-1d builds the fuller matrix)
+### Version-skew matrix (SR-1b: one case; SR-1d: the fuller matrix below)
 
-An old `kwe-scene-inspector` binary that predates `--report-fd` rejects the
-daemon's `--report-fd 3` argument the way clap itself rejects any unknown
-flag: a usage error printed to stderr, exit 2. The daemon always passes
-`--report-fd` unconditionally — there is no daemon-side fallback to the old
-stdout contract — so this resolves as `inspector-failed`, with that usage
-error visible in `stderr_tail`, never a crash and never a decision
-reconstructed from stdout. This is the only skew combination SR-1b
-implements and tests
-(`crates/kwe-daemon/src/inspect.rs`'s
-`old_inspector_without_report_fd_support_is_inspector_failed`); daemon and
-inspector ship in the same package, so this is a partial-upgrade window
-(the package half-updated, or an operator pointing `--inspector` at a stray
-old binary), not a supported long-term compatibility mode. SR-1d is the
-fuller old/new daemon x worker x display-bridge upgrade/downgrade/
-canary-rollback matrix plan §5.3 calls for.
+Every combination of daemon/inspector vintage and calling context this
+crate's report-FD path can actually be exercised under, and the test that
+proves each row. `kwe-scene-inspector` and `kwe-daemon` ship in the same
+package and version together — every "old"/"new" pairing below is a
+partial-upgrade window (a half-updated package, or an operator pointing
+`--inspector` at a stray old binary), not a supported long-term
+compatibility mode.
+
+| Combination | Behavior | Proof |
+|---|---|---|
+| New daemon + new inspector (same package) | `--report-fd 3` passed and honored; exactly one `scene-inspection-v1` frame arrives, digest-verified, stdout empty. | `crates/kwe-daemon/src/inspect.rs`'s `valid_v1_report_passes_through_verbatim_digest_verified`; `crates/kwe-scene-inspector/tests/report_fd.rs`'s `report_fd_present_emits_one_validated_frame_and_empty_stdout`. |
+| New daemon + OLD inspector (partial upgrade window) | The old binary's argparse rejects the daemon's unconditional `--report-fd 3` as an unrecognized argument — a usage error to stderr, exit 2. The daemon never falls back to the old stdout contract: this resolves `inspector-failed`, usage text in `stderr_tail`. Through the SR-1c apply gate this is inspection outcome `unknown`, so `wallpaper.apply` for a scene PROCEEDS with `{"inspection": "unavailable", "inspection_reason": "inspector-failed"}` attached (decision (b): infrastructure failure never blocks Apply). | Inspect level: `crates/kwe-daemon/src/inspect.rs`'s `old_inspector_without_report_fd_support_is_inspector_failed` (SR-1b). Apply level (SR-1d, closes the gap): `crates/kwe-daemon/src/main.rs`'s `scene_apply_gate_proceeds_with_an_old_inspector_binary`. |
+| OLD daemon + new inspector | The old daemon never passes `--report-fd` at all; the inspector's flag is optional, so it falls back to its pre-SR-1b contract: the `scene-feature-inventory-v0` record on stdout, byte-identical to before. | `crates/kwe-scene-inspector/tests/report_fd.rs`'s `no_report_fd_flag_emits_the_v0_line_on_stdout`; `scripts/smoke-scene-corpus.sh` (`KWE_RUN_SCENE_CORPUS_SMOKE=1`), which also drives the inspector with no `--report-fd`. |
+| Direct script/manual use (no daemon at all) | Same absent-flag path as "old daemon" above — the inspector cannot distinguish an old daemon from a human or `scripts/scene-corpus-inventory.sh` invoking it directly; stdout v0. | `scripts/smoke-scene-corpus.sh` (`KWE_RUN_SCENE_CORPUS_SMOKE=1`, `./scripts/check.sh`'s opt-in corpus smoke gate) — the corpus runner IS this calling context. |
+| Daemon restart / process death mid-inspection | `documented-only`. The inspector's `pre_exec` closure (`crates/kwe-daemon/src/inspect.rs`, the block installing `setpgid(0, 0)` / `PR_SET_PDEATHSIG` `SIGKILL` / the parent-pid check / `PR_SET_NO_NEW_PRIVS`, mirroring `supervisor::spawn_worker`'s containment exactly — SR-0b) means the inspector dies with its parent: no orphan survives a daemon crash or restart, and the daemon's own copy of the report pipe's read end is closed as part of process teardown, so nothing is left holding it open. No new test: this is the same containment contract SR-0b already established and the supervisor's own worker tests already cover for the long-lived case; the one-shot inspector reuses it verbatim rather than re-deriving it. |
+| Inspector binary replaced on disk mid-uptime (package upgrade, daemon not restarted) | The daemon spawns whatever is at the configured `inspector_path` at call time — a plain path-based `Command::new`, no cached `File`/fd/handle to the binary held between calls. Overwriting the same path between two inspections is picked up by the very next one, no daemon action required. | `crates/kwe-daemon/src/inspect.rs`'s `replaced_binary_on_disk_is_picked_up_without_caching` (SR-1d, new: two inspections against the same configured path, the script rewritten between them, asserts the second call's `inspector.build` marker is the NEW content). |
+| Report FD vs stdout both written by a misbehaving new inspector | `finalize` (`crates/kwe-daemon/src/inspect.rs`) only ever parses the accumulated report-FD bytes — stdout content never reaches the result, by construction (the field it returns is built from `report_bytes`, not from anything captured off stdout), so "report wins" is a `documented-only` structural fact, not something a test needs to race. Stdout is still drained and bounded defensively (pipe-backpressure safety for a misbehaving/old-format child), independently of whatever the report FD carries. | `documented-only` (see `finalize`'s signature/body) for "report wins"; `crates/kwe-daemon/src/inspect.rs`'s `flooded_stdout_is_also_refused_as_report_oversize` (SR-1b) for "stdout flood still bounds". |
+| Apply retry after refusal, with a changed build/inspector | No inspection cache (SR-1c decision (c)): `retry: true` re-runs the gate against whatever `inspect_config` currently resolves to, so a fixed inspector (or a fixed scene) applies on retry instead of replaying the first refusal. | `crates/kwe-daemon/src/main.rs`'s `scene_apply_gate_retry_re_runs_the_gate_no_negative_caching` (SR-1c). |
+
+SR-1d intentionally does not add a renderer-worker row: the long-lived
+renderer worker's own report-FD stream (`report-late`,
+`report-unavailable` in the renderer-worker sense) does not exist yet — see
+the reason-code table above and `docs/SR1.md`'s SR-1c entry ("Out of
+scope"). SR-1d closes the gaps in the one-shot inspector's matrix only.
 
 ## Wire format
 

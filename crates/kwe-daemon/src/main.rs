@@ -3327,6 +3327,147 @@ write_frame(1, payload)
         assert_eq!(status.phase, WorkerPhase::Live);
     }
 
+    // -------------------------------------------------------------------
+    // SR-1d: version-skew matrix — end-to-end gaps closed at the apply
+    // level (docs/REPORT_PROTOCOL_V1.md's "Version-skew matrix").
+    // -------------------------------------------------------------------
+
+    /// A fake inspector that predates `--report-fd` (mirrors
+    /// `inspect.rs`'s `old_inspector_without_report_fd_support_is_
+    /// inspector_failed` fixture exactly): argparse itself rejects the
+    /// daemon's unconditional `--report-fd 3` as an unrecognized argument,
+    /// prints a usage error to stderr, and exits 2 — the partial-upgrade
+    /// window (daemon and inspector ship in the same package; this is what
+    /// a half-updated package, or `--inspector` pointed at a stray old
+    /// binary, looks like).
+    fn fake_inspector_old_binary(root: &Path, name: &str) -> PathBuf {
+        write_script(
+            root,
+            name,
+            r#"#!/usr/bin/env python3
+import argparse
+parser = argparse.ArgumentParser(prog="fake-inspector.py")
+parser.add_argument("--input", required=True)
+parser.add_argument("--max-wall-ms", type=int, default=10000)
+# No --report-fd: argparse rejects the daemon's --report-fd 3 as an
+# unrecognized argument, prints a usage error to stderr, and exits 2.
+args = parser.parse_args()
+"#,
+        )
+    }
+
+    /// Version-skew matrix row "new daemon + OLD inspector": through the
+    /// apply gate, an inspector-failed usage-error rejection classifies as
+    /// outcome `unknown` (the inspect-level case is
+    /// `old_inspector_without_report_fd_support_is_inspector_failed`,
+    /// SR-1b) — decision (b) says `unknown` never blocks Apply, so the
+    /// apply must proceed with the reason attached for diagnosability.
+    #[test]
+    fn scene_apply_gate_proceeds_with_an_old_inspector_binary() {
+        let root = temp_dir("gate-old-binary");
+        let catalog = scene_catalog();
+        let supervisor_service = fast_scene_supervisor(&root);
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe_with_switch(vec![dp1_output()]);
+        let inspector = fake_inspector_old_binary(&root, "fake-inspector.py");
+        let handle = apply_handle(probe.clone(), &catalog, supervisor.clone()).with_inspect_config(
+            sr1c_inspect_config(&root, Some(inspector), Duration::from_secs(5)),
+        );
+        let scene = fixture_scene_path(&catalog.read().unwrap());
+        let (ok, result) = process_with_apply(
+            &format!(
+                r#"{{"version":1,"method":"wallpaper.apply","params":{{"output":"DP-1","wallpaper_id":"1","kind":"scene","content":"{}"}}}}"#,
+                scene.display()
+            ),
+            &handle,
+            &catalog,
+        );
+        assert!(ok, "apply must proceed against an old inspector: {result}");
+        assert_eq!(result["inspection"], "unavailable");
+        assert_eq!(result["inspection_reason"], "inspector-failed");
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Live);
+    }
+
+    /// The plan's "killed inspector/hidden renderer leaves previous
+    /// wallpaper" acceptance, for the pieces that exist today: a scene
+    /// apply that PASSES the gate (a valid inventoried record,
+    /// required=["scene.layer.image"], no missing capabilities) but whose
+    /// renderer then never promotes — the existing promotion-timeout
+    /// rollback path (mirrors `apply_promotion_timeout_rolls_back_and_
+    /// stops_the_renderer`) must be entirely unchanged by the gate's
+    /// presence, and the PRIOR assignment (seeded before this apply,
+    /// exactly like SR-1c's own blocking-refusal test) must survive.
+    #[test]
+    fn scene_apply_gate_pass_then_renderer_failure_rolls_back_to_previous() {
+        let root = temp_dir("gate-rollback");
+        let catalog = scene_catalog();
+        // A renderer that never publishes a frame: it can never promote, so
+        // the bounded promotion wait times out and the transaction rolls
+        // back -- the gate having already passed must not change this.
+        let hang = root.join("hang-renderer.py");
+        fs::write(
+            &hang,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = fast_scene_supervisor_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Scene, hang)]);
+        let supervisor_service = SupervisorService::start(config).unwrap();
+        let supervisor = supervisor_service.handle();
+        let probe = stub_probe(vec![dp1_output()], Some(DP1_PROBE_REPLY));
+        let inspector =
+            fake_inspector_inventoried(&root, "fake-inspector.py", &["scene.layer.image"]);
+        let store_dir = temp_dir("gate-rollback-store");
+        let mut store = apply::AssignmentStore::open(&store_dir).unwrap();
+        seed_assignment(&mut store, "DP-1", "prior");
+        let handle = apply::ApplyHandle::for_test(
+            store,
+            probe,
+            catalog.clone(),
+            supervisor.clone(),
+            // Far below the 3 s startup timeout so the wait times out while
+            // the renderer is still starting (mirrors
+            // apply_promotion_timeout_rolls_back_and_stops_the_renderer).
+            Duration::from_millis(300),
+        )
+        .with_inspect_config(sr1c_inspect_config(
+            &root,
+            Some(inspector),
+            Duration::from_secs(5),
+        ));
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.apply","params":{"output":"DP-1","wallpaper_id":"1","kind":"scene"}}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(!ok, "the never-promoting renderer must fail: {result}");
+        assert_eq!(
+            result["error"], "apply_failed",
+            "the gate passed; the failure is the renderer's, unchanged: {result}"
+        );
+        assert!(
+            result["detail"]
+                .as_str()
+                .unwrap()
+                .contains("did not promote"),
+            "{result}"
+        );
+        let status = supervisor.status().unwrap();
+        assert_eq!(status.phase, WorkerPhase::Stopped);
+        let (ok, result) = process_with_apply(
+            r#"{"version":1,"method":"wallpaper.assignments"}"#,
+            &handle,
+            &catalog,
+        );
+        assert!(ok);
+        assert_eq!(
+            result["outputs"]["DP-1"]["wallpaper_id"], "prior",
+            "the previous wallpaper must survive the rollback: {result}"
+        );
+    }
+
     #[test]
     fn apply_quarantined_names_the_reason_and_retry_clears_it() {
         // B4: a quarantined identity answers `apply_quarantined` with the

@@ -488,17 +488,134 @@ Open risks:              capability_limitations is transient (StartSpec/
                          previewed under "SR-1c" before this slice's
                          narrower conductor decisions; still a later slice's
                          territory.
-Commit(s):               (fill in after commit)
+Commit(s):               5069b0f
 ```
 
-## SR-1d — old/new version-skew matrix
+## SR-1d — report/inspector version-skew matrix
 
-- Tests every combination of old/new daemon, old/new worker/inspector
-  binary, and canary rollback the plan's §5.3 closing sentence names
-  ("SR-1 must test old/new daemon, worker, and display-bridge upgrade/
-  downgrade and canary rollback combinations") — an old worker with no
-  `--report-fd` support must resolve to `report-unavailable`, never a crash
-  or a reconstructed-from-stderr guess.
+**Scope note:** this slice covers the one-shot `kwe-scene-inspector`'s
+version-skew combinations only (the plan §5.3 acceptance row "old/new
+adapter matrix", for the pieces that exist today). The renderer-worker's
+own report-FD stream does not exist yet (SR-1c's scope note, `docs/SR1.md`
+above); a canary/display-bridge upgrade-downgrade matrix has nothing to
+attach to until that lands, so it stays out of scope here too — the
+"canary rollback" acceptance below is the apply-transaction rollback path
+(promotion timeout → stop the renderer, restore the previous wallpaper),
+not a canary-generation display-bridge handoff.
+
+```text
+Task:            Close the gaps in the report/inspector version-skew matrix:
+                 document every daemon/inspector-vintage combination the
+                 report-FD path can be exercised under, name the test that
+                 proves each row (or mark it documented-only with why), and
+                 add the end-to-end tests the existing SR-1b/SR-1c coverage
+                 did not already reach.
+Milestone/Slice: SR-1d
+Goal:            Turn plan §5.3's "SR-1 must test old/new daemon, worker,
+                 and display-bridge upgrade/downgrade and canary rollback
+                 combinations" into an auditable table with a named proof
+                 per row, for the one-shot inspector path that exists today
+                 -- and, per this slice's own scope note above, explicitly
+                 flag the renderer-worker/display-bridge half as still
+                 open rather than silently skip it.
+Outcome:         docs/REPORT_PROTOCOL_V1.md: the old "Version skew" prose
+                 subsection (SR-1b, one case) is replaced with a
+                 "Version-skew matrix" table of 8 rows, each with its
+                 proving test named or (2 rows) marked documented-only with
+                 the cited rationale (the pre_exec PDEATHSIG containment
+                 block for daemon-death-mid-inspection; finalize's
+                 report-only parse path for report-vs-stdout precedence).
+                 Two stale "see Version skew" cross-references and one
+                 stale "SR-1c/a future renderer-worker report slice"
+                 mention (now that SR-1c's own scope note records that it
+                 did NOT touch the renderer-worker stream) were corrected
+                 in the same pass since this slice was already editing the
+                 surrounding prose.
+                 3 new tests close the gaps the existing SR-1b/SR-1c
+                 coverage did not reach: an apply-level (not just
+                 inspect-level) old-inspector-binary test, a binary-
+                 replaced-on-disk-mid-uptime test (no caching), and a
+                 gate-passes-then-renderer-fails rollback test proving the
+                 apply gate's presence does not change the existing
+                 promotion-timeout rollback path or its "previous wallpaper
+                 survives" guarantee.
+                 No production code changed -- every row's behavior already
+                 existed from SR-1a/SR-1b/SR-1c; this slice is tests +
+                 documentation only, per the conductor's framing of this as
+                 a small slice.
+In scope:        docs/REPORT_PROTOCOL_V1.md (the matrix table + the two
+                 stale cross-reference fixes), docs/SR1.md, crates/
+                 kwe-daemon/src/inspect.rs (1 new test:
+                 replaced_binary_on_disk_is_picked_up_without_caching),
+                 crates/kwe-daemon/src/main.rs (2 new tests:
+                 scene_apply_gate_proceeds_with_an_old_inspector_binary,
+                 scene_apply_gate_pass_then_renderer_failure_rolls_back_to_
+                 previous, plus their fake-inspector-old-binary helper).
+Out of scope:    Any production code change (STOP condition per the task:
+                 "if a test exposes a real bug, STOP and report it... rather
+                 than fixing it in this slice" -- no bug was found, so this
+                 did not trigger; see "STOP findings" below). The renderer-
+                 worker's own report-FD stream and any canary/display-
+                 bridge upgrade-downgrade matrix built on top of it (no
+                 such stream exists yet -- SR-1c's scope note). Inspection
+                 caching (still absent, SR-1c decision (c), unchanged here).
+Acceptance tests:        crates/kwe-daemon: 175 tests total, up from 172 --
+                         scene_apply_gate_proceeds_with_an_old_inspector_
+                         binary and
+                         scene_apply_gate_pass_then_renderer_failure_rolls_
+                         back_to_previous in main.rs's test module,
+                         replaced_binary_on_disk_is_picked_up_without_
+                         caching in inspect.rs's test module (the fake
+                         inspector reuses inspect.rs's private
+                         PYTHON_WRITE_FRAME_HELPER directly, since this test
+                         lives in the same module -- no duplication needed
+                         here, unlike main.rs's own copy from SR-1c).
+                         821 workspace tests total, up from 818 (172+3 = 175
+                         kwe-daemon; every other crate unchanged).
+                         cargo fmt/clippy/test --workspace green.
+                         ./scripts/check.sh green end to end, including the
+                         C++/QML build and qml-typecheck.
+Failure/recovery tests:  scene_apply_gate_pass_then_renderer_failure_rolls_
+                         back_to_previous IS the failure/recovery test for
+                         this slice: a gate PASS followed by a renderer that
+                         never promotes still rolls back exactly like
+                         before the gate existed (apply_failed, the
+                         never-promoting renderer stopped, the seeded PRIOR
+                         assignment for the output verified unchanged
+                         afterward via wallpaper.assignments) -- the plan's
+                         "killed inspector/hidden renderer leaves previous
+                         wallpaper" acceptance, for the pieces that exist
+                         today.
+Upstream/provenance:     Original; every new test's fake-inspector/fake-
+                         renderer fixtures mirror an existing SR-1b/SR-1c
+                         fixture pattern exactly (named in each test's doc
+                         comment) rather than inventing a new one.
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D warnings
+                         -- clean.
+                         cargo test --workspace -- 821 passed, 0 failed.
+                         ./scripts/check.sh -- green end-to-end, including the
+                         C++/QML build and qml-typecheck.
+Open risks:              The renderer-worker's own report-FD stream and the
+                         canary/display-bridge half of plan §5.3's matrix
+                         remain unimplemented -- this slice's matrix table
+                         says so explicitly per row rather than implying
+                         full coverage.
+                         The "report FD vs stdout both written" row's
+                         "report wins the parse" half is documented-only
+                         (a structural fact about finalize's code, not
+                         exercised by a dedicated test); if finalize is ever
+                         refactored to read stdout for anything, this
+                         guarantee should get an explicit regression test
+                         at that point.
+STOP findings:           None. No test written for this slice exposed a
+                         production bug -- every row in the matrix already
+                         behaved as documented before this slice; the gaps
+                         closed were missing PROOF (an apply-level test, a
+                         binary-replacement test, a gate-plus-rollback
+                         test), not missing behavior.
+Commit(s):               (fill in after commit)
+```
 
 ## SR-1e — manager result-state flow
 
