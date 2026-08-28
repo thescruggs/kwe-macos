@@ -1083,3 +1083,163 @@ STOP findings:           None that blocked the slice. Every candidate STOP
                          message-text consumer was found.
 Commit(s):               933b430, 5b80f1d
 ```
+
+## SR-2c2 — investigation: the 1629635521 frame divergence (STOP — no scene/parsing bug found)
+
+**Priority interrupt investigation**, filed after a corpus FRAME sweep (as
+opposed to `ir_parity_corpus`'s PARSE-level sweep) flagged a rendering
+difference on one real corpus scene (workshop id `1629635521`, a
+16-particle-system, particle-file-referenced scene) between the pre-SR-2c
+binary (`e6aac50`) and the post-SR-2c binary (`5b80f1d`): reference
+`avg 28.1,28.1,28.1|86` nonzero px vs. candidate `avg 35.3,35.3,35.3|211`
+nonzero px, each individually reported "self-stable across runs" by the
+reporting sweep. `ir_parity_corpus` already passed 60/60 for this exact
+scene, so the divergence — if real — had to live outside the compared
+`SceneConfig`/`LayerSpec`/`ParticleSpec` structs.
+
+**Root cause: there is no scene-parsing or particle-registration bug. The
+divergence is a false positive from the corpus sweep's WALL-CLOCK-based
+comparison methodology, colliding with a PRE-EXISTING (M3f-era, long
+before SR-2c) property of the render loop: particle simulation is stepped
+by REAL elapsed time, not a deterministic virtual clock** —
+`crates/kwe-scene-renderer/src/main.rs`'s `RenderLoop::run`, the line
+`let dt = now.duration_since(last_step).as_secs_f64();` (now carrying an
+explanatory comment, see Outcome below). For a scene whose particle
+systems are still young/ramping up (spawn count still growing, which this
+16-system scene's `particles_capped` diagnostics confirm is exactly its
+state within the sweep's 3 s window), the EXACT wall-clock tick count
+reached by a fixed deadline is sensitive to incidental per-process timing
+(OS scheduling, cache warmth, disk I/O for the pkg read, GPU driver
+selection) that has NOTHING to do with scene data or renderer logic —
+including, critically, being sensitive to which TWO BINARIES happen to be
+compared, since different binaries (even unrelated ones) can have
+different code size/layout shifting their own per-iteration overhead by a
+few milliseconds, which compounds over a still-growing particle system
+into a materially different frame.
+
+**Evidence chain (each step independently verifiable, none relies on
+"staring"):**
+
+1. `git diff e6aac50 5b80f1d -- crates/kwe-scene-renderer/src/main.rs
+   crates/kwe-scene-renderer/src/particles.rs` shows ZERO logic changes —
+   only mechanical `PartialEq` derive additions (for the differential test
+   infrastructure) and the `mod scene_ir_adapter;` line. The particle
+   simulation code (`particles.rs`) and its consumer (`main.rs`'s
+   `load_particle_file_definitions`, `ScriptEngine::new`'s
+   `ParticleSystemState::from_spec` construction) are BYTE-IDENTICAL
+   between the two binaries.
+2. A temporary env-gated instrumentation (`KWE_DEBUG_DUMP_PARTICLES`,
+   dumping every `ParticleSpec` via `{:?}` — including the fully decoded
+   texture RGBA bytes and the resolved `ComponentModel` — right after
+   `load_particle_file_definitions` runs, i.e. everything that reaches
+   `ScriptEngine::new`) produced BYTE-IDENTICAL 1.2 MB dumps between the
+   real `e6aac50` and `5b80f1d` binaries against the real
+   `1629635521/scene.pkg` — confirming empirically, not just by parity-test
+   inference, that every input to particle simulation (spec fields,
+   decoded pixels, component model, PRNG seed source) is identical. This
+   instrumentation was temporary (added to throwaway git worktrees for
+   this investigation, never committed).
+3. A second temporary instrumentation forced the render loop's `dt` to a
+   FIXED synthetic value and its step count to a FIXED target (removing
+   wall-clock sensitivity from the comparison entirely) via env vars.
+   Under two INDEPENDENT deterministic trajectories (8 steps @ dt=0.1s;
+   25 steps @ dt=0.05s), the two real binaries produced stderr AND
+   rendered-frame-file output that `cmp` reports BYTE-IDENTICAL (exit 0,
+   no differing byte) in both cases — the strongest possible proof that,
+   with the wall-clock component neutralized, the two binaries render
+   this scene identically.
+4. Reproducing the ORIGINAL (wall-clock, `KWE_SWEEP_TIMEOUT=3`) sweep
+   methodology against the SAME two binaries FOUR consecutive times
+   produced: run 1 = "REGRESSION reference=35.3...|211 candidate=28.1...|86"
+   (the exact two numbers from the original report, but with which build
+   produced which number REVERSED from the original report — proving the
+   split is not a fixed property of "SR-2c" vs "not SR-2c" at all); runs
+   2-4 = "IDENTICAL" (both landed on 35.3.../211) — the SAME binary pair,
+   same script, same scene, same machine, no code change between runs.
+   This is direct, reproduced proof that the sweep's wall-clock
+   methodology itself is what's non-deterministic here, not the renderer's
+   handling of this scene's data.
+
+**Deliverables (per the task's explicit "STOP and report... I will
+decide" provision — there is no bug to fix, so no behavior-changing
+commit was made):**
+
+- `crates/kwe-scene-renderer/src/main.rs`: a comment-only addition at the
+  `dt` computation explaining this property in place, for the next reader
+  who investigates a similar false alarm.
+- `scripts/scene-corpus-byte-identity-sweep.sh`: a new header-comment
+  CAVEAT section naming this exact failure mode (particle-heavy scenes,
+  single-run false positives) with the reproduced evidence summarized, a
+  recommendation to re-run / prefer a longer timeout / prefer
+  `particles.rs`'s own fixed-dt determinism unit test for this class of
+  scene, and an inline reminder appended to the script's own FAILED output
+  line so a future maintainer sees the caveat AT THE POINT OF FAILURE, not
+  only in a header comment they may not have read.
+  `deterministic_across_independent_runs` (`crates/kwe-scene-renderer/src/particles.rs`)
+  ALREADY proves, at the unit level, that a FIXED dt sequence produces
+  bit-identical particles — this existing test IS the "missing comparison
+  surface" for the class of bug the task asked to guard against (parse/
+  simulation-logic divergence); it was not extended because it already
+  covers exactly this contract and nothing about SR-2c changed it.
+- docs/SR2.md (this section).
+- NOT changed: any scene-parsing/adapter code (`ir.rs`, `scene.rs`,
+  `scene_ir_adapter.rs`) — there is nothing to fix there; `ir_parity_corpus`
+  re-run fresh on this branch still passes 60/60 (unchanged, since no
+  parsing code was touched).
+
+Commands run and results: cargo fmt --all -- clean.
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 913 passed, 0 failed
+                         (unchanged from SR-3a's own count -- no test was
+                         added or removed; the pre-existing
+                         deterministic_across_independent_runs already
+                         covers the relevant contract).
+                         KWE_SCENE_IR_PARITY_DIR=<real corpus> cargo test
+                         -p kwe-scene-renderer ir_parity_corpus --
+                         --ignored -- "60/60 item(s) parity-passed"
+                         (re-confirmed fresh on this branch).
+                         ./scripts/check.sh -- exit 0, green end-to-end
+                         (one transient, unrelated flake on
+                         kwe-daemon's workshop_cache::tests::
+                         fills_placeholder_metadata_on_missing_items on a
+                         run taken while this investigation's build/render
+                         load was still active on the machine -- passed in
+                         isolation immediately after, and passed on a
+                         clean re-run of the full check.sh moments later;
+                         not this investigation's own doing, noted here
+                         for the record since it happened during this
+                         slice's acceptance run).
+                         scripts/scene-corpus-byte-identity-sweep.sh
+                         against 1629635521 specifically, same
+                         reference(e6aac50)/candidate(this branch) pair,
+                         4 consecutive runs -- see evidence step 4 above
+                         (1 REGRESSION, 3 IDENTICAL, no code change
+                         between them).
+STOP findings:           The entire slice IS the STOP finding: no scene-
+                         parsing, particle-registration, or rendering
+                         LOGIC bug was found anywhere in SR-2c's changes.
+                         The apparent regression is fully explained by
+                         pre-existing (M3f-era) wall-clock-driven particle
+                         simulation timing combined with the sweep
+                         script's fixed-wall-clock-deadline methodology --
+                         a property that predates SR-2c and can affect a
+                         comparison between ANY two renderer binaries, not
+                         specifically SR-2c's. Making particle simulation
+                         timing fully deterministic across builds (e.g. a
+                         frame-count-driven virtual clock instead of
+                         `Instant::now()` deltas) would close this gap
+                         properly, but is a real architecture change well
+                         beyond this investigation's scope -- left for the
+                         conductor to decide whether/when to schedule it.
+                         Evidence: see the four-step chain above, all
+                         independently reproducible (temporary
+                         instrumentation was NOT committed; the two
+                         reproduction commands anyone can re-run are
+                         `cargo test -p kwe-scene-renderer
+                         deterministic_across_independent_runs` and
+                         `scripts/scene-corpus-byte-identity-sweep.sh`
+                         against the same scene/binaries, run several
+                         times).
+Commit(s):               (fill in after commit)
+```

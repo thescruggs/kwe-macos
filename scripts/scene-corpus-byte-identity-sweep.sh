@@ -39,6 +39,31 @@
 # a failure by itself -- this script measures REGRESSION, not
 # acceptance (scripts/smoke-corpus-pkg.sh already covers preflight
 # acceptance).
+#
+# SR-2c2 CAVEAT (particle-heavy scenes, single-run false positives): a
+# scene whose particle systems are still ramping up (all emitters young,
+# spawn count still growing) is captured at a fixed WALL-CLOCK timeout
+# (KWE_SWEEP_TIMEOUT), not a fixed simulation-tick count --
+# crates/kwe-scene-renderer/src/main.rs's render loop steps particle
+# simulation by REAL elapsed time (`dt = now.duration_since(last_step)`,
+# not a deterministic virtual clock). Two DIFFERENT BINARIES -- built from
+# different commits, or even the SAME commit built twice -- can reach a
+# different simulation tick count by the SAME wall-clock deadline purely
+# from incidental OS/scheduling/cache-warmth timing, with NO difference in
+# scene data or renderer logic. Investigated in depth for scene
+# 1629635521 (SR-2c2, docs/SR2.md): the exact same reference/candidate
+# binary PAIR reported a REGRESSION on one run and IDENTICAL on the next
+# three consecutive runs, with no code change in between -- proof this is
+# sweep-methodology jitter, not a renderer regression. A single-run
+# REGRESSION on a particle-heavy scene is NOT by itself evidence of a
+# rendering bug: re-run a few times before treating it as real, and
+# prefer a LONGER KWE_SWEEP_TIMEOUT (the transient ramp-up phase settles
+# once spawn/death reach equilibrium) or a deterministic per-system check
+# (crates/kwe-scene-renderer/src/particles.rs's own
+# `deterministic_across_independent_runs` unit test, which proves
+# simulation determinism for a FIXED dt sequence, immune to this class of
+# noise) over this script's wall-clock comparison for that specific class
+# of scene.
 set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -172,6 +197,7 @@ done
 echo "scene corpus byte-identity sweep: total=$total compared=$compared refused_by_either=$refused flagged=${#flagged[@]}"
 if (( ${#flagged[@]} > 0 )); then
     echo "scene corpus byte-identity sweep: FAILED, regressions in: ${flagged[*]}" >&2
+    echo "scene corpus byte-identity sweep: NOTE -- a particle-heavy scene can flag on wall-clock timing jitter alone (see this script's SR-2c2 CAVEAT comment); re-run before treating a single flagged scene as a confirmed regression" >&2
     exit 1
 fi
 echo "scene corpus byte-identity sweep: passed"

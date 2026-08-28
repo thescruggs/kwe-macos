@@ -278,5 +278,5 @@ STOP findings:           None. No STOP condition was named for this task,
                          and the decision-(c) "which of the two options"
                          choice was made explicitly (protocol-error,
                          documented above) rather than left ambiguous.
-Commit(s):               (fill in after commit)
+Commit(s):               31b2c10
 ```

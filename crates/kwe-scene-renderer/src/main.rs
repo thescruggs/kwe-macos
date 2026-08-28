@@ -590,6 +590,24 @@ impl SceneWorker {
                 std::thread::sleep(deadline.duration_since(now).min(MAX_WAIT));
                 continue;
             }
+            // SR-2c2: this `dt` is REAL elapsed wall-clock time, not a
+            // deterministic virtual clock -- particle simulation (a young,
+            // still-ramping-up system especially) is therefore sensitive
+            // to incidental per-process timing (OS scheduling, cache
+            // warmth, which two binaries happen to be compared), NOT just
+            // to scene data/renderer logic. Two builds with byte-identical
+            // parsed scene data and byte-identical simulation code can
+            // still land on a different tick count by a fixed wall-clock
+            // deadline -- investigated in depth for a real corpus scene in
+            // docs/SR2.md's SR-2c2 entry (a genuine SR-2c false alarm this
+            // property produced) and documented as a known false-positive
+            // source in scripts/scene-corpus-byte-identity-sweep.sh's own
+            // header. `ParticleSystemState::step`/`simulate` themselves
+            // ARE deterministic given a FIXED dt sequence (particles.rs's
+            // `deterministic_across_independent_runs` proves this at the
+            // unit level) -- the nondeterminism lives entirely in what
+            // real-world `dt` sequence a given process run happens to
+            // produce, not in anything downstream of it.
             let dt = now.duration_since(last_step).as_secs_f64();
             last_step = now;
             let step = self.engine.step(dt);
