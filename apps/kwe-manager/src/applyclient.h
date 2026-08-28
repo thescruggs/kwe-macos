@@ -98,6 +98,15 @@ public:
     /// enumeration), for the UI's retry affordance. No-op when nothing
     /// failed.
     Q_INVOKABLE void retry();
+    /// SR-1e: maps a scene capability id (e.g. "scene.layer.sound") to the
+    /// short user-facing phrase used both in the missing-feature refusal
+    /// message below and in the applied-with-limitations notice
+    /// (WallpaperDetail.qml calls this directly for
+    /// rendererStatus.capabilityLimitations) — the table lives in exactly
+    /// one place rather than being duplicated in the status model.
+    /// Unrecognized ids pass through verbatim: never hide an id the table
+    /// does not yet know about.
+    Q_INVOKABLE static QString friendlyCapabilityName(const QString &id);
 
 signals:
     void stateChanged();
@@ -150,12 +159,15 @@ private:
     void setErrorMessage(const QString &message);
     void clearResult();
     void finish(bool ok, const QJsonObject &result, const QString &errorCode,
-                const QString &detail);
+                const QString &detail, const QStringList &missing);
     void applyOutputs(const QJsonObject &result);
     void applyAssignments(const QJsonObject &result);
     /// Maps the daemon's wire error codes to actionable user-facing text.
-    /// `detail` is the daemon's bounded failure detail.
-    static QString mapError(const QString &code, const QString &detail);
+    /// `detail` is the daemon's bounded failure detail. `missing` (SR-1c's
+    /// apply gate) is the sorted list of capability ids the apply refused
+    /// over; non-empty only for `apply_incompatible`.
+    static QString mapError(const QString &code, const QString &detail,
+                             const QStringList &missing);
     static bool validIdentity(const QString &value);
     static bool validKind(const QString &kind);
     static bool validScaling(const QString &scaling);
@@ -192,5 +204,9 @@ private:
     /// the daemon to clear the record (retry: true) or it would fail again
     /// with the same answer.
     bool m_lastFailedQuarantined = false;
+    /// SR-1c/SR-1e: the last apply's `apply_incompatible` missing-capability
+    /// list (empty for every other failure, and for the kind-mismatch shape
+    /// of apply_incompatible, which carries no `missing` field).
+    QStringList m_lastFailedMissing;
     QVariantMap m_assignments;
 };

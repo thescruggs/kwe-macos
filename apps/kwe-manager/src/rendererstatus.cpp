@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "rendererstatus.h"
 
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 
@@ -21,10 +22,18 @@ RendererStatus::RendererStatus(QString socketPath, QObject *parent)
         const auto phase = status.value(QStringLiteral("phase")).toString();
         const auto id = status.value(QStringLiteral("wallpaper_id")).toString();
         const auto detail = status.value(QStringLiteral("last_failure_detail")).toString();
-        if (phase == m_phase && id == m_wallpaperId && detail == m_detail) return;
+        // SR-1c: capability_limitations, empty by default (absent on the
+        // wire, a non-scene wallpaper, or a scene with nothing tolerated).
+        QStringList limitations;
+        for (const auto &value : status.value(QStringLiteral("capability_limitations")).toArray())
+            limitations.push_back(value.toString());
+        if (phase == m_phase && id == m_wallpaperId && detail == m_detail
+            && limitations == m_capabilityLimitations)
+            return;
         m_phase = phase;
         m_wallpaperId = id;
         m_detail = detail;
+        m_capabilityLimitations = limitations;
         emit statusChanged();
         m_socket.disconnectFromServer();
     });

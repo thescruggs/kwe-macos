@@ -278,12 +278,19 @@ void ApplyClient::consumeResponse() {
     const bool ok = response.value(QStringLiteral("ok")).toBool();
     const auto result = response.value(QStringLiteral("result")).toObject();
     m_retryDelayMilliseconds = InitialRetryMilliseconds;
+    // SR-1c: the apply gate's refusal carries `missing` as a flat sibling of
+    // `error`/`detail`, the same shape apply_quarantined already uses for
+    // its own extras — extracted here, alongside error/detail, for every
+    // response (empty for everything except a blocking apply_incompatible).
+    QStringList missing;
+    for (const auto &value : result.value(QStringLiteral("missing")).toArray())
+        missing.push_back(value.toString());
     finish(ok, result, result.value(QStringLiteral("error")).toString(),
-           result.value(QStringLiteral("detail")).toString());
+           result.value(QStringLiteral("detail")).toString(), missing);
 }
 
 void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &errorCode,
-                         const QString &detail) {
+                         const QString &detail, const QStringList &missing) {
     m_requestTimer.stop();
     const auto method = m_current.method;
     const auto output = m_current.output;
@@ -310,19 +317,26 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
             m_lastFailedScaling = scaling.isEmpty() ? QStringLiteral("aspect") : scaling;
             m_lastFailedFps = fps;
             m_lastFailedQuarantined = errorCode == QStringLiteral("apply_quarantined");
+            m_lastFailedMissing = missing;
             clearResult();
             // The UI's Try Again only makes sense for operations with a
             // recorded target to replay (apply/restore). An enumeration
             // failure has no payload, so failedMethod stays empty and the
             // affordance stays hidden (the picker re-lists on its own).
-            m_failedMethod = method == Apply ? QStringLiteral("apply")
-                                             : method == Restore ? QStringLiteral("restore")
-                                                                 : QString();
+            // SR-1e: apply_incompatible is excluded even though it is an
+            // Apply failure — retry cannot help (it is not a quarantine; the
+            // scene needs a capability this build does not implement, or the
+            // inspector itself refused the content), so the affordance stays
+            // hidden exactly like the enumeration case.
+            const bool retryable = method == Apply && errorCode != QStringLiteral("apply_incompatible");
+            m_failedMethod = retryable ? QStringLiteral("apply")
+                                       : method == Restore ? QStringLiteral("restore")
+                                                           : QString();
             // clearResult() above emitted with failedMethod still empty; without
             // this the Try Again affordance never re-evaluates its binding.
             if (!m_failedMethod.isEmpty())
                 emit resultChanged();
-            setErrorMessage(mapError(errorCode, detail));
+            setErrorMessage(mapError(errorCode, detail, missing));
             setState(Failed);
         }
     } else {
@@ -358,7 +372,7 @@ void ApplyClient::finish(bool ok, const QJsonObject &result, const QString &erro
         }
     }
     if (callback)
-        callback(ok, result, ok ? QString{} : mapError(errorCode, detail));
+        callback(ok, result, ok ? QString{} : mapError(errorCode, detail, missing));
     drainQueue();
 }
 
@@ -503,7 +517,39 @@ void ApplyClient::applyAssignments(const QJsonObject &result) {
     emit assignmentsChanged();
 }
 
-QString ApplyClient::mapError(const QString &code, const QString &detail) {
+QString ApplyClient::friendlyCapabilityName(const QString &id) {
+    // SR-1e: docs/SCENE_CAPABILITIES.md's ids, in the phrase a user should
+    // see rather than the dotted taxonomy id. Never hide an id this table
+    // does not yet know about — it passes through verbatim instead.
+    if (id == QStringLiteral("scene.layer.sound"))
+        return tr("sound layers");
+    if (id == QStringLiteral("scene.lighting"))
+        return tr("lighting");
+    if (id == QStringLiteral("scene.particle"))
+        return tr("particles");
+    if (id == QStringLiteral("scene.effects"))
+        return tr("image effects");
+    if (id == QStringLiteral("scene.layer.text"))
+        return tr("text layers");
+    if (id == QStringLiteral("scene.layer.video"))
+        return tr("video layers");
+    if (id == QStringLiteral("scene.layer.image"))
+        return tr("image layers");
+    if (id == QStringLiteral("scene.package"))
+        return tr("packaged scenes");
+    if (id == QStringLiteral("scene.model3d"))
+        return tr("3D models");
+    if (id == QStringLiteral("scene.camera"))
+        return tr("3D cameras");
+    if (id == QStringLiteral("scene.puppet"))
+        return tr("puppet animation");
+    if (id == QStringLiteral("scene.physics"))
+        return tr("physics");
+    return id;
+}
+
+QString ApplyClient::mapError(const QString &code, const QString &detail,
+                              const QStringList &missing) {
     // B2: the daemon refuses a scene whose every layer needs a feature this
     // build does not have yet. The raw detail is a preflight sentence with a
     // file path in it; the user needs the "why", not the path, and they need
@@ -528,10 +574,24 @@ QString ApplyClient::mapError(const QString &code, const QString &detail) {
     if (code == QStringLiteral("apply_unknown_wallpaper"))
         return detail.isEmpty() ? tr("This wallpaper is not available to apply")
                                 : tr("This wallpaper is not available to apply: %1").arg(detail);
-    if (code == QStringLiteral("apply_incompatible"))
+    // SR-1c/SR-1e: the apply gate's refusal names exactly what the scene
+    // needs that this build does not implement yet, in the user's own
+    // words rather than the dotted capability ids — the kind-mismatch shape
+    // of apply_incompatible (no `missing`) keeps today's generic message.
+    if (code == QStringLiteral("apply_incompatible")) {
+        if (!missing.isEmpty()) {
+            QStringList friendly;
+            friendly.reserve(missing.size());
+            for (const auto &id : missing)
+                friendly.push_back(friendlyCapabilityName(id));
+            return tr("This wallpaper needs features this version does not support yet: "
+                      "%1. Your current wallpaper is unchanged.")
+                .arg(friendly.join(QStringLiteral(", ")));
+        }
         return detail.isEmpty()
             ? tr("This wallpaper cannot be applied in its current form")
             : tr("This wallpaper cannot be applied in its current form: %1").arg(detail);
+    }
     if (code == QStringLiteral("display_unavailable"))
         return tr("The wallpaper service started before the desktop session and "
                   "cannot see your displays. Restart it with `systemctl --user "

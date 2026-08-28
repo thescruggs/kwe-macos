@@ -281,13 +281,15 @@ bounded one):
 | `output_missing` | "Output not found: \<name\>" |
 | `apply_busy` | "Another apply is in progress; wait for it to finish." |
 | `apply_unknown_wallpaper` | "This wallpaper is not available to apply: \<id\>" |
-| `apply_incompatible` | "This wallpaper cannot be applied in its current form: \<detail\>" |
+| `apply_incompatible` | "This wallpaper cannot be applied in its current form: \<detail\>" — kind-mismatch shape (no `missing`); Try Again hidden (retry cannot help) |
+| `apply_incompatible` with `missing` (SR-1c/SR-1e) | "This wallpaper needs features this version does not support yet: \<friendly names\>. Your current wallpaper is unchanged." — the apply gate's refusal; `missing`'s capability ids are mapped through `ApplyClient::friendlyCapabilityName`'s table (unrecognized ids pass through verbatim), comma-joined; Try Again hidden (not a quarantine, retry cannot help) |
 | `shell_unreachable` | "The Plasma desktop could not be reached: \<detail\>; nothing was changed." |
 | `apply_failed` | "Applying failed: \<detail\>" |
 | `apply_quarantined` (B4) | "This wallpaper was disabled after repeated failures (\<detail\>). Try Again re-enables it and applies it once more." — Try Again re-applies with `retry: true` |
 | `service_stale` (B4) | "The wallpaper service was upgraded but is still running the old version. Restart it with `systemctl --user restart kwe-daemon`, then try again." |
 | `restore_failed` | "Restoring the previous wallpaper failed: \<detail\>" |
 | `invalid_params` / `apply_unavailable` | rejected-request / no-apply-lane wording |
+| Success with `limitations` (SR-1c/SR-1e) | Not an error: a scene apply that proceeded despite tolerated-missing capabilities. Surfaced separately, as a persistent (not one-shot) `Kirigami.InlineMessage` on `WallpaperDetail.qml` re-derived from `rendererStatus.capabilityLimitations` (SR-1c's `renderer.status` field): "Applied with limitations: \<friendly names\> not supported yet." Not persisted into the assignment (SR-1c open risk) — a daemon restart clears the notice even though the scene itself is unchanged, until it is re-applied. |
 
 ### The UI flow (WallpaperDetail.qml)
 

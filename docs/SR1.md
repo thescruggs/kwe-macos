@@ -614,12 +614,225 @@ STOP findings:           None. No test written for this slice exposed a
                          closed were missing PROOF (an apply-level test, a
                          binary-replacement test, a gate-plus-rollback
                          test), not missing behavior.
-Commit(s):               (fill in after commit)
+Commit(s):               abc29df
 ```
 
 ## SR-1e — manager result-state flow
 
-- Surfaces the daemon's report-derived result state (inventoried/incompatible/
-  unknown, and the typed report-policy reasons above) through to
-  `apps/kwe-manager`'s UI, so a user sees why a wallpaper was refused instead
-  of a bare failure.
+**Scope note:** the preview above talked about surfacing the FULL
+inventoried/incompatible/unknown/report-policy vocabulary; the conductor's
+actual SR-1e task narrowed this to the two states SR-1c's apply gate
+already made real for the manager to show: the missing-feature refusal
+(`apply_incompatible` with `missing`) and the applied-with-limitations
+notice (`limitations` / `capability_limitations`). The broader
+inventoried/incompatible/unknown vocabulary is daemon-internal
+(`docs/REPORT_PROTOCOL_V1.md`) and was never meant to reach the manager
+verbatim — only its two apply-time consequences do.
+
+```text
+Task:            Manager result-state flow for the SR-1c apply gate: show
+                 the missing-feature refusal with friendly capability names
+                 (never a bare id list) and hide Try Again for it (retry
+                 cannot help); show a persistent, non-blocking notice when a
+                 scene applied despite tolerated-missing capabilities.
+Milestone/Slice: SR-1e (final SR-1 child)
+Goal:            Close the loop plan SR-1 opened: SR-1c's daemon-side gate
+                 is invisible to a user until the manager explains WHY a
+                 wallpaper was refused (in their words, not a dotted
+                 capability id) and WHAT changed about a wallpaper that did
+                 apply.
+Outcome:         apps/kwe-manager/src/applyclient.h/.cpp: consumeResponse()
+                 extracts the new top-level `missing` array alongside
+                 error/detail (the same flat-sibling shape apply_quarantined
+                 already used) and threads it into finish()/mapError() as a
+                 new parameter; m_lastFailedMissing stores it (mirroring
+                 m_lastFailedQuarantined's storage, write-only in this slice
+                 -- nothing currently reads it back the way retry() reads
+                 the quarantine flag, since apply_incompatible is never
+                 retried). mapError()'s apply_incompatible branch: non-empty
+                 missing -> "This wallpaper needs features this version
+                 does not support yet: <friendly names>. Your current
+                 wallpaper is unchanged.", friendly names via a new
+                 Q_INVOKABLE static ApplyClient::friendlyCapabilityName(id)
+                 (the task's exact 12-entry table, tr()'d per entry,
+                 unrecognized ids pass through verbatim); empty missing
+                 (the pre-existing kind-mismatch shape) keeps today's
+                 generic message unchanged. Try Again: verified
+                 failedMethod (not m_lastFailedQuarantined) is what
+                 WallpaperDetail.qml's Try Again action actually gates
+                 (`visible: applyClient.failedMethod !== ""`) and that it
+                 was a GENERIC retry affordance for every Apply/Restore
+                 failure, not quarantine-only -- so finish()'s failure
+                 branch now computes `retryable = method == Apply &&
+                 errorCode != "apply_incompatible"` and only sets
+                 failedMethod to "apply" when retryable, gating off the
+                 WHOLE apply_incompatible code (both the missing-feature
+                 shape and the pre-existing kind-mismatch shape -- retry
+                 cannot help either one).
+                 apps/kwe-manager/src/rendererstatus.h/.cpp: a new
+                 capabilityLimitations QStringList property, added to the
+                 existing renderer.status poll exactly like
+                 phase/wallpaperId/detail already flow (a JSON array read
+                 off `status`, change-detected alongside the other three
+                 fields, one statusChanged() emission) -- empty by default
+                 (absent field, non-scene wallpaper, or nothing tolerated).
+                 apps/kwe-manager/qml/WallpaperDetail.qml: one new
+                 Kirigami.InlineMessage (Information severity, matching the
+                 page's existing InlineMessage pattern exactly -- no
+                 explicit icon.name, relying on Kirigami's built-in
+                 per-severity icon, which is what every sibling message on
+                 this page already does) placed right after the "Applied
+                 %1 to %2" success message. Deliberately re-derived from
+                 rendererStatus.capabilityLimitations (not a one-shot toast
+                 tied to applyClient's transient applied* fields): it
+                 reads correctly again after reopening the manager, and
+                 disappears only when the daemon's own status no longer
+                 reports a limitation. No close button (passively
+                 informative, not dismissible) -- the "quarantined"
+                 InlineMessage in GalleryPage.qml is the closest existing
+                 behavioral analog (status-derived, not a one-shot
+                 confirmation) and follows the same no-close-button
+                 convention; a close button bound to a live QML expression
+                 would silently break the binding on first dismiss, a
+                 pre-existing footgun this slice did not need to introduce
+                 into a new message.
+                 Mapping-exposure decision (task's explicit either/or):
+                 picked the Q_INVOKABLE-on-ApplyClient option over
+                 duplicating the table in RendererStatus/a status model --
+                 smaller diff (one method, reused by both the refusal
+                 message and the limitations notice, one source of truth)
+                 vs. a second copy of a 12-entry tr() table that could drift
+                 from the first. applyClient is already a global QML
+                 context property reachable from every page, so
+                 WallpaperDetail.qml calls
+                 applyClient.friendlyCapabilityName(id) directly on each
+                 rendererStatus.capabilityLimitations entry.
+                 docs/BETA_M4.md's manager apply-message table gained two
+                 rows (the missing-feature apply_incompatible shape; the
+                 limitations success notice). docs/SUPERVISOR_API_V1.md
+                 needed no changes -- every field name exposed
+                 (missing/limitations/capability_limitations) already
+                 matches what SR-1c documented there.
+                 No Rust code changed in this slice (task's own expectation
+                 confirmed by inspection: `git status` shows only
+                 apps/kwe-manager/** and docs/** touched).
+In scope:        apps/kwe-manager/src/applyclient.h, apps/kwe-manager/src/
+                 applyclient.cpp, apps/kwe-manager/src/rendererstatus.h,
+                 apps/kwe-manager/src/rendererstatus.cpp, apps/kwe-manager/
+                 qml/WallpaperDetail.qml, apps/kwe-manager/tests/
+                 applyclienttest.cpp (extended: Fail gained a `missing`
+                 field, 2 new tests), apps/kwe-manager/tests/
+                 rendererstatustest.cpp (NEW -- no dedicated RendererStatus
+                 test file existed before this slice; 2 new focused tests),
+                 apps/kwe-manager/tests/CMakeLists.txt (new
+                 kwe-renderer-status-test target, mirroring
+                 kwe-apply-client-test's registration exactly), docs/
+                 BETA_M4.md, docs/SR1.md.
+Out of scope:    Persisting capability_limitations into the assignment so
+                 the limitations notice survives a daemon restart -- SR-1c's
+                 recorded open risk, unchanged here (the QML doc comment at
+                 the new InlineMessage names it explicitly). Any Rust
+                 change (none was needed; the daemon-side fields this slice
+                 consumes were all already shipped by SR-1c). The broader
+                 inventoried/incompatible/unknown vocabulary surfacing
+                 (this slice's scope note above).
+Acceptance tests:        apps/kwe-manager: kwe-apply-client-test grew from
+                         25 to 27 (2 new:
+                         missingFeatureRefusalNamesFriendlyCapabilitiesAndHidesTryAgain,
+                         emptyMissingKeepsTheGenericIncompatibleMessageAndHidesTryAgain),
+                         both passing against the existing StubDaemon
+                         (extended with a `missing` field on Fail). A new
+                         kwe-renderer-status-test target (4 slots: init/
+                         cleanup + 2 tests --
+                         capabilityLimitationsRoundTripsFromTheStatusJson,
+                         capabilityLimitationsIsEmptyWhenTheFieldIsAbsent),
+                         a minimal QLocalServer stand-in for renderer.status
+                         mirroring StubDaemon's style.
+                         qmllint clean via scripts/qml-typecheck.sh (used
+                         directly and via ./scripts/check.sh): "no
+                         unresolved types".
+                         ctest: all 10 manager test targets (including the
+                         2 touched and the 1 new one) pass; cd build/cmake
+                         && ctest green end to end.
+                         cargo fmt/clippy/test --workspace green (rust
+                         untouched, confirmed unaffected).
+                         ./scripts/check.sh green end to end, including the
+                         C++/QML build and qml-typecheck.
+Failure/recovery tests:  missingFeatureRefusalNamesFriendlyCapabilitiesAndHidesTryAgain
+                         covers both halves of the UI rule at once: the
+                         friendly-name mapping (including an id the table
+                         does not recognize, proving it passes through
+                         verbatim rather than being hidden) and the
+                         Try-Again-hidden guarantee, in the same assertion
+                         pass, against a real ApplyClient/StubDaemon round
+                         trip rather than a mocked mapError() call.
+Upstream/provenance:     Original; every new QML/C++ pattern (InlineMessage
+                         shape, the daemon-json -> member -> notify ->
+                         property flow, the StubDaemon/StubStatusDaemon test
+                         style) mirrors an existing one in the same files
+                         rather than inventing a new convention.
+Commands run and results: cmake --build build/cmake --parallel -- clean.
+                         scripts/qml-typecheck.sh -- "no unresolved types".
+                         cd build/cmake && ctest -- all 10 targets passed.
+                         cargo fmt --all -- --check -- clean (no rust
+                         changes).
+                         cargo clippy --workspace --all-targets -- -D
+                         warnings -- clean.
+                         cargo test --workspace -- 821 passed, 0 failed
+                         (unchanged from SR-1d).
+                         ./scripts/check.sh -- green end-to-end, including
+                         the C++/QML build and qml-typecheck.
+Open risks:              capabilityLimitations (and therefore the
+                         applied-with-limitations notice) is transient: it
+                         reads empty again after a daemon restart even
+                         though the underlying scene's capability gap is
+                         unchanged, because SR-1c never persisted
+                         capability_limitations into the assignment. Noted
+                         explicitly at the QML message and here; carried
+                         forward from SR-1c's own recorded open risk rather
+                         than fixed in this UI-only slice.
+                         m_lastFailedMissing is currently write-only (stored
+                         per the task's instruction, mirroring
+                         m_lastFailedQuarantined's storage pattern, but
+                         nothing reads it back the way retry() reads the
+                         quarantine flag) -- harmless today since
+                         apply_incompatible is never retried, but a future
+                         slice that wanted to re-show the missing list
+                         without a fresh daemon round trip has somewhere to
+                         read it from already.
+STOP findings:           None -- no bug was found in the daemon-side SR-1c
+                         work this slice builds on; every change here is
+                         additive manager-side UI/tests.
+Commit(s):               (fill in after commit)
+```
+
+## SR-1 epic — COMPLETE
+
+All five children (SR-1a report protocol v1 doc + codec crate, SR-1b
+report-FD wiring inspector+daemon, SR-1c the scene apply gate, SR-1d the
+version-skew matrix, SR-1e the manager result-state flow) are merged:
+SR-1a `1c2b65e`, SR-1b `9b75367`, SR-1c `5069b0f`, SR-1d `abc29df`, SR-1e
+(this commit, filled below). Plan §5.3/§8's SR-1 acceptance bullets are
+met by the pieces that exist today: a real report-FD wire format and
+schema (SR-1a) actually carrying a `scene-inspection-v1` record between
+two real processes (SR-1b), a fail-closed apply-time decision built on it
+(SR-1c) that a user can see and understand (SR-1e), with the old/new
+adapter matrix for the one-shot inspector path documented and tested
+(SR-1d). Recorded open risks carried forward past the epic boundary, none
+of them silently dropped: **no inspection cache** (SR-1c decision (c) —
+every scene apply re-pays the inspection; corpus timing keeps this inside
+the apply window today, but a cache design is still open); **limitations
+not persisted** (capability_limitations/`limitations` is transient
+daemon- and manager-side; a restart loses the notice until the next
+apply — SR-1c and SR-1e both flag this at the point it matters);
+**playlist lane ungated** (`PlaylistApplyLane::apply_playlist` does not
+run the SR-1c gate — a playlist-driven advance onto a scene requiring an
+unimplemented capability is not refused the way a direct
+`wallpaper.apply` is, SR-1c's recorded gap); and **render-report kind 2
+reserved but unused** (`docs/REPORT_PROTOCOL_V1.md`'s `SceneRenderReportV1`
+frame kind, and the renderer-worker's own report-FD stream generally —
+`report-late`/the renderer-worker sense of `report-unavailable` — never
+landed in SR-1; SR-1c and SR-1d both scoped themselves away from it
+explicitly rather than silently missing it). None of these four risks
+block using what SR-1 shipped; each is a named, findable next step rather
+than an undocumented gap.

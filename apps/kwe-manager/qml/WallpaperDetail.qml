@@ -437,6 +437,23 @@ Kirigami.ScrollablePage {
         }
         Kirigami.InlineMessage {
             Layout.fillWidth: true
+            // SR-1c/SR-1e: re-derived from the live renderer.status poll
+            // (rendererStatus), not a one-shot toast tied to this apply — it
+            // still reads correctly after reopening the manager, and clears
+            // itself once the status no longer reports a limitation (a later
+            // apply, or the daemon restarting — SR-1c's recorded open risk
+            // is that capability_limitations is not persisted into the
+            // assignment, so a restart clears this notice even though the
+            // scene itself is unchanged).
+            visible: WallpaperSelection.selectedId !== "" && rendererStatus.capabilityLimitations.length > 0
+            type: Kirigami.MessageType.Information
+            text: qsTr("Applied with limitations: %1 not supported yet.").arg(
+                rendererStatus.capabilityLimitations.map(function (id) {
+                    return applyClient.friendlyCapabilityName(id);
+                }).join(", "))
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
             visible: WallpaperSelection.selectedId !== ""
                 && applyClient.restoredOutput !== ""
                 && applyClient.restoredOutput === outputPicker.currentText

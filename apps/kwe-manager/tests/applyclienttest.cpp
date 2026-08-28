@@ -22,6 +22,10 @@ public:
     struct Fail {
         QString error;
         QString detail;
+        /// SR-1c: the apply gate's `apply_incompatible` refusal carries this
+        /// as a flat sibling of error/detail; empty for every other code and
+        /// for apply_incompatible's kind-mismatch shape.
+        QJsonArray missing;
     };
     StubDaemon() {
         connect(&m_server, &QLocalServer::newConnection, this, &StubDaemon::onConnection);
@@ -103,6 +107,8 @@ private:
                     result.insert(QStringLiteral("error"), fail.error);
                     if (!fail.detail.isEmpty())
                         result.insert(QStringLiteral("detail"), fail.detail);
+                    if (!fail.missing.isEmpty())
+                        result.insert(QStringLiteral("missing"), fail.missing);
                 } else if (method == QStringLiteral("wallpaper.outputs")) {
                     result.insert(QStringLiteral("outputs"), outputs);
                 } else if (method == QStringLiteral("wallpaper.apply")) {
@@ -306,6 +312,47 @@ private slots:
               QStringLiteral("DP-2"), QStringLiteral("Output not found: DP-2"));
         check(QStringLiteral("wallpaper.restore"), QStringLiteral("restore_failed"),
               QStringLiteral("script error: rejected"), QStringLiteral("Restoring the previous wallpaper failed"));
+    }
+
+    // SR-1e: the apply gate's missing-feature refusal names the friendly
+    // capability phrases (mapped through the table, unknown ids verbatim)
+    // and, unlike every other apply failure, offers no Try Again — retry
+    // cannot help.
+    void missingFeatureRefusalNamesFriendlyCapabilitiesAndHidesTryAgain() {
+        m_daemon.failByMethod.insert(
+            QStringLiteral("wallpaper.apply"),
+            {QStringLiteral("apply_incompatible"), QString(),
+             QJsonArray{QStringLiteral("scene.model3d"), QStringLiteral("scene.future")}});
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("scene"),
+                              QUrl::fromLocalFile(QStringLiteral("/scene.json")));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        QVERIFY2(client.errorMessage().contains(QStringLiteral("3D models")),
+                 qPrintable(client.errorMessage()));
+        // An id the friendly-name table does not know about passes through
+        // verbatim rather than being hidden.
+        QVERIFY2(client.errorMessage().contains(QStringLiteral("scene.future")),
+                 qPrintable(client.errorMessage()));
+        // Not a quarantine, and retry cannot help: no replay target.
+        QCOMPARE(client.failedMethod(), QString());
+    }
+
+    // The kind-mismatch shape of apply_incompatible (no `missing`) keeps
+    // today's generic message. Try Again stays hidden here too: retry
+    // cannot help a kind mismatch any more than a missing-feature refusal
+    // (docs/BETA_M4.md's manager apply-message table; this is the whole
+    // apply_incompatible code, not just the missing-feature shape of it).
+    void emptyMissingKeepsTheGenericIncompatibleMessageAndHidesTryAgain() {
+        m_daemon.failByMethod.insert(
+            QStringLiteral("wallpaper.apply"),
+            {QStringLiteral("apply_incompatible"), QStringLiteral("kind mismatch"), QJsonArray{}});
+        ApplyClient client(m_socketPath);
+        client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
+                              QUrl::fromLocalFile(QStringLiteral("/x.mp4")));
+        QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Failed, 5000);
+        QVERIFY2(client.errorMessage().contains(QStringLiteral("cannot be applied")),
+                 qPrintable(client.errorMessage()));
+        QCOMPARE(client.failedMethod(), QString());
     }
 
     void queuedOperationsWaitForTheInFlightOne() {

@@ -49,6 +49,14 @@ qt_add_executable(kwe-apply-client-test
 target_link_libraries(kwe-apply-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Qml Qt6::Test)
 add_test(NAME kwe-apply-client-test COMMAND kwe-apply-client-test)
 
+qt_add_executable(kwe-renderer-status-test
+    rendererstatustest.cpp
+    ../src/rendererstatus.cpp
+    ../src/rendererstatus.h
+)
+target_link_libraries(kwe-renderer-status-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME kwe-renderer-status-test COMMAND kwe-renderer-status-test)
+
 qt_add_executable(kwe-web-preview-test
     webpreviewtest.cpp
     ../src/webpreview.cpp
