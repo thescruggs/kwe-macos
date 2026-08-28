@@ -416,6 +416,16 @@ name = "kwe-mpv"
 version = "0.1.0-alpha.1"
 
 [[package]]
+name = "kwe-report-protocol"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "hex",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "kwe-scene-inspector"
 version = "0.1.0-alpha.1"
 dependencies = [

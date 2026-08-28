@@ -9,6 +9,7 @@ members = [
     "crates/kwe-frame-protocol",
     "crates/kwe-input-protocol",
     "crates/kwe-mpv",
+    "crates/kwe-report-protocol",
     "crates/kwe-scene-inspector",
     "crates/kwe-scene-renderer",
     "crates/kwe-test-renderer",
