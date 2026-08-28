@@ -9,6 +9,17 @@
 //! frames in the arrival order and nothing more — see
 //! `docs/REPORT_PROTOCOL_V1.md`'s "codec vs. policy" split.
 //!
+//! SR-3a: the SAME 12-byte `KWR1` frame codec is reused for the killable
+//! shader-compile helper's stdin/stdout channels (kinds 16-18, a separate
+//! namespace from the report-FD kinds below — see
+//! `docs/SHADER_HELPER_PROTOCOL_V1.md`). The two channel FAMILIES are
+//! otherwise unrelated: report-FD is a one-way, daemon-owned side channel a
+//! worker writes once; the shader helper's stdin/stdout are a two-way
+//! request/response exchange with its own stream caps (`StreamCaps`,
+//! `SHADER_REQUEST_CAPS`/`SHADER_RESPONSE_CAPS` below) — only the wire
+//! FORMAT (header shape, per-frame byte cap) and this crate's codec are
+//! shared, never the channel semantics.
+//!
 //! ## Deviation from the task text
 //!
 //! The originating task described this crate's error types as
@@ -45,6 +56,64 @@ pub const SCENE_INSPECTION_SCHEMA: &str = "scene-inspection-v1";
 /// record's capability IDs (`scene.layer.image`, ...) are drawn from.
 pub const SCENE_CAPABILITIES_SCHEMA: &str = "scene-capabilities-v1";
 
+/// SR-3a: `shader-compile-request-v1`'s own `"schema"` field value (kind
+/// 16 payload) — see `docs/SHADER_HELPER_PROTOCOL_V1.md`.
+pub const SHADER_COMPILE_REQUEST_SCHEMA: &str = "shader-compile-request-v1";
+/// SR-3a: `shader-compile-response-v1`'s own `"schema"` field value (kind
+/// 17 payload).
+pub const SHADER_COMPILE_RESPONSE_SCHEMA: &str = "shader-compile-response-v1";
+
+/// SR-3a decision (b): the shader helper's REQUEST channel (daemon stdin
+/// of the helper process) caps — one kind-16 frame plus slack, never
+/// anywhere near the report channel's own 16-frame/1-MiB default.
+pub const SHADER_REQUEST_MAX_FRAMES: usize = 4;
+pub const SHADER_REQUEST_MAX_TOTAL_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// SR-3a decision (b): the shader helper's RESPONSE channel (helper
+/// stdout) caps — one kind-17 frame plus up to 128 kind-18 SPIR-V chunks
+/// (a future compiling helper's shape, reserved now) plus slack.
+pub const SHADER_RESPONSE_MAX_FRAMES: usize = 132;
+pub const SHADER_RESPONSE_MAX_TOTAL_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// SR-3a decision (b): `FrameReader::with_caps`' bundle of the two
+/// stream-level caps (frame count, total payload bytes) — the per-frame
+/// [`MAX_PAYLOAD_BYTES`] cap stays universal, unconfigurable, and is
+/// checked unconditionally regardless of which `StreamCaps` a reader uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCaps {
+    pub max_frames: usize,
+    pub max_total_payload_bytes: usize,
+}
+
+impl StreamCaps {
+    /// The report-FD channel's own long-standing caps — byte-identical to
+    /// what `FrameReader::new` always enforced before SR-3a made the caps
+    /// configurable.
+    pub const REPORT: StreamCaps = StreamCaps {
+        max_frames: MAX_FRAMES_PER_STREAM,
+        max_total_payload_bytes: MAX_TOTAL_PAYLOAD_BYTES,
+    };
+    /// SR-3a: the shader helper's request-channel caps.
+    pub const SHADER_REQUEST: StreamCaps = StreamCaps {
+        max_frames: SHADER_REQUEST_MAX_FRAMES,
+        max_total_payload_bytes: SHADER_REQUEST_MAX_TOTAL_PAYLOAD_BYTES,
+    };
+    /// SR-3a: the shader helper's response-channel caps.
+    pub const SHADER_RESPONSE: StreamCaps = StreamCaps {
+        max_frames: SHADER_RESPONSE_MAX_FRAMES,
+        max_total_payload_bytes: SHADER_RESPONSE_MAX_TOTAL_PAYLOAD_BYTES,
+    };
+}
+
+/// SR-3a: a shader-compile request's `"includes"` map may name at most this
+/// many files.
+pub const MAX_SHADER_INCLUDES: usize = 32;
+/// SR-3a: any single include's byte length cap.
+pub const MAX_SHADER_INCLUDE_BYTES: usize = 64 * 1024;
+/// SR-3a: a shader-compile request's `"combos"` map's entry-count cap.
+pub const MAX_SHADER_COMBOS: usize = 128;
+/// SR-3a: a shader-compile request's `"defines"` map's entry-count cap.
+pub const MAX_SHADER_DEFINES: usize = 128;
+
 /// One frame's kind (header byte 4). `Unknown` carries the raw byte so a
 /// reader built against this version never has to reject a stream just
 /// because a later version added a kind it does not recognize yet
@@ -57,6 +126,17 @@ pub enum FrameKind {
     /// producer arrives with the render-report slices; this codec carries
     /// the kind and payload opaquely until then.
     SceneRenderReportV1,
+    /// Kind 16: a `shader-compile-request-v1` JSON record (SR-3a) — the
+    /// daemon/caller -> shader helper direction, on the helper's stdin.
+    /// See `docs/SHADER_HELPER_PROTOCOL_V1.md`.
+    ShaderCompileRequestV1,
+    /// Kind 17: a `shader-compile-response-v1` JSON record (SR-3a) — the
+    /// helper -> caller direction, on the helper's stdout.
+    ShaderCompileResponseV1,
+    /// Kind 18: one raw SPIR-V binary chunk (SR-3a), repeatable — RESERVED,
+    /// no producer yet in this skeleton (SR-3c's compiling helper is the
+    /// first). Unlike kinds 1/2/16/17 this payload is NOT JSON.
+    SpirvChunkV1,
     /// Any other kind byte.
     Unknown(u8),
 }
@@ -66,6 +146,9 @@ impl FrameKind {
         match value {
             1 => Self::SceneInspectionV1,
             2 => Self::SceneRenderReportV1,
+            16 => Self::ShaderCompileRequestV1,
+            17 => Self::ShaderCompileResponseV1,
+            18 => Self::SpirvChunkV1,
             other => Self::Unknown(other),
         }
     }
@@ -74,6 +157,9 @@ impl FrameKind {
         match self {
             Self::SceneInspectionV1 => 1,
             Self::SceneRenderReportV1 => 2,
+            Self::ShaderCompileRequestV1 => 16,
+            Self::ShaderCompileResponseV1 => 17,
+            Self::SpirvChunkV1 => 18,
             Self::Unknown(value) => value,
         }
     }
@@ -108,10 +194,15 @@ pub enum FrameError {
     TruncatedHeader,
     #[error("frame payload truncated")]
     TruncatedPayload,
-    #[error("stream exceeded {MAX_FRAMES_PER_STREAM} frames")]
-    FrameCountExceeded,
-    #[error("stream exceeded {MAX_TOTAL_PAYLOAD_BYTES} total payload bytes")]
-    TotalBytesExceeded,
+    /// SR-3a: carries the ACTUAL configured cap (`StreamCaps::max_frames`)
+    /// now that it is no longer always [`MAX_FRAMES_PER_STREAM`].
+    #[error("stream exceeded {max} frames")]
+    FrameCountExceeded { max: usize },
+    /// SR-3a: carries the ACTUAL configured cap
+    /// (`StreamCaps::max_total_payload_bytes`) now that it is no longer
+    /// always [`MAX_TOTAL_PAYLOAD_BYTES`].
+    #[error("stream exceeded {max} total payload bytes")]
+    TotalBytesExceeded { max: usize },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -151,21 +242,36 @@ pub fn write_frame(writer: &mut impl Write, kind: FrameKind, payload: &[u8]) -> 
     Ok(())
 }
 
-/// Bounded frame reader over one report stream. Enforces the stream caps
-/// (`MAX_FRAMES_PER_STREAM`, `MAX_TOTAL_PAYLOAD_BYTES`) across the whole
-/// `FrameReader` lifetime — construct a fresh one per stream/generation.
+/// Bounded frame reader over one stream. Enforces its `StreamCaps` (frame
+/// count, total payload bytes) across the whole `FrameReader` lifetime —
+/// construct a fresh one per stream/generation. The per-frame
+/// [`MAX_PAYLOAD_BYTES`] cap is separate and always enforced, regardless of
+/// `caps`.
 pub struct FrameReader<R: Read> {
     reader: R,
     frames_read: usize,
     total_payload_bytes: usize,
+    caps: StreamCaps,
 }
 
 impl<R: Read> FrameReader<R> {
+    /// The report-FD channel's reader: [`StreamCaps::REPORT`] — the same
+    /// 16-frame/1-MiB caps this constructor always enforced before SR-3a
+    /// made caps configurable (byte-identical behavior, existing callers
+    /// unaffected).
     pub fn new(reader: R) -> Self {
+        Self::with_caps(reader, StreamCaps::REPORT)
+    }
+
+    /// SR-3a: a reader over stream-level caps OTHER than the report
+    /// channel's own defaults (e.g. [`StreamCaps::SHADER_REQUEST`]/
+    /// [`StreamCaps::SHADER_RESPONSE`]).
+    pub fn with_caps(reader: R, caps: StreamCaps) -> Self {
         Self {
             reader,
             frames_read: 0,
             total_payload_bytes: 0,
+            caps,
         }
     }
 
@@ -208,20 +314,31 @@ impl<R: Read> FrameReader<R> {
         // Every well-formed header counts against the stream caps, even an
         // Unknown-kind one that gets skipped semantically below — a
         // flood of tiny unknown frames must not be a way around the caps.
-        // The byte cap is checked before the frame-count cap: with this
-        // protocol's exact constants (16 frames x 64 KiB == 1 MiB exactly),
+        // The byte cap is checked before the frame-count cap: with the
+        // report channel's own caps (16 frames x 64 KiB == 1 MiB exactly),
         // a stream cannot go OVER the byte cap without ALSO being at frame
         // 17 or later, so checking bytes first is what makes
         // TotalBytesExceeded reachable at all as a distinct outcome from
         // FrameCountExceeded — a small-payload stream past 16 frames still
         // hits FrameCountExceeded here, since its byte total stays low.
+        // SR-3a: a caller with a DIFFERENT `StreamCaps` (the shader
+        // helper's channels) may not have this exact coincidence, but the
+        // check order itself — bytes, then count — stays the same either
+        // way; each cap is independently reachable by construction (a
+        // small-payload stream past the frame-count cap always hits
+        // FrameCountExceeded, a stream at the frame cap but under the byte
+        // cap never hits TotalBytesExceeded).
         self.total_payload_bytes += payload_len as usize;
-        if self.total_payload_bytes > MAX_TOTAL_PAYLOAD_BYTES {
-            return Err(FrameError::TotalBytesExceeded);
+        if self.total_payload_bytes > self.caps.max_total_payload_bytes {
+            return Err(FrameError::TotalBytesExceeded {
+                max: self.caps.max_total_payload_bytes,
+            });
         }
         self.frames_read += 1;
-        if self.frames_read > MAX_FRAMES_PER_STREAM {
-            return Err(FrameError::FrameCountExceeded);
+        if self.frames_read > self.caps.max_frames {
+            return Err(FrameError::FrameCountExceeded {
+                max: self.caps.max_frames,
+            });
         }
 
         let mut payload = vec![0_u8; payload_len as usize];
@@ -331,6 +448,169 @@ pub fn validate_inspection(payload: &[u8]) -> Result<Value, ValidationError> {
     }
 
     Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// SR-3a: shader-compile-request-v1 / shader-compile-response-v1
+// ---------------------------------------------------------------------------
+
+/// `validate_shader_compile_request` failures — same "distinguish missing
+/// from wrong-type" style as [`ValidationError`], plus the shader
+/// request's own shape bounds (decision (b)/task §2).
+#[derive(Debug, Error)]
+pub enum ShaderRequestError {
+    #[error("payload is not valid JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("payload is not a JSON object")]
+    NotAnObject,
+    #[error("\"schema\" does not match {SHADER_COMPILE_REQUEST_SCHEMA:?}")]
+    WrongSchema,
+    #[error("missing required field {0:?}")]
+    MissingField(&'static str),
+    #[error("field {0:?} has the wrong JSON type")]
+    WrongType(&'static str),
+    #[error("\"stage\" must be \"vertex\" or \"fragment\"")]
+    InvalidStage,
+    #[error("\"source\" is {len} bytes; maximum is {max}")]
+    SourceOversize { len: usize, max: usize },
+    #[error("\"includes\" has more than {MAX_SHADER_INCLUDES} entries")]
+    TooManyIncludes,
+    #[error("include {0:?} is not a string, or exceeds {MAX_SHADER_INCLUDE_BYTES} bytes")]
+    InvalidInclude(String),
+    #[error("\"combos\" has more than {MAX_SHADER_COMBOS} entries")]
+    TooManyCombos,
+    #[error("\"defines\" has more than {MAX_SHADER_DEFINES} entries")]
+    TooManyDefines,
+}
+
+/// Validates one `shader-compile-request-v1` payload (kind 16): schema tag,
+/// every required field's presence/type, `stage`'s enum, `source`'s length
+/// against `max_source_bytes` (a CALLER-supplied bound — the shader
+/// helper's own `--max-source-bytes` flag, decision (b)/task §2; NOT a
+/// fixed protocol constant, unlike the include/combo/define counts, which
+/// are), and `includes`/`combos`/`defines`'s own fixed shape bounds
+/// ([`MAX_SHADER_INCLUDES`]/[`MAX_SHADER_INCLUDE_BYTES`]/
+/// [`MAX_SHADER_COMBOS`]/[`MAX_SHADER_DEFINES`]).
+///
+/// Does not itself enforce [`MAX_PAYLOAD_BYTES`] — same caller-already-
+/// capped-it assumption `validate_inspection` documents.
+pub fn validate_shader_compile_request(
+    payload: &[u8],
+    max_source_bytes: usize,
+) -> Result<Value, ShaderRequestError> {
+    let value: Value = serde_json::from_slice(payload)?;
+    let object = value.as_object().ok_or(ShaderRequestError::NotAnObject)?;
+
+    let schema = shader_require_str(object, "schema", "schema")?;
+    if schema != SHADER_COMPILE_REQUEST_SCHEMA {
+        return Err(ShaderRequestError::WrongSchema);
+    }
+    let stage = shader_require_str(object, "stage", "stage")?;
+    if stage != "vertex" && stage != "fragment" {
+        return Err(ShaderRequestError::InvalidStage);
+    }
+    let source = shader_require_str(object, "source", "source")?;
+    if source.len() > max_source_bytes {
+        return Err(ShaderRequestError::SourceOversize {
+            len: source.len(),
+            max: max_source_bytes,
+        });
+    }
+
+    let includes = shader_require_object(object, "includes", "includes")?;
+    if includes.len() > MAX_SHADER_INCLUDES {
+        return Err(ShaderRequestError::TooManyIncludes);
+    }
+    for (name, contents) in includes {
+        match contents {
+            Value::String(text) if text.len() <= MAX_SHADER_INCLUDE_BYTES => {}
+            _ => return Err(ShaderRequestError::InvalidInclude(name.clone())),
+        }
+    }
+
+    let combos = shader_require_object(object, "combos", "combos")?;
+    if combos.len() > MAX_SHADER_COMBOS {
+        return Err(ShaderRequestError::TooManyCombos);
+    }
+    let defines = shader_require_object(object, "defines", "defines")?;
+    if defines.len() > MAX_SHADER_DEFINES {
+        return Err(ShaderRequestError::TooManyDefines);
+    }
+
+    Ok(value)
+}
+
+/// `validate_shader_compile_response` failures.
+#[derive(Debug, Error)]
+pub enum ShaderResponseError {
+    #[error("payload is not valid JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+    #[error("payload is not a JSON object")]
+    NotAnObject,
+    #[error("\"schema\" does not match {SHADER_COMPILE_RESPONSE_SCHEMA:?}")]
+    WrongSchema,
+    #[error("missing required field {0:?}")]
+    MissingField(&'static str),
+    #[error("field {0:?} has the wrong JSON type")]
+    WrongType(&'static str),
+}
+
+/// Validates one `shader-compile-response-v1` payload (kind 17): schema
+/// tag, `"status"`/`"reason"` presence and type. This skeleton's own
+/// producer (`kwe-shader-compiler`) only ever emits `status`
+/// `"unimplemented"` or `"protocol-error"`; the status enum itself is not
+/// closed here (a LATER helper's `"ok"`/`"compile-error"`/... are additive,
+/// same "don't retroactively break an older reader" principle as
+/// `FrameKind::Unknown`) — this function only checks shape, never the
+/// specific string value.
+pub fn validate_shader_compile_response(payload: &[u8]) -> Result<Value, ShaderResponseError> {
+    let value: Value = serde_json::from_slice(payload)?;
+    let object = value.as_object().ok_or(ShaderResponseError::NotAnObject)?;
+
+    let schema = match object.get("schema") {
+        None => return Err(ShaderResponseError::MissingField("schema")),
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return Err(ShaderResponseError::WrongType("schema")),
+    };
+    if schema != SHADER_COMPILE_RESPONSE_SCHEMA {
+        return Err(ShaderResponseError::WrongSchema);
+    }
+    match object.get("status") {
+        None => return Err(ShaderResponseError::MissingField("status")),
+        Some(Value::String(_)) => {}
+        Some(_) => return Err(ShaderResponseError::WrongType("status")),
+    }
+    match object.get("reason") {
+        None => return Err(ShaderResponseError::MissingField("reason")),
+        Some(Value::String(_)) => {}
+        Some(_) => return Err(ShaderResponseError::WrongType("reason")),
+    }
+
+    Ok(value)
+}
+
+fn shader_require_str<'a>(
+    map: &'a Map<String, Value>,
+    key: &str,
+    path: &'static str,
+) -> Result<&'a str, ShaderRequestError> {
+    match map.get(key) {
+        None => Err(ShaderRequestError::MissingField(path)),
+        Some(Value::String(value)) => Ok(value.as_str()),
+        Some(_) => Err(ShaderRequestError::WrongType(path)),
+    }
+}
+
+fn shader_require_object<'a>(
+    map: &'a Map<String, Value>,
+    key: &str,
+    path: &'static str,
+) -> Result<&'a Map<String, Value>, ShaderRequestError> {
+    match map.get(key) {
+        None => Err(ShaderRequestError::MissingField(path)),
+        Some(Value::Object(value)) => Ok(value),
+        Some(_) => Err(ShaderRequestError::WrongType(path)),
+    }
 }
 
 fn require_str<'a>(
@@ -508,7 +788,12 @@ mod tests {
                 assert_eq!(read, count, "count={count}");
             } else {
                 assert!(
-                    matches!(result, Err(FrameError::FrameCountExceeded)),
+                    matches!(
+                        result,
+                        Err(FrameError::FrameCountExceeded {
+                            max: MAX_FRAMES_PER_STREAM
+                        })
+                    ),
                     "count={count}: {result:?}"
                 );
                 assert_eq!(read, MAX_FRAMES_PER_STREAM, "count={count}");
@@ -601,7 +886,12 @@ mod tests {
             }
         }
         assert!(
-            matches!(result, Err(FrameError::TotalBytesExceeded)),
+            matches!(
+                result,
+                Err(FrameError::TotalBytesExceeded {
+                    max: MAX_TOTAL_PAYLOAD_BYTES
+                })
+            ),
             "{result:?}"
         );
     }
@@ -949,5 +1239,418 @@ mod tests {
         // already capped it via FrameReader), but it must not panic.
         let huge = vec![b'{'; MAX_PAYLOAD_BYTES * 4];
         assert!(validate_inspection(&huge).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3a: kinds 16/17/18 round-trip
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shader_kinds_round_trip_and_map_to_their_wire_bytes() {
+        for (kind, byte) in [
+            (FrameKind::ShaderCompileRequestV1, 16_u8),
+            (FrameKind::ShaderCompileResponseV1, 17),
+            (FrameKind::SpirvChunkV1, 18),
+        ] {
+            assert_eq!(kind.as_u8(), byte);
+            assert_eq!(FrameKind::from_u8(byte), kind);
+        }
+
+        let mut buffer = Vec::new();
+        write_frame(
+            &mut buffer,
+            FrameKind::ShaderCompileRequestV1,
+            b"request-payload",
+        )
+        .unwrap();
+        write_frame(
+            &mut buffer,
+            FrameKind::ShaderCompileResponseV1,
+            b"response-payload",
+        )
+        .unwrap();
+        write_frame(&mut buffer, FrameKind::SpirvChunkV1, b"\x00\x01spirv-bytes").unwrap();
+
+        let mut reader = FrameReader::with_caps(Cursor::new(buffer), StreamCaps::SHADER_RESPONSE);
+        let first = reader.next_frame().unwrap().unwrap();
+        assert_eq!(first.kind, FrameKind::ShaderCompileRequestV1);
+        assert_eq!(first.payload, b"request-payload");
+        let second = reader.next_frame().unwrap().unwrap();
+        assert_eq!(second.kind, FrameKind::ShaderCompileResponseV1);
+        assert_eq!(second.payload, b"response-payload");
+        let third = reader.next_frame().unwrap().unwrap();
+        assert_eq!(third.kind, FrameKind::SpirvChunkV1);
+        assert_eq!(third.payload, b"\x00\x01spirv-bytes");
+        assert!(reader.next_frame().unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3a: with_caps — custom caps at limit-1/limit/limit+1
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn with_caps_frame_count_is_enforced_at_the_configured_boundary() {
+        let caps = StreamCaps {
+            max_frames: 4,
+            max_total_payload_bytes: 1024,
+        };
+        for (count, expect_ok) in [(3, true), (4, true), (5, false)] {
+            let mut buffer = Vec::new();
+            for _ in 0..count {
+                write_frame(&mut buffer, FrameKind::ShaderCompileRequestV1, b"x").unwrap();
+            }
+            let mut reader = FrameReader::with_caps(Cursor::new(buffer), caps);
+            let mut read = 0;
+            let mut result = Ok(());
+            loop {
+                match reader.next_frame() {
+                    Ok(Some(_)) => read += 1,
+                    Ok(None) => break,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            if expect_ok {
+                assert!(result.is_ok(), "count={count}: {result:?}");
+                assert_eq!(read, count, "count={count}");
+            } else {
+                assert!(
+                    matches!(result, Err(FrameError::FrameCountExceeded { max: 4 })),
+                    "count={count}: {result:?}"
+                );
+                assert_eq!(read, 4, "count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_caps_total_bytes_is_enforced_at_the_configured_boundary() {
+        // A cap small enough that the byte limit binds well before the
+        // (generous) frame-count limit, so this exercises
+        // TotalBytesExceeded specifically, independent of frame count —
+        // the mirror of the report channel's own boundary test above, but
+        // for a StreamCaps whose two limits do NOT coincide the way the
+        // report channel's 16 x 64 KiB == 1 MiB happens to.
+        let caps = StreamCaps {
+            max_frames: 1000,
+            max_total_payload_bytes: 300,
+        };
+        for (payload_len, expect_ok) in [(299, true), (300, true), (301, false)] {
+            let mut buffer = Vec::new();
+            write_frame(
+                &mut buffer,
+                FrameKind::ShaderCompileRequestV1,
+                &vec![0_u8; payload_len],
+            )
+            .unwrap();
+            let mut reader = FrameReader::with_caps(Cursor::new(buffer), caps);
+            let result = reader.next_frame();
+            if expect_ok {
+                assert!(result.is_ok(), "len={payload_len}: {result:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(FrameError::TotalBytesExceeded { max: 300 })),
+                    "len={payload_len}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_caps_never_relaxes_the_universal_per_frame_cap() {
+        // StreamCaps only ever governs the STREAM-level totals; a single
+        // frame over MAX_PAYLOAD_BYTES is refused regardless of how
+        // generous the configured StreamCaps are.
+        let generous = StreamCaps {
+            max_frames: 1_000_000,
+            max_total_payload_bytes: 1_000_000_000,
+        };
+        let mut over = Vec::new();
+        over.extend_from_slice(&MAGIC);
+        over.push(FrameKind::ShaderCompileRequestV1.as_u8());
+        over.push(0);
+        over.extend_from_slice(&0_u16.to_le_bytes());
+        over.extend_from_slice(&((MAX_PAYLOAD_BYTES + 1) as u32).to_le_bytes());
+        let mut reader = FrameReader::with_caps(Cursor::new(over), generous);
+        assert!(matches!(
+            reader.next_frame(),
+            Err(FrameError::PayloadOversize { len }) if len as usize == MAX_PAYLOAD_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn new_and_with_caps_report_are_byte_identical() {
+        // FrameReader::new must behave EXACTLY like with_caps(reader,
+        // StreamCaps::REPORT) -- SR-3a's own additive-behavior promise for
+        // every existing report-FD caller.
+        let mut buffer = Vec::new();
+        for _ in 0..(MAX_FRAMES_PER_STREAM + 1) {
+            write_frame(&mut buffer, FrameKind::SceneInspectionV1, b"x").unwrap();
+        }
+        let mut via_new = FrameReader::new(Cursor::new(buffer.clone()));
+        let mut via_with_caps = FrameReader::with_caps(Cursor::new(buffer), StreamCaps::REPORT);
+        loop {
+            let a = via_new.next_frame();
+            let b = via_with_caps.next_frame();
+            match (&a, &b) {
+                (Ok(Some(fa)), Ok(Some(fb))) => assert_eq!(fa, fb),
+                (Ok(None), Ok(None)) => break,
+                (Err(_), Err(_)) => break,
+                other => panic!("new()/with_caps(REPORT) diverged: {other:?}"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3a: validate_shader_compile_request
+    // -----------------------------------------------------------------
+
+    fn golden_shader_request() -> Value {
+        json!({
+            "schema": SHADER_COMPILE_REQUEST_SCHEMA,
+            "stage": "fragment",
+            "source": "void main() {}",
+            "includes": {"common.glsl": "// shared"},
+            "combos": {"USE_FOG": 1},
+            "defines": {"MAX_LIGHTS": 4},
+        })
+    }
+
+    #[test]
+    fn golden_shader_request_validates() {
+        let record = golden_shader_request();
+        let payload = serde_json::to_vec(&record).unwrap();
+        let validated = validate_shader_compile_request(&payload, 256 * 1024).unwrap();
+        assert_eq!(validated, record);
+    }
+
+    #[test]
+    fn shader_request_missing_fields_are_reported() {
+        for field in ["schema", "stage", "source", "includes", "combos", "defines"] {
+            let mut record = golden_shader_request();
+            record.as_object_mut().unwrap().remove(field);
+            let payload = serde_json::to_vec(&record).unwrap();
+            assert!(
+                matches!(
+                    validate_shader_compile_request(&payload, 256 * 1024),
+                    Err(ShaderRequestError::MissingField(reported)) if reported == field
+                ),
+                "field={field}: {:?}",
+                validate_shader_compile_request(&payload, 256 * 1024)
+            );
+        }
+    }
+
+    #[test]
+    fn shader_request_wrong_types_are_reported() {
+        let mut record = golden_shader_request();
+        record["source"] = json!(42);
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::WrongType("source"))
+        ));
+
+        let mut record = golden_shader_request();
+        record["includes"] = json!("not an object");
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::WrongType("includes"))
+        ));
+    }
+
+    #[test]
+    fn shader_request_wrong_schema_is_rejected() {
+        let mut record = golden_shader_request();
+        record["schema"] = json!("shader-compile-request-v0");
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::WrongSchema)
+        ));
+    }
+
+    #[test]
+    fn shader_request_stage_must_be_vertex_or_fragment() {
+        for stage in ["vertex", "fragment"] {
+            let mut record = golden_shader_request();
+            record["stage"] = json!(stage);
+            let payload = serde_json::to_vec(&record).unwrap();
+            assert!(validate_shader_compile_request(&payload, 256 * 1024).is_ok());
+        }
+        let mut record = golden_shader_request();
+        record["stage"] = json!("geometry");
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::InvalidStage)
+        ));
+    }
+
+    #[test]
+    fn shader_request_source_length_is_bounded_by_the_caller_supplied_max() {
+        for (len, max, expect_ok) in [(9, 10, true), (10, 10, true), (11, 10, false)] {
+            let mut record = golden_shader_request();
+            record["source"] = json!("x".repeat(len));
+            let payload = serde_json::to_vec(&record).unwrap();
+            let result = validate_shader_compile_request(&payload, max);
+            if expect_ok {
+                assert!(result.is_ok(), "len={len} max={max}: {result:?}");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ShaderRequestError::SourceOversize { len: reported_len, max: reported_max })
+                            if reported_len == len && reported_max == max
+                    ),
+                    "len={len} max={max}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shader_request_includes_are_bounded_at_the_count_and_per_entry_boundary() {
+        // Exactly MAX_SHADER_INCLUDES is fine; one more rejects.
+        for (count, expect_ok) in [
+            (MAX_SHADER_INCLUDES - 1, true),
+            (MAX_SHADER_INCLUDES, true),
+            (MAX_SHADER_INCLUDES + 1, false),
+        ] {
+            let mut record = golden_shader_request();
+            let includes: Map<String, Value> = (0..count)
+                .map(|index| (format!("f{index}.glsl"), json!("x")))
+                .collect();
+            record["includes"] = Value::Object(includes);
+            let payload = serde_json::to_vec(&record).unwrap();
+            let result = validate_shader_compile_request(&payload, 256 * 1024);
+            assert_eq!(result.is_ok(), expect_ok, "count={count}: {result:?}");
+            if !expect_ok {
+                assert!(matches!(result, Err(ShaderRequestError::TooManyIncludes)));
+            }
+        }
+
+        // Per-entry byte cap: at the boundary, then one over.
+        let mut record = golden_shader_request();
+        record["includes"] = json!({"big.glsl": "x".repeat(MAX_SHADER_INCLUDE_BYTES)});
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(validate_shader_compile_request(&payload, 256 * 1024).is_ok());
+
+        let mut record = golden_shader_request();
+        record["includes"] = json!({"big.glsl": "x".repeat(MAX_SHADER_INCLUDE_BYTES + 1)});
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::InvalidInclude(name)) if name == "big.glsl"
+        ));
+
+        // A non-string include value is invalid regardless of size.
+        let mut record = golden_shader_request();
+        record["includes"] = json!({"bad.glsl": 42});
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::InvalidInclude(name)) if name == "bad.glsl"
+        ));
+    }
+
+    #[test]
+    fn shader_request_combos_and_defines_are_bounded_at_the_count() {
+        let mut record = golden_shader_request();
+        let combos: Map<String, Value> = (0..MAX_SHADER_COMBOS + 1)
+            .map(|index| (format!("C{index}"), json!(1)))
+            .collect();
+        record["combos"] = Value::Object(combos);
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::TooManyCombos)
+        ));
+
+        let mut record = golden_shader_request();
+        let defines: Map<String, Value> = (0..MAX_SHADER_DEFINES + 1)
+            .map(|index| (format!("D{index}"), json!(1)))
+            .collect();
+        record["defines"] = Value::Object(defines);
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_request(&payload, 256 * 1024),
+            Err(ShaderRequestError::TooManyDefines)
+        ));
+    }
+
+    #[test]
+    fn shader_request_not_an_object_and_invalid_json_are_rejected_gracefully() {
+        assert!(matches!(
+            validate_shader_compile_request(b"[1,2,3]", 256 * 1024),
+            Err(ShaderRequestError::NotAnObject)
+        ));
+        assert!(matches!(
+            validate_shader_compile_request(b"{not json", 256 * 1024),
+            Err(ShaderRequestError::Parse(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // SR-3a: validate_shader_compile_response
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn golden_shader_response_validates() {
+        let record = json!({
+            "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+            "status": "unimplemented",
+            "reason": "skeleton",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert_eq!(validate_shader_compile_response(&payload).unwrap(), record);
+    }
+
+    #[test]
+    fn shader_response_missing_fields_are_reported() {
+        for field in ["schema", "status", "reason"] {
+            let mut record = json!({
+                "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+                "status": "protocol-error",
+                "reason": "wrong-kind",
+            });
+            record.as_object_mut().unwrap().remove(field);
+            let payload = serde_json::to_vec(&record).unwrap();
+            assert!(
+                matches!(
+                    validate_shader_compile_response(&payload),
+                    Err(ShaderResponseError::MissingField(reported)) if reported == field
+                ),
+                "field={field}"
+            );
+        }
+    }
+
+    #[test]
+    fn shader_response_wrong_schema_and_types_are_rejected() {
+        let record = json!({
+            "schema": "shader-compile-response-v0",
+            "status": "unimplemented",
+            "reason": "skeleton",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_response(&payload),
+            Err(ShaderResponseError::WrongSchema)
+        ));
+
+        let record = json!({
+            "schema": SHADER_COMPILE_RESPONSE_SCHEMA,
+            "status": 1,
+            "reason": "skeleton",
+        });
+        let payload = serde_json::to_vec(&record).unwrap();
+        assert!(matches!(
+            validate_shader_compile_response(&payload),
+            Err(ShaderResponseError::WrongType("status"))
+        ));
     }
 }

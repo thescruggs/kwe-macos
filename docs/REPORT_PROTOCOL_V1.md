@@ -18,9 +18,14 @@ for an APPLY decision (a long-lived renderer worker, not the one-shot
 inspector) is SR-1c.
 
 Cross-references: `docs/SCENE_CAPABILITIES.md` (the frozen v1 capability ID
-taxonomy this record's `required`/`detected` arrays draw from) and
+taxonomy this record's `required`/`detected` arrays draw from);
 `docs/SUPERVISOR_API_V1.md` (the daemon's existing JSON-line control-socket
-API, `scene.inspect` in particular — unrelated transport, same daemon).
+API, `scene.inspect` in particular — unrelated transport, same daemon); and
+`docs/SHADER_HELPER_PROTOCOL_V1.md` (SR-3a: the killable shader-compile
+helper reuses this SAME 12-byte `KWR1` frame codec, on both directions of
+its own stdin/stdout channels, under a separate kind namespace — kinds 16-18
+below — and its own `StreamCaps`; the wire FORMAT and this crate's codec are
+shared, the channel semantics are not).
 
 ## Codec vs. policy
 
@@ -154,6 +159,10 @@ proceed as if the flag meant nothing.
 |---|---|---|---|
 | 1 | `scene-inspection-v1` | JSON, `validate_inspection`-checked | Defined by this document |
 | 2 | `scene-render-report-v1` | JSON | Reserved. Its producer arrives with the render-report slices (plan §5.3's "phase and typed failure/recovery action", frame timing, etc.); this codec already carries kind 2 opaquely (the payload passes through `Frame.payload` untouched), so no codec change is needed when that producer lands — only a schema/validator, the same shape `validate_inspection` is for kind 1. |
+| 3-15 | — | — | Unused, reserved for future report-FD kinds (this namespace). |
+| 16 | `shader-compile-request-v1` | JSON | SR-3a. Belongs to the shader helper's SEPARATE stdin/stdout namespace, not the report-FD stream this document otherwise describes — see `docs/SHADER_HELPER_PROTOCOL_V1.md` for the full schema. |
+| 17 | `shader-compile-response-v1` | JSON | SR-3a, same namespace as kind 16. |
+| 18 | `spirv-chunk-v1` | raw binary, repeatable | SR-3a, same namespace; reserved, no producer yet. |
 | anything else | — | opaque | `FrameReader` reads the frame (so the stream stays correctly positioned for the next one), returns it as `Frame { kind: FrameKind::Unknown(n), payload }`, and does not attempt to interpret the payload. This is what makes the wire format additive: a daemon built against this document can read a stream from a future writer that emits a kind it has never heard of, without losing its place in the stream or corrupting its accounting of the stream caps below. Whether an `Unknown` frame in a given stream is fine (forward-compatible metadata) or a protocol violation (SR-1c never expects a kind 3 yet) is daemon policy, not this crate's job. |
 
 Duplicate-kind policy (e.g. two `kind = 1` frames in one stream) is
@@ -164,18 +173,31 @@ decides, at the daemon layer, whether a repeated kind is acceptable.
 
 ## Stream caps (reader-enforced)
 
-`FrameReader` enforces these bounds itself, independent of anything the
-payload claims about itself:
+`FrameReader` enforces two STREAM-level bounds (frame count, total payload
+bytes) itself, independent of anything the payload claims about itself, plus
+one UNIVERSAL per-frame bound that no `StreamCaps` value can relax:
 
-| Cap | Value | Constant |
-|---|---|---|
-| Frames per stream | 16 | `MAX_FRAMES_PER_STREAM` |
-| Total payload bytes per stream | 1 MiB (1,048,576) | `MAX_TOTAL_PAYLOAD_BYTES` |
-| Payload bytes per frame | 64 KiB (65,536) | `MAX_PAYLOAD_BYTES` |
+| Cap | Value | Constant | Configurable? |
+|---|---|---|---|
+| Frames per stream | 16 | `MAX_FRAMES_PER_STREAM` | Yes — `StreamCaps::max_frames` |
+| Total payload bytes per stream | 1 MiB (1,048,576) | `MAX_TOTAL_PAYLOAD_BYTES` | Yes — `StreamCaps::max_total_payload_bytes` |
+| Payload bytes per frame | 64 KiB (65,536) | `MAX_PAYLOAD_BYTES` | No — universal, checked unconditionally |
 
-An `Unknown`-kind frame still counts against every one of these caps — a
-flood of frames in a kind this reader does not recognize is not a way around
-the bounds.
+**SR-3a:** the two stream-level bounds above were fixed constants through
+SR-1/SR-2; `FrameReader::new(reader)` still enforces exactly those values
+(`StreamCaps::REPORT`, byte-identical to the pre-SR-3a behavior — see
+`new_and_with_caps_report_are_byte_identical`), but a caller with different
+needs can now construct `FrameReader::with_caps(reader, StreamCaps { ... })`
+instead. The shader helper (`docs/SHADER_HELPER_PROTOCOL_V1.md`) is the
+first other caller: `StreamCaps::SHADER_REQUEST` (4 frames / 1 MiB) for its
+stdin, `StreamCaps::SHADER_RESPONSE` (132 frames / 8 MiB) for its stdout.
+The per-frame cap is unaffected by any of this — every `StreamCaps` value
+still refuses a >64 KiB single frame the same way.
+
+An `Unknown`-kind frame still counts against every configured stream-level
+cap — a flood of frames in a kind this reader does not recognize is not a
+way around the bounds, regardless of which `StreamCaps` a reader was built
+with.
 
 Per plan §9 ("Every bound defines behavior at `limit-1`, `limit`, and
 `limit+1`: accept, degrade, refuse, or terminate"), the behavior at each

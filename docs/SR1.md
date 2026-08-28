@@ -865,7 +865,7 @@ STOP findings:           None. The task's own two forks (which
                          file) before any code was written, exactly as the
                          task asked -- no code-level STOP condition was
                          named for this slice and none was found.
-Commit(s):               (fill in after commit)
+Commit(s):               f5095ff
 ```
 
 ## SR-1d — report/inspector version-skew matrix

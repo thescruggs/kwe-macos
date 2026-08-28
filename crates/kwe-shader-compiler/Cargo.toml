@@ -1,0 +1,10 @@
+[package]
+name = "kwe-shader-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kwe-report-protocol = { path = "../kwe-report-protocol" }
+serde_json.workspace = true

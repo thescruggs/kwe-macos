@@ -12,6 +12,7 @@ members = [
     "crates/kwe-report-protocol",
     "crates/kwe-scene-inspector",
     "crates/kwe-scene-renderer",
+    "crates/kwe-shader-compiler",
     "crates/kwe-test-renderer",
     "crates/kwe-video-renderer",
     "crates/kwe-vulkan",
