@@ -57,6 +57,9 @@ fi
 if [[ "${KWE_RUN_WORKSHOP_CACHE_SMOKE:-0}" == "1" ]]; then
     scripts/smoke-workshop-cache.sh
 fi
+if [[ "${KWE_RUN_SCENE_CORPUS_SMOKE:-0}" == "1" ]]; then
+    scripts/smoke-scene-corpus.sh
+fi
 # Destructive live-session smoke (BETA_M4d): authorized on this machine only.
 if [[ "${KWE_RUN_LIVE_APPLY_SMOKE:-0}" == "1" ]]; then
     scripts/smoke-live-apply.sh

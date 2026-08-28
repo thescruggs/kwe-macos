@@ -371,11 +371,169 @@ Open risks:              The task's literal entry-point signature
 Commit(s):               1783148, 4304b25 (R1/R2 review fix)
 ```
 
-## SR-0d — Private corpus metadata runner
+## SR-0d — private corpus metadata inventory runner
 
-- `scripts/scene-corpus-inventory.sh` + CLI surface: run the inspector over
-  the local 60-item corpus, metadata-only records (feature histogram, unknown
-  counts, per-item time/bytes), no source bytes leave the machine, nothing
-  committed.
-- Also captures the current S7d failure cases as reproducible local
-  diagnostic records (plan §8 SR-0 in-scope item).
+```text
+Task:            scripts/scene-corpus-inventory.sh: run kwe-scene-inspector over a
+                 directory of Workshop items, write bounded metadata-only NDJSON
+                 records and a deterministic aggregate summary, nothing committed.
+Milestone/Slice: SR-0d
+Goal:            Turn SR-0b/c's per-item inspector into a corpus-wide local lab tool
+                 the maintainer can point at the real 60-item Workshop corpus (or any
+                 other) to see the object-family inventory's aggregate shape —
+                 outcome/reason histogram, detected/required capability counts,
+                 unknown-key samples — without any of it ever leaving the machine or
+                 landing in the repo.
+Conductor scope decisions: (1) This script invokes kwe-scene-inspector DIRECTLY
+                 under `timeout`, not through the daemon's scene.inspect RPC
+                 (crates/kwe-daemon/src/inspect.rs). It is an uncommitted-output
+                 local lab harness over the maintainer's own corpus, not a
+                 production code path: the inspector is still its own process with
+                 its own bounds (byte/time caps, the 64 KiB report cap), but it does
+                 NOT get the daemon's containment (private HOME, PDEATHSIG, rlimits,
+                 process-group kill, the single-in-flight gate). Daemon-grade
+                 containment for inspection remains the production path
+                 (scene.inspect); this script trades that off deliberately for a
+                 maintainer-only convenience over trusted local content.
+                 (2) The original SR-0d line "captures the current S7d failure cases
+                 as reproducible local diagnostic records" is narrowed OUT of this
+                 slice: those diagnoses and maintainer reports already exist locally
+                 (~/.local/share/kwe/reports/, project memory notes,
+                 docs/s7-report-root-causes.md-style notes) — a renderer-side
+                 capture harness is not inventory work and was never implemented
+                 here.
+Outcome:         New scripts/scene-corpus-inventory.sh (bash, set -euo pipefail):
+                 --corpus-dir (required), --inspector (default
+                 $CARGO_TARGET_DIR-or-target/debug/kwe-scene-inspector beside the repo
+                 root), --out (default
+                 ${XDG_DATA_HOME:-$HOME/.local/share}/kwe/corpus/<UTC
+                 yyyymmdd-HHMMSS>/, chmod 700), --per-item-timeout-s (15),
+                 --max-source-mib (512, passed through). Discovers immediate
+                 subdirectories of corpus-dir, sorted (find -mindepth 1 -maxdepth 1 |
+                 sort -z, never recursing deeper): a symlinked item dir is detected
+                 with `-L` BEFORE anything that would traverse it and recorded
+                 skipped-symlink; scene.pkg present -> inspect that file; else
+                 scene.json present -> inspect the item directory; else recorded
+                 skipped — none of these three ever runs the inspector except the
+                 scene.pkg/scene.json cases. Each inspected item runs `timeout
+                 <n>s <inspector> --input <path> --max-source-mib <n>`; a single
+                 python3 wrapper (defined once, invoked via `python3 -c` per item —
+                 avoids the heredoc-consumes-stdin trap of `python3 - <<EOF`)
+                 constructs one NDJSON line per item with a uniform shape ({"item",
+                 "status": inspected|skipped|skipped-symlink, "exit", "timed_out",
+                 "record", ["stdout_invalid"]}), so malformed inspector stdout
+                 becomes record:null + stdout_invalid:true instead of corrupting the
+                 file, and unusual item basenames can never break JSON escaping.
+                 stderr is captured separately, truncated to 4 KiB, one file per
+                 item under <out>/stderr/. A per-item failure/timeout never aborts
+                 the run (bracketed set +e/set -e around the capture); the script
+                 exits nonzero only for usage errors, a missing/non-executable
+                 inspector binary, or an unwritable out dir.
+                 New scripts/scene-corpus-summarize.py (python3 stdlib only —
+                 argparse/json/statistics/collections/datetime): reads records.ndjson,
+                 writes <out>/summary.json (sort_keys=True, byte-deterministic for
+                 identical input) with corpus_items (total/skipped/inspected), an
+                 outcome:reason histogram, timed_out/stdout_invalid counts, detected
+                 {capability: {items, total_count}}, required {capability: items},
+                 an unknown aggregate (keys/types/objects totals + top-20
+                 item-frequency-sorted sample paths), a limits_hit histogram,
+                 wall_ms {max, median}, source_bytes {max, total}, and the sorted set
+                 of inspector.build values seen — no titles, no absolute paths, item
+                 basenames (Workshop IDs) only. Also prints a compact stdout table,
+                 with each histogram sorted by count desc then name asc (summary.json
+                 itself stays alphabetically key-sorted for diffability; the two
+                 outputs sort differently on purpose — see the script's own docstring).
+                 New scripts/smoke-scene-corpus.sh, gated
+                 KWE_RUN_SCENE_CORPUS_SMOKE=1 exactly like every other opt-in smoke
+                 suite (scripts/check.sh): builds a synthetic 4-item corpus (one dir
+                 item with a visible image object, one dir item with a visible text
+                 object — deliberately different capabilities so both show up
+                 distinctly — one item with neither scene.pkg nor scene.json, one
+                 symlinked item dir), builds kwe-scene-inspector first, runs the
+                 real inventory script against the fixture with an explicit
+                 --inspector, and asserts records.ndjson has exactly 4 wrapped lines
+                 with the right statuses, summary.json exists with matching
+                 corpus_items/outcome counts, and the detected histogram carries both
+                 scene.layer.image and scene.layer.text at items=1. Wired into
+                 scripts/check.sh next to the other KWE_RUN_*_SMOKE gates. pkg-kind
+                 coverage is NOT duplicated here — it already lives in
+                 crates/kwe-scene-inspector/src/main.rs's pkg_* Rust unit tests
+                 (SR-0c); this smoke only proves the shell/python harness's own
+                 wrapping, skip, and symlink logic end to end.
+In scope:        scripts/scene-corpus-inventory.sh (new), scripts/scene-corpus-summarize.py
+                 (new), scripts/smoke-scene-corpus.sh (new), scripts/check.sh (one
+                 new KWE_RUN_SCENE_CORPUS_SMOKE gate), docs/SR0.md. No Rust code
+                 changed.
+Out of scope:    The S7d capture harness (conductor scope decision 2, above); running
+                 the real Workshop corpus (the conductor runs that separately after
+                 merge — this report does not include real corpus output); any
+                 daemon/CLI change (the script talks to the inspector binary
+                 directly, per conductor scope decision 1); docs/SUPERVISOR_API_V1.md
+                 and docs/SCENE_CAPABILITIES.md (untouched, per the task).
+Acceptance tests:        scripts/smoke-scene-corpus.sh (KWE_RUN_SCENE_CORPUS_SMOKE=1):
+                         4/4 NDJSON lines with the right statuses (2 inspected, 1
+                         skipped, 1 skipped-symlink); both inspected items answer
+                         inventoried/ok; summary.json's corpus_items
+                         (total=4/inspected=2/skipped=2) and the
+                         inventoried:ok=2 outcome count match; the detected histogram
+                         carries scene.layer.image and scene.layer.text each at
+                         items=1. Manual runs during implementation additionally
+                         verified: an empty corpus dir exits 0 with an all-zero
+                         summary (no bash unbound-array error under `set -u`, bash
+                         5.3); a malformed scene.json item (invalid JSON) yields
+                         outcome incompatible/reason parse-error in the record and
+                         does not abort the run; --corpus-dir omitted, a nonexistent
+                         --corpus-dir, and a missing --inspector binary each exit
+                         nonzero with a clear message (2, 2, 1 respectively); the out
+                         dir is created 0700.
+                         cargo fmt/clippy/test --workspace: unchanged from trunk (no
+                         Rust files touched) — 777 passed, 0 failed, both before and
+                         after this slice.
+                         ./scripts/check.sh: green both without
+                         KWE_RUN_SCENE_CORPUS_SMOKE (default, matching every other
+                         opt-in smoke) and with it set to 1 (includes the C++/QML
+                         build and qml-typecheck both times).
+Failure/recovery tests:  A per-item inspector failure/timeout is captured and
+                         recorded, never aborts the corpus run (verified via the
+                         malformed-JSON manual case above, which the harness's own
+                         set +e/set -e bracketing around the timeout capture keeps
+                         from tripping `set -e`); usage/missing-binary/unwritable-out
+                         errors exit nonzero with a message naming the problem.
+Upstream/provenance:     Original; style-matched to scripts/smoke-corpus-pkg.sh and
+                         scripts/scene-corpus-byte-identity-sweep.sh (jq for JSON
+                         assertions, mktemp -d + trap cleanup, KWE_RUN_*_SMOKE gating)
+                         and scripts/frame-read.py (python3 stdlib, non-executable,
+                         invoked as `python3 <path>`).
+Commands run and results: shellcheck: NOT INSTALLED on this machine (`command -v
+                         shellcheck` and `pacman -Q shellcheck` both fail) — could not
+                         run it; both new shell scripts were syntax-checked with
+                         `bash -n` (clean) and exercised manually instead (see
+                         Acceptance tests).
+                         python3 -m py_compile scripts/scene-corpus-summarize.py --
+                         clean.
+                         cargo fmt --all -- --check -- clean (no Rust changed).
+                         cargo clippy --workspace --all-targets -- -D warnings --
+                         clean (no Rust changed).
+                         cargo test --workspace -- 777 passed, 0 failed (identical to
+                         the SR-0c baseline).
+                         KWE_RUN_SCENE_CORPUS_SMOKE=1 ./scripts/smoke-scene-corpus.sh
+                         -- passed standalone.
+                         ./scripts/check.sh -- green both with and without
+                         KWE_RUN_SCENE_CORPUS_SMOKE=1.
+Open risks:              shellcheck was not available to verify the two new shell
+                         scripts against its lint rules; only manual review + bash -n
+                         + actual execution covered them. A maintainer with
+                         shellcheck installed should run it once before or after the
+                         first real corpus pass.
+                         summary.json's "median"/other statistics.median() output can
+                         serialize as a JSON float even for integer-valued input
+                         (Python averages the two middle values for an even-length
+                         sample) — cosmetic only, not a correctness issue, but worth
+                         knowing when diffing summaries across runs with different
+                         item counts.
+                         This tool is explicitly less contained than production
+                         scene.inspect (conductor scope decision 1) — it must never be
+                         pointed at untrusted content, only the maintainer's own local
+                         corpus.
+Commit(s):               <filled after commit; same commit as this file>
+```
