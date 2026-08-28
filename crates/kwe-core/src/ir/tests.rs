@@ -186,7 +186,8 @@ fn video_object_loop_default_is_true_and_tolerant_of_string_forms() {
         "objects": [
             {"id": 1, "name": "default", "video": "a.mp4"},
             {"id": 2, "name": "stringfalse", "video": "b.mp4", "loop": "false"},
-            {"id": 3, "name": "stringother", "video": "c.mp4", "loop": "yes"}
+            {"id": 3, "name": "stringother", "video": "c.mp4", "loop": "yes"},
+            {"id": 4, "name": "stringfalsepadded", "video": "d.mp4", "loop": "  FALSE  "}
         ]
     }));
     let default_loop = object_by_name(&scene, "default");
@@ -195,6 +196,10 @@ fn video_object_loop_default_is_true_and_tolerant_of_string_forms() {
     assert!(matches!(&string_false.kind, ObjectKindIr::Video(v) if !v.loop_playback));
     let string_other = object_by_name(&scene, "stringother");
     assert!(matches!(&string_other.kind, ObjectKindIr::Video(v) if v.loop_playback));
+    // SR-2c fix: scene.rs's own `loop` parser trims + lowercases before
+    // matching "false"/"0"/"no" — padding/casing must not defeat it.
+    let string_false_padded = object_by_name(&scene, "stringfalsepadded");
+    assert!(matches!(&string_false_padded.kind, ObjectKindIr::Video(v) if !v.loop_playback));
 }
 
 #[test]
@@ -250,6 +255,35 @@ fn text_object_has_size_records_presence_and_preserves_the_raw_value() {
 }
 
 #[test]
+fn pointsize_stays_in_raw_points_whether_authored_or_defaulted() {
+    // SR-2c fix: an authored pointsize must not be silently unit-mixed
+    // with the (already-pixel) default — both must be in RAW POINTS, so a
+    // consumer applies `text::pointsize_to_px`'s ×4-and-clamp conversion
+    // uniformly regardless of whether the field was authored.
+    let scene = parse(&json!({
+        "general": {},
+        "objects": [
+            {"id": 1, "name": "authored", "text": "hi", "pointsize": 24.0},
+            {"id": 2, "name": "defaulted", "text": "hi"}
+        ]
+    }));
+    let ObjectKindIr::Text(authored) = &object_by_name(&scene, "authored").kind else {
+        panic!("expected Text");
+    };
+    assert_eq!(
+        authored.pointsize, 24.0,
+        "authored value stays in raw points, not ×4'd"
+    );
+    let ObjectKindIr::Text(defaulted) = &object_by_name(&scene, "defaulted").kind else {
+        panic!("expected Text");
+    };
+    assert_eq!(
+        defaulted.pointsize, 12.0,
+        "default is text::DEFAULT_POINT_SIZE in points, not 48px"
+    );
+}
+
+#[test]
 fn particle_object_reads_known_fields_and_leaves_speed_fields_in_unknown() {
     let scene = parse(&json!({
         "general": {},
@@ -259,9 +293,14 @@ fn particle_object_reads_known_fields_and_leaves_speed_fields_in_unknown() {
                 "sizeStart": 4.0, "sizeEnd": 12.0, "alphaStart": 0.8, "alphaEnd": 0.1,
                 "gravity": [0.0, -9.8], "colorStart": [1, 0, 0], "colorEnd": [0, 0, 1],
                 "maxCount": 500, "texture": "textures/spark.png", "material": "ignored.png",
-                "speed": 5.0, "speedMin": 1.0, "speedMax": 9.0,
-                "instanceoverride": {"count": "0.5", "colorn": "0.2 0.4 0.6", "color": [9, 9, 9]}
-            }}
+                "speed": 5.0, "speedMin": 1.0, "speedMax": 9.0
+            },
+            // `instanceoverride` is a SIBLING of `particle` on the object,
+            // not nested inside it (`scene.rs`'s `parse_particle_system`
+            // reads `object.get("instanceoverride")`) — an earlier version
+            // of this fixture nested it wrongly, matching a since-fixed
+            // bug in `parse_particle_ir` that never found it there.
+            "instanceoverride": {"count": "0.5", "colorn": "0.2 0.4 0.6", "color": [9, 9, 9]}}
         ]
     }));
     let object = object_by_name(&scene, "p");
@@ -300,7 +339,11 @@ fn particle_object_reads_known_fields_and_leaves_speed_fields_in_unknown() {
     assert_eq!(
         residue.get("instanceoverride"),
         None,
-        "instanceoverride was read"
+        "instanceoverride is never a particle-definition key, so it can never appear in the particle residue"
+    );
+    assert!(
+        object.unknown.get("instanceoverride").is_none(),
+        "instanceoverride was read from the object level and consumed"
     );
 }
 
@@ -543,11 +586,19 @@ fn a_non_object_root_is_refused() {
 }
 
 #[test]
-fn objects_missing_or_non_array_is_treated_as_empty() {
+fn objects_missing_is_treated_as_empty_but_a_present_non_array_is_rejected() {
     let scene = parse(&json!({"general": {}}));
     assert!(scene.objects.is_empty());
-    let scene = parse(&json!({"general": {}, "objects": "not an array"}));
-    assert!(scene.objects.is_empty());
+    // Mirrors `scene.rs`'s own `parse_objects`: an ABSENT "objects" key
+    // defaults to empty, but a PRESENT non-array value is a shape reject
+    // (`value.as_array().ok_or_else(...)`), not a silent empty-scene
+    // fallback — SR-2c's differential testing caught an earlier version of
+    // this function silently treating both cases as empty.
+    let error = parse_scene_ir(
+        &serde_json::to_vec(&json!({"general": {}, "objects": "not an array"})).unwrap(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, IrError::ObjectsNotAnArray));
 }
 
 // ---------------------------------------------------------------------------
@@ -592,9 +643,9 @@ fn round_trip_through_to_raw_value_reproduces_an_equal_scene_ir() {
              "verticalalign": "bottom", "color": [1, 1, 0], "size": [5, 6]},
             {"id": 7, "name": "particle", "particle": {
                 "spawnRate": 5.0, "texture": "p.png", "material": "loser.png",
-                "speed": 3.0, "speedMin": 1.0, "speedMax": 9.0,
-                "instanceoverride": {"colorn": "0.5 0.5 0.5", "color": [9, 9, 9]}
-            }},
+                "speed": 3.0, "speedMin": 1.0, "speedMax": 9.0
+            },
+             "instanceoverride": {"colorn": "0.5 0.5 0.5", "color": [9, 9, 9]}},
             {"id": 8, "name": "particlefile", "particle": "particles/p.json"},
             {"id": 8, "name": "duplicate-id"},
             {"name": "sound", "sound": "a.mp3"},

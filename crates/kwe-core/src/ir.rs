@@ -172,6 +172,8 @@ pub enum IrError {
     NotAnObject,
     #[error("scene.json \"objects\" has more than {MAX_OBJECTS} entries")]
     ObjectsCap,
+    #[error("scene.json \"objects\" must be an array")]
+    ObjectsNotAnArray,
     #[error("scene.json \"objects\"[{index}] must be an object")]
     ObjectEntryNotAnObject { index: usize },
 }
@@ -212,9 +214,15 @@ pub fn parse_scene_ir(bytes: &[u8]) -> Result<SceneIr, IrError> {
         None => GeneralIr::default(),
     };
 
+    // Mirrors `scene.rs`'s own `parse_objects`: an ABSENT "objects" key
+    // defaults to empty (a scene with no objects is valid), but a PRESENT
+    // key that is not an array is a shape reject — legacy's own
+    // `value.as_array().ok_or_else(...)` does not tolerate a non-array
+    // "objects" the way it tolerates a missing one.
     let raw_objects: &[Value] = match root_object.get("objects") {
+        None => &[],
         Some(Value::Array(items)) => items,
-        _ => &[],
+        Some(_) => return Err(IrError::ObjectsNotAnArray),
     };
     if raw_objects.len() > MAX_OBJECTS {
         return Err(IrError::ObjectsCap);
@@ -484,6 +492,14 @@ pub struct EffectRefIr {
     pub file: Option<String>,
     pub passes: Vec<Value>,
     pub unknown: UnknownBag,
+    /// The entry's ORIGINAL raw JSON value, byte-faithful. `id`/`name`/
+    /// `visible` above are typed WITH a default when absent (0/""/true) —
+    /// indistinguishable from an authored `0`/`""`/`true` once typed — so
+    /// a consumer that needs to reproduce exactly what was authored (a
+    /// scene-family adapter reconstructing a legacy `Vec<Value>` for later
+    /// effect-FILE resolution, not this module's own concern) reads this
+    /// field instead of reconstructing from the typed ones.
+    pub raw: Value,
 }
 
 fn parse_effect_ref_ir(entry: &Value) -> Option<EffectRefIr> {
@@ -534,6 +550,7 @@ fn parse_effect_ref_ir(entry: &Value) -> Option<EffectRefIr> {
         file,
         passes,
         unknown,
+        raw: entry.clone(),
     })
 }
 
@@ -722,6 +739,12 @@ pub struct VideoIr {
 pub struct TextIr {
     pub text: String,
     pub font: Option<String>,
+    /// Raw authored `pointsize` (points, NOT pixels) — the renderer's own
+    /// `text::pointsize_to_px` does the ×4-and-clamp conversion; this field
+    /// deliberately stays unconverted so it is consistent whether authored
+    /// or defaulted (SR-2c fix: an earlier draft of this field defaulted to
+    /// the ALREADY-CONVERTED 48px value while an authored value stayed in
+    /// raw points, a real unit-mixing bug this comment now guards against).
     pub pointsize: f32,
     pub horizontal_align: HorizontalAlignIr,
     pub vertical_align: VerticalAlignIr,
@@ -765,9 +788,23 @@ pub struct ParticleIr {
 
 /// A particle system whose `"particle"` value is a bare string — an
 /// external particle-definition file reference (M3f/S4b).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `instanceoverride` (see [`ParticleIr::instance_colorn`]'s doc comment)
+/// is a SIBLING key of `"particle"` on the object, read by `scene.rs`'s
+/// `parse_particle_system` UNCONDITIONALLY before it branches on whether
+/// `particle` is a string or an object — so a file-referenced particle
+/// system gets its instance overrides applied exactly like an inline one,
+/// and this struct carries the same 7 typed fields `ParticleIr` does.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParticleFileIr {
     pub file_ref: Option<String>,
+    pub instance_count: f32,
+    pub instance_rate: f32,
+    pub instance_size: f32,
+    pub instance_lifetime: f32,
+    pub instance_speed: f32,
+    pub instance_alpha: f32,
+    pub instance_colorn: f32,
 }
 
 /// One object's family-specific payload. Mirrors `SceneObjectKind`'s own
@@ -1043,7 +1080,7 @@ fn parse_kind_ir(
             // always safe here; parse_particle_ir tracks which of ITS OWN
             // sub-keys it read and returns the rest as `residue`.
             consumed.insert("particle".to_string());
-            let (particle, residue) = parse_particle_ir(object);
+            let (particle, residue) = parse_particle_ir(object, consumed);
             if !residue.is_empty() {
                 extra_unknown.insert("particle".to_string(), Value::Object(residue));
             }
@@ -1054,20 +1091,40 @@ fn parse_kind_ir(
             // for ANY non-Particle shape of `particle` — including a
             // non-string one (e.g. a bare number). Only consume when the
             // unwrap actually produced a string; otherwise the raw shape
-            // is left for the unknown bag.
-            match object
+            // is left for the unknown bag. `instanceoverride` is read the
+            // same way regardless (see `ParticleFileIr`'s doc comment) —
+            // `scene.rs` applies it before branching on the shape of
+            // `particle` at all.
+            let (
+                instance_count,
+                instance_rate,
+                instance_size,
+                instance_lifetime,
+                instance_speed,
+                instance_alpha,
+                instance_colorn,
+            ) = parse_object_instance_override(object, consumed);
+            let file_ref = match object
                 .get("particle")
                 .map(scene_property_value)
                 .and_then(Value::as_str)
             {
                 Some(file_ref) => {
                     consumed.insert("particle".to_string());
-                    ObjectKindIr::ParticleFile(ParticleFileIr {
-                        file_ref: Some(file_ref.to_string()),
-                    })
+                    Some(file_ref.to_string())
                 }
-                None => ObjectKindIr::ParticleFile(ParticleFileIr { file_ref: None }),
-            }
+                None => None,
+            };
+            ObjectKindIr::ParticleFile(ParticleFileIr {
+                file_ref,
+                instance_count,
+                instance_rate,
+                instance_size,
+                instance_lifetime,
+                instance_speed,
+                instance_alpha,
+                instance_colorn,
+            })
         }
         SceneObjectKind::Text => parse_text_ir(object, consumed),
         SceneObjectKind::Other => ObjectKindIr::Unknown,
@@ -1086,7 +1143,11 @@ fn parse_kind_ir(
 fn as_bool_tolerant(value: &Value, default: bool) -> bool {
     match scene_property_value(value) {
         Value::Bool(b) => *b,
-        Value::String(s) => !matches!(s.to_ascii_lowercase().as_str(), "false" | "0" | "no"),
+        // SR-2c fix: `scene.rs`'s own `loop` parser trims before
+        // lowercasing (`value.trim().to_ascii_lowercase()`); an earlier
+        // draft of this function omitted the trim, so `" false "` fell
+        // through to the tolerant-default `true` instead of matching.
+        Value::String(s) => !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"),
         Value::Number(n) => n.as_f64().is_none_or(|n| n != 0.0),
         _ => default,
     }
@@ -1166,7 +1227,10 @@ fn parse_text_ir(object: &Map<String, Value>, consumed: &mut BTreeSet<String>) -
         }
         None => None,
     };
-    const DEFAULT_POINTSIZE_PX: f32 = 48.0; // text::DEFAULT_POINT_SIZE(12.0) * text::POINT_TO_PX(4.0)
+    // Raw points (text::DEFAULT_POINT_SIZE), NOT pixels — see the
+    // `TextIr::pointsize` field doc comment for why this must stay
+    // consistent between the authored and defaulted cases.
+    const DEFAULT_POINTSIZE_POINTS: f32 = 12.0;
     let pointsize = match object
         .get("pointsize")
         .and_then(|value| as_number(scene_property_value(value)))
@@ -1176,7 +1240,7 @@ fn parse_text_ir(object: &Map<String, Value>, consumed: &mut BTreeSet<String>) -
             consumed.insert("pointsize".to_string());
             v as f32
         }
-        None => DEFAULT_POINTSIZE_PX,
+        None => DEFAULT_POINTSIZE_POINTS,
     };
     let (horizontal_align, horizontal_consumed) = resolve_horizontal_align(object);
     for key in horizontal_consumed {
@@ -1226,16 +1290,40 @@ fn parse_text_ir(object: &Map<String, Value>, consumed: &mut BTreeSet<String>) -
 /// `"particle"` when it is non-empty, so a reader finds exactly the
 /// un-typed particle sub-keys there — never the whole (mostly-typed)
 /// particle object again, and never silently dropped either.
-fn parse_particle_ir(object: &Map<String, Value>) -> (ParticleIr, Map<String, Value>) {
+fn parse_particle_ir(
+    object: &Map<String, Value>,
+    consumed: &mut BTreeSet<String>,
+) -> (ParticleIr, Map<String, Value>) {
+    let (
+        instance_count,
+        instance_rate,
+        instance_size,
+        instance_lifetime,
+        instance_speed,
+        instance_alpha,
+        instance_colorn,
+    ) = parse_object_instance_override(object, consumed);
     let definition = object
         .get("particle")
         .map(scene_property_value)
         .and_then(Value::as_object);
     let Some(definition) = definition else {
         // classify_scene_object only reaches Particle for an object shape;
-        // defensive fallback to an empty definition (all defaults, no
-        // residue).
-        return (default_particle_ir(), Map::new());
+        // defensive fallback to an empty definition (all defaults except
+        // the instance overrides already read above, no residue).
+        return (
+            ParticleIr {
+                instance_count,
+                instance_rate,
+                instance_size,
+                instance_lifetime,
+                instance_speed,
+                instance_alpha,
+                instance_colorn,
+                ..default_particle_ir()
+            },
+            Map::new(),
+        );
     };
 
     // `speed`/`speedMin`/`speedMax` are DELIBERATELY not read here — see
@@ -1320,24 +1408,15 @@ fn parse_particle_ir(object: &Map<String, Value>) -> (ParticleIr, Map<String, Va
         None => None,
     };
 
-    let (
-        instance_count,
-        instance_rate,
-        instance_size,
-        instance_lifetime,
-        instance_speed,
-        instance_alpha,
-        instance_colorn,
-    ) = match definition
-        .get("instanceoverride")
-        .and_then(|value| scene_property_value(value).as_object())
-    {
-        Some(overrides) => {
-            inner_consumed.insert("instanceoverride".to_string());
-            parse_instance_override(overrides)
-        }
-        None => (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
-    };
+    // `instanceoverride` is NOT a key of `definition` — it is a SIBLING of
+    // `"particle"` on the OUTER object (`scene.rs`'s `parse_particle_system`
+    // reads `object.get("instanceoverride")`, not the particle definition's
+    // own key), already read into `instance_count`..`instance_colorn` above
+    // via `parse_object_instance_override(object, ..)` before `definition`
+    // was even extracted. An earlier version of this function mistakenly
+    // read it from `definition` instead, which meant it was NEVER found in
+    // any real scene (SR-2c differential testing caught this: `object.rs`
+    // always nests `instanceoverride` beside `particle`, never inside it).
 
     // Every definition key this function did not read — including
     // speed/speedMin/speedMax and any WE component-model keys
@@ -1433,6 +1512,28 @@ fn parse_instance_override(overrides: &Map<String, Value>) -> (f32, f32, f32, f3
         None => 1.0,
     };
     (count, rate, size, lifetime, speed, alpha, colorn)
+}
+
+/// `instanceoverride` as authored on the OBJECT itself (a sibling of
+/// `"particle"`, read the same way whether `particle` is a string, an
+/// object, or anything else — see `ParticleFileIr`'s doc comment).
+/// Consumes the top-level `"instanceoverride"` key on success, matching
+/// every other object-typed field this module reads fully.
+#[allow(clippy::type_complexity)]
+fn parse_object_instance_override(
+    object: &Map<String, Value>,
+    consumed: &mut BTreeSet<String>,
+) -> (f32, f32, f32, f32, f32, f32, f32) {
+    match object
+        .get("instanceoverride")
+        .and_then(|value| scene_property_value(value).as_object())
+    {
+        Some(overrides) => {
+            consumed.insert("instanceoverride".to_string());
+            parse_instance_override(overrides)
+        }
+        None => (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,55 +1678,81 @@ impl ObjectKindIr {
                 if let Some(material) = &inner.material {
                     definition.insert("texture".to_string(), Value::String(material.clone()));
                 }
-                let mut overrides = Map::new();
-                overrides.insert("count".to_string(), json!(inner.instance_count));
-                overrides.insert("rate".to_string(), json!(inner.instance_rate));
-                overrides.insert("size".to_string(), json!(inner.instance_size));
-                overrides.insert("lifetime".to_string(), json!(inner.instance_lifetime));
-                overrides.insert("speed".to_string(), json!(inner.instance_speed));
-                overrides.insert("alpha".to_string(), json!(inner.instance_alpha));
-                // Re-emitted as a 3-vector (mirroring the authored WE
-                // shape `parse_instance_override` expects), not the
-                // reduced scalar `instance_colorn` itself holds — a bare
-                // number would fail `as_vector`'s `&[3]` shape check on
-                // re-parse and silently reset to the 1.0 default.
-                overrides.insert(
-                    "colorn".to_string(),
-                    json!([
-                        inner.instance_colorn,
-                        inner.instance_colorn,
-                        inner.instance_colorn
-                    ]),
-                );
-                definition.insert("instanceoverride".to_string(), Value::Object(overrides));
                 map.insert("particle".to_string(), Value::Object(definition));
+                // `instanceoverride` is a SIBLING of `"particle"` on the
+                // OBJECT (see `ParticleFileIr`'s doc comment) — inserted
+                // into `map`, not `definition`, matching where it was read.
+                map.insert(
+                    "instanceoverride".to_string(),
+                    instance_override_to_raw_value(
+                        inner.instance_count,
+                        inner.instance_rate,
+                        inner.instance_size,
+                        inner.instance_lifetime,
+                        inner.instance_speed,
+                        inner.instance_alpha,
+                        inner.instance_colorn,
+                    ),
+                );
             }
             ObjectKindIr::ParticleFile(inner) => {
                 if let Some(file_ref) = &inner.file_ref {
                     map.insert("particle".to_string(), Value::String(file_ref.clone()));
                 }
+                map.insert(
+                    "instanceoverride".to_string(),
+                    instance_override_to_raw_value(
+                        inner.instance_count,
+                        inner.instance_rate,
+                        inner.instance_size,
+                        inner.instance_lifetime,
+                        inner.instance_speed,
+                        inner.instance_alpha,
+                        inner.instance_colorn,
+                    ),
+                );
             }
             ObjectKindIr::Unknown => {}
         }
     }
 }
 
+/// The inverse of `parse_instance_override`'s reduction — re-emits the
+/// 7 typed `instance_*` fields as the `instanceoverride` object WE's own
+/// schema expects. `colorn` is re-emitted as a 3-vector (mirroring the
+/// authored shape `parse_instance_override`'s `as_vector(.., &[3])` call
+/// requires), not the reduced scalar `instance_colorn` itself holds — a
+/// bare number would fail that shape check on re-parse and silently reset
+/// to the 1.0 default.
+#[allow(clippy::too_many_arguments)]
+fn instance_override_to_raw_value(
+    count: f32,
+    rate: f32,
+    size: f32,
+    lifetime: f32,
+    speed: f32,
+    alpha: f32,
+    colorn: f32,
+) -> Value {
+    let mut overrides = Map::new();
+    overrides.insert("count".to_string(), json!(count));
+    overrides.insert("rate".to_string(), json!(rate));
+    overrides.insert("size".to_string(), json!(size));
+    overrides.insert("lifetime".to_string(), json!(lifetime));
+    overrides.insert("speed".to_string(), json!(speed));
+    overrides.insert("alpha".to_string(), json!(alpha));
+    overrides.insert("colorn".to_string(), json!([colorn, colorn, colorn]));
+    Value::Object(overrides)
+}
+
 impl EffectRefIr {
+    /// Exactly `self.raw` — the typed fields (`id`/`name`/`visible`) each
+    /// carry a default indistinguishable from an authored value once
+    /// typed (see `raw`'s own doc comment), so reconstructing from them
+    /// would silently materialize keys the original entry never had.
+    /// Returning `raw` directly is both simpler and exact.
     fn to_raw_value(&self) -> Value {
-        let mut map = Map::new();
-        map.insert("id".to_string(), json!(self.id));
-        map.insert("name".to_string(), Value::String(self.name.clone()));
-        map.insert("visible".to_string(), Value::Bool(self.visible));
-        if let Some(file) = &self.file {
-            map.insert("file".to_string(), Value::String(file.clone()));
-        }
-        if !self.passes.is_empty() {
-            map.insert("passes".to_string(), Value::Array(self.passes.clone()));
-        }
-        for (key, value) in &self.unknown.0 {
-            map.insert(key.clone(), value.clone());
-        }
-        Value::Object(map)
+        self.raw.clone()
     }
 }
 

@@ -40,6 +40,7 @@ mod materialshader;
 mod particlefile;
 mod particles;
 mod scene;
+mod scene_ir_adapter;
 mod shaderpre;
 mod text;
 mod textures;

@@ -13,7 +13,7 @@ use image::ImageReader;
 /// One decoded layer texture, ready for a R8G8B8A8_UNORM upload. RGBA8,
 /// straight alpha (the GPU's src-over blend combines it with the layer
 /// alpha).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodedTexture {
     pub rgba: Vec<u8>,
     pub width: u32,

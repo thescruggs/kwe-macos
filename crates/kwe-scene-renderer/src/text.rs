@@ -801,6 +801,12 @@ pub enum VerticalAlign {
 }
 
 impl HorizontalAlign {
+    // SR-2c: only the legacy differential-test oracle
+    // (`scene::parse_text_align`, `#[cfg(test)]`-gated) still calls this —
+    // the production path (`scene_ir_adapter`) matches
+    // `kwe_core::HorizontalAlignIr`/`VerticalAlignIr` directly instead of
+    // re-parsing a word.
+    #[cfg(test)]
     pub fn parse(s: &str) -> Option<HorizontalAlign> {
         match s.to_ascii_lowercase().as_str() {
             "left" => Some(HorizontalAlign::Left),
@@ -812,6 +818,7 @@ impl HorizontalAlign {
 }
 
 impl VerticalAlign {
+    #[cfg(test)]
     pub fn parse(s: &str) -> Option<VerticalAlign> {
         match s.to_ascii_lowercase().as_str() {
             "top" => Some(VerticalAlign::Top),

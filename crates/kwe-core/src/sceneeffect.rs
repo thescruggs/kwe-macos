@@ -98,7 +98,7 @@ pub fn is_runtime_target_name(name: &str) -> bool {
 }
 
 /// One `fbos[]` entry: `EffectParser.cpp:97-111`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FboSpec {
     pub name: String,
     /// Defaults to `"rgba8888"`, matching upstream's default and this
@@ -117,7 +117,7 @@ pub struct FboSpec {
 }
 
 /// One resolved effect-pass texture slot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EffectTextureSlot {
     /// A real, decodable `.tex` asset, resolved the same way
     /// `scenemodel::TextureSlot` is (bytes present, TEXV header checked
@@ -135,7 +135,7 @@ pub enum EffectTextureSlot {
 }
 
 /// One material pass inside an effect chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectMaterialPass {
     /// The pass's own `material` reference (a `materials/*.json` path,
     /// resolved exactly like `scenemodel::resolve_model`'s material
@@ -171,20 +171,20 @@ pub enum EffectCommand {
     Swap,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectCommandPass {
     pub command: EffectCommand,
     pub source: String,
     pub target: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EffectPass {
     Material(EffectMaterialPass),
     Command(EffectCommandPass),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectSpec {
     pub name: String,
     pub fbos: Vec<FboSpec>,
@@ -192,7 +192,7 @@ pub struct EffectSpec {
 }
 
 /// One resolved `effects[]` entry on a scene object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ObjectEffect {
     pub id: i64,
     pub name: String,

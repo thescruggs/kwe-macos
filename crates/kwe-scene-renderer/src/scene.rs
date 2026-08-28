@@ -18,10 +18,16 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+// SR-2c: only the legacy differential-test oracle (the #[cfg(test)]-gated
+// functions below) still classifies/unwraps objects directly — the
+// production path goes through `scene_ir_adapter` instead.
+#[cfg(test)]
 use kwe_core::{SceneObjectKind, classify_scene_object, scene_property_value};
 use serde_json::Value;
 
-use crate::layers::{MAX_LAYER_VALUE, MAX_LAYERS};
+use crate::layers::MAX_LAYER_VALUE;
+#[cfg(test)]
+use crate::layers::MAX_LAYERS;
 use crate::particles;
 use crate::text::{HorizontalAlign, VerticalAlign};
 use crate::textures::DecodedTexture;
@@ -87,7 +93,7 @@ impl From<serde_json::Error> for SceneError {
 }
 
 /// The interpreted part of a scene.json the M3a worker needs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SceneConfig {
     /// RGBA straight-alpha clear color from `general.clearcolor` (0..=1).
     /// Defaults to opaque black when absent.
@@ -101,7 +107,7 @@ pub struct SceneConfig {
     pub script_entry: Option<usize>,
     /// Raw `general.script` string, before resolution against either the
     /// content root (file scenes) or the package table (pkg scenes).
-    script_reference: Option<String>,
+    pub(crate) script_reference: Option<String>,
     /// Optional `general.resolution` (the worker still renders at the size
     /// the daemon asked for; the field is only validated and reported).
     /// S7: real Wallpaper Engine's `general.orthogonalprojection
@@ -159,7 +165,7 @@ pub struct SceneConfig {
 /// follow the researched wallpaper-engine schema (docs/SCENE_FORMAT_V1.md,
 /// M3c section): vectors may be the space-separated string form the editor
 /// writes or arrays; every numeric is finite and bounded to ±1e6.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayerSpec {
     /// The script's identity for this layer (`Scene.getLayer(name)`).
     pub name: String,
@@ -271,7 +277,7 @@ pub struct LayerSpec {
 /// `kwe_core::sceneeffect::EffectTextureSlot` the same way `MaterialSpec`
 /// thins `ResolvedModel` — an owned copy so `scene.rs` stays free of
 /// `kwe_core::sceneeffect`'s full surface.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MaterialTextureSource {
     /// A real, resolved `.tex` asset's raw (undecoded) bytes.
     Bytes(Vec<u8>),
@@ -286,7 +292,7 @@ pub enum MaterialTextureSource {
 /// a material pipeline for one layer. A thin, owned copy (rather than
 /// keeping the whole `ResolvedModel` around) so `scene.rs` does not need
 /// to depend on `kwe_core::scenemodel`'s full surface.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MaterialSpec {
     pub shader: Option<String>,
     pub blending: Option<String>,
@@ -336,7 +342,7 @@ pub struct MaterialSpec {
 /// fields; playback scalars CLAMP to the documented ranges (the M3f
 /// convention) rather than rejecting the scene, because a video that
 /// cannot play must never cost the user the rest of the wallpaper.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VideoSpec {
     /// Raw `video` reference exactly as written: a path relative to the
     /// content root (file scenes) or a package entry path (pkg scenes).
@@ -379,7 +385,7 @@ pub struct VideoSpec {
 /// property-wrapped like the M3c fields, and out-of-range values CLAMP to
 /// the documented ranges (the M3f task contract — deviating from layer
 /// property strictness, recorded in the matrix).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParticleSpec {
     /// The script's identity (`Scene.getParticleSystem(name)`; also
     /// reachable through Scene.getLayer, WE-style).
@@ -499,7 +505,7 @@ pub struct ParticleSpec {
 /// `fontsize` is not a WE key. Text layers render at their automatic size
 /// (a `size` field is ignored, see `text_size_ignored`); `scale` still
 /// scales the layer, `origin` positions it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextSpec {
     /// The string to render. Capped at text::MAX_TEXT_CHARS chars when the
     /// layout runs (text.rs); the parser keeps the raw value so the
@@ -540,7 +546,9 @@ impl SceneConfig {
     pub fn parse(path: &Path) -> Result<SceneConfig, SceneError> {
         let root = canonical_root(path)?;
         let bytes = read_bounded(path, MAX_SCENE_JSON_BYTES)?;
-        let parsed = parse_scene_json(&bytes)?;
+        // SR-2c: the typed-IR adapter, not the legacy `parse_scene_json`
+        // (kept as the differential-test oracle, see its own doc comment).
+        let parsed = crate::scene_ir_adapter::parse_scene_json_via_ir(&bytes)?;
         let script_path = match &parsed.script_reference {
             None => None,
             Some(reference) => Some(resolve_script(&root, reference)?),
@@ -561,7 +569,8 @@ impl SceneConfig {
         bytes: &[u8],
         entries: &[kwe_core::PkgEntry],
     ) -> Result<SceneConfig, SceneError> {
-        let parsed = parse_scene_json(bytes)?;
+        // SR-2c: see the doc comment on `SceneConfig::parse` above.
+        let parsed = crate::scene_ir_adapter::parse_scene_json_via_ir(bytes)?;
         let script_entry = match &parsed.script_reference {
             None => None,
             Some(reference) => Some(resolve_pkg_script(reference, entries)?),
@@ -577,6 +586,20 @@ impl SceneConfig {
 /// reference is left unresolved (`script_reference`); the two entry points
 /// resolve it against their own root: the content directory (file scenes)
 /// or the package entry table (pkg scenes).
+///
+/// SR-2c: production `SceneConfig::parse`/`parse_pkg` no longer call this —
+/// they go through `crate::scene_ir_adapter::parse_scene_json_via_ir`
+/// instead. This function (and every other JSON-interpretation helper
+/// `#[cfg(test)]`-gated alongside it: `parse_objects`, `parse_common_props`,
+/// `parse_size_and_tint`, `parse_model_layer`, `parse_image_layer`,
+/// `parse_text_layer`, `parse_video_layer`, `parse_particle_system` and its
+/// helpers, `parse_clear_color`, `parse_resolution`, `parse_orthogonal_
+/// projection`, `parse_fps`) is kept, unchanged, as the differential-test
+/// ORACLE `scene_ir_adapter`'s test module asserts parity against — SR-2c
+/// conductor decision (b). Deletion happens only after a full SR-2 epic
+/// soak; do not remove these just because they show as "only used in
+/// tests" — that is the point.
+#[cfg(test)]
 fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
     let value: Value = serde_json::from_slice(bytes)?;
     let root_obj = value.as_object().ok_or_else(|| {
@@ -634,6 +657,7 @@ fn parse_scene_json(bytes: &[u8]) -> Result<SceneConfig, SceneError> {
 /// Bounded counts the parser collects while interpreting `objects` (M3e,
 /// M3f): never rejections, only one-time worker diagnostics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ObjectCounts {
     /// Objects that can put pixels on the screen in this build, by the
     /// shared classification (`kwe_core::SceneObjectKind::can_draw`): a
@@ -684,6 +708,7 @@ pub struct ObjectCounts {
 /// rejection); particle systems beyond particles::MAX_PARTICLE_SYSTEMS are
 /// skipped the same way. The layer caps (MAX_TEXT_LAYERS and MAX_LAYERS)
 /// apply to the layers that register; the particle pool is separate.
+#[cfg(test)]
 fn parse_objects(
     root_obj: &serde_json::Map<String, Value>,
 ) -> Result<(Vec<LayerSpec>, Vec<ParticleSpec>, ObjectCounts), SceneError> {
@@ -831,6 +856,7 @@ fn parse_objects(
 /// original parse_image_layer code exactly; `kind` only labels the name
 /// error ("image layers" / "text layers").
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct CommonProps {
     name: String,
     /// S5: the object's own WE `"id"` field, when present (an integer,
@@ -850,6 +876,7 @@ struct CommonProps {
     brightness: f32,
 }
 
+#[cfg(test)]
 fn parse_common_props(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1035,6 +1062,7 @@ fn parse_common_props(
 /// `size` and `tint`/`color`: shared by image and model layers (S1) — a
 /// model instance is drawn as a quad through the same geometry pipeline an
 /// image layer uses, so it carries the same two fields.
+#[cfg(test)]
 fn parse_size_and_tint(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1088,6 +1116,7 @@ fn parse_size_and_tint(
 /// no name, an out-of-range alpha, or any other malformed field must not
 /// take the whole scene down). `None` means "this object registers
 /// nothing" — the caller skips it exactly as if it never resolved.
+#[cfg(test)]
 fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> Option<LayerSpec> {
     let common = parse_common_props(object, index, "model").ok()?;
     let model_ref = match scene_property_value(object.get("image").expect("caller checked")) {
@@ -1144,6 +1173,7 @@ fn parse_model_layer(object: &serde_json::Map<String, Value>, index: usize) -> O
 /// One image layer entry. Numeric out-of-range values reject the whole
 /// scene (like clearcolor); an unresolvable image never does (the task's
 /// policy — a missing image skips the layer, not the scene).
+#[cfg(test)]
 fn parse_image_layer(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1197,6 +1227,7 @@ fn parse_image_layer(
 /// like OWE's align_or_default, default "center"), and `color` (vec3/vec4
 /// multiplier). A `size` field is tolerated and ignored (counted via
 /// `text_size_ignored`); a missing/blank `text` renders nothing.
+#[cfg(test)]
 fn parse_text_layer(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1315,6 +1346,7 @@ fn parse_text_layer(
 /// Unlike an image layer, an unreadable source is ALWAYS survivable: the
 /// layer registers, the decoder never opens, and the scene renders
 /// without it.
+#[cfg(test)]
 fn parse_video_layer(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1418,6 +1450,7 @@ fn parse_video_layer(
 /// A particle spec with every flat emitter-model field at its documented
 /// default (common props land from the shared parse path). `index` is the
 /// object's position in the `objects` array (the draw-order merge key).
+#[cfg(test)]
 fn particle_spec_defaults(common: CommonProps, index: usize) -> ParticleSpec {
     ParticleSpec {
         name: common.name,
@@ -1468,6 +1501,7 @@ fn particle_spec_defaults(common: CommonProps, index: usize) -> ParticleSpec {
 /// rejection (recorded in the coverage matrix). The WE component model
 /// keys (emitter/initializer/operator/renderer/controlpoint/children/
 /// flags/...) are tolerated extra keys that parse to nothing in M3f.
+#[cfg(test)]
 fn parse_particle_system(
     object: &serde_json::Map<String, Value>,
     index: usize,
@@ -1711,6 +1745,7 @@ fn parse_particle_system(
 /// forms (array or space-separated string, property-wrapped allowed), each
 /// component clamped 0..=1 like the layer tint; 3 components imply alpha
 /// 1.0. Missing -> opaque white.
+#[cfg(test)]
 fn parse_particle_color(
     definition: &serde_json::Map<String, Value>,
     name: &str,
@@ -1737,6 +1772,7 @@ fn parse_particle_color(
 /// consulted for the polarity words; default "center". The returned
 /// HorizontalAlign doubles as the vertical polarity (Top/Bottom) through
 /// `parse_text_align_v`.
+#[cfg(test)]
 fn parse_text_align(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -1773,6 +1809,7 @@ fn parse_text_align(
 }
 
 /// Vertical counterpart of parse_text_align (`top`/`bottom` polarity).
+#[cfg(test)]
 fn parse_text_align_v(object: &serde_json::Map<String, Value>, key: &str) -> VerticalAlign {
     // Exact vertical words first; combined strings ("top-left") fall
     // through to the shared polarity parser (top -> Left -> Top).
@@ -1789,6 +1826,7 @@ fn parse_text_align_v(object: &serde_json::Map<String, Value>, key: &str) -> Ver
     }
 }
 
+#[cfg(test)]
 fn field(index: usize, name: &str) -> String {
     format!("objects[{index}].{name}")
 }
@@ -1923,6 +1961,7 @@ pub(crate) fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, SceneError>
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn parse_clear_color(general: &serde_json::Map<String, Value>) -> Result<[f32; 4], SceneError> {
     let Some(value) = general.get("clearcolor") else {
         return Ok([0.0, 0.0, 0.0, 1.0]);
@@ -2020,6 +2059,7 @@ fn parse_clear_color(general: &serde_json::Map<String, Value>) -> Result<[f32; 4
 ///
 /// Borrowed-From: Almamu/linux-wallpaperengine (GPL-3.0-or-later)
 /// src/WallpaperEngine/Data/Parsers/WallpaperParser.cpp:28-29,74 @ b016d7d1
+#[cfg(test)]
 fn parse_resolution(
     general: &serde_json::Map<String, Value>,
 ) -> Result<Option<(u32, u32)>, SceneError> {
@@ -2069,6 +2109,7 @@ fn parse_resolution(
 /// shape this can't make sense of — not an object, missing either field,
 /// unparsable, non-finite, or out of `1..=MAX_DIMENSION` — returns `None`
 /// rather than rejecting the scene (see the caller's doc comment).
+#[cfg(test)]
 fn parse_orthogonal_projection(general: &serde_json::Map<String, Value>) -> Option<(u32, u32)> {
     let projection = general.get("orthogonalprojection")?.as_object()?;
     let dim = |name: &str| -> Option<u32> {
@@ -2093,6 +2134,7 @@ fn parse_orthogonal_projection(general: &serde_json::Map<String, Value>) -> Opti
     Some((width, height))
 }
 
+#[cfg(test)]
 fn parse_fps(general: &serde_json::Map<String, Value>) -> Result<Option<f32>, SceneError> {
     let Some(value) = general.get("fps") else {
         return Ok(None);
@@ -3942,5 +3984,417 @@ mod tests {
         assert_eq!(spec.source.as_deref(), Some("movies/clip.mp4"));
         assert!(!spec.loop_playback);
         assert_eq!(spec.rate, 0.5);
+    }
+
+    // -----------------------------------------------------------------
+    // SR-2c: the differential parity suite — legacy `parse_scene_json`
+    // (this module, unchanged, kept as the oracle per conductor decision
+    // (b)) vs `scene_ir_adapter::parse_scene_json_via_ir` (the new
+    // production path). Every OTHER test in this module already exercises
+    // the swapped production path indirectly (`SceneConfig::parse`/
+    // `parse_pkg` now go through the adapter) — this suite additionally
+    // compares the two paths DIRECTLY, byte-for-byte, over the same
+    // fixture, which is the differential proof the task actually asks
+    // for.
+    // -----------------------------------------------------------------
+
+    /// `SceneError`'s message TEXT is deliberately NOT compared (SR-2c
+    /// study: `grep -rn "SceneError"` across the whole repo turns up
+    /// nothing outside this crate; the daemon classifies a renderer's
+    /// scene rejection by its fixed EXIT CODE, never by scraping stderr —
+    /// only `SceneErrorKind` and the Ok/Err outcome are load-bearing).
+    fn assert_ir_parity(label: &str, bytes: &[u8]) {
+        let legacy = parse_scene_json(bytes);
+        let via_ir = crate::scene_ir_adapter::parse_scene_json_via_ir(bytes);
+        match (legacy, via_ir) {
+            (Ok(legacy), Ok(via_ir)) => {
+                assert_eq!(legacy, via_ir, "{label}: Ok values differ");
+            }
+            (Err(legacy), Err(via_ir)) => {
+                assert_eq!(
+                    legacy.kind, via_ir.kind,
+                    "{label}: both rejected but with a different SceneErrorKind \
+                     (legacy={:?} detail={:?} / via_ir={:?} detail={:?})",
+                    legacy.kind, legacy.message, via_ir.kind, via_ir.message
+                );
+            }
+            (Ok(legacy), Err(via_ir)) => panic!(
+                "{label}: legacy ACCEPTED, the IR adapter REJECTED ({:?} {:?})\nlegacy={legacy:?}",
+                via_ir.kind, via_ir.message
+            ),
+            (Err(legacy), Ok(via_ir)) => panic!(
+                "{label}: legacy REJECTED ({:?} {:?}), the IR adapter ACCEPTED\nvia_ir={via_ir:?}",
+                legacy.kind, legacy.message
+            ),
+        }
+    }
+
+    #[test]
+    fn ir_parity_general_block() {
+        for (label, bytes) in [
+            ("empty", &br#"{}"#[..]),
+            ("clearcolor_array", br#"{"general":{"clearcolor":[0.25,0.5,0.75,1.0],"resolution":[1920,1080],"fps":30},"objects":[]}"#),
+            ("clearcolor_string", br#"{"general":{"clearcolor":"0.7 0.7 0.7"}}"#),
+            ("clearcolor_array_out_of_range", br#"{"general":{"clearcolor":[1.5,0,0,1]}}"#),
+            ("clearcolor_string_wrong_arity", br#"{"general":{"clearcolor":"0.7 0.7"}}"#),
+            ("resolution_and_orthogonalprojection_both_present", br#"{"general":{"resolution":[1280,720],"orthogonalprojection":{"width":3840,"height":2160}}}"#),
+            ("orthogonalprojection_only", br#"{"general":{"orthogonalprojection":{"width":3840,"height":2160}}}"#),
+            ("orthogonalprojection_numeric_strings", br#"{"general":{"orthogonalprojection":{"width":"1920.7","height":1080.9}}}"#),
+            ("orthogonalprojection_out_of_range_is_lenient", br#"{"general":{"orthogonalprojection":{"width":0,"height":999999999}}}"#),
+            ("resolution_out_of_range_rejects", br#"{"general":{"resolution":[999999,1080]}}"#),
+            ("resolution_wrong_type_rejects", br#"{"general":{"resolution":["a","b"]}}"#),
+            ("fps_valid", br#"{"general":{"fps":30}}"#),
+            ("fps_out_of_range_rejects", br#"{"general":{"fps":9999}}"#),
+            ("script_non_string_rejects", br#"{"general":{"script":42}}"#),
+            ("root_not_object_rejects", br#"[1,2,3]"#),
+            ("invalid_json_rejects", br#"{"general": "#),
+            ("objects_wrong_shape_rejects", br#"{"objects":42}"#),
+            ("object_entry_wrong_shape_rejects", br#"{"objects":[42]}"#),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_alias_precedence() {
+        for (label, bytes) in [
+            (
+                "tint_wins_over_color",
+                &br#"{"objects":[{"name":"a","image":"a.png","tint":[0.1,0.2,0.3,0.4],"color":[9,9,9]}]}"#[..],
+            ),
+            (
+                "color_only",
+                br#"{"objects":[{"name":"a","image":"a.png","color":[0.5,0.5,0.5]}]}"#,
+            ),
+            (
+                "blendmode_wins_over_colorblendmode",
+                br#"{"objects":[{"name":"a","image":"a.png","blendMode":2,"colorBlendMode":5}]}"#,
+            ),
+            (
+                "colorblendmode_only",
+                br#"{"objects":[{"name":"a","image":"a.png","colorBlendMode":7}]}"#,
+            ),
+            (
+                "particle_texture_wins_over_material",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png","material":"m.png"}}]}"#,
+            ),
+            (
+                "particle_instanceoverride_colorn_wins_over_color",
+                // `instanceoverride` is a SIBLING of `particle` on the
+                // object (`parse_particle_system` reads
+                // `object.get("instanceoverride")`), not nested inside it.
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png"},
+                    "instanceoverride":{"colorn":"0.2 0.4 0.6","color":[9,9,9]}}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_property_bound_visible() {
+        for (label, bytes) in [
+            (
+                "bool_wrapped",
+                &br#"{"objects":[{"name":"a","image":"a.png","visible":{"user":"v","value":false}}]}"#[..],
+            ),
+            (
+                "non_bool_wrapped_rejects",
+                br#"{"objects":[{"name":"a","image":"a.png","visible":{"user":"v","value":{"nested":1}}}]}"#,
+            ),
+            (
+                "non_bool_bare_rejects",
+                br#"{"objects":[{"name":"a","image":"a.png","visible":1}]}"#,
+            ),
+            (
+                "absent",
+                br#"{"objects":[{"name":"a","image":"a.png"}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_duplicate_ids() {
+        assert_ir_parity(
+            "duplicate_ids",
+            br#"{"objects":[
+                {"id":5,"name":"first","image":"a.png"},
+                {"id":5,"name":"duplicate","image":"b.png"},
+                {"name":"no_id","image":"c.png"}
+            ]}"#,
+        );
+    }
+
+    #[test]
+    fn ir_parity_missing_name() {
+        for (label, bytes) in [
+            (
+                "image_missing_name_rejects",
+                &br#"{"objects":[{"image":"a.png"}]}"#[..],
+            ),
+            (
+                "text_missing_name_rejects",
+                br#"{"objects":[{"text":"hi"}]}"#,
+            ),
+            (
+                "video_missing_name_rejects",
+                br#"{"objects":[{"video":"a.mp4"}]}"#,
+            ),
+            (
+                "particle_missing_name_rejects",
+                br#"{"objects":[{"particle":{"texture":"t.png"}}]}"#,
+            ),
+            (
+                "model_missing_name_skips_never_rejects",
+                br#"{"objects":[{"image":"m.json"}]}"#,
+            ),
+            (
+                "name_wrong_type_rejects",
+                br#"{"objects":[{"name":42,"image":"a.png"}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_effects_with_unknown_keys() {
+        assert_ir_parity(
+            "effects_unknown_keys",
+            br#"{"objects":[{"name":"m","image":"models/deco.json","effects":[
+                {"id":7,"name":"godrays","visible":false,"file":"effects/godrays.json",
+                 "passes":[{"target":"a"}],"folder":"vendor/godrays"},
+                {"file":"effects/tint.json"},
+                {"name":"fileless,kept"}
+            ]}]}"#,
+        );
+    }
+
+    #[test]
+    fn ir_parity_particle_speed_cross_field_combinations() {
+        // Decision (c)'s exact required case: speed/speedMin/speedMax are
+        // deliberately untyped in the IR (a cross-field default chain);
+        // the adapter reads the raw residue and reimplements legacy's
+        // scalar+swap logic verbatim — every combination below exercises
+        // a different branch of that logic.
+        for (label, bytes) in [
+            (
+                "bare_speed_only",
+                &br#"{"objects":[{"name":"p","particle":{"texture":"t.png","speed":60}}]}"#[..],
+            ),
+            (
+                "speed_and_min_and_max_all_present",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png",
+                    "speed":1,"speedMin":10,"speedMax":20}}]}"#,
+            ),
+            (
+                "max_falls_back_to_resolved_min",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png",
+                    "speed":100,"speedMin":90}}]}"#,
+            ),
+            (
+                "reversed_pair_normalizes",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png",
+                    "speedMin":80,"speedMax":20}}]}"#,
+            ),
+            (
+                "malformed_speed_rejects",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png","speed":"fast"}}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_instanceoverride_colorn_shapes() {
+        // `instanceoverride` is a SIBLING of `particle` on the object
+        // (`parse_particle_system` reads `object.get("instanceoverride")`,
+        // never a key of the particle definition itself).
+        for (label, bytes) in [
+            (
+                "vector_string",
+                &br#"{"objects":[{"name":"p","particle":{"texture":"t.png"},
+                    "instanceoverride":{"colorn":"0.5 0.5 0.5"}}]}"#[..],
+            ),
+            (
+                "vector_array",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png"},
+                    "instanceoverride":{"colorn":[0.1,0.2,0.3]}}]}"#,
+            ),
+            (
+                "scalar_shape_is_tolerant_not_a_reject",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png"},
+                    "instanceoverride":{"colorn":0.5}}]}"#,
+            ),
+            (
+                "wrong_length_is_tolerant_not_a_reject",
+                br#"{"objects":[{"name":"p","particle":{"texture":"t.png"},
+                    "instanceoverride":{"colorn":[1,2]}}]}"#,
+            ),
+        ] {
+            assert_ir_parity(label, bytes);
+        }
+    }
+
+    #[test]
+    fn ir_parity_particle_object_classified_as_particle_file_still_parses_flat_fields() {
+        // classify_scene_object routes an object-valued `particle` with no
+        // texture/material to ParticleFile — legacy's parse_particle_system
+        // does not re-check that classification, so it still parses every
+        // flat field (this is the exact shape js.rs's
+        // `particle_systems_registered_before_script_load` fixture uses).
+        assert_ir_parity(
+            "inline_object_without_texture_classifies_as_particlefile",
+            br#"{"objects":[
+                {"name": "bg", "image": "bg.png"},
+                {"particle": {"spawnRate": 100, "life": 1, "speed": 60,
+                              "sizeStart": 8, "sizeEnd": 8,
+                              "alphaStart": 1, "alphaEnd": 1},
+                 "name": "dust"}
+            ]}"#,
+        );
+    }
+
+    #[test]
+    fn ir_parity_every_family_in_one_scene() {
+        // The SR-2b golden fixture, extended: every family, every alias,
+        // duplicate ids, unknown keys at root/general/object/effect
+        // levels, all in one scene — the same shape SR-2b's own
+        // `round_trip_through_to_raw_value_reproduces_an_equal_scene_ir`
+        // test in kwe-core exercises for the IR alone; this proves the
+        // ADAPTER agrees with legacy over the identical fixture.
+        assert_ir_parity(
+            "golden",
+            br#"{
+                "general": {
+                    "clearcolor": "0.5 0.25 0.75",
+                    "orthogonalprojection": {"width": 1920, "height": 1080},
+                    "fps": 30,
+                    "script": "wallpaper.js",
+                    "camera": "unknown general key"
+                },
+                "objects": [
+                    {"id": 1, "name": "img", "image": "a.png", "tint": [1,0,0,1],
+                     "color": [9,9,9], "blendMode": 2, "colorBlendMode": 5,
+                     "visible": false, "effects": [
+                        {"id": 1, "name": "e", "file": "e.json", "extra": "kept"}
+                     ]},
+                    {"id": 2, "name": "model", "image": "m.json"},
+                    {"id": 3, "name": "texv", "image": "t.tex"},
+                    {"id": 4, "name": "textureless", "image": 42},
+                    {"id": 5, "name": "video", "video": "v.mp4", "loop": false, "rate": 2.0},
+                    {"id": 6, "name": "text", "text": "hi", "horizontalalign": "right",
+                     "verticalalign": "bottom", "color": [1,1,0], "size": [5,6]},
+                    {"id": 7, "name": "particle", "particle": {
+                        "spawnRate": 5.0, "texture": "p.png", "material": "loser.png",
+                        "speed": 3.0, "speedMin": 1.0, "speedMax": 9.0
+                    }, "instanceoverride": {"colorn": "0.5 0.5 0.5", "color": [9,9,9]}},
+                    {"id": 8, "name": "particlefile", "particle": "particles/p.json"},
+                    {"id": 8, "name": "duplicate_id"},
+                    {"name": "sound", "sound": "a.mp3"},
+                    {"name": "extra_key", "image": "x.png", "vendorField": {"nested": true}}
+                ],
+                "unknownRoot": "kept"
+            }"#,
+        );
+    }
+
+    /// Iterates every `scene.pkg`/`scene.json` under
+    /// `KWE_SCENE_IR_PARITY_DIR` (not set -> the test is a no-op skip, so
+    /// CI/the default `cargo test` never needs the real corpus), asserting
+    /// `assert_ir_parity` for each one's extracted scene.json bytes.
+    /// `#[ignore]`d: opt in explicitly —
+    /// `KWE_SCENE_IR_PARITY_DIR=<corpus> cargo test -p kwe-scene-renderer
+    /// ir_parity_corpus -- --ignored`. Prints a running pass count and, on
+    /// the FIRST divergence, the item's basename and which side (legacy
+    /// Ok/IR Err, legacy Err/IR Ok, or both Ok-but-unequal) differed,
+    /// before panicking — actionable without re-running under a debugger.
+    #[test]
+    #[ignore = "opt-in: set KWE_SCENE_IR_PARITY_DIR to a corpus directory"]
+    fn ir_parity_corpus() {
+        let Some(root) = std::env::var_os("KWE_SCENE_IR_PARITY_DIR") else {
+            eprintln!("ir_parity_corpus: KWE_SCENE_IR_PARITY_DIR not set, skipping");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut checked = 0usize;
+        let mut items = Vec::new();
+        collect_scene_json_bytes(&root, &mut items);
+        for (basename, bytes) in &items {
+            let legacy = parse_scene_json(bytes);
+            let via_ir = crate::scene_ir_adapter::parse_scene_json_via_ir(bytes);
+            match (&legacy, &via_ir) {
+                (Ok(legacy_config), Ok(via_ir_config)) => {
+                    if legacy_config != via_ir_config {
+                        panic!("ir_parity_corpus: {basename}: both Ok but VALUES differ");
+                    }
+                }
+                (Err(legacy_error), Err(via_ir_error)) => {
+                    if legacy_error.kind != via_ir_error.kind {
+                        panic!(
+                            "ir_parity_corpus: {basename}: both Err but kinds differ \
+                             (legacy={:?} via_ir={:?})",
+                            legacy_error.kind, via_ir_error.kind
+                        );
+                    }
+                }
+                (Ok(_), Err(error)) => panic!(
+                    "ir_parity_corpus: {basename}: legacy Ok, IR adapter Err ({:?} {:?})",
+                    error.kind, error.message
+                ),
+                (Err(error), Ok(_)) => panic!(
+                    "ir_parity_corpus: {basename}: legacy Err ({:?} {:?}), IR adapter Ok",
+                    error.kind, error.message
+                ),
+            }
+            checked += 1;
+        }
+        eprintln!("ir_parity_corpus: {checked} item(s) checked, all parity-passed");
+    }
+
+    /// Collects every scene.json's bytes under `root`: a bare `scene.json`
+    /// file, or a `scene.json` extracted from a `scene.pkg` archive (via
+    /// the real `kwe_core::PkgReader`, exactly like `main.rs`'s own pkg
+    /// lane) — `(basename, bytes)` pairs, appended into `out`.
+    fn collect_scene_json_bytes(root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_scene_json_bytes(&path, out);
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name.eq_ignore_ascii_case("scene.json") {
+                if let Ok(bytes) = fs::read(&path) {
+                    let label = path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(file_name)
+                        .to_string();
+                    out.push((label, bytes));
+                }
+            } else if file_name.eq_ignore_ascii_case("scene.pkg")
+                && let Ok(reader) = kwe_core::PkgReader::open(&path)
+                && let Ok(index) = kwe_core::scene_json_entry(reader.entries())
+                && let Ok(bytes) = reader.read_entry(index)
+            {
+                let label = path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(file_name)
+                    .to_string();
+                out.push((label, bytes));
+            }
+        }
     }
 }

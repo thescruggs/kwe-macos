@@ -264,7 +264,7 @@ pub const MAX_COMPONENT_ITEMS: usize = 16;
 /// One emitter kind (S4b). Distances/directions/origin are already
 /// axis-clamped to ±1e6 and non-finite-safe at parse time (mirrors the
 /// flat model's `clamp_gravity`/`clamp_direction` bounds).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Emitter {
     /// `boxrandom`: a per-axis random offset in `[distance_min,
     /// distance_max]` (sign randomized), scaled by `directions`, from
@@ -305,7 +305,7 @@ impl Emitter {
 
 /// One initializer kind (S4b): runs once per particle at spawn, in file
 /// order, after the emitter sets its starting position/velocity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 // The shared `Random` suffix mirrors upstream's own type names verbatim
 // (`ColorRandomInitializer`, `SizeRandomInitializer`, ... `CParticle.h`) —
 // every WE initializer IS a "pick a random value" kind, so the names stay
@@ -369,7 +369,7 @@ pub(crate) enum Initializer {
 
 /// One operator kind (S4b): runs every fixed step, over every alive
 /// particle, in file order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Operator {
     Movement {
         gravity: [f32; 2],
@@ -445,7 +445,7 @@ pub(crate) enum Operator {
 /// Immutable after parse; `ParticleSystemState::from_spec` derives its own
 /// per-system runtime extras (emitter accumulators, resolved turbulence
 /// phase/speed) from it once at construction.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ComponentModel {
     pub maxcount: u32,
     pub(crate) emitters: Vec<Emitter>,
