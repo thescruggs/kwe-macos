@@ -2902,14 +2902,16 @@ mod tests {
         let script = root.join("hog-renderer");
         fs::write(
             &script,
-            "#!/usr/bin/env python3\nimport time\nblock = bytearray(192 * 1024 * 1024)\nfor i in range(0, len(block), 4096):\n    block[i] = 1\ntime.sleep(30)\n",
+            "#!/usr/bin/env python3\nimport time\nblock = bytearray(400 * 1024 * 1024)\nfor i in range(0, len(block), 4096):\n    block[i] = 1\ntime.sleep(30)\n",
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = validated_config(&root);
         config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
+        // 256 MiB is the smallest budget validate() accepts; the hog
+        // touches 400 MiB.
         for limits in config.resource_limits_by_kind.values_mut() {
-            limits.address_space_mib = 64;
+            limits.address_space_mib = 256;
         }
         let config = config.validate().unwrap();
         let (store, state) = StateStore::open(root.join("state")).unwrap();
