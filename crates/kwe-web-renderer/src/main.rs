@@ -963,6 +963,9 @@ fn spawn_browser(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(directory) = &web_command.working_dir {
+        process.current_dir(directory);
+    }
     unsafe {
         process.pre_exec(move || {
             // The sandboxed child must be its own process group so the

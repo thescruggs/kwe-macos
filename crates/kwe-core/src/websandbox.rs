@@ -9,6 +9,11 @@ pub struct WebSandboxCommand {
     /// CDP targets against it (`file:///wallpaper/index.html` inside the
     /// Linux namespace, the real content path on macOS).
     pub page_url: String,
+    /// Working directory for the browser process. Linux: `None` (bwrap's
+    /// `--chdir /wallpaper` handles it inside the namespace). macOS: the
+    /// content root, so the browser never runs with a cwd inside a tree
+    /// the Seatbelt profile denies (getcwd/realpath would fail there).
+    pub working_dir: Option<PathBuf>,
 }
 
 /// Marker the renderer looks for in a CDP target URL to recognise the
@@ -51,6 +56,7 @@ pub fn chromium_command(root: &Path, network_allowed: bool) -> WebSandboxCommand
         program: "bwrap".into(),
         arguments,
         page_url: LINUX_PAGE_URL.into(),
+        working_dir: None,
     }
 }
 
@@ -169,6 +175,7 @@ fn linux_web_renderer_command(
         program: "bwrap".into(),
         arguments,
         page_url: LINUX_PAGE_URL.into(),
+        working_dir: None,
     }
 }
 
@@ -270,6 +277,7 @@ pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxComm
         program: "bwrap".into(),
         arguments,
         page_url: LINUX_PAGE_URL.into(),
+        working_dir: None,
     }
 }
 
@@ -425,6 +433,11 @@ pub mod macos {
         // profile/temp trees.
         if variant != ProfileVariant::NoHomeDeny {
             rules.push_str("(deny file-read* (subpath \"/Users\"))\n");
+            // Path resolution (realpath, getcwd) stats each parent directory;
+            // the home directory NAMES are not secret, their contents are.
+            rules.push_str(
+                "(allow file-read-metadata (literal \"/Users\") (regex #\"^/Users/[^/]+$\"))\n",
+            );
         }
         let mut allowed_reads = vec![
             format!("(subpath {})", sbpl_string(root)),
@@ -519,6 +532,7 @@ pub mod macos {
                 program: browser,
                 arguments: browser_arguments,
                 page_url,
+                working_dir: Some(root.to_path_buf()),
             };
         };
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -543,6 +557,7 @@ pub mod macos {
             program: "/usr/bin/sandbox-exec".into(),
             arguments,
             page_url,
+            working_dir: Some(root.to_path_buf()),
         }
     }
 
@@ -592,6 +607,7 @@ mod tests {
             program: "x".into(),
             arguments: Vec::new(),
             page_url: "file:///wallpaper/index.html".into(),
+            working_dir: None,
         };
         assert_eq!(page_url_marker(&command), "/wallpaper/index.html");
     }
