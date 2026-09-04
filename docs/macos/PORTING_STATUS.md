@@ -67,6 +67,13 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
   level/back order re-asserted every 5 s (Finder redraws its desktop window
   at the same level after wake/relaunch/Space change), exact-geometry match
   refuses ambiguous (mirrored) outputs.
+- 2026-09-04 MP-9 watchdog review (independent, sonnet): no show-stoppers;
+  two defects fixed — the watchdog measured only the worker pid (the web
+  renderer's browser is a child) and reused `address_space_mib` (128 GiB
+  for web) as the budget; it now sums the worker's process tree against
+  min(address_space_mib, 2 GiB) once a second, verified by a nested-child
+  hog test on the macOS runner. Noted: a re-parented escapee is not
+  counted; the Linux unit's aggregate cgroup limit has no macOS twin yet.
 - 2026-09-04 CI-fix batch review (independent, sonnet): one show-stopper
   — the "named setrlimit" error wrapper dropped the raw errno (std hands
   a failing pre_exec closure to the parent as errno only), which would
@@ -119,7 +126,7 @@ Unverified on macOS (spike S-A): window ordering under Finder icons on
 14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
 whether the mouse-moved global monitor needs a TCC prompt.
 
-## macOS CI: green (GitHub macos-14 runner, run 33835238015, 2026-09-04)
+## macOS CI: green (GitHub macos-14 runner, latest run 33837270786, 2026-09-04)
 
 `rust-macos` (whole workspace builds; every portable crate's tests pass
 with Homebrew shaderc/mpv/MoltenVK, including the macOS-only resident-set

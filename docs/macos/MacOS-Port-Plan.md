@@ -156,7 +156,7 @@ inverse. Spikes (§7) precede MP-2.
   - arm64 first; universal binary after MP-9.
   - Accept: clean install on a fresh macOS user account; uninstall leaves no
     LaunchAgent or desktop-level window.
-- **MP-9 Hardening** — partial 2026-09-04: resident-set watchdog replaces the refused RLIMIT_AS on macOS (ResourceLimit failure, tested on the macOS runner); battery pause, App Nap for renderers, TCC states, login ordering still pending
+- **MP-9 Hardening** — partial 2026-09-04: process-tree resident-set watchdog replaces the refused RLIMIT_AS on macOS (ResourceLimit failure, nested-child test green on the macOS runner); battery pause, App Nap for renderers, TCC states, login ordering still pending
   - battery/low-power pause (extends F3 pause-when-covered), App Nap opt-out
     for renderers, display reconfigure storms, TCC denial states, login-item
     ordering, memory watchdog calibration.
