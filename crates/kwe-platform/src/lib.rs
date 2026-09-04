@@ -372,6 +372,92 @@ pub fn resident_set_bytes(pid: libc::pid_t) -> Option<u64> {
     }
 }
 
+/// Resident set (bytes) of `root` PLUS every live descendant, when the
+/// platform can enumerate processes. A wallpaper worker's memory often
+/// lives in children (the web renderer's browser tree, the scene
+/// renderer's shader helper), so a per-pid number under-counts.
+/// macOS: `proc_listpids` + `proc_pidinfo(PROC_PIDTBSDINFO)` for parent
+/// links; Linux: `/proc/*/stat`. Bounded to 4096 processes per scan.
+pub fn resident_set_tree_bytes(root: libc::pid_t) -> Option<u64> {
+    let links = process_parent_links()?;
+    let mut total = resident_set_bytes(root)?;
+    let mut frontier = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(parent) = frontier.pop() {
+        for &(pid, ppid) in &links {
+            if ppid == parent && pid != parent && seen.insert(pid) {
+                total = total.saturating_add(resident_set_bytes(pid).unwrap_or(0));
+                frontier.push(pid);
+            }
+        }
+    }
+    Some(total)
+}
+
+const MAX_PROCESS_SCAN: usize = 4096;
+/// `PROC_ALL_PIDS` from <libproc.h> (not exported by the libc crate).
+#[cfg(target_os = "macos")]
+const PROC_ALL_PIDS: u32 = 1;
+
+#[cfg(target_os = "macos")]
+fn process_parent_links() -> Option<Vec<(libc::pid_t, libc::pid_t)>> {
+    let mut pids = vec![0 as libc::pid_t; MAX_PROCESS_SCAN];
+    let capacity = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` is a valid buffer of `capacity` bytes.
+    let filled = unsafe {
+        libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), capacity)
+    };
+    if filled <= 0 {
+        return None;
+    }
+    let count = (filled as usize / std::mem::size_of::<libc::pid_t>()).min(pids.len());
+    let mut links = Vec::with_capacity(count);
+    for &pid in &pids[..count] {
+        if pid <= 0 {
+            continue;
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a valid, writable proc_bsdinfo of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
+        if got == size {
+            links.push((pid, info.pbi_ppid as libc::pid_t));
+        }
+    }
+    Some(links)
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_links() -> Option<Vec<(libc::pid_t, libc::pid_t)>> {
+    let mut links = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten().take(MAX_PROCESS_SCAN * 2) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid ..." — comm may contain spaces/parens.
+        let Some(rest) = stat.rfind(')').map(|end| &stat[end + 1..]) else {
+            continue;
+        };
+        if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|f| f.parse().ok()) {
+            links.push((pid, ppid));
+        }
+        if links.len() >= MAX_PROCESS_SCAN {
+            break;
+        }
+    }
+    Some(links)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_parent_links() -> Option<Vec<(libc::pid_t, libc::pid_t)>> {
+    None
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -566,6 +652,25 @@ mod tests {
         let rss = resident_set_bytes(std::process::id() as libc::pid_t).expect("rss");
         assert!(rss > 64 * 1024, "implausible rss {rss}");
         assert_eq!(resident_set_bytes(i32::MAX), None);
+    }
+
+    #[test]
+    fn process_tree_resident_set_includes_a_child() {
+        // A sleeping child: the tree total must exceed this process alone.
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let me = std::process::id() as libc::pid_t;
+        let own = resident_set_bytes(me).unwrap();
+        let mut tree = 0;
+        for _ in 0..50 {
+            tree = resident_set_tree_bytes(me).unwrap();
+            if tree > own {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(tree > own, "tree {tree} should exceed own {own}");
     }
 
     #[test]

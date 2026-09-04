@@ -166,7 +166,7 @@ build/agent/apps/kwe-display-macos/kwe-display-macos --cover-all
 
 - No `PR_SET_PDEATHSIG`: workers arm a kqueue guard on their parent pid.
 - No `PR_SET_NO_NEW_PRIVS`.
-- `RLIMIT_AS` is refused by XNU (`EINVAL`) and skipped; the supervisor instead kills a worker whose resident set exceeds `address_space_mib` (checked every tick, `ResourceLimit` failure, same strike/restart path). Address-space overcommit without touching pages is therefore not bounded on macOS.
+- `RLIMIT_AS` is refused by XNU (`EINVAL`) and skipped; the supervisor instead kills a worker whose **process tree's** resident set (worker + descendants: the web renderer's browser tree, the scene renderer's shader helper) exceeds min(`address_space_mib`, 2 GiB), checked once a second (`ResourceLimit` failure, same strike/restart path). Address-space overcommit without touching pages is not bounded on macOS, and a process that escapes the tree (re-parented) is not counted.
 - `pipe`/`socketpair` + `fcntl(FD_CLOEXEC)` instead of atomic `*_CLOEXEC`.
 - Paths: socket `~/Library/Application Support/kwe/daemon-v1.sock`,
   state `~/Library/Application Support/kwe/state`, reports

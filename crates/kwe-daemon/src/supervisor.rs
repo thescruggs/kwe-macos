@@ -897,6 +897,9 @@ struct ActiveWorker {
     reader: Option<SharedFrameReader>,
     started: Instant,
     last_progress: Instant,
+    /// macOS resident-set watchdog cadence (the process-tree scan is not
+    /// free, so it runs once a second, not every 40 ms tick).
+    last_resident_check: Instant,
     last_snapshot_saved: Option<Instant>,
     sequence: u64,
     input: ChildStdin,
@@ -1324,6 +1327,7 @@ impl SupervisorRuntime {
             reader: None,
             started: now,
             last_progress: now,
+            last_resident_check: now,
             last_snapshot_saved: None,
             sequence: 0,
             input,
@@ -1923,6 +1927,13 @@ impl SupervisorRuntime {
     }
 }
 
+/// macOS resident-set watchdog: per-worker process-tree budget cap and
+/// cadence (see `inspect_worker`). 2 GiB is well above a 4K scene's
+/// textures and a headless browser tree (~250 MB per browser process,
+/// measured), and twice the Linux unit's aggregate hard limit.
+const MACOS_RESIDENT_BUDGET_MIB: u64 = 2048;
+const RESIDENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 enum WorkerObservation {
     Progress(FrameSnapshot),
     Failure(FailureKind, String),
@@ -1984,18 +1995,26 @@ fn inspect_worker(
     }
 
     drain_stderr(worker, STDERR_READ_BYTES_PER_TICK);
-    // macOS (MP-9): Darwin refuses RLIMIT_AS, so the address-space budget is
-    // enforced here as a resident-set watchdog on every tick; a worker over
-    // budget is a ResourceLimit failure (killed, struck, restarted like any
-    // other). Linux keeps the kernel rlimit and never reaches this branch.
-    if !kwe_platform::address_space_limit_enforced() {
+    // macOS (MP-9): Darwin refuses RLIMIT_AS, so memory is bounded here as a
+    // resident-set watchdog over the worker's whole process tree (the web
+    // renderer's browser and the scene renderer's shader helper are
+    // children). Budget = min(address_space_mib, MACOS_RESIDENT_BUDGET_MIB):
+    // the address-space numbers were sized for reservations (128 GiB for
+    // the browser) and are not resident budgets. Checked once a second; a
+    // tree over budget is a ResourceLimit failure (killed, struck,
+    // restarted like any other). Linux never enters the branch.
+    if !kwe_platform::address_space_limit_enforced()
+        && Instant::now().duration_since(worker.last_resident_check) >= RESIDENT_CHECK_INTERVAL
+    {
+        worker.last_resident_check = Instant::now();
         let mib = 1024_u64 * 1024;
         let budget = config
             .resource_limits_for(worker.spec.kind)
             .address_space_mib
+            .min(MACOS_RESIDENT_BUDGET_MIB)
             .saturating_mul(mib);
         if let Ok(pid) = i32::try_from(worker.child.id())
-            && let Some(resident) = kwe_platform::resident_set_bytes(pid)
+            && let Some(resident) = kwe_platform::resident_set_tree_bytes(pid)
             && resident > budget
         {
             return Some(WorkerObservation::Failure(
@@ -2899,10 +2918,19 @@ mod tests {
 
         let root = temporary_directory("rss-watchdog");
         fs::create_dir_all(&root).unwrap();
+        // The memory lives in a CHILD of the worker (as the browser does
+        // for the web renderer); only the process-tree total catches it.
         let script = root.join("hog-renderer");
         fs::write(
             &script,
-            "#!/usr/bin/env python3\nimport time\nblock = bytearray(400 * 1024 * 1024)\nfor i in range(0, len(block), 4096):\n    block[i] = 1\ntime.sleep(30)\n",
+            concat!(
+                "#!/usr/bin/env python3\n",
+                "import subprocess, sys, time\n",
+                "child = subprocess.Popen([sys.executable, '-c', ",
+                "'import time\\nb = bytearray(400 * 1024 * 1024)\\n",
+                "for i in range(0, len(b), 4096): b[i] = 1\\ntime.sleep(30)'])\n",
+                "time.sleep(30)\n",
+            ),
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2936,12 +2964,17 @@ mod tests {
         };
         let mut worker = runtime.spawn_worker(spec).unwrap();
         let mut observation = None;
-        for _ in 0..600 {
+        // The watchdog scans once a second; allow a slow runner ~12 s.
+        for _ in 0..1200 {
             if let Some(found) = inspect_worker(&mut worker, &runtime.config) {
                 observation = Some(found);
                 break;
             }
             thread::sleep(Duration::from_millis(10));
+        }
+        // Kill the whole tree (the child hog is in the worker's group).
+        unsafe {
+            libc::kill(-(worker.child.id() as i32), libc::SIGKILL);
         }
         let _ = worker.child.kill();
         let _ = worker.child.wait();
@@ -2953,7 +2986,7 @@ mod tests {
                 panic!("expected ResourceLimit, got {kind:?}: {detail}")
             }
             Some(WorkerObservation::Progress(_)) => panic!("expected ResourceLimit, got progress"),
-            None => panic!("expected ResourceLimit, observed nothing within 6 s"),
+            None => panic!("expected ResourceLimit, observed nothing within 12 s"),
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -3416,6 +3449,7 @@ mod tests {
             reader: None,
             started: Instant::now(),
             last_progress: Instant::now(),
+            last_resident_check: Instant::now(),
             last_snapshot_saved: None,
             sequence: 0,
             input,
@@ -3617,6 +3651,7 @@ mod tests {
             reader: None,
             started: Instant::now(),
             last_progress: Instant::now(),
+            last_resident_check: Instant::now(),
             last_snapshot_saved: None,
             sequence: 0,
             input,
