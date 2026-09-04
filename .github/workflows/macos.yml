@@ -34,7 +34,7 @@ jobs:
         # driver" is expected here; the listing validates the ICD path the
         # dev install script uses.
         run: |
-          find "$(brew --prefix molten-vk)" -name '*.json' -print || true
+          find -L "$(brew --prefix molten-vk)" "$(brew --prefix)/share/vulkan" "$(brew --prefix)/etc/vulkan" -name '*.json' -print 2>/dev/null || true
           target/debug/kwe-vulkan || true
   qt-macos:
     # The display agent + manager (Kirigami compatibility module) built

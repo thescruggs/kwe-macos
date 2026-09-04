@@ -122,7 +122,8 @@ whether the mouse-moved global monitor needs a TCC prompt.
 ## macOS CI: green (GitHub macos-14 runner, run 33835238015, 2026-09-04)
 
 `rust-macos` (whole workspace builds; every portable crate's tests pass
-with Homebrew shaderc/mpv/MoltenVK), `qt-macos` (agent + manager build
+with Homebrew shaderc/mpv/MoltenVK, including the macOS-only resident-set
+watchdog test and the per-step containment test), `qt-macos` (agent + manager build
 against Homebrew qt@6; daemon + kwe-test-renderer + kwe-display-macos
 offscreen smoke passes: frame shown, display generation acknowledged) and
 the Linux seam guard all pass. Scene-renderer tests (need a Vulkan device)

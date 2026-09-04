@@ -16,7 +16,9 @@ linker. Put this in your shell profile:
 
 ```sh
 export PKG_CONFIG_PATH="$(brew --prefix shaderc)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/share/vulkan/icd.d/MoltenVK_icd.json"
+# The manifest lives under share/ or etc/ depending on the Homebrew release;
+# `packaging/macos/install-dev.sh` discovers it and prints the path.
+export VK_ICD_FILENAMES="$(find -L "$(brew --prefix molten-vk)" -name MoltenVK_icd.json | head -1)"
 ```
 
 (`kwe-mpv/build.rs` finds libmpv through `pkg-config`, `brew --prefix mpv`,

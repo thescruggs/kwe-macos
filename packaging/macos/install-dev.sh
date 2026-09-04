@@ -48,8 +48,25 @@ bin_dir="$root/target/release"
 [ -x "$bin_dir/kwe-daemon" ] || { echo "missing $bin_dir/kwe-daemon (build first)" >&2; exit 1; }
 agent_bin="$root/build/agent/apps/kwe-display-macos/kwe-display-macos"
 manager_bin="$root/build/agent/apps/kwe-manager/kwe-manager"
-icd="$(brew --prefix molten-vk 2>/dev/null || echo "$brew_prefix/opt/molten-vk")/share/vulkan/icd.d/MoltenVK_icd.json"
-[ -f "$icd" ] || echo "warning: MoltenVK ICD not found at $icd (brew install molten-vk); scene wallpapers will not work" >&2
+# MoltenVK's ICD manifest: Homebrew has moved it between share/ and etc/;
+# search the usual places (following the opt/ symlink) before giving up.
+icd=""
+for candidate in \
+  "$(brew --prefix molten-vk 2>/dev/null || echo "$brew_prefix/opt/molten-vk")/share/vulkan/icd.d/MoltenVK_icd.json" \
+  "$(brew --prefix molten-vk 2>/dev/null || echo "$brew_prefix/opt/molten-vk")/etc/vulkan/icd.d/MoltenVK_icd.json" \
+  "$brew_prefix/share/vulkan/icd.d/MoltenVK_icd.json" \
+  "$brew_prefix/etc/vulkan/icd.d/MoltenVK_icd.json"; do
+  if [ -f "$candidate" ]; then icd="$candidate"; break; fi
+done
+if [ -z "$icd" ]; then
+  icd="$(find -L "$brew_prefix/opt/molten-vk" -name 'MoltenVK_icd.json' -print 2>/dev/null | head -1)"
+fi
+if [ -z "$icd" ]; then
+  echo "warning: MoltenVK ICD manifest not found (brew install molten-vk); scene wallpapers will not work" >&2
+  icd="$brew_prefix/share/vulkan/icd.d/MoltenVK_icd.json"
+else
+  echo "MoltenVK ICD: $icd"
+fi
 
 app_support="$HOME/Library/Application Support/kwe"
 log_dir="$HOME/Library/Logs/kwe"
