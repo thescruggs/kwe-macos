@@ -417,13 +417,14 @@ pub mod macos {
             "(allow file-write* (subpath {}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\"))\n",
             sbpl_string(profile_dir)
         ));
-        // Reads: the user's home is off limits except the content root, the
-        // browser's own bundle (when it lives under ~/Applications), and
-        // the profile/temp trees.
-        if let Some(home) = home
-            && variant != ProfileVariant::NoHomeDeny
-        {
-            rules.push_str(&format!("(deny file-read* (subpath {}))\n", sbpl_string(home)));
+        // Reads: every user home (/Users) is off limits except the content
+        // root, the worker's own private HOME (a daemon-created per-launch
+        // directory the browser resolves its default paths under — denying
+        // it broke Chrome's user-data-dir lookup on macOS 14), the
+        // browser's bundle when it lives under ~/Applications, and the
+        // profile/temp trees.
+        if variant != ProfileVariant::NoHomeDeny {
+            rules.push_str("(deny file-read* (subpath \"/Users\"))\n");
         }
         let mut allowed_reads = vec![
             format!("(subpath {})", sbpl_string(root)),
@@ -431,6 +432,9 @@ pub mod macos {
             "(subpath \"/private/var/folders\")".to_string(),
             "(subpath \"/private/tmp\")".to_string(),
         ];
+        if let Some(worker_home) = home {
+            allowed_reads.push(format!("(subpath {})", sbpl_string(worker_home)));
+        }
         if let Some(bundle) = browser_bundle {
             allowed_reads.push(format!("(subpath {})", sbpl_string(bundle)));
         }
@@ -551,11 +555,13 @@ pub mod macos {
             let text = profile(
                 Path::new("/Users/me/WE/steamapps/workshop/content/431960/1"),
                 Path::new("/private/var/folders/x/T/kwe-web-profile-1"),
-                Some(Path::new("/Users/me")),
+                Some(Path::new("/Users/me/Library/Application Support/kwe/state/runtime/home-3")),
                 Some(Path::new("/Users/me/Applications/Chromium.app")),
                 false,
             );
+            assert!(text.contains("(deny file-read* (subpath \"/Users\"))"));
             assert!(text.contains("(subpath \"/Users/me/Applications/Chromium.app\")"));
+            assert!(text.contains("(subpath \"/Users/me/Library/Application Support/kwe/state/runtime/home-3\")"));
             assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/var/folders\")"));
             assert_eq!(
                 bundle_root(Path::new("/Users/me/Applications/Chromium.app/Contents/MacOS/Chromium")),
@@ -564,11 +570,10 @@ pub mod macos {
             assert_eq!(bundle_root(Path::new("/opt/homebrew/bin/chromium")), None);
             assert!(text.starts_with("(version 1)\n(allow default)\n"));
             assert!(text.contains("(deny file-write*)"));
-            assert!(text.contains("(deny file-read* (subpath \"/Users/me\"))"));
             assert!(text.contains("(deny network*)\n(allow network* (local unix-socket) (remote unix-socket))\n"));
             let open = profile(Path::new("/a"), Path::new("/b"), None, None, true);
             assert!(!open.contains("network"));
-            assert!(!open.contains("file-read* (subpath \"/Users"));
+            assert!(open.contains("(deny file-read* (subpath \"/Users\"))"));
         }
 
         #[test]
