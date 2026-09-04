@@ -955,6 +955,12 @@ fn spawn_browser(
     // What the page's CDP target URL must contain: `/wallpaper/index.html`
     // inside the Linux namespace, the real content path on macOS.
     let page_marker = kwe_core::page_url_marker(&web_command);
+    match web_command.sandbox {
+        "bwrap" | "seatbelt" => {}
+        weakened => eprintln!(
+            "event=renderer.web.sandbox_weakened mode={weakened} detail=KWE_WEB_SANDBOX is set; the OS sandbox around the browser is reduced or off"
+        ),
+    }
     let (client_read, browser_write) = socket_pair()?;
     let (browser_read, client_write) = socket_pair()?;
     let mut process = Command::new(&web_command.program);
@@ -1394,7 +1400,17 @@ impl WebWorker {
             );
         }
         let browser =
-            BrowserSession::start(&self.content, self.spec, self.arguments.allow_network)?;
+            match BrowserSession::start(&self.content, self.spec, self.arguments.allow_network) {
+                Ok(session) => session,
+                Err(first) => {
+                    // One bounded retry: a browser's first-ever launch on a
+                    // machine can fail its own first-run setup (measured on
+                    // macOS: Keystone/backup-exclusion XPC on a fresh
+                    // account) and the daemon never retries a refusal.
+                    eprintln!("event=renderer.web.bootstrap_retry detail={first:#}");
+                    BrowserSession::start(&self.content, self.spec, self.arguments.allow_network)?
+                }
+            };
         self.browser = Some(browser);
         self.capture_loop()
     }

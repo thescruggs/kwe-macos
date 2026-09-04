@@ -14,6 +14,11 @@ pub struct WebSandboxCommand {
     /// content root, so the browser never runs with a cwd inside a tree
     /// the Seatbelt profile denies (getcwd/realpath would fail there).
     pub working_dir: Option<PathBuf>,
+    /// The OS sandbox this command runs under, for the renderer's spawn
+    /// log: `bwrap`, `seatbelt`, `seatbelt:net-only`, `seatbelt:no-home`,
+    /// or `none` (KWE_WEB_SANDBOX=off). Anything but the first two is a
+    /// weakened configuration the renderer logs as a warning.
+    pub sandbox: &'static str,
 }
 
 /// Marker the renderer looks for in a CDP target URL to recognise the
@@ -57,6 +62,7 @@ pub fn chromium_command(root: &Path, network_allowed: bool) -> WebSandboxCommand
         arguments,
         page_url: LINUX_PAGE_URL.into(),
         working_dir: None,
+        sandbox: "bwrap",
     }
 }
 
@@ -176,6 +182,7 @@ fn linux_web_renderer_command(
         arguments,
         page_url: LINUX_PAGE_URL.into(),
         working_dir: None,
+        sandbox: "bwrap",
     }
 }
 
@@ -278,6 +285,7 @@ pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxComm
         arguments,
         page_url: LINUX_PAGE_URL.into(),
         working_dir: None,
+        sandbox: "bwrap",
     }
 }
 
@@ -411,6 +419,36 @@ pub mod macos {
         network_allowed: bool,
         variant: ProfileVariant,
     ) -> String {
+        profile_variant_with_temp(
+            root,
+            profile_dir,
+            temp_root().as_deref(),
+            home,
+            browser_bundle,
+            network_allowed,
+            variant,
+        )
+    }
+
+    /// The resolved per-user temp directory (`$TMPDIR`, usually
+    /// `/private/var/folders/<xx>/<yyy>/T`). The browser binds its IPC and
+    /// crash-handler sockets there, so the profile grants that directory —
+    /// not the whole `/private/var/folders` tree, which also holds every
+    /// other app's caches for the same user.
+    fn temp_root() -> Option<PathBuf> {
+        let base = std::env::temp_dir();
+        Some(std::fs::canonicalize(&base).unwrap_or(base))
+    }
+
+    pub fn profile_variant_with_temp(
+        root: &Path,
+        profile_dir: &Path,
+        temp_root: Option<&Path>,
+        home: Option<&Path>,
+        browser_bundle: Option<&Path>,
+        network_allowed: bool,
+        variant: ProfileVariant,
+    ) -> String {
         let mut rules = String::from("(version 1)\n(allow default)\n");
         if variant == ProfileVariant::NetworkOnly {
             if !network_allowed {
@@ -419,12 +457,18 @@ pub mod macos {
             }
             return rules;
         }
-        // Writes: only the throwaway browser profile, temp trees, and /dev.
+        // Writes: only the throwaway browser profile, the per-user temp
+        // directory, /private/tmp, and /dev.
         rules.push_str("(deny file-write*)\n");
-        rules.push_str(&format!(
-            "(allow file-write* (subpath {}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\"))\n",
-            sbpl_string(profile_dir)
-        ));
+        let mut allowed_writes = vec![
+            format!("(subpath {})", sbpl_string(profile_dir)),
+            "(subpath \"/private/tmp\")".to_string(),
+            "(subpath \"/dev\")".to_string(),
+        ];
+        if let Some(temp) = temp_root {
+            allowed_writes.push(format!("(subpath {})", sbpl_string(temp)));
+        }
+        rules.push_str(&format!("(allow file-write* {})\n", allowed_writes.join(" ")));
         // Reads: every user home (/Users) is off limits except the content
         // root, the worker's own private HOME (a daemon-created per-launch
         // directory the browser resolves its default paths under — denying
@@ -447,9 +491,11 @@ pub mod macos {
         let mut allowed_reads = vec![
             format!("(subpath {})", sbpl_string(root)),
             format!("(subpath {})", sbpl_string(profile_dir)),
-            "(subpath \"/private/var/folders\")".to_string(),
             "(subpath \"/private/tmp\")".to_string(),
         ];
+        if let Some(temp) = temp_root {
+            allowed_reads.push(format!("(subpath {})", sbpl_string(temp)));
+        }
         if let Some(worker_home) = home {
             allowed_reads.push(format!("(subpath {})", sbpl_string(worker_home)));
         }
@@ -538,6 +584,7 @@ pub mod macos {
                 arguments: browser_arguments,
                 page_url,
                 working_dir: Some(root.to_path_buf()),
+                sandbox: "none",
             };
         };
         let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -563,6 +610,11 @@ pub mod macos {
             arguments,
             page_url,
             working_dir: Some(root.to_path_buf()),
+            sandbox: match variant {
+                ProfileVariant::Full => "seatbelt",
+                ProfileVariant::NetworkOnly => "seatbelt:net-only",
+                ProfileVariant::NoHomeDeny => "seatbelt:no-home",
+            },
         }
     }
 
@@ -572,19 +624,23 @@ pub mod macos {
 
         #[test]
         fn profile_denies_home_and_network_but_allows_content_and_profile() {
-            let text = profile(
+            let text = profile_variant_with_temp(
                 Path::new("/Users/me/WE/steamapps/workshop/content/431960/1"),
                 Path::new("/private/var/folders/x/T/kwe-web-profile-1"),
+                Some(Path::new("/private/var/folders/x/T")),
                 Some(Path::new("/Users/me/Library/Application Support/kwe/state/runtime/home-3")),
                 Some(Path::new("/Users/me/Applications/Chromium.app")),
                 false,
+                ProfileVariant::Full,
             );
+            assert!(text.contains("(allow file-write* (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/tmp\") (subpath \"/dev\") (subpath \"/private/var/folders/x/T\"))"));
+            assert!(!text.contains("(subpath \"/private/var/folders\")"));
             assert!(text.contains("(deny file-read* (subpath \"/Users\"))"));
             assert!(text.contains("(allow file-read-data (regex #\"^/Users/[^/]+/\\.CFUserTextEncoding$\"))"));
             assert!(text.contains("(regex #\"^/Users/[^/]+/Library/Application Support$\")"));
             assert!(text.contains("(subpath \"/Users/me/Applications/Chromium.app\")"));
             assert!(text.contains("(subpath \"/Users/me/Library/Application Support/kwe/state/runtime/home-3\")"));
-            assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/var/folders\")"));
+            assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/tmp\") (subpath \"/private/var/folders/x/T\")"));
             assert_eq!(
                 bundle_root(Path::new("/Users/me/Applications/Chromium.app/Contents/MacOS/Chromium")),
                 Some(PathBuf::from("/Users/me/Applications/Chromium.app"))
@@ -615,6 +671,7 @@ mod tests {
             arguments: Vec::new(),
             page_url: "file:///wallpaper/index.html".into(),
             working_dir: None,
+            sandbox: "bwrap",
         };
         assert_eq!(page_url_marker(&command), "/wallpaper/index.html");
     }

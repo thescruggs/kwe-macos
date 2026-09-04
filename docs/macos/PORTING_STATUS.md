@@ -12,7 +12,7 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | G3 display agent | Qt Quick + ObjC++ shim reusing `org.kde.kwe.display` verbatim. |
 | G4 manager UI | QQC2 rewrite of the QML pages, Kirigami dropped in the fork. |
 | G5 floor | macOS 14+, arm64 first. |
-| G6 web sandbox | `sandbox-exec` profile + Chromium's own sandbox. |
+| G6 web sandbox | `sandbox-exec` profile with `--no-sandbox` (measured: Chromium's nested sandbox cannot start inside an outer profile), mirroring bwrap + `--no-sandbox` on Linux. Hardening backlog in the review log. |
 | G7 audio | Core Audio process tap primary; BlackHole documented fallback. |
 | G8 scene backend | MoltenVK; no Metal rewrite. |
 
@@ -87,6 +87,17 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
   min(address_space_mib, 2 GiB) once a second, verified by a nested-child
   hog test on the macOS runner. Noted: a re-parented escapee is not
   counted; the Linux unit's aggregate cgroup limit has no macOS twin yet.
+- 2026-09-04 web-sandbox security review (independent, sonnet): no
+  show-stoppers. Landed: temp grants narrowed from `/private/var/folders`
+  to the resolved `$TMPDIR`; the renderer logs the sandbox mode at spawn
+  and warns when `KWE_WEB_SANDBOX` weakens it; one bounded browser
+  bootstrap retry (Chrome's first-ever launch on a fresh account failed
+  its own first-run setup once in three CI attempts). **Hardening
+  backlog, ranked:** (1) `(deny mach-lookup)` with an allow-list — a
+  `--no-sandbox` browser can otherwise reach LaunchServices (unconfined
+  process launch) and the pasteboard; (2) `(deny process-exec)` except
+  the browser bundle; (3) `(deny iokit-open)`; each to be built with the
+  CI smoke's denial capture as the oracle, the way the current rules were.
 - 2026-09-04 CI-fix batch review (independent, sonnet): one show-stopper
   — the "named setrlimit" error wrapper dropped the raw errno (std hands
   a failing pre_exec closure to the parent as errno only), which would

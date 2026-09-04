@@ -75,8 +75,10 @@ run_lane() {
   fi
   $call --method renderer.stop >/dev/null 2>&1 || true
   kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; daemon_pid=""
-  # Stray browser helpers from this lane must not leak into the next.
-  pkill -f "kwe-web-profile" 2>/dev/null || true
+  # Stray browser helpers from this lane must not leak into the next. Only
+  # on CI: on a developer Mac the pattern would also match a live
+  # daemon-supervised wallpaper's browser.
+  if [[ -n "${CI:-}" ]]; then pkill -f "kwe-web-profile" 2>/dev/null || true; fi
   sleep 1
   return $result
 }
