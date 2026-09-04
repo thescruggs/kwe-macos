@@ -435,9 +435,14 @@ pub mod macos {
             rules.push_str("(deny file-read* (subpath \"/Users\"))\n");
             // Path resolution (realpath, getcwd) stats each parent directory;
             // the home directory NAMES are not secret, their contents are.
+            // CoreFoundation start-up in the browser reads the real user's
+            // ~/.CFUserTextEncoding and stats ~/Library and
+            // ~/Library/Application Support (measured denials on macOS 14:
+            // without these the browser fails its user-data-dir lookup).
             rules.push_str(
-                "(allow file-read-metadata (literal \"/Users\") (regex #\"^/Users/[^/]+$\"))\n",
+                "(allow file-read-metadata (literal \"/Users\") (regex #\"^/Users/[^/]+$\") (regex #\"^/Users/[^/]+/Library$\") (regex #\"^/Users/[^/]+/Library/Application Support$\"))\n",
             );
+            rules.push_str("(allow file-read-data (regex #\"^/Users/[^/]+/\\.CFUserTextEncoding$\"))\n");
         }
         let mut allowed_reads = vec![
             format!("(subpath {})", sbpl_string(root)),
@@ -575,6 +580,8 @@ pub mod macos {
                 false,
             );
             assert!(text.contains("(deny file-read* (subpath \"/Users\"))"));
+            assert!(text.contains("(allow file-read-data (regex #\"^/Users/[^/]+/\\.CFUserTextEncoding$\"))"));
+            assert!(text.contains("(regex #\"^/Users/[^/]+/Library/Application Support$\")"));
             assert!(text.contains("(subpath \"/Users/me/Applications/Chromium.app\")"));
             assert!(text.contains("(subpath \"/Users/me/Library/Application Support/kwe/state/runtime/home-3\")"));
             assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/var/folders\")"));
