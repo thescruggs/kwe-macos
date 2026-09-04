@@ -63,10 +63,15 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
    per-launch directory, re-allowed); CoreFoundation start-up needs
    `~/.CFUserTextEncoding` and metadata of `~/Library` and
    `~/Library/Application Support`; the browser's cwd is the content
-   root. `scripts/macos/smoke-web-macos.sh` keeps running the production
-   lane three times per CI run and dumps denials on any failure. A
-   bootstrap refusal (exit 73) is not retried by the daemon (B4
-   semantics); Apply again if one ever happens.
+   root; Google Chrome's first launch on a machine must create
+   `~/Library/Application Support/Google` (Keystone) and stat it, or it
+   aborts its user-data lookup — creation of that directory (and
+   `Google/Chrome`) plus their metadata is allowed, nothing inside is.
+   `scripts/macos/smoke-web-macos.sh` keeps running the production lane
+   three times per CI run and dumps denials on any failure; the renderer
+   retries a genuine bootstrap failure once. A bootstrap refusal (exit
+   73) is not retried by the daemon (B4 semantics); Apply again if one
+   ever happens.
 4. MoltenVK: `kwe-vulkan` lists the Apple GPU; scene corpus behaviour.
 5. ffmpeg/BlackHole capture feeds audio-reactive scenes.
 6. Homebrew Qt: `cmake -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)` configures
@@ -150,14 +155,15 @@ Unverified on macOS (spike S-A): window ordering under Finder icons on
 14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
 whether the mouse-moved global monitor needs a TCC prompt.
 
-## macOS CI: green (GitHub macos-14 runner, latest run 33837270786, 2026-09-04)
+## macOS CI: green (GitHub macos-14 runner, latest run 33841660502, 2026-09-04)
 
 `rust-macos` (whole workspace builds; every portable crate's tests pass
 with Homebrew shaderc/mpv/MoltenVK, including the macOS-only resident-set
 watchdog test and the per-step containment test), `qt-macos` (agent + manager build
 against Homebrew qt@6; daemon + kwe-test-renderer + kwe-display-macos
-offscreen smoke passes: frame shown, display generation acknowledged) and
-the Linux seam guard all pass. Scene-renderer tests (need a Vulkan device)
+offscreen smoke passes: frame shown, display generation acknowledged; a
+web wallpaper renders under the production Seatbelt profile 3/3) and the
+Linux seam guard all pass. Scene-renderer tests (need a Vulkan device)
 are built, not run, on the runner.
 
 ## macOS CI findings (how it got there)
