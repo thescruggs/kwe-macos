@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+mod workshop_sync;
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
@@ -104,6 +106,57 @@ enum Command {
     /// (~/.local/share/kwe/reports/*/report.md), newest first, with the
     /// note's first line — a quick index for the next debugging session.
     Reports,
+    /// Download Wallpaper Engine Workshop items with SteamCMD into a
+    /// Steam-library-shaped root the scanner indexes (macOS: Steam cannot
+    /// install the Windows-only app, so it never syncs its Workshop items).
+    /// Subscriptions come from Steam's appworkshop_431960.acf manifest
+    /// (--manifest-root: a Steam root, local or copied from the machine
+    /// that has Wallpaper Engine), a public collection, explicit ids/URLs,
+    /// or the Web API. SteamCMD's own cached login is used; run
+    /// `steamcmd +login <user>` once interactively first.
+    WorkshopSync {
+        /// Steam account name (or env KWE_STEAM_USER).
+        #[arg(long)]
+        user: Option<String>,
+        /// SteamCMD binary (default: `steamcmd` on PATH).
+        #[arg(long, default_value = "steamcmd")]
+        steamcmd: PathBuf,
+        /// Sync root; items land under <root>/steamapps/workshop/content/431960.
+        /// Default: STEAM_ROOT, else the kwe sync root
+        /// (macOS ~/Library/Application Support/kwe/steam, Linux ~/.local/share/kwe/steam).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Steam root whose steamapps/appworkshop_431960.acf lists the
+        /// subscriptions. May be repeated. Defaults to the discovered Steam roots.
+        #[arg(long = "manifest-root")]
+        manifest_roots: Vec<PathBuf>,
+        /// Public Workshop collection id or URL. May be repeated.
+        #[arg(long = "collection")]
+        collections: Vec<String>,
+        /// Workshop item id or URL. May be repeated.
+        #[arg(long = "item")]
+        items: Vec<String>,
+        /// Steam Web API key (with --steamid): enumerate subscriptions
+        /// server-side. Valve may restrict this call to publisher keys.
+        #[arg(long = "api-key")]
+        api_key: Option<String>,
+        /// SteamID64 of the account (with --api-key).
+        #[arg(long)]
+        steamid: Option<String>,
+        /// Also install the app's Windows build for its assets/ folder
+        /// (scene wallpapers need it; about 1 GB, one time).
+        #[arg(long)]
+        assets: bool,
+        /// Resolve and list what would be downloaded; run nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable report.
+        #[arg(long)]
+        json: bool,
+        /// Do not ask the running daemon to rescan afterwards.
+        #[arg(long)]
+        no_rescan: bool,
+    },
     /// Call the daemon's `scene.inspect` RPC (SR-0b) for one scene entry and
     /// pretty-print the draft `scene-feature-inventory-v0` record.
     SceneInspect {
@@ -304,6 +357,80 @@ fn main() -> Result<()> {
             let response = call_daemon(&socket, &method, params)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             if response.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                std::process::exit(2);
+            }
+        }
+        Command::WorkshopSync {
+            user,
+            steamcmd,
+            root,
+            manifest_roots,
+            collections,
+            items,
+            api_key,
+            steamid,
+            assets,
+            dry_run,
+            json,
+            no_rescan,
+        } => {
+            let user = user
+                .or_else(|| std::env::var("KWE_STEAM_USER").ok())
+                .context("pass --user <steam account name> (or set KWE_STEAM_USER)")?;
+            let api_key = api_key.or_else(|| std::env::var("KWE_STEAM_API_KEY").ok());
+            let root = root
+                .or_else(|| std::env::var_os("STEAM_ROOT").map(PathBuf::from))
+                .or_else(kwe_platform::workshop_sync_root)
+                .context("no sync root: pass --root")?;
+            let manifest_roots = if manifest_roots.is_empty()
+                && collections.is_empty()
+                && items.is_empty()
+                && api_key.is_none()
+            {
+                // Default source: every discovered Steam LIBRARY (roots plus
+                // the folders their libraryfolders.vdf registers) that has
+                // the Workshop manifest.
+                let roots = default_steam_roots();
+                let (libraries, _) = kwe_core::discover_libraries(&roots);
+                libraries
+                    .into_iter()
+                    .map(|library| library.path)
+                    .filter(|candidate| {
+                        workshop_sync::manifest_candidates(candidate)
+                            .iter()
+                            .any(|path| path.is_file())
+                    })
+                    .collect()
+            } else {
+                manifest_roots
+            };
+            let rescan_socket = if no_rescan {
+                None
+            } else {
+                kwe_platform::runtime_dir()
+                    .map(|dir| dir.join("kwe/daemon-v1.sock"))
+                    .filter(|socket| socket.exists())
+            };
+            let options = workshop_sync::SyncOptions {
+                steam_user: user,
+                steamcmd,
+                root: root.clone(),
+                manifest_roots,
+                collections,
+                items,
+                api_key,
+                steamid,
+                assets,
+                dry_run,
+                rescan_socket,
+            };
+            let report = workshop_sync::run(&options)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                workshop_sync::print_human(&report, &root);
+            }
+            if report.login_failure.is_some() || (report.failed() > 0 && report.downloaded() == 0) {
                 std::process::exit(2);
             }
         }

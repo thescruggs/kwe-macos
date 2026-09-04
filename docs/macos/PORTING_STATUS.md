@@ -24,7 +24,7 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | kwe-core | ok | Steam roots per platform |
 | kwe-frame-protocol, kwe-input-protocol, kwe-report-protocol | ok | unchanged |
 | kwe-cdp | ok | socketpair via kwe-platform |
-| kwe-cli | ok | reports dir via kwe-platform |
+| kwe-cli | ok | reports dir via kwe-platform; `kwe workshop-sync` (MP-1b): SteamCMD-driven Workshop sync, sources = Steam manifest / collection / ids / Web API, bounded subprocesses, stub-tested + live `GetPublishedFileDetails` exercised on Linux; a real SteamCMD download needs the maintainer's cached login |
 | kwe-daemon | ok | pre_exec containment, rlimit type, peer creds, socket/state dirs via kwe-platform; macOS apply backend `macos_desktop.rs` (CoreGraphics displays + Plasma-script emulation, persisted); macOS worker env passthrough (DYLD_FALLBACK_LIBRARY_PATH, VK_ICD_FILENAMES, VK_DRIVER_FILES, TMPDIR) |
 | kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok; **web verified on the macOS runner** | worker-side parent guard; web renderer on macOS runs the browser under `sandbox-exec` with `--no-sandbox` (generated SBPL: no writes outside its profile dir/temp, no reads under /Users except content root, worker home, browser bundle; IP networking denied unless granted, Unix sockets allowed); browser from `KWE_CHROMIUM` or /Applications; `KWE_WEB_SANDBOX=off|net-only|no-home` for diagnosis |
 | kwe-scene-renderer, kwe-shader-compiler, kwe-vulkan | ok (type-check only) | C build scripts need Xcode CLT on the Mac; VK_KHR_portability_enumeration + VK_KHR_portability_subset enabled when advertised (MoltenVK) |
@@ -45,6 +45,17 @@ defaults to Fusion on macOS. macOS branches in C++: daemon activation via
 `~/Library/Application Support/kwe/state`. Verified on Linux offscreen
 against a live daemon (97 items, screenshot reviewed); named theme icons
 render blank without a Freedesktop icon theme (text labels carry meaning).
+
+## Upstream finding (not changed in the fork)
+
+`kwe_core::scan` reads Workshop subscriptions from
+`steamapps/appworkshop_431960.acf` under the `WorkshopItems` key; Steam
+actually writes `steamapps/workshop/appworkshop_431960.acf` with
+`WorkshopItemsInstalled` and `WorkshopItemDetails` sections (verified on
+the maintainer's Linux library, ~300 subscriptions reported as 0). That is
+why `subscribed_missing`/`subscribed_installed` states never appear.
+`kwe workshop-sync` reads the real location; the scanner is left as
+upstream has it (Linux-neutral fork rule) — worth an upstream fix.
 
 ## Hardware-verify list (blocking a "done" on the Mac)
 

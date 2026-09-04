@@ -19,6 +19,7 @@ workspace cross-checked for `aarch64-apple-darwin`.
 ```sh
 xcode-select --install
 brew install rustup pkg-config cmake ninja mpv shaderc molten-vk vulkan-loader vulkan-headers qt@6 ffmpeg jq
+brew install --cask steamcmd          # Workshop sync (docs/macos/CONTENT.md)
 brew install --cask chromium          # web wallpapers (Chrome/Brave/Edge also detected)
 rustup-init -y && . "$HOME/.cargo/env"
 
@@ -29,6 +30,8 @@ packaging/macos/install-dev.sh        # builds everything, installs two LaunchAg
 Then:
 
 ```sh
+steamcmd +login <steam account> +quit                    # once, interactive (brew install --cask steamcmd)
+target/release/kwe workshop-sync --user <steam account> --manifest-root <dir with steamapps/appworkshop_431960.acf> --assets
 target/release/kwe scan                                   # what content was found (see docs/macos/CONTENT.md)
 target/release/kwe daemon-call --method wallpaper.outputs # your displays as the daemon sees them
 build/agent/apps/kwe-manager/kwe-manager                  # gallery; Apply covers the chosen display

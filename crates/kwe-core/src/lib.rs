@@ -56,6 +56,7 @@ pub use scan::{
     Catalog, CatalogItem, CatalogStats, Compatibility, Diagnostic, DiagnosticLevel, ProjectKind,
     ScanLimits, SteamLibrary, default_steam_roots, default_wallpaper_engine_assets_dir,
     discover_libraries, scan_installed,
+    workshop_subscriptions,
 };
 pub use sceneeffect::{
     EffectCommand, EffectCommandPass, EffectMaterialPass, EffectPass, EffectSpec,

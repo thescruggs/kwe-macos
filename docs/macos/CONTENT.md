@@ -39,7 +39,56 @@ inherits it from the plist; add it to `EnvironmentVariables` or pass
 `--steam-root`). A `libraryfolders.vdf` is not required for `STEAM_ROOT`
 itself, only for additional libraries.
 
-## Option B: SteamCMD on the Mac
+## Option B: `kwe workshop-sync` (SteamCMD, automated)
+
+Syncs your subscribed Workshop items with SteamCMD into a
+Steam-library-shaped root the daemon indexes. One-time setup:
+
+```sh
+brew install --cask steamcmd
+steamcmd +login <steam account name> +quit     # interactive once: password + Steam Guard; SteamCMD caches the session
+```
+
+Then, whenever you want to sync:
+
+```sh
+kwe workshop-sync --user <steam account name> --manifest-root <where the subscriptions come from> [--assets]
+```
+
+Where the subscription list comes from (SteamCMD itself cannot list
+subscriptions):
+
+- **A Steam manifest.** `steamapps/workshop/appworkshop_431960.acf`
+  lists every subscribed item (`WorkshopItemDetails`); it exists in the
+  Steam library that holds Wallpaper Engine on your Linux box (the
+  library folder, not necessarily `~/.local/share/Steam`). Copy that file
+  to the Mac into
+  `~/Library/Application Support/kwe/steam/steamapps/workshop/`, and
+  pass `--manifest-root ~/Library/Application Support/kwe/steam` (or leave
+  the flag off: every discovered Steam root, including that one, is read).
+  Re-copy it after subscribing to new items.
+- **A public Workshop collection** you curate on any device:
+  `--collection <id or URL>` (repeatable). No credentials involved.
+- **Explicit items:** `--item <id or URL>` (repeatable).
+- **The Steam Web API** with your own key: `--api-key <key> --steamid
+  <SteamID64>`. Valve may restrict that call to publisher keys; the tool
+  says so plainly if refused.
+
+What it does: merges the sources, drops ids that are not Wallpaper Engine
+items (via the key-less `GetPublishedFileDetails`), runs SteamCMD in
+batches of 25 with `@NoPromptForPassword` against its cached session,
+reports every item, optionally installs the app's Windows build for
+`assets/` (`--assets`, about 1 GB, one time), and asks the running daemon
+to rescan. Items land in `<root>/steamapps/workshop/content/431960/<id>`
+where `<root>` is `STEAM_ROOT` or `~/Library/Application Support/kwe/steam`
+(a default scan root on macOS). `--dry-run` lists without downloading;
+`--json` for scripts. Unsubscribing does not delete: remove the item's
+folder yourself. Re-running updates changed items.
+
+If the cached session expired the run stops with `steamcmd login failed`;
+repeat the interactive login once.
+
+## Option C: SteamCMD by hand
 
 SteamCMD runs natively on macOS and can download Workshop items for an app
 the account owns, and the app's Windows depot for the `assets/` folder:

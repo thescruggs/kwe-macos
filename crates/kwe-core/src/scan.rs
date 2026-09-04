@@ -586,6 +586,18 @@ fn collect_library_paths(root: &KvValue, output: &mut BTreeSet<PathBuf>) {
     }
 }
 
+/// The Workshop item ids Steam records as subscribed for Wallpaper Engine
+/// under `<root>/steamapps/appworkshop_431960.acf`, with download
+/// progress where the manifest carries it. Empty when the manifest is
+/// absent. (macOS fork: also the subscription source for
+/// `kwe workshop-sync`, where the manifest may be a copy from another
+/// machine — pass that machine's Steam root.)
+pub fn workshop_subscriptions(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<String, Option<u8>>, String> {
+    read_workshop_subscriptions(root)
+}
+
 fn read_workshop_subscriptions(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<String, Option<u8>>, String> {

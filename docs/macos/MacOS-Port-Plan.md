@@ -109,7 +109,7 @@ inverse. Spikes (§7) precede MP-2.
   - `cargo check --workspace` matrix on macOS; record per-crate failures in
     `docs/macos/PORTING_STATUS.md`.
   - Accept: CI green on the portable crate subset; status doc complete.
-- **MP-1 Content acquisition gate** — done 2026-09-04 (`docs/macos/CONTENT.md`: bring-your-own-folder contract, SteamCMD flow documented, macOS Steam root probed); scan on a Mac unverified
+- **MP-1 Content acquisition gate** — done 2026-09-04 (`docs/macos/CONTENT.md`: bring-your-own-folder contract, SteamCMD flow documented, macOS Steam root probed); **MP-1b `kwe workshop-sync`** done 2026-09-04 (SteamCMD-driven sync of subscribed items from a Steam manifest / collection / ids / Web API; stub-tested, live Steam validation exercised from Linux; real download needs the maintainer's account)
   - macOS Steam roots; `STEAM_ROOT` override honored;
   - documented SteamCMD flow for Workshop items and the `assets/` depot;
   - `kwe scan` lists items on a Mac.

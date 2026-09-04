@@ -519,12 +519,16 @@ pub fn data_home() -> Option<PathBuf> {
 
 /// Default Steam installation roots for this platform, in probe order.
 /// Linux: `~/.local/share/Steam`, `~/.steam/steam`, `~/.steam/root`.
-/// macOS: `~/Library/Application Support/Steam`. Callers prepend
-/// `STEAM_ROOT`.
+/// macOS: `~/Library/Application Support/Steam`, then the
+/// `kwe workshop-sync` root (`~/Library/Application Support/kwe/steam`,
+/// see [`workshop_sync_root`]). Callers prepend `STEAM_ROOT`.
 pub fn default_steam_roots(home: &std::path::Path) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        vec![home.join("Library/Application Support/Steam")]
+        vec![
+            home.join("Library/Application Support/Steam"),
+            home.join("Library/Application Support/kwe/steam"),
+        ]
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -534,6 +538,15 @@ pub fn default_steam_roots(home: &std::path::Path) -> Vec<PathBuf> {
             home.join(".steam/root"),
         ]
     }
+}
+
+/// Where `kwe workshop-sync` puts SteamCMD's downloads when no root is
+/// given: a Steam-library-shaped directory owned by kwe, kept apart from
+/// the Steam client's own library. macOS:
+/// `~/Library/Application Support/kwe/steam` (also a default scan root);
+/// Linux: `XDG_DATA_HOME/kwe/steam` or `~/.local/share/kwe/steam`.
+pub fn workshop_sync_root() -> Option<PathBuf> {
+    data_home().map(|data| data.join("kwe/steam"))
 }
 
 #[cfg(test)]
