@@ -2,6 +2,26 @@
 
 **Current as of:** 2026-08-22 (M3g merged; apply lane repaired; Alpha 1 package release 3 built and verified). Read `INSTRUCTIONS.md` first; `BETA_PLAN.md` is the living plan.
 
+## macOS fork (read first in THIS repository)
+
+This checkout is the macOS fork (`origin` = github.com/thescruggs/kwe-macos;
+`upstream` = the Linux/Plasma project). Everything below this section is
+the upstream project memory, kept for context. The fork's own plan, status,
+review log, and hardware-verify list live in `docs/macos/` — start with
+`docs/macos/PORTING_STATUS.md`. Rules that differ from upstream:
+
+- macOS code lives behind `cfg(target_os = "macos")`, the `kwe-platform`
+  crate, `apps/kwe-display-macos/`, `apps/kwe-manager/kirigami-shim/`,
+  `packaging/macos/`, `scripts/macos/`. Linux behavior stays byte-identical
+  so `git merge upstream/<trunk>` stays cheap.
+- Before every commit: `scripts/macos/cross-check.sh` (type-checks the
+  whole workspace for aarch64-apple-darwin from Linux) and the Linux tests
+  of every crate touched. GitHub Actions (`.github/workflows/macos.yml`)
+  builds and runs the portable tests + the offscreen agent smoke on
+  macos-14 — the only real macOS execution until the maintainer tests.
+- Session 2026-09-04 (overnight, Claude): MP-0..MP-7 code-complete, MP-8
+  partial; five independent reviews, all findings fixed or recorded.
+
 ## Current repo state
 
 - **Repo:** `/home/qcv123/gitProjects/KDE-Wallpaper-Engine` — KDE Plasma 6 Wallpaper Engine-compatible experience for Arch/CachyOS. **Beta work happens in per-slice worktrees** (`/home/qcv123/gitProjects/kwe-*`, deleted after merge); the trunk branch is `fix/qt611-gallery-delegates` (no upstream).
