@@ -2014,9 +2014,6 @@ mod tests {
 
         fn read_response(stream: &mut UnixStream) -> Value {
             use std::io::BufRead;
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
             let mut reader = BufReader::new(stream);
             let mut line = Vec::new();
             reader.read_until(b'\n', &mut line).unwrap();
@@ -2025,6 +2022,11 @@ mod tests {
 
         let (a_write, mut a_read) = UnixStream::pair().unwrap();
         let (b_write, mut b_read) = UnixStream::pair().unwrap();
+        // Arm the read timeouts while both peers are still open: macOS
+        // refuses SO_RCVTIMEO (EINVAL) on a socketpair end whose peer has
+        // already been closed, which is the state after the threads join.
+        a_read.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        b_read.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         // Race both calls into the gate at (as close to) the same instant,
         // so the test exercises the atomic swap under real contention
         // instead of one call always winning by construction order.

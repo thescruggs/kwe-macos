@@ -127,7 +127,12 @@ limits.
 
 ## Runtime status on a Mac
 
-Nothing verified on real hardware yet. First test target on the Mac:
+**macOS CI (GitHub macos-14, 2026-09-04): the offscreen display-agent smoke
+passes** — kwe-daemon starts, spawns kwe-test-renderer, the agent opens and
+validates the frame file, shows a frame, and acknowledges the display
+generation, all on real macOS. Homebrew Qt configures and builds the agent
+and the manager (Kirigami compatibility module). Nothing has been shown on
+a real macOS desktop yet. First test target on the Mac:
 
 ```sh
 packaging/macos/install-dev.sh            # daemon as LaunchAgent

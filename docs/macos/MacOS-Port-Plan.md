@@ -4,8 +4,8 @@
 CDT); gates §6 taken on the plan's recommendations and recorded in
 `PORTING_STATUS.md`. Fork created 2026-09-04 at
 `github.com/thescruggs/kwe-macos` (private), upstream = the Linux checkout.
-MP-0 done; MP-2 seam landed (`kwe-platform`), whole workspace cross-checks
-for `aarch64-apple-darwin`. Each milestone gets an independent review; show
+MP-0..MP-7 code-complete, MP-8 partial; whole workspace builds on the
+macos-14 CI runner and the offscreen display-agent smoke passes there. Each milestone gets an independent review; show
 stoppers are fixed, everything else documented here and continued.
 
 **Baseline:** upstream trunk `fix/qt611-gallery-delegates` at `1cbc08f`

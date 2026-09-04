@@ -22,7 +22,10 @@ jobs:
         # The scene renderer's own tests need a Vulkan device (MoltenVK on
         # the hosted runner is unverified); they are built above and run
         # on developer machines until MP-5c settles the CI story.
-        run: cargo test --workspace --exclude kwe-scene-renderer --no-fail-fast
+        # Two test threads: several daemon tests wait on real child
+        # processes with fixed promotion deadlines and starve on the
+        # 3-core hosted runner when run fully in parallel.
+        run: cargo test --workspace --exclude kwe-scene-renderer --no-fail-fast -- --test-threads=2
       - name: Vulkan preflight (MoltenVK on the hosted runner; informational)
         env:
           VK_ICD_FILENAMES: /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json
@@ -56,4 +59,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y pkg-config libshaderc-dev libmpv-dev
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p kwe-platform -p kwe-daemon -p kwe-cdp -p kwe-core -p kwe-cli
+      - run: cargo test -p kwe-platform -p kwe-daemon -p kwe-cdp -p kwe-core -p kwe-cli -- --test-threads=2
