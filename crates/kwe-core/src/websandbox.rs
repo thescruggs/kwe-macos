@@ -284,8 +284,9 @@ pub fn sandbox_root(path: &Path) -> Option<PathBuf> {
 
 /// macOS web sandbox (docs/macos/MacOS-Port-Plan.md, MP-5b, gate G6).
 /// There is no bubblewrap; the browser runs under `sandbox-exec` with a
-/// generated SBPL profile plus Chromium's own macOS sandbox (so no
-/// `--no-sandbox`). The profile is last-match-wins SBPL: allow by default,
+/// generated SBPL profile and, as under bwrap on Linux, `--no-sandbox`
+/// (Chromium's nested sandbox cannot initialise inside an outer Seatbelt
+/// profile). The profile is last-match-wins SBPL: allow by default,
 /// then deny every write outside the throwaway profile dir and the
 /// temp/dev trees, deny reading the user's home except the content root,
 /// and deny the network unless the content permission set grants it.
@@ -526,7 +527,13 @@ pub mod macos {
             network_allowed,
             variant,
         );
-        let mut arguments = vec!["-p".to_string(), profile, browser];
+        // Inside the outer Seatbelt profile the browser's own nested sandbox
+        // cannot initialise (measured on macOS 14: "Failed to initialize
+        // sandbox", network service and GPU process crash loops), exactly
+        // as under bwrap on Linux — so, as on Linux, the OS sandbox is the
+        // boundary and the browser runs with --no-sandbox. The bare
+        // (KWE_WEB_SANDBOX=off) lane keeps the browser's own sandbox.
+        let mut arguments = vec!["-p".to_string(), profile, browser, "--no-sandbox".to_string()];
         arguments.extend(browser_arguments);
         WebSandboxCommand {
             program: "/usr/bin/sandbox-exec".into(),
