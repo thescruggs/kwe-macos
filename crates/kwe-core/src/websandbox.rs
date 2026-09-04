@@ -494,7 +494,10 @@ pub mod macos {
             // images where the directory already existed). Creating that
             // one empty directory is allowed; nothing inside it is.
             rules.push_str(
-                "(allow file-write-create (regex #\"^/Users/[^/]+/Library/Application Support/Google$\"))\n",
+                "(allow file-write-create (regex #\"^/Users/[^/]+/Library/Application Support/Google(/Chrome)?$\"))\n",
+            );
+            rules.push_str(
+                "(allow file-read-metadata (regex #\"^/Users/[^/]+/Library/Application Support/Google(/[^/]+)?$\"))\n",
             );
         }
         let mut allowed_reads = vec![
@@ -647,7 +650,8 @@ pub mod macos {
             assert!(text.contains("(deny file-read* (subpath \"/Users\"))"));
             assert!(text.contains("(allow file-read-data (regex #\"^/Users/[^/]+/\\.CFUserTextEncoding$\"))"));
             assert!(text.contains("(regex #\"^/Users/[^/]+/Library/Application Support$\")"));
-            assert!(text.contains("(allow file-write-create (regex #\"^/Users/[^/]+/Library/Application Support/Google$\"))"));
+            assert!(text.contains("(allow file-write-create (regex #\"^/Users/[^/]+/Library/Application Support/Google(/Chrome)?$\"))"));
+            assert!(text.contains("(allow file-read-metadata (regex #\"^/Users/[^/]+/Library/Application Support/Google(/[^/]+)?$\"))"));
             assert!(text.contains("(subpath \"/Users/me/Applications/Chromium.app\")"));
             assert!(text.contains("(subpath \"/Users/me/Library/Application Support/kwe/state/runtime/home-3\")"));
             assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/tmp\") (subpath \"/private/var/folders/x/T\")"));
