@@ -658,6 +658,7 @@ fn validate_report_fd(raw: Option<i32>) -> Result<Option<i32>, String> {
 const EXIT_USAGE_ERROR: i32 = 2;
 
 fn main() {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = Arguments::parse();
     let report_fd = match validate_report_fd(arguments.report_fd) {
         Ok(value) => value,

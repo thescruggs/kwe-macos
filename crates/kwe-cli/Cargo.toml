@@ -10,6 +10,7 @@ name = "kwe"
 path = "src/main.rs"
 
 [dependencies]
+kwe-platform = { path = "../kwe-platform" }
 anyhow.workspace = true
 clap.workspace = true
 kwe-core = { path = "../kwe-core" }

@@ -349,14 +349,9 @@ fn main() -> Result<()> {
 /// ~/.local/share/kwe/reports (honouring XDG_DATA_HOME), matching the
 /// manager's IssueReporter (apps/kwe-manager/src/issuereporter.cpp).
 fn reports_root() -> PathBuf {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".local/share"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-    data_home.join("kwe/reports")
+    kwe_platform::data_home()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kwe/reports")
 }
 
 /// Outcome of a renderer `--probe` lane; each failure mode prints a

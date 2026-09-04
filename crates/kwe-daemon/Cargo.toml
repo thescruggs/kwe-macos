@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+kwe-platform = { path = "../kwe-platform" }
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true

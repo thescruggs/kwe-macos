@@ -383,18 +383,7 @@ impl ShaderHelper {
         // RENDERER's own process group.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != expected_parent {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "renderer exited before helper exec",
-                    ));
-                }
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                kwe_platform::child_pre_exec(expected_parent, libc::SIGKILL)?;
                 apply_helper_resource_limits()?;
                 Ok(())
             });
@@ -546,13 +535,13 @@ fn resolve_beside_self() -> Option<PathBuf> {
 /// deliberately NOT set here — see the module doc's containment section.
 fn apply_helper_resource_limits() -> std::io::Result<()> {
     const MIB: u64 = 1024 * 1024;
-    set_resource_limit(libc::RLIMIT_AS, 512 * MIB)?;
-    set_resource_limit(libc::RLIMIT_FSIZE, 16 * MIB)?;
-    set_resource_limit(libc::RLIMIT_NOFILE, 32)?;
+    set_resource_limit(kwe_platform::RLIMIT_AS, 512 * MIB)?;
+    set_resource_limit(kwe_platform::RLIMIT_FSIZE, 16 * MIB)?;
+    set_resource_limit(kwe_platform::RLIMIT_NOFILE, 32)?;
     Ok(())
 }
 
-fn set_resource_limit(resource: libc::__rlimit_resource_t, value: u64) -> std::io::Result<()> {
+fn set_resource_limit(resource: kwe_platform::RlimitResource, value: u64) -> std::io::Result<()> {
     let value = libc::rlim_t::try_from(value).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "resource limit overflow")
     })?;

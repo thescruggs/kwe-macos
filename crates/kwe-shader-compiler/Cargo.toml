@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+kwe-platform = { path = "../kwe-platform" }
+libc.workspace = true
 kwe-core = { path = "../kwe-core" }
 kwe-report-protocol = { path = "../kwe-report-protocol" }
 serde_json.workspace = true

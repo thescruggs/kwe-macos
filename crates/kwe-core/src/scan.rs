@@ -121,10 +121,7 @@ pub fn default_steam_roots() -> Vec<PathBuf> {
         roots.push(PathBuf::from(value));
     }
     if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        roots.push(home.join(".local/share/Steam"));
-        roots.push(home.join(".steam/steam"));
-        roots.push(home.join(".steam/root"));
+        roots.extend(kwe_platform::default_steam_roots(&PathBuf::from(home)));
     }
     roots
 }

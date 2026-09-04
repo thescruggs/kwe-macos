@@ -174,21 +174,18 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
     // neither leaks into any OTHER child this daemon spawns; the write
     // end's CLOEXEC is cleared (via dup2 onto REPORT_FD, not here) only
     // inside THIS child's own pre_exec, right before its own exec.
-    let mut report_fds = [0_i32; 2];
-    // SAFETY: report_fds is a valid 2-element buffer for pipe2 to fill.
-    if unsafe { libc::pipe2(report_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        eprintln!(
-            "event=inspect.pipe_error detail={}",
-            std::io::Error::last_os_error()
-        );
-        cleanup_renderer_home(&home_dir);
-        return (
-            json!({"outcome": "unknown", "reason": "inspector-unavailable"}),
-            None,
-            home_dir,
-        );
-    }
-    let [report_read_fd, report_write_fd] = report_fds;
+    let [report_read_fd, report_write_fd] = match kwe_platform::pipe_cloexec() {
+        Ok(fds) => fds,
+        Err(error) => {
+            eprintln!("event=inspect.pipe_error detail={error}");
+            cleanup_renderer_home(&home_dir);
+            return (
+                json!({"outcome": "unknown", "reason": "inspector-unavailable"}),
+                None,
+                home_dir,
+            );
+        }
+    };
 
     let mut command = ProcessCommand::new(inspector_path);
     command
@@ -223,18 +220,7 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != expected_parent {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "daemon exited before inspector exec",
-                ));
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            kwe_platform::child_pre_exec(expected_parent, libc::SIGKILL)?;
             // dup2 clears O_CLOEXEC on the TARGET fd (REPORT_FD), so it
             // survives exec; report_write_fd's own O_CLOEXEC (from the
             // pipe2 call above) still closes it automatically at exec

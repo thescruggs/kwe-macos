@@ -994,6 +994,7 @@ fn diag_invalid_frame(count: u64) {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = Arguments::parse();
     if arguments.probe {
         print_probe_report();

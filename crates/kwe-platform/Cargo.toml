@@ -1,0 +1,10 @@
+[package]
+name = "kwe-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OS-specific process, descriptor, credential, and path primitives shared by the daemon and every worker (Linux and macOS)"
+
+[dependencies]
+libc.workspace = true

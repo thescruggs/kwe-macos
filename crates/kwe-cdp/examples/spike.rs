@@ -558,16 +558,8 @@ impl StderrRing {
 }
 
 fn socket_pair() -> Result<(RawFd, RawFd)> {
-    let mut fds = [0 as RawFd; 2];
-    let rc = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    ensure!(rc == 0, "socketpair failed: {}", io::Error::last_os_error());
+    let fds = kwe_platform::socketpair_stream_cloexec()
+        .map_err(|error| anyhow::anyhow!("socketpair failed: {error}"))?;
     Ok((fds[0], fds[1]))
 }
 

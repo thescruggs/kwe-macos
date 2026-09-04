@@ -865,6 +865,7 @@ fn print_probe_report(arguments: &Arguments) {
 }
 
 fn main() -> Result<()> {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = Arguments::parse();
     if arguments.probe {
         print_probe_report(&arguments);
@@ -4109,8 +4110,10 @@ fn ensure_video_dir(home: &Path) -> std::io::Result<VideoDir> {
     // SAFETY: fstat succeeded and initialized stat.
     let stat = unsafe { stat.assume_init() };
     if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR
-        || stat.st_dev != meta.dev()
-        || stat.st_ino != meta.ino()
+        // `st_dev`/`st_ino` are platform-typed (dev_t is i32 on Darwin);
+        // widen both sides the way `MetadataExt` does.
+        || stat.st_dev as u64 != meta.dev()
+        || stat.st_ino as u64 != meta.ino()
     {
         // SAFETY: fd is owned here after open.
         unsafe { libc::close(fd) };

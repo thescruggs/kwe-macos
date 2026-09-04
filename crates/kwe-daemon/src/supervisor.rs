@@ -1272,18 +1272,10 @@ impl SupervisorRuntime {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() != expected_parent {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "daemon exited before renderer exec",
-                    ));
-                }
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                // Parent-death signal, parent-pid check, no-new-privs
+                // (Linux); parent-pid check only on macOS, where the
+                // worker-side kqueue guard covers parent death.
+                kwe_platform::child_pre_exec(expected_parent, libc::SIGKILL)?;
                 apply_resource_limits(resource_limits)?;
                 Ok(())
             });
@@ -2391,15 +2383,15 @@ pub(crate) fn build_identity(config: &SupervisorConfig) -> String {
 
 pub(crate) fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
     let mib = 1024_u64 * 1024;
-    set_resource_limit(libc::RLIMIT_AS, limits.address_space_mib * mib)?;
-    set_resource_limit(libc::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
-    set_resource_limit(libc::RLIMIT_NOFILE, limits.open_files)?;
-    set_resource_limit(libc::RLIMIT_NPROC, limits.processes)?;
-    set_resource_limit(libc::RLIMIT_CORE, limits.core_dump_bytes)?;
+    set_resource_limit(kwe_platform::RLIMIT_AS, limits.address_space_mib * mib)?;
+    set_resource_limit(kwe_platform::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
+    set_resource_limit(kwe_platform::RLIMIT_NOFILE, limits.open_files)?;
+    set_resource_limit(kwe_platform::RLIMIT_NPROC, limits.processes)?;
+    set_resource_limit(kwe_platform::RLIMIT_CORE, limits.core_dump_bytes)?;
     Ok(())
 }
 
-fn set_resource_limit(resource: libc::__rlimit_resource_t, value: u64) -> io::Result<()> {
+fn set_resource_limit(resource: kwe_platform::RlimitResource, value: u64) -> io::Result<()> {
     let value = libc::rlim_t::try_from(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource limit overflow"))?;
     let limit = libc::rlimit {

@@ -40,16 +40,7 @@ pub(crate) mod testutil {
     use std::os::fd::RawFd;
 
     pub(crate) fn socket_pair() -> (RawFd, RawFd) {
-        let mut fds = [0 as RawFd; 2];
-        let rc = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-                0,
-                fds.as_mut_ptr(),
-            )
-        };
-        assert_eq!(rc, 0, "socketpair failed");
+        let fds = kwe_platform::socketpair_stream_cloexec().expect("socketpair failed");
         (fds[0], fds[1])
     }
 }

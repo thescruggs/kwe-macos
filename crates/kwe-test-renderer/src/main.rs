@@ -64,6 +64,7 @@ struct Arguments {
 }
 
 fn main() -> Result<()> {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = Arguments::parse();
     if arguments.memory_pressure_after.is_some() != arguments.memory_pressure_mib.is_some() {
         anyhow::bail!(

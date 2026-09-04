@@ -471,6 +471,7 @@ fn run(arguments: &Arguments) -> i32 {
 }
 
 fn main() {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = match parse_arguments(std::env::args().skip(1)) {
         Ok(arguments) => arguments,
         Err(message) => {

@@ -1517,9 +1517,9 @@ fn resource_limits_for_kinds(
 }
 
 fn default_socket_path() -> Result<PathBuf> {
-    let runtime =
-        std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set; pass --socket")?;
-    Ok(PathBuf::from(runtime).join("kwe/daemon-v1.sock"))
+    let runtime = kwe_platform::runtime_dir()
+        .context("no runtime directory (XDG_RUNTIME_DIR is not set); pass --socket")?;
+    Ok(runtime.join("kwe/daemon-v1.sock"))
 }
 
 /// Default per-kind renderer binaries beside the daemon executable. Absent
@@ -1572,11 +1572,7 @@ fn default_shader_helper_path() -> Option<PathBuf> {
 }
 
 fn default_state_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("kwe"));
-    }
-    let home = std::env::var_os("HOME").context("HOME is not set; pass --state-dir")?;
-    Ok(PathBuf::from(home).join(".local/state/kwe"))
+    kwe_platform::state_dir().context("HOME is not set; pass --state-dir")
 }
 
 fn unix_ms() -> u128 {
@@ -1598,26 +1594,12 @@ struct PeerCred {
 /// Peer credentials of a Unix stream connection. SO_PEERCRED is read
 /// directly because std's peer_cred() is still feature-gated.
 fn peer_cred(stream: &UnixStream) -> PeerCred {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` is a valid mutable ucred buffer and `len` its bound;
-    // getsockopt fills it with the peer credentials of our own descriptor.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    if rc == 0 {
-        PeerCred {
-            pid: cred.pid as u32,
-            uid: cred.uid,
-        }
-    } else {
-        PeerCred::default()
+    match kwe_platform::peer_credentials(stream.as_raw_fd()) {
+        Some(credentials) => PeerCred {
+            pid: credentials.pid,
+            uid: credentials.uid,
+        },
+        None => PeerCred::default(),
     }
 }
 

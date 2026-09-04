@@ -12,3 +12,4 @@
 /packaging/*.pkg.tar
 /packaging/*.pkg.tar.zst
 
+/target-mac/

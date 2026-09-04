@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: macos
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  rust-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Homebrew dependencies
+        run: brew install pkg-config mpv shaderc molten-vk vulkan-loader vulkan-headers
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/shaderc/lib/pkgconfig
+        run: cargo build --workspace --all-targets
+      - name: Test portable crates
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/shaderc/lib/pkgconfig
+        # The scene renderer's own tests need a Vulkan device (MoltenVK on
+        # the hosted runner is unverified); they are built above and run
+        # on developer machines until MP-5c settles the CI story.
+        run: cargo test --workspace --exclude kwe-scene-renderer
+  rust-linux-seam-guard:
+    # The macOS seams must stay behavior-neutral on Linux.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libshaderc-dev libmpv-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p kwe-platform -p kwe-daemon -p kwe-cdp -p kwe-core -p kwe-cli

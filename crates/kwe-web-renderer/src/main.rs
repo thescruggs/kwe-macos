@@ -274,19 +274,8 @@ impl StderrRing {
 }
 
 fn socket_pair() -> Result<(RawFd, RawFd)> {
-    let mut fds = [0 as RawFd; 2];
-    // SAFETY: socketpair writes two descriptors into `fds` on success.
-    let rc = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    if rc != 0 {
-        bail!("socketpair failed: {}", std::io::Error::last_os_error());
-    }
+    let fds = kwe_platform::socketpair_stream_cloexec()
+        .map_err(|error| anyhow::anyhow!("socketpair failed: {error}"))?;
     Ok((fds[0], fds[1]))
 }
 
@@ -1795,6 +1784,7 @@ fn probe_report() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    kwe_platform::guard_parent_exit(libc::SIGKILL);
     let arguments = Arguments::parse();
     if arguments.probe {
         match probe_report() {

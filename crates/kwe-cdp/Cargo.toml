@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Minimal bounded CDP client for the Chromium remote-debugging pipe"
 
 [dependencies]
+kwe-platform = { path = "../kwe-platform" }
 libc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

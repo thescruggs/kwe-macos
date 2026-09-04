@@ -46,15 +46,7 @@ fn report_fd_present_emits_one_validated_frame_and_empty_stdout() {
     // the write end's CLOEXEC is then cleared so the spawned child inherits
     // it (at the SAME fd number, since fork()+exec() via `Command` does not
     // renumber a non-stdio inherited fd), the way `--report-fd` expects.
-    let mut fds = [0_i32; 2];
-    // SAFETY: `fds` is a valid 2-element buffer for pipe2 to fill.
-    assert_eq!(
-        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-        0,
-        "pipe2 failed: {}",
-        std::io::Error::last_os_error()
-    );
-    let [read_fd, write_fd] = fds;
+    let [read_fd, write_fd] = kwe_platform::pipe_cloexec().expect("pipe failed");
     // SAFETY: write_fd is the valid, just-created pipe write end.
     let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFD) };
     assert!(flags >= 0);

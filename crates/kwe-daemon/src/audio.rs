@@ -267,18 +267,7 @@ impl Runtime {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != expected_parent {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "daemon exited before audio worker exec",
-                    ));
-                }
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                kwe_platform::child_pre_exec(expected_parent, libc::SIGTERM)?;
                 Ok(())
             });
         }
