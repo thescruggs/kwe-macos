@@ -365,7 +365,12 @@ mod tests {
     fn budget_disables_after_three_restarts_within_the_window() {
         let config = AudioCaptureConfig {
             enabled: true,
-            worker_path: PathBuf::from("/bin/false"),
+            // A worker that exits 1 at once (macOS ships false in /usr/bin).
+            worker_path: PathBuf::from(if cfg!(target_os = "macos") {
+                "/usr/bin/false"
+            } else {
+                "/bin/false"
+            }),
             socket: PathBuf::from("/nonexistent/kwe.sock"),
             capture_node: None,
         };
@@ -463,7 +468,9 @@ mod tests {
 
     #[test]
     fn exit_detail_names_code_and_signal() {
-        let status = Command::new("/bin/false").status().unwrap();
+        // `sh -c 'exit 1'` rather than /bin/false: macOS ships false at
+        // /usr/bin/false.
+        let status = Command::new("sh").args(["-c", "exit 1"]).status().unwrap();
         assert_eq!(exit_detail(&status), "exit_code_1");
     }
 }

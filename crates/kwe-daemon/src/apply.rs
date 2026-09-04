@@ -3479,6 +3479,9 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // systemd display-environment recovery is a Linux concept; the stubbed
+    // systemctl and /bin/false do not exist on macOS.
+    #[cfg(target_os = "linux")]
     #[test]
     fn display_env_failure_is_actionable_and_never_cached() {
         let root = temporary_directory("display-fail");

@@ -7,7 +7,6 @@ ColumnLayout {
     id: root
     property string text: ""
     property string explanation: ""
-    // Grouped `icon.name:` assignments need an object-typed property.
     // Grouped `icon.name:` assignments resolve against the declared TYPE,
     // so the group needs a named inline component, not a bare QtObject.
     component IconGroup: QtObject {

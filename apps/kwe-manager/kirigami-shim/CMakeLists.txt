@@ -25,6 +25,7 @@ qt_add_qml_module(kwe_kirigami_shim
         PlaceholderMessage.qml
         ScrollablePage.qml
         SearchField.qml
+        Separator.qml
         Theme.qml
         Units.qml
 )

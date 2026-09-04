@@ -111,6 +111,18 @@ Unverified on macOS (spike S-A): window ordering under Finder icons on
 14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
 whether the mouse-moved global monitor needs a TCC prompt.
 
+## macOS CI findings (GitHub macos-14 runner, 2026-09-04)
+
+The first real macOS execution. Fixed from its logs so far:
+`CGDisplayCreateUUIDFromDisplayID` needs ColorSync linked; an ARC-disallowed
+`WId` cast in the AppKit shim; scan tests comparing `/var` vs
+`/private/var` temp paths; `/bin/false` and systemd-specific assertions in
+daemon tests. Whole Rust workspace **builds** on macOS with Homebrew
+shaderc/mpv/MoltenVK. Open at the time of writing: every worker spawn on
+the runner fails in the pre-exec containment with `EINVAL`
+(renderers quarantined, agent smoke sees no frame); the launch error now
+names the failing `setrlimit` resource so the next run pins it down.
+
 ## Runtime status on a Mac
 
 Nothing verified on real hardware yet. First test target on the Mac:

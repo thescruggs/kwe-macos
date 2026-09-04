@@ -47,8 +47,7 @@ PackageInstaller::PackageInstaller(QString packagePath, QString systemPackagePat
                 "manager or on PATH; wallpapers will apply but nothing will show."));
   else
     setState(Installed, tr("The desktop display agent is available at %1.").arg(found));
-  return;
-#endif
+#else
   if (QFileInfo::exists(m_packagePath + DisabledSuffix))
     setState(SafeMode, tr("The Plasma package is disabled in safe mode."));
   else if (QFileInfo::exists(m_packagePath))
@@ -59,6 +58,7 @@ PackageInstaller::PackageInstaller(QString packagePath, QString systemPackagePat
              tr("The Plasma display package is installed system-wide."));
   else
     setState(Unavailable, tr("The Plasma display package is not installed."));
+#endif
 }
 
 bool PackageInstaller::userPackagePresent() const {

@@ -2422,15 +2422,23 @@ pub(crate) fn build_identity(config: &SupervisorConfig) -> String {
 
 pub(crate) fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
     let mib = 1024_u64 * 1024;
-    set_resource_limit(kwe_platform::RLIMIT_AS, limits.address_space_mib * mib)?;
-    set_resource_limit(kwe_platform::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
-    set_resource_limit(kwe_platform::RLIMIT_NOFILE, limits.open_files)?;
-    set_resource_limit(kwe_platform::RLIMIT_NPROC, limits.processes)?;
-    set_resource_limit(kwe_platform::RLIMIT_CORE, limits.core_dump_bytes)?;
+    set_resource_limit("RLIMIT_AS", kwe_platform::RLIMIT_AS, limits.address_space_mib * mib)?;
+    set_resource_limit("RLIMIT_FSIZE", kwe_platform::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
+    set_resource_limit("RLIMIT_NOFILE", kwe_platform::RLIMIT_NOFILE, limits.open_files)?;
+    set_resource_limit("RLIMIT_NPROC", kwe_platform::RLIMIT_NPROC, limits.processes)?;
+    set_resource_limit("RLIMIT_CORE", kwe_platform::RLIMIT_CORE, limits.core_dump_bytes)?;
     Ok(())
 }
 
-fn set_resource_limit(resource: kwe_platform::RlimitResource, value: u64) -> io::Result<()> {
+/// Names the failing resource in the error: a launch failure surfaces as
+/// the daemon's `last_failure_detail`, and "Invalid argument" alone was
+/// undiagnosable (macOS CI, 2026-09-04). Runs between fork and exec, so
+/// the message is built only on the failure path.
+fn set_resource_limit(
+    name: &'static str,
+    resource: kwe_platform::RlimitResource,
+    value: u64,
+) -> io::Result<()> {
     let value = libc::rlim_t::try_from(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource limit overflow"))?;
     let limit = libc::rlimit {
@@ -2440,7 +2448,11 @@ fn set_resource_limit(resource: kwe_platform::RlimitResource, value: u64) -> io:
     // SAFETY: `limit` is a valid immutable rlimit structure and `resource` is
     // one of the constants selected by `apply_resource_limits`.
     if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("setrlimit({name}={value}): {error}"),
+        ));
     }
     Ok(())
 }
@@ -2828,20 +2840,26 @@ mod tests {
             ("PATH".to_string(), WORKER_PATH.to_string()),
         ];
         for kind in [RendererKind::Test, RendererKind::Video, RendererKind::Scene] {
-            assert_eq!(
-                env_allowlist_with_runtime(kind, home, Some("/run/user/1000".into())),
-                expected_base,
+            let entries = env_allowlist_with_runtime(kind, home, Some("/run/user/1000".into()));
+            // HOME and PATH lead; macOS appends its dyld/Vulkan passthrough
+            // after them, which is why this is a prefix comparison.
+            assert_eq!(&entries[..2], &expected_base[..]);
+            assert!(
+                entries.iter().all(|(name, _)| name != "XDG_RUNTIME_DIR"),
                 "kind {} must not inherit XDG_RUNTIME_DIR",
                 kind.as_str()
             );
         }
-        assert_eq!(
-            env_allowlist_with_runtime(RendererKind::Web, home, None),
-            expected_base
-        );
+        let web_without = env_allowlist_with_runtime(RendererKind::Web, home, None);
+        assert_eq!(&web_without[..2], &expected_base[..]);
+        assert!(web_without.iter().all(|(name, _)| name != "XDG_RUNTIME_DIR"));
         let web =
             env_allowlist_with_runtime(RendererKind::Web, home, Some("/run/user/1000".into()));
-        assert_eq!(web.len(), 3);
+        assert_eq!(&web[..2], &expected_base[..]);
+        assert_eq!(
+            web.iter().filter(|(name, _)| name == "XDG_RUNTIME_DIR").count(),
+            1
+        );
         assert!(web.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())));
     }
 

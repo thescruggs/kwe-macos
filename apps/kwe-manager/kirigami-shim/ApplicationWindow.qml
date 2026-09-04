@@ -15,9 +15,17 @@ Controls.ApplicationWindow {
             if (initialPage && depth === 0)
                 push(initialPage);
         }
-        // Kirigami pages declare `visible: false` while parked; StackView
-        // shows the current item regardless.
-        onCurrentItemChanged: if (currentItem) currentItem.visible = true
+        // Kirigami pages declare `visible: false` while parked and bind
+        // their tab's `checked` to that visibility, so the outgoing page
+        // must be hidden again explicitly (StackView alone leaves it).
+        property Item previousItem: null
+        onCurrentItemChanged: {
+            if (previousItem && previousItem !== currentItem)
+                previousItem.visible = false;
+            if (currentItem)
+                currentItem.visible = true;
+            previousItem = currentItem;
+        }
         pushEnter: Transition {}
         pushExit: Transition {}
         popEnter: Transition {}
