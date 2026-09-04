@@ -92,6 +92,13 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
   min(address_space_mib, 2 GiB) once a second, verified by a nested-child
   hog test on the macOS runner. Noted: a re-parented escapee is not
   counted; the Linux unit's aggregate cgroup limit has no macOS twin yet.
+- 2026-09-04 strict Seatbelt variant (`KWE_WEB_SANDBOX=strict`,
+  d0ade39): Mach allow-list without LaunchServices/pasteboard, `(deny
+  iokit-open)`, process-exec only inside the browser bundle and /usr/lib.
+  Opt-in; the smoke reports it as an informational lane with denial
+  capture. NOT yet measured on macOS (CI blocked by billing right after
+  the push) — expect the allow-list to need additions from the
+  `deny(1) mach-lookup <service>` lines.
 - 2026-09-04 web-sandbox security review (independent, sonnet): no
   show-stoppers. Landed: temp grants narrowed from `/private/var/folders`
   to the resolved `$TMPDIR`; the renderer logs the sandbox mode at spawn
@@ -155,7 +162,17 @@ Unverified on macOS (spike S-A): window ordering under Finder icons on
 14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
 whether the mouse-moved global monitor needs a TCC prompt.
 
-## macOS CI: green (GitHub macos-14 runner, latest run 33841660502, 2026-09-04)
+## macOS CI: green (GitHub macos-14 runner, last run 33841871578 on commit 253d1d2, 2026-09-04)
+
+**CI is currently blocked by GitHub billing, not by code:** from run
+33842187967 on, jobs fail at "Set up job" with "The job was not started
+because recent account payments have failed or your spending limit needs
+to be increased". macOS runners consume included minutes at 10×; this
+session ran ~30 workflow runs. Raise the Actions spending limit (Settings
+→ Billing) or make the repository public (public repositories get free
+hosted minutes) and re-run the latest workflow. Commits after 253d1d2
+(the opt-in `strict` Seatbelt variant, d0ade39) are Linux-tested and
+Darwin cross-checked only; they do not change the default profile.
 
 `rust-macos` (whole workspace builds; every portable crate's tests pass
 with Homebrew shaderc/mpv/MoltenVK, including the macOS-only resident-set

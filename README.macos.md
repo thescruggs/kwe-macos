@@ -42,6 +42,11 @@ scripts/macos/smoke-display-agent.sh build/agent
 ```
 
 Logs: `~/Library/Logs/kwe/`. Undo: `packaging/macos/uninstall-dev.sh`.
+First visual check on the real desktop: `scripts/macos/desktop-test.sh 20`.
+
+GitHub Actions (`.github/workflows/macos.yml`) builds and smoke-tests
+every push on hosted macOS runners; it needs Actions minutes (macOS bills
+at 10×) — see the billing note in `docs/macos/PORTING_STATUS.md`.
 
 ## What to expect
 
