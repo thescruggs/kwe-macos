@@ -718,7 +718,9 @@ mod tests {
         let path = env::temp_dir().join(format!("kwe-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(path.join("steamapps/workshop/content/431960/100")).unwrap();
-        path
+        // The scanner canonicalises what it returns; macOS's $TMPDIR is a
+        // symlink (/var -> /private/var), so compare against the real path.
+        fs::canonicalize(&path).unwrap_or(path)
     }
 
     #[test]

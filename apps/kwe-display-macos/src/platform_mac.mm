@@ -35,7 +35,8 @@ namespace platform {
 void makeDesktopWindow(QWindow *window) {
   if (window == nullptr)
     return;
-  NSView *view = reinterpret_cast<NSView *>(window->winId());
+  // Qt's cocoa WId is the NSView pointer; ARC requires an explicit bridge.
+  NSView *view = (__bridge NSView *)reinterpret_cast<void *>(window->winId());
   NSWindow *nsWindow = [view window];
   if (nsWindow == nil)
     return;
