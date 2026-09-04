@@ -1999,12 +1999,18 @@ mod tests {
         let handle = service.handle();
         handle.put(daily_playlist()).unwrap();
         handle.activate(Some("daily".into())).unwrap();
-        // Let a few ticks run so the reported decision is Waiting.
-        std::thread::sleep(Duration::from_millis(150));
-        let before = handle.status().unwrap();
-        let before_remaining = match before.decision.unwrap() {
-            PlaylistDecision::Waiting { remaining_ms, .. } => remaining_ms,
-            other => panic!("expected Waiting, got {other:?}"),
+        // Wait (bounded) until the session thread has ticked past Started
+        // into Waiting; a fixed sleep starved on the 3-core macOS CI runner.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let before_remaining = loop {
+            let before = handle.status().unwrap();
+            match before.decision {
+                Some(PlaylistDecision::Waiting { remaining_ms, .. }) => break remaining_ms,
+                other if std::time::Instant::now() >= deadline => {
+                    panic!("expected Waiting, got {other:?}")
+                }
+                _ => std::thread::sleep(Duration::from_millis(25)),
+            }
         };
         let after = handle.debug_clock_skip(60_000).unwrap();
         assert_eq!(after.clock_skipped_ms, 60_000);
