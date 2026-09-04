@@ -28,7 +28,7 @@ jobs:
         run: cargo test --workspace --exclude kwe-scene-renderer --no-fail-fast -- --test-threads=2
       - name: Vulkan preflight (MoltenVK on the hosted runner; informational)
         env:
-          VK_ICD_FILENAMES: /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json
+          VK_ICD_FILENAMES: /opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
           DYLD_FALLBACK_LIBRARY_PATH: /opt/homebrew/lib
         # Hosted macOS VMs have no Metal device, so "Unable to find a Vulkan
         # driver" is expected here; the listing validates the ICD path the
