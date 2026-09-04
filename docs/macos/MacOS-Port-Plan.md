@@ -127,7 +127,7 @@ inverse. Spikes (§7) precede MP-2.
   - `smoke-supervisor.sh` fault matrix passes with `kwe-test-renderer`.
   - Accept: hang/exit/corrupt-header faults recover; no orphans after
     `kill -9` of the daemon.
-- **MP-4 Display agent** — pending (gate G3)
+- **MP-4 Display agent** — code complete 2026-09-04 (Qt + ObjC++ shim; Linux offscreen smoke); macOS behavior unverified until spike S-A runs on hardware
   - Qt Quick app + ObjC++ shim, or Swift app (per G3);
   - desktop-level windows per screen, frame reuse, input monitor;
   - `smoke-plasma-display.sh` equivalent: test pattern on desktop, freeze on

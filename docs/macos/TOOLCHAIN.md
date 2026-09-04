@@ -32,6 +32,22 @@ Binaries land in `target/release/`: `kwe-daemon`, `kwe`, the renderers, and
 workers. The daemon expects its workers beside itself, so run everything
 from that directory or install them together.
 
+## Display agent (Qt)
+
+```sh
+cmake -S . -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+cmake --build build/agent --parallel
+scripts/macos/smoke-display-agent.sh build/agent     # offscreen end-to-end smoke
+build/agent/apps/kwe-display-macos/kwe-display-macos # covers assigned screens
+```
+
+`kwe-display-macos --windowed --cover-all` shows the active renderer's
+frames in ordinary windows on every screen (debugging). Without flags it
+creates one desktop-level, click-through window per screen and covers only
+the screens the daemon reports as assigned (`wallpaper.outputs`). It has
+no Dock icon; quit it with `pkill kwe-display-macos`.
+
 ## Smoke (no desktop involvement)
 
 ```sh

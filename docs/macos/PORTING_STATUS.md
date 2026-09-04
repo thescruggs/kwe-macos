@@ -39,10 +39,36 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
   verbatim; `kwe-mpv/build.rs` gates on `CARGO_CFG_TARGET_OS` only. Nits
   addressed: allocation caveat documented, guard-thread spawn failure logged.
 
+## Display agent (MP-4)
+
+`apps/kwe-display-macos`: Qt Quick, one `QQuickView` per `QScreen` reusing
+`org.kde.kwe.display` (DisplaySession/FrameSurface/InputClient) verbatim;
+`platform_mac.mm` sets the AppKit window level (`kCGDesktopWindowLevel`),
+all-Spaces/stationary collection behavior, click-through, accessory
+activation policy, App Nap opt-out, and a global mouse-moved monitor for
+passive pointer forwarding. Screen ↔ output identity is a geometry match
+against the daemon's `wallpaper.outputs` (both sides derive geometry from
+CoreGraphics display bounds). Builds on Linux as a windowed harness; the
+offscreen smoke `scripts/macos/smoke-display-agent.sh` proves frame
+display + display-generation ack against a real daemon.
+
+Unverified on macOS (spike S-A): window ordering under Finder icons on
+14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
+whether the mouse-moved global monitor needs a TCC prompt.
+
 ## Runtime status on a Mac
 
-Nothing verified on real hardware yet. First test target: `kwe-daemon` +
-`kwe-test-renderer` + the display agent (MP-4) showing the test pattern.
+Nothing verified on real hardware yet. First test target on the Mac:
+
+```sh
+packaging/macos/install-dev.sh            # daemon as LaunchAgent
+cmake -S . -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+cmake --build build/agent --parallel
+scripts/macos/smoke-display-agent.sh build/agent
+# then, live: start a test renderer and cover all screens
+target/release/kwe daemon-call --method renderer.start --params '{"wallpaper_id":"t","content_hash":"t","width":1920,"height":1080,"fps":30}'
+build/agent/apps/kwe-display-macos/kwe-display-macos --cover-all
+```
 
 ## Behavior differences vs Linux (by design)
 
