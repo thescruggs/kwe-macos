@@ -381,6 +381,11 @@ pub mod macos {
         Full,
         NetworkOnly,
         NoHomeDeny,
+        /// `Full` plus the hardening backlog: Mach service allow-list,
+        /// no IOKit, process-exec only inside the browser bundle.
+        /// Opt-in (`KWE_WEB_SANDBOX=strict`) and measured on CI until it
+        /// renders reliably; then it becomes `Full`.
+        Strict,
     }
 
     impl ProfileVariant {
@@ -389,10 +394,70 @@ pub mod macos {
                 Ok("off") => None,
                 Ok("net-only") => Some(Self::NetworkOnly),
                 Ok("no-home") => Some(Self::NoHomeDeny),
+                Ok("strict") => Some(Self::Strict),
                 _ => Some(Self::Full),
             }
         }
     }
+
+    /// Mach services a headless Chromium needs, drawn from Chromium's own
+    /// sandbox profiles (common.sb and friends) and grown from measured
+    /// `deny(1) mach-lookup` lines on CI. Anything not listed is denied
+    /// under `Strict` — notably LaunchServices (unconfined app launch) and
+    /// the pasteboard.
+    pub const STRICT_MACH_SERVICES: &[&str] = &[
+        "com.apple.system.logger",
+        "com.apple.system.notification_center",
+        "com.apple.distributed_notifications@Uv3",
+        "com.apple.cfprefsd.daemon",
+        "com.apple.cfprefsd.agent",
+        "com.apple.SecurityServer",
+        "com.apple.trustd",
+        "com.apple.trustd.agent",
+        "com.apple.system.opendirectoryd.libinfo",
+        "com.apple.system.opendirectoryd.membership",
+        "com.apple.CoreServices.coreservicesd",
+        "com.apple.lsd.mapdb",
+        "com.apple.fonts",
+        "com.apple.FontObjectsServer",
+        "com.apple.FontServer",
+        "com.apple.logd",
+        "com.apple.diagnosticd",
+        "com.apple.analyticsd",
+        "com.apple.PowerManagement.control",
+        "com.apple.audio.audiohald",
+        "com.apple.audio.coreaudiod",
+        "com.apple.audio.SandboxHelper",
+        "com.apple.windowserver.active",
+        "com.apple.CARenderServer",
+        "com.apple.dyld.closured",
+        "com.apple.system.DirectoryService.libinfo_v1",
+        "com.apple.system.DirectoryService.membership_v1",
+        "com.apple.mobileassetd",
+        "com.apple.tccd",
+        "com.apple.tccd.system",
+        "com.apple.nesessionmanager.content-filter",
+        "com.apple.networkd",
+        "com.apple.usymptomsd",
+        "com.apple.symptomsd",
+        "com.apple.SystemConfiguration.configd",
+        "com.apple.SystemConfiguration.DNSConfiguration",
+        "com.apple.SystemConfiguration.NetworkInformation",
+        "com.apple.system.libinfo.muser",
+        "com.apple.bsd.dirhelper",
+        "com.apple.iconservices",
+        "com.apple.iconservices.store",
+        "com.apple.ocspd",
+        "com.apple.securityd.xpc",
+        "com.apple.xpc.activity.unmanaged",
+        "com.apple.lskdd",
+        "com.apple.metalcompilerservice",
+        "com.apple.cvmsServ",
+        "com.apple.gpumemd.source",
+        "com.apple.backupd.sandbox.xpc",
+        "com.apple.language.assetd",
+        "com.apple.runningboard",
+    ];
 
     /// The production SBPL profile for one renderer launch (`Full`). Pure.
     /// Seatbelt matches RESOLVED paths, so temp dirs are allowed both as
@@ -524,6 +589,26 @@ pub mod macos {
             rules.push_str("(deny network*)\n");
             rules.push_str("(allow network* (local unix-socket) (remote unix-socket))\n");
         }
+        if variant == ProfileVariant::Strict {
+            // Mach services: only the allow-list. LaunchServices (unconfined
+            // app launch) and the pasteboard are deliberately absent.
+            rules.push_str("(deny mach-lookup)\n");
+            let names: Vec<String> = STRICT_MACH_SERVICES
+                .iter()
+                .map(|name| format!("(global-name \"{name}\")"))
+                .collect();
+            rules.push_str(&format!("(allow mach-lookup {})\n", names.join(" ")));
+            // No device access for a headless, software-rendered browser.
+            rules.push_str("(deny iokit-open)\n");
+            // exec only inside the browser's own bundle (helpers, crashpad)
+            // — and the system loader/shell stubs Chromium's helpers use.
+            rules.push_str("(deny process-exec*)\n");
+            let mut exec_allows = vec!["(subpath \"/usr/lib\")".to_string()];
+            if let Some(bundle) = browser_bundle {
+                exec_allows.push(format!("(subpath {})", sbpl_string(bundle)));
+            }
+            rules.push_str(&format!("(allow process-exec* {})\n", exec_allows.join(" ")));
+        }
         rules
     }
 
@@ -624,6 +709,7 @@ pub mod macos {
             working_dir: Some(root.to_path_buf()),
             sandbox: match variant {
                 ProfileVariant::Full => "seatbelt",
+                ProfileVariant::Strict => "seatbelt:strict",
                 ProfileVariant::NetworkOnly => "seatbelt:net-only",
                 ProfileVariant::NoHomeDeny => "seatbelt:no-home",
             },
@@ -666,6 +752,25 @@ pub mod macos {
             let open = profile(Path::new("/a"), Path::new("/b"), None, None, true);
             assert!(!open.contains("network"));
             assert!(open.contains("(deny file-read* (subpath \"/Users\"))"));
+        }
+
+        #[test]
+        fn strict_variant_adds_mach_iokit_and_exec_rules_after_the_full_ones() {
+            let strict = profile_variant_with_temp(
+                Path::new("/a"),
+                Path::new("/private/var/folders/x/T/p"),
+                Some(Path::new("/private/var/folders/x/T")),
+                None,
+                Some(Path::new("/Applications/Google Chrome.app")),
+                false,
+                ProfileVariant::Strict,
+            );
+            assert!(strict.contains("(deny file-write*)"));
+            assert!(strict.contains("(deny mach-lookup)\n(allow mach-lookup (global-name \"com.apple.system.logger\")"));
+            assert!(strict.contains("(deny iokit-open)"));
+            assert!(strict.contains("(deny process-exec*)\n(allow process-exec* (subpath \"/usr/lib\") (subpath \"/Applications/Google Chrome.app\"))"));
+            assert!(!strict.contains("launchservicesd"));
+            assert!(!strict.contains("pasteboard"));
         }
 
         #[test]

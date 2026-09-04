@@ -103,11 +103,15 @@ done
 [[ $sandboxed_passes -gt 0 ]] && sandboxed=0
 echo "production profile: $sandboxed_passes/3 attempts rendered"
 run_lane bare KWE_WEB_SANDBOX=off && bare=0 || true
+# Hardening candidate (Mach allow-list, no IOKit, exec only in the bundle):
+# informational until it renders reliably; denials name what it lacks.
+strict=1
+run_lane strict KWE_WEB_SANDBOX=strict && strict=0 || denials
 # Bisect lanes: which rule group the browser trips on.
 run_lane net-only KWE_WEB_SANDBOX=net-only && netonly=0 || true
 run_lane no-home KWE_WEB_SANDBOX=no-home && nohome=0 || true
 verdict() { [[ $1 == 0 ]] && echo PASS || echo FAIL; }
-echo "summary: sandbox-exec full $(verdict $sandboxed) ($sandboxed_passes/3); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
+echo "summary: sandbox-exec full $(verdict $sandboxed) ($sandboxed_passes/3); strict candidate $(verdict $strict); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
 # 0: production profile renders. 2: the browser renders under sandbox-exec
 # with a reduced profile or bare (profile needs work). 1: nothing renders.
 if [[ $sandboxed == 0 ]]; then exit 0; fi
