@@ -337,6 +337,41 @@ pub fn peer_credentials(fd: RawFd) -> Option<PeerCredentials> {
     }
 }
 
+/// Resident set size (bytes) of a live process, when the platform reports
+/// it: `proc_pid_rusage` on macOS, `/proc/<pid>/statm` on Linux. The macOS
+/// daemon uses it as the address-space budget's substitute because Darwin
+/// refuses `RLIMIT_AS`; Linux keeps the rlimit and does not consult this.
+pub fn resident_set_bytes(pid: libc::pid_t) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a valid, writable rusage_info_v2 buffer and the
+        // flavor names exactly that layout (Apple's rusage_info_t is `void*`,
+        // hence the pointer cast).
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+            )
+        };
+        (rc == 0).then_some(info.ri_resident_size)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: sysconf with a valid name has no preconditions.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        (page_size > 0).then(|| pages * page_size as u64)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -457,6 +492,9 @@ mod tests {
     /// in its own child, so a platform that refuses one names it. (macOS
     /// CI, 2026-09-04: every worker spawn failed with std's EINVAL
     /// placeholder, which hides which pre_exec step returned an error.)
+    /// Assumes the ambient hard limits allow NOFILE 256 and NPROC 1024, as
+    /// the daemon's defaults do; a tighter container would fail here first,
+    /// which is the intended early warning.
     #[test]
     fn each_containment_step_succeeds_in_a_child() {
         use std::os::unix::process::CommandExt;
@@ -521,6 +559,13 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "containment steps refused: {failures:?}");
+    }
+
+    #[test]
+    fn resident_set_of_this_process_is_reported() {
+        let rss = resident_set_bytes(std::process::id() as libc::pid_t).expect("rss");
+        assert!(rss > 64 * 1024, "implausible rss {rss}");
+        assert_eq!(resident_set_bytes(i32::MAX), None);
     }
 
     #[test]

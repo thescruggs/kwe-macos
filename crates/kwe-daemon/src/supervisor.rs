@@ -1984,6 +1984,30 @@ fn inspect_worker(
     }
 
     drain_stderr(worker, STDERR_READ_BYTES_PER_TICK);
+    // macOS (MP-9): Darwin refuses RLIMIT_AS, so the address-space budget is
+    // enforced here as a resident-set watchdog on every tick; a worker over
+    // budget is a ResourceLimit failure (killed, struck, restarted like any
+    // other). Linux keeps the kernel rlimit and never reaches this branch.
+    if !kwe_platform::address_space_limit_enforced() {
+        let mib = 1024_u64 * 1024;
+        let budget = config
+            .resource_limits_for(worker.spec.kind)
+            .address_space_mib
+            .saturating_mul(mib);
+        if let Ok(pid) = i32::try_from(worker.child.id())
+            && let Some(resident) = kwe_platform::resident_set_bytes(pid)
+            && resident > budget
+        {
+            return Some(WorkerObservation::Failure(
+                FailureKind::ResourceLimit,
+                format!(
+                    "resident_set_exceeded:{}MiB>{}MiB",
+                    resident / mib,
+                    budget / mib
+                ),
+            ));
+        }
+    }
     let now = Instant::now();
     if worker.reader.is_none() {
         match SharedFrameReader::open(&worker.frame_path) {
@@ -2435,12 +2459,13 @@ pub(crate) fn apply_resource_limits(limits: RendererResourceLimits) -> io::Resul
     Ok(())
 }
 
-/// Names the failing resource in the error: a launch failure surfaces as
-/// the daemon's `last_failure_detail`, and "Invalid argument" alone was
-/// undiagnosable (macOS CI, 2026-09-04). Runs between fork and exec, so
-/// the message is built only on the failure path.
+/// Runs between fork and exec. The error must stay a RAW OS error: std
+/// carries a failing pre_exec closure back to the parent as errno only
+/// (anything else becomes EINVAL), so the parent's `last_failure_detail`
+/// keeps the true cause (EPERM, EINVAL, ...). Which RESOURCE failed is
+/// answered by `kwe_platform`'s per-step containment test, not here.
 fn set_resource_limit(
-    name: &'static str,
+    _name: &'static str,
     resource: kwe_platform::RlimitResource,
     value: u64,
 ) -> io::Result<()> {
@@ -2453,11 +2478,7 @@ fn set_resource_limit(
     // SAFETY: `limit` is a valid immutable rlimit structure and `resource` is
     // one of the constants selected by `apply_resource_limits`.
     if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-        let error = io::Error::last_os_error();
-        return Err(io::Error::new(
-            error.kind(),
-            format!("setrlimit({name}={value}): {error}"),
-        ));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -2866,6 +2887,69 @@ mod tests {
             1
         );
         assert!(web.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())));
+    }
+
+    /// macOS: the resident-set watchdog stands in for RLIMIT_AS. A renderer
+    /// that grows past its address-space budget is observed as a
+    /// ResourceLimit failure within a few ticks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_set_over_budget_is_a_resource_limit_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_directory("rss-watchdog");
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("hog-renderer");
+        fs::write(
+            &script,
+            "#!/usr/bin/env python3\nimport time\nblock = bytearray(192 * 1024 * 1024)\nfor i in range(0, len(block), 4096):\n    block[i] = 1\ntime.sleep(30)\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
+        for limits in config.resource_limits_by_kind.values_mut() {
+            limits.address_space_mib = 64;
+        }
+        let config = config.validate().unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+        );
+        let spec = StartSpec {
+            wallpaper_id: "431960-rss".into(),
+            content_hash: "rss".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+            scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
+        };
+        let mut worker = runtime.spawn_worker(spec).unwrap();
+        let mut observation = None;
+        for _ in 0..600 {
+            if let Some(found) = inspect_worker(&mut worker, &runtime.config) {
+                observation = Some(found);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = worker.child.kill();
+        let _ = worker.child.wait();
+        match observation {
+            Some(WorkerObservation::Failure(FailureKind::ResourceLimit, detail)) => {
+                assert!(detail.contains("resident_set_exceeded"), "{detail}");
+            }
+            other => panic!("expected a ResourceLimit observation, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

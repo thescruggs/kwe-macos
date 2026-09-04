@@ -30,7 +30,12 @@ jobs:
         env:
           VK_ICD_FILENAMES: /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json
           DYLD_FALLBACK_LIBRARY_PATH: /opt/homebrew/lib
-        run: target/debug/kwe-vulkan || true
+        # Hosted macOS VMs have no Metal device, so "Unable to find a Vulkan
+        # driver" is expected here; the listing validates the ICD path the
+        # dev install script uses.
+        run: |
+          find "$(brew --prefix molten-vk)" -name '*.json' -print || true
+          target/debug/kwe-vulkan || true
   qt-macos:
     # The display agent + manager (Kirigami compatibility module) built
     # against Homebrew Qt, and the daemon + test renderer + agent smoke run

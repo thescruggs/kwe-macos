@@ -67,6 +67,14 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
   level/back order re-asserted every 5 s (Finder redraws its desktop window
   at the same level after wake/relaunch/Space change), exact-geometry match
   refuses ambiguous (mirrored) outputs.
+- 2026-09-04 CI-fix batch review (independent, sonnet): one show-stopper
+  — the "named setrlimit" error wrapper dropped the raw errno (std hands
+  a failing pre_exec closure to the parent as errno only), which would
+  have turned every real Linux rlimit failure into "Invalid argument";
+  reverted to the raw error, the per-step containment test in
+  `kwe-platform` is the naming tool. Merge surface noted: supervisor.rs,
+  shader_helper.rs (upstream is active there), test-only edits in
+  main.rs/audio.rs/apply.rs.
 - 2026-09-04 MP-5b/MP-6 review (independent, sonnet): two show-stoppers
   fixed — the CDP page match failed on percent-encoded spaces (default
   Steam path has "Application Support"; the renderer now also compares the
@@ -111,7 +119,16 @@ Unverified on macOS (spike S-A): window ordering under Finder icons on
 14/15, Sonoma "click wallpaper to reveal desktop", Stage Manager, sleep/wake,
 whether the mouse-moved global monitor needs a TCC prompt.
 
-## macOS CI findings (GitHub macos-14 runner, 2026-09-04)
+## macOS CI: green (GitHub macos-14 runner, run 33835238015, 2026-09-04)
+
+`rust-macos` (whole workspace builds; every portable crate's tests pass
+with Homebrew shaderc/mpv/MoltenVK), `qt-macos` (agent + manager build
+against Homebrew qt@6; daemon + kwe-test-renderer + kwe-display-macos
+offscreen smoke passes: frame shown, display generation acknowledged) and
+the Linux seam guard all pass. Scene-renderer tests (need a Vulkan device)
+are built, not run, on the runner.
+
+## macOS CI findings (how it got there)
 
 The first real macOS execution. Fixed from its logs so far:
 `CGDisplayCreateUUIDFromDisplayID` needs ColorSync linked; an ARC-disallowed
@@ -148,7 +165,7 @@ build/agent/apps/kwe-display-macos/kwe-display-macos --cover-all
 
 - No `PR_SET_PDEATHSIG`: workers arm a kqueue guard on their parent pid.
 - No `PR_SET_NO_NEW_PRIVS`.
-- `RLIMIT_AS` is refused by XNU (`EINVAL`) and skipped; RSS watchdog pending (MP-9).
+- `RLIMIT_AS` is refused by XNU (`EINVAL`) and skipped; the supervisor instead kills a worker whose resident set exceeds `address_space_mib` (checked every tick, `ResourceLimit` failure, same strike/restart path). Address-space overcommit without touching pages is therefore not bounded on macOS.
 - `pipe`/`socketpair` + `fcntl(FD_CLOEXEC)` instead of atomic `*_CLOEXEC`.
 - Paths: socket `~/Library/Application Support/kwe/daemon-v1.sock`,
   state `~/Library/Application Support/kwe/state`, reports
