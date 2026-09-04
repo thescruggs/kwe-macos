@@ -2488,8 +2488,26 @@ fn set_resource_limit(
     resource: kwe_platform::RlimitResource,
     value: u64,
 ) -> io::Result<()> {
-    let value = libc::rlim_t::try_from(value)
+    let mut value = libc::rlim_t::try_from(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource limit overflow"))?;
+    // macOS: an unprivileged process cannot raise a hard limit (EPERM), and
+    // the web kind's RLIMIT_NPROC (32768, sized for Linux's bwrap fork tree)
+    // exceeds Darwin's per-user default. Clamp to the inherited hard limit;
+    // the budget is then "as tight as this platform allows". Linux keeps
+    // the exact value (its unit raises the hard limits deliberately).
+    if cfg!(target_os = "macos") {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `current` is a valid writable rlimit for getrlimit.
+        if unsafe { libc::getrlimit(resource, &mut current) } == 0
+            && current.rlim_max != libc::RLIM_INFINITY
+            && value > current.rlim_max
+        {
+            value = current.rlim_max;
+        }
+    }
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
