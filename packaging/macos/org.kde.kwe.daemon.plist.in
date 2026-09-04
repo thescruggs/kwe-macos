@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- KDE Wallpaper Engine (macOS fork): user LaunchAgent for kwe-daemon.
+     Installed by packaging/macos/install-dev.sh; @TOKENS@ are substituted. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.kde.kwe.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@KWE_BIN_DIR@/kwe-daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@KWE_BIN_DIR@:@BREW_PREFIX@/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DYLD_FALLBACK_LIBRARY_PATH</key>
+    <string>@BREW_PREFIX@/lib</string>
+    <key>VK_ICD_FILENAMES</key>
+    <string>@MOLTENVK_ICD@</string>
+    <key>VK_DRIVER_FILES</key>
+    <string>@MOLTENVK_ICD@</string>
+  </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@KWE_LOG_DIR@/kwe-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>@KWE_LOG_DIR@/kwe-daemon.log</string>
+</dict>
+</plist>

@@ -25,11 +25,19 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | kwe-frame-protocol, kwe-input-protocol, kwe-report-protocol | ok | unchanged |
 | kwe-cdp | ok | socketpair via kwe-platform |
 | kwe-cli | ok | reports dir via kwe-platform |
-| kwe-daemon | ok | pre_exec containment, rlimit type, peer creds, socket/state dirs via kwe-platform; **apply lane still Plasma-only** (MP-3) |
+| kwe-daemon | ok | pre_exec containment, rlimit type, peer creds, socket/state dirs via kwe-platform; macOS apply backend `macos_desktop.rs` (CoreGraphics displays + Plasma-script emulation, persisted); macOS worker env passthrough (DYLD_FALLBACK_LIBRARY_PATH, VK_ICD_FILENAMES, VK_DRIVER_FILES, TMPDIR) |
 | kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok | worker-side parent guard added; web renderer still spawns `bwrap` (MP-5b) |
-| kwe-scene-renderer, kwe-shader-compiler, kwe-vulkan | ok (type-check only) | C build scripts need Xcode CLT on the Mac; no portability-enumeration yet (MP-5c) |
+| kwe-scene-renderer, kwe-shader-compiler, kwe-vulkan | ok (type-check only) | C build scripts need Xcode CLT on the Mac; VK_KHR_portability_enumeration + VK_KHR_portability_subset enabled when advertised (MoltenVK) |
 | kwe-audio-worker | ok | still PipeWire-only at runtime (MP-6) |
 | kwe-mpv | ok | build.rs adds Homebrew link search |
+
+## Review log
+
+- 2026-09-04 MP-2 review (independent, sonnet): no show-stoppers. Fixed:
+  audio worker's `pw-record` child had silently gained `PR_SET_NO_NEW_PRIVS`
+  (now `Containment::ParentOnly`); socket-path error string restored
+  verbatim; `kwe-mpv/build.rs` gates on `CARGO_CFG_TARGET_OS` only. Nits
+  addressed: allocation caveat documented, guard-thread spawn failure logged.
 
 ## Runtime status on a Mac
 

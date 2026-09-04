@@ -120,7 +120,7 @@ inverse. Spikes (§7) precede MP-2.
     `kwe-scene-inspector`, `kwe-shader-compiler`, `kwe-cdp`, `kwe-mpv`,
     `kwe-test-renderer` build and pass unit tests on macOS.
   - Accept: `cargo test` passes for those crates on arm64.
-- **MP-3 Daemon** — pending
+- **MP-3 Daemon** — done 2026-09-04 (macos_desktop backend, launchd LaunchAgent + dev install scripts, env passthrough); RSS watchdog deferred to MP-9
   - supervisor platform layer (parent death, rlimit subset, RSS watchdog);
   - `ShellBackend` trait: `Plasma` (upstream) vs `MacDisplayAgent`;
   - LaunchAgent plist; socket under `~/Library/Application Support/kwe`;

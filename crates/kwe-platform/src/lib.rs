@@ -6,7 +6,10 @@
 //! `SOCK_CLOEXEC`, `SO_PEERCRED`, XDG directories). macOS supplies the
 //! closest Darwin equivalent for each primitive; where Darwin has no
 //! equivalent the substitute and its weaker guarantee are documented on the
-//! function. Nothing here allocates inside a `pre_exec` closure.
+//! function. Inside a `pre_exec` closure nothing here allocates on the
+//! success path; the parent-check failure path builds an `io::Error` with a
+//! static message (a small allocation), exactly as the call sites did before
+//! this crate existed.
 //!
 //! macOS port note (docs/macos/MacOS-Port-Plan.md, MP-2): this is the seam
 //! that keeps every other crate free of `#[cfg(target_os)]` sprawl.
@@ -51,8 +54,34 @@ pub const fn address_space_limit_enforced() -> bool {
 ///
 /// # Safety
 /// Must be called only between fork and exec. Calls only
-/// async-signal-safe functions and never allocates.
+/// async-signal-safe functions; allocates only on the parent-check failure
+/// path (a static-message `io::Error`).
 pub unsafe fn child_pre_exec(expected_parent: libc::pid_t, death_signal: libc::c_int) -> io::Result<()> {
+    unsafe { child_pre_exec_with(expected_parent, death_signal, Containment::Full) }
+}
+
+/// How much of the Linux containment [`child_pre_exec`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+    /// Parent-death signal, parent check, and `PR_SET_NO_NEW_PRIVS`
+    /// (renderers, inspector, shader helper, audio worker).
+    Full,
+    /// Parent-death signal and parent check only. Used for children that
+    /// are not kwe code and may legitimately gain privileges at exec
+    /// (the audio worker's `pw-record`, which some distributions ship with
+    /// file capabilities for realtime scheduling).
+    ParentOnly,
+}
+
+/// [`child_pre_exec`] with an explicit containment level.
+///
+/// # Safety
+/// Same contract as [`child_pre_exec`].
+pub unsafe fn child_pre_exec_with(
+    expected_parent: libc::pid_t,
+    death_signal: libc::c_int,
+    containment: Containment,
+) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: prctl with these constants takes no pointers.
@@ -71,11 +100,15 @@ pub unsafe fn child_pre_exec(expected_parent: libc::pid_t, death_signal: libc::c
     }
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: prctl with these constants takes no pointers.
-        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            return Err(io::Error::last_os_error());
+        if containment == Containment::Full {
+            // SAFETY: prctl with these constants takes no pointers.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = containment;
     Ok(())
 }
 
@@ -98,7 +131,7 @@ pub fn guard_parent_exit(signal: libc::c_int) {
             unsafe { libc::kill(libc::getpid(), signal) };
             return;
         }
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("kwe-parent-guard".into())
             .spawn(move || {
                 if !wait_parent_exit_kqueue(parent) {
@@ -112,8 +145,10 @@ pub fn guard_parent_exit(signal: libc::c_int) {
                 }
                 // SAFETY: signalling our own pid with a valid signal number.
                 unsafe { libc::kill(libc::getpid(), signal) };
-            })
-            .ok();
+            });
+        if let Err(error) = spawned {
+            eprintln!("event=worker.parent_guard_unavailable detail={error}");
+        }
     }
 }
 

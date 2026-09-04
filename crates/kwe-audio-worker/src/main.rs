@@ -454,7 +454,13 @@ impl Capture {
                 if libc::setpgid(0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                kwe_platform::child_pre_exec(expected_parent, libc::SIGTERM)?;
+                // Parent-death SIGTERM + parent check only: pw-record is not
+                // kwe code and never had PR_SET_NO_NEW_PRIVS applied.
+                kwe_platform::child_pre_exec_with(
+                    expected_parent,
+                    libc::SIGTERM,
+                    kwe_platform::Containment::ParentOnly,
+                )?;
                 Ok(())
             });
         }

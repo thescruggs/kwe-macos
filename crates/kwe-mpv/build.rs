@@ -9,7 +9,8 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
-    if !cfg!(target_os = "macos") && std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    // Build scripts run on the HOST; only CARGO_CFG_TARGET_OS names the target.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
     if let Some(dir) = std::env::var_os("MPV_LIB_DIR").map(PathBuf::from) {

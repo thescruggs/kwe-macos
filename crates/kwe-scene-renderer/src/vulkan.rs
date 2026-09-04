@@ -673,7 +673,11 @@ impl LayerRenderer {
             .engine_name(app_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_2);
-        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let portability = portability::instance_extensions(&entry);
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&portability.names)
+            .flags(portability.flags);
         let instance = unsafe { entry.create_instance(&create_info, None) }?;
 
         let (physical, queue_family, device_name, device_kind) =
@@ -683,8 +687,10 @@ impl LayerRenderer {
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
-        let device_info =
-            vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue_info));
+        let device_extensions = portability::device_extensions(&instance, physical);
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(std::slice::from_ref(&queue_info))
+            .enabled_extension_names(&device_extensions);
         let device = unsafe { instance.create_device(physical, &device_info, None) }?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
@@ -3981,7 +3987,11 @@ impl LayerRenderer {
             .engine_name(app_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_2);
-        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let portability = portability::instance_extensions(&entry);
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&portability.names)
+            .flags(portability.flags);
         let instance = unsafe { entry.create_instance(&create_info, None) }?;
         let (physical, _, device_name, device_kind) = pick_device(&instance, device_filter)?;
         let format = pick_format(&instance, physical);
@@ -7185,6 +7195,61 @@ mod tests {
                 &[5, 10, 10, 192],
                 "multiply α=0.5 over α=0.5 clear: BGRA (premultiplied src, S7b/B1)"
             );
+        }
+    }
+}
+
+/// MoltenVK / Vulkan Portability support (docs/macos/MacOS-Port-Plan.md,
+/// MP-5c). On a conformant Linux driver neither extension exists and both
+/// helpers return empty lists, so instance/device creation is byte-for-byte
+/// what it was. On MoltenVK the loader hides the (non-conformant) device
+/// unless `VK_KHR_portability_enumeration` is enabled with the
+/// `ENUMERATE_PORTABILITY_KHR` flag, and the spec REQUIRES enabling
+/// `VK_KHR_portability_subset` on any device that advertises it.
+pub(crate) mod portability {
+    use std::ffi::{CStr, c_char};
+
+    use ash::{Entry, Instance, vk};
+
+    pub(crate) struct InstanceExtensions {
+        pub(crate) names: Vec<*const c_char>,
+        pub(crate) flags: vk::InstanceCreateFlags,
+    }
+
+    pub(crate) fn instance_extensions(entry: &Entry) -> InstanceExtensions {
+        let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+            .unwrap_or_default();
+        let has = |needle: &CStr| {
+            available
+                .iter()
+                .any(|property| property.extension_name_as_c_str().ok() == Some(needle))
+        };
+        let mut names = Vec::new();
+        let mut flags = vk::InstanceCreateFlags::empty();
+        if has(ash::khr::portability_enumeration::NAME) {
+            names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+            // portability_subset requires it on the instance side.
+            if has(ash::khr::get_physical_device_properties2::NAME) {
+                names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+            }
+        }
+        InstanceExtensions { names, flags }
+    }
+
+    pub(crate) fn device_extensions(
+        instance: &Instance,
+        physical: vk::PhysicalDevice,
+    ) -> Vec<*const c_char> {
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .unwrap_or_default();
+        let subset = available.iter().any(|property| {
+            property.extension_name_as_c_str().ok() == Some(ash::khr::portability_subset::NAME)
+        });
+        if subset {
+            vec![ash::khr::portability_subset::NAME.as_ptr()]
+        } else {
+            Vec::new()
         }
     }
 }

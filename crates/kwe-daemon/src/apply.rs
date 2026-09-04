@@ -1668,14 +1668,23 @@ impl ApplyService {
         supervisor: SupervisorHandle,
     ) -> Result<Self> {
         let store = AssignmentStore::open(&config.state_dir)?;
-        let probe: Arc<dyn ShellProbe> = Arc::new(QdbusShellProbe::new(
-            config.shell_service,
-            config.qdbus_binary,
-            config.switch_command,
-            config.kscreen_binary,
-            config.systemctl_binary,
-            config.probe_timeout,
-        ));
+        // macOS: the desktop emulation backend (crate::macos_desktop) unless
+        // an external switch command keeps the stubbed Plasma boundary.
+        // Linux (and any macOS smoke with --plasma-switch-command): qdbus.
+        let probe: Arc<dyn ShellProbe> = match crate::macos_desktop::MacDesktopProbe::from_config(
+            &config.state_dir,
+            config.switch_command.as_deref(),
+        ) {
+            Some(desktop) => Arc::new(desktop),
+            None => Arc::new(QdbusShellProbe::new(
+                config.shell_service,
+                config.qdbus_binary,
+                config.switch_command,
+                config.kscreen_binary,
+                config.systemctl_binary,
+                config.probe_timeout,
+            )),
+        };
         Ok(Self {
             handle: ApplyHandle {
                 store: Arc::new(Mutex::new(store)),

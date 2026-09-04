@@ -6,6 +6,7 @@ mod apply;
 mod audio;
 mod grants;
 mod inspect;
+mod macos_desktop;
 mod persist;
 mod playlist_session;
 mod selfcheck;
@@ -1517,8 +1518,7 @@ fn resource_limits_for_kinds(
 }
 
 fn default_socket_path() -> Result<PathBuf> {
-    let runtime = kwe_platform::runtime_dir()
-        .context("no runtime directory (XDG_RUNTIME_DIR is not set); pass --socket")?;
+    let runtime = kwe_platform::runtime_dir().context("XDG_RUNTIME_DIR is not set; pass --socket")?;
     Ok(runtime.join("kwe/daemon-v1.sock"))
 }
 

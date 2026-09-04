@@ -100,7 +100,30 @@ unsafe fn probe(create_device: bool) -> Result<Report> {
         .engine_name(&app_name)
         .engine_version(vk::make_api_version(0, 0, 1, 0))
         .api_version(loader_version.min(vk::API_VERSION_1_3));
-    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    // MoltenVK (macOS): the loader hides portability devices unless asked.
+    // On conformant drivers the extension is absent and nothing changes.
+    let instance_extensions = unsafe { entry.enumerate_instance_extension_properties(None) }
+        .unwrap_or_default();
+    let has_instance_extension = |needle: &CStr| {
+        instance_extensions
+            .iter()
+            .any(|property| property.extension_name_as_c_str().ok() == Some(needle))
+    };
+    let mut enabled_instance_extensions = Vec::new();
+    let mut instance_flags = vk::InstanceCreateFlags::empty();
+    let portability_enumeration = has_instance_extension(ash::khr::portability_enumeration::NAME);
+    if portability_enumeration {
+        enabled_instance_extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
+        instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        if has_instance_extension(ash::khr::get_physical_device_properties2::NAME) {
+            enabled_instance_extensions
+                .push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
+        }
+    }
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_extension_names(&enabled_instance_extensions)
+        .flags(instance_flags);
     let instance =
         unsafe { entry.create_instance(&create_info, None) }.context("create Vulkan instance")?;
     let result = (|| -> Result<Vec<DeviceReport>> {
@@ -140,8 +163,17 @@ unsafe fn probe(create_device: bool) -> Result<Report> {
                     let queue = vk::DeviceQueueCreateInfo::default()
                         .queue_family_index(family)
                         .queue_priorities(&priorities);
+                    // Required by the spec whenever the device advertises it
+                    // (MoltenVK); empty everywhere else.
+                    let device_extensions: Vec<*const std::ffi::c_char> =
+                        if has_extension(ash::khr::portability_subset::NAME) {
+                            vec![ash::khr::portability_subset::NAME.as_ptr()]
+                        } else {
+                            Vec::new()
+                        };
                     let device_info = vk::DeviceCreateInfo::default()
-                        .queue_create_infos(std::slice::from_ref(&queue));
+                        .queue_create_infos(std::slice::from_ref(&queue))
+                        .enabled_extension_names(&device_extensions);
                     let device = unsafe { instance.create_device(physical, &device_info, None) }
                         .with_context(|| format!("create logical device for {name}"))?;
                     logical_device_created = true;

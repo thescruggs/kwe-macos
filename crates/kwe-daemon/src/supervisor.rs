@@ -2233,8 +2233,31 @@ fn env_allowlist_with_runtime(
             runtime.to_string_lossy().into_owned(),
         ));
     }
+    macos_env_passthrough(&mut entries);
     entries
 }
+
+/// macOS (MP-3): the variables a worker needs to find Homebrew dylibs
+/// (`libvulkan`, `libmpv`) and the MoltenVK ICD, copied from the daemon's
+/// own environment when present. The LaunchAgent sets them
+/// (packaging/macos/org.kde.kwe.daemon.plist.in). `TMPDIR` is the per-user
+/// secure temp dir every macOS process expects. No-op on Linux.
+#[cfg(target_os = "macos")]
+fn macos_env_passthrough(entries: &mut Vec<(String, String)>) {
+    for name in [
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "VK_ICD_FILENAMES",
+        "VK_DRIVER_FILES",
+        "TMPDIR",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            entries.push((name.to_string(), value.to_string_lossy().into_owned()));
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_env_passthrough(_entries: &mut [(String, String)]) {}
 
 /// Bounded ring of worker stderr diagnostics, newest last. Oldest lines are
 /// evicted (their bytes counted as dropped) whenever the 64-line or 16 KiB
