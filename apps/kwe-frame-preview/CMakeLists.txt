@@ -14,7 +14,7 @@ qt_add_qml_module(kwe-frame-preview
 )
 
 target_link_libraries(kwe-frame-preview PRIVATE
-    KF6Kirigami
+    ${KWE_KIRIGAMI_TARGET}
     kwe_display
     Qt6::Core
     Qt6::Gui

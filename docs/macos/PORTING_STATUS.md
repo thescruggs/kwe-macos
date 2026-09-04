@@ -31,7 +31,51 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | kwe-audio-worker | ok | macOS capture = `ffmpeg -f avfoundation` on a loopback device (`KWE_AUDIO_DEVICE`, default "BlackHole 2ch"; `brew install ffmpeg blackhole-2ch`, route output via a Multi-Output Device); Core Audio process tap still planned |
 | kwe-mpv | ok | build.rs adds Homebrew link search |
 
+## Manager (MP-7)
+
+Built without KF6 Kirigami: `apps/kwe-manager/kirigami-shim` provides the
+subset of `org.kde.kirigami` the manager's QML imports (ApplicationWindow,
+Page, ScrollablePage, NavigationTabBar, Action, InlineMessage, MessageType,
+Units, Theme, Heading, PlaceholderMessage, Icon, SearchField). The QML pages
+stay byte-identical to upstream, so upstream UI changes merge cleanly.
+`KWE_MANAGER_KIRIGAMI_SHIM` (default ON on macOS) selects it; the style
+defaults to Fusion on macOS. macOS branches in C++: daemon activation via
+`launchctl kickstart`/`bootstrap`, the "display bridge" is the presence of
+`kwe-display-macos` (safe mode unavailable), last-good frame under
+`~/Library/Application Support/kwe/state`. Verified on Linux offscreen
+against a live daemon (97 items, screenshot reviewed); named theme icons
+render blank without a Freedesktop icon theme (text labels carry meaning).
+
+## Hardware-verify list (blocking a "done" on the Mac)
+
+1. Desktop window sits under Finder icons and survives wake/Space change
+   (agent re-asserts level every 5 s).
+2. Mouse-moved global monitor works without an Accessibility prompt.
+3. `sandbox-exec` profile lets Chromium bootstrap; if web wallpapers fail,
+   bisect with `KWE_WEB_SANDBOX=off` (open question: whether Seatbelt's
+   `network*` deny also blocks Chromium's own new local IPC sockets).
+4. MoltenVK: `kwe-vulkan` lists the Apple GPU; scene corpus behaviour.
+5. ffmpeg/BlackHole capture feeds audio-reactive scenes.
+6. Homebrew Qt: `cmake -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)` configures
+   the manager + agent; `smoke-display-agent.sh` passes offscreen.
+
 ## Review log
+
+- 2026-09-04 MP-4 review (independent, sonnet): no show-stoppers. Fixed:
+  `platform_mac.mm` now compiled with ARC (the App Nap token and the event
+  monitor were unretained under MRC), dead local monitor removed, desktop
+  level/back order re-asserted every 5 s (Finder redraws its desktop window
+  at the same level after wake/relaunch/Space change), exact-geometry match
+  refuses ambiguous (mirrored) outputs.
+- 2026-09-04 MP-5b/MP-6 review (independent, sonnet): two show-stoppers
+  fixed — the CDP page match failed on percent-encoded spaces (default
+  Steam path has "Application Support"; the renderer now also compares the
+  percent-decoded URL), and the Seatbelt profile denied a browser under
+  ~/Applications its own bundle (bundle re-allowed) and read access to the
+  resolved temp tree (`/private/var/folders` now allowed for reads too,
+  profile dir canonicalised). A Linux-literal PATH assertion that would have
+  failed on the macOS CI runner now uses the platform constant. Open:
+  `(deny network*)` vs Chromium local IPC (hardware-verify item 3).
 
 - 2026-09-04 MP-3 review (independent, sonnet): no show-stoppers. Fixed:
   desktop-state persistence now uses the crate's `atomic_write` (unique

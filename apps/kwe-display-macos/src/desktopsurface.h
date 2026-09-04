@@ -30,6 +30,10 @@ public:
   // be covered. Returns true when the visible state changed.
   bool applyOutputs(const QList<OutputRecord> &outputs, bool available);
 
+  // Re-assert desktop level and back ordering (Finder redraws its own
+  // desktop window at the same level after wake, relaunch, Space changes).
+  void reassertDesktopLevel();
+
   // Pointer position in global top-left logical coordinates; forwarded as
   // a normalized position when it falls inside this surface.
   void forwardGlobalPointer(const QPointF &global);

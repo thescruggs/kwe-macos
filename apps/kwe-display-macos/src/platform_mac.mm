@@ -6,9 +6,15 @@
 
 #include <QWindow>
 
+#if !__has_feature(objc_arc)
+#error "platform_mac.mm must be compiled with -fobjc-arc (see CMakeLists.txt)"
+#endif
+
 namespace {
+// Strong references under ARC: the monitor token must stay alive until
+// removeMonitor:, and the activity token for as long as App Nap must stay
+// off.
 id globalMonitor = nil;
-id localMonitor = nil;
 id<NSObject> activityToken = nil;
 std::function<void(QPointF)> pointerCallback;
 
@@ -71,27 +77,19 @@ void startPointerMonitor(std::function<void(QPointF)> callback) {
   // Global monitors observe events delivered to OTHER applications; a
   // desktop window never receives them itself. Mouse-moved monitoring does
   // not need the Accessibility permission (key events would).
+  // Our windows ignore mouse events, so a local monitor could never fire;
+  // the global monitor is the only source.
   globalMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:mask
                                                          handler:^(NSEvent *) {
                                                            if (pointerCallback)
                                                              pointerCallback(topLeftPointer());
                                                          }];
-  localMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask
-                                                       handler:^NSEvent *(NSEvent *event) {
-                                                         if (pointerCallback)
-                                                           pointerCallback(topLeftPointer());
-                                                         return event;
-                                                       }];
 }
 
 void stopPointerMonitor() {
   if (globalMonitor != nil) {
     [NSEvent removeMonitor:globalMonitor];
     globalMonitor = nil;
-  }
-  if (localMonitor != nil) {
-    [NSEvent removeMonitor:localMonitor];
-    localMonitor = nil;
   }
   pointerCallback = nullptr;
 }

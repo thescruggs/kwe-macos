@@ -345,11 +345,25 @@ pub mod macos {
         out
     }
 
-    /// The SBPL profile for one renderer launch. Pure.
+    /// The `.app` bundle directory containing `binary`, when it is inside
+    /// one (`~/Applications/Chromium.app/Contents/MacOS/Chromium` ->
+    /// `~/Applications/Chromium.app`).
+    pub fn bundle_root(binary: &Path) -> Option<PathBuf> {
+        binary
+            .ancestors()
+            .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+            .map(Path::to_path_buf)
+    }
+
+    /// The SBPL profile for one renderer launch. Pure. Seatbelt matches
+    /// RESOLVED paths, so temp dirs are allowed both as given and under
+    /// `/private/var/folders` (where `$TMPDIR` really lives), and a browser
+    /// bundle under the (otherwise denied) home is re-allowed explicitly.
     pub fn profile(
         root: &Path,
         profile_dir: &Path,
         home: Option<&Path>,
+        browser_bundle: Option<&Path>,
         network_allowed: bool,
     ) -> String {
         let mut rules = String::from("(version 1)\n(allow default)\n");
@@ -359,15 +373,26 @@ pub mod macos {
             "(allow file-write* (subpath {}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\"))\n",
             sbpl_string(profile_dir)
         ));
-        // Reads: the user's home is off limits except the content root.
+        // Reads: the user's home is off limits except the content root, the
+        // browser's own bundle (when it lives under ~/Applications), and
+        // the profile/temp trees.
         if let Some(home) = home {
             rules.push_str(&format!("(deny file-read* (subpath {}))\n", sbpl_string(home)));
         }
-        rules.push_str(&format!(
-            "(allow file-read* (subpath {}) (subpath {}))\n",
-            sbpl_string(root),
-            sbpl_string(profile_dir)
-        ));
+        let mut allowed_reads = vec![
+            format!("(subpath {})", sbpl_string(root)),
+            format!("(subpath {})", sbpl_string(profile_dir)),
+            "(subpath \"/private/var/folders\")".to_string(),
+            "(subpath \"/private/tmp\")".to_string(),
+        ];
+        if let Some(bundle) = browser_bundle {
+            allowed_reads.push(format!("(subpath {})", sbpl_string(bundle)));
+        }
+        rules.push_str(&format!("(allow file-read* {})\n", allowed_reads.join(" ")));
+        // Network: TCP/UDP off unless the content grant allows it. Whether
+        // Seatbelt's `network*` also covers the browser's own newly created
+        // local IPC sockets is a hardware-verify item (docs/macos/
+        // PORTING_STATUS.md); KWE_WEB_SANDBOX=off bisects it.
         if !network_allowed {
             rules.push_str("(deny network*)\n");
         }
@@ -375,7 +400,11 @@ pub mod macos {
     }
 
     fn temp_profile_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("kwe-{label}-{}", std::process::id()))
+        // Resolved (`/private/var/folders/...`) when possible: Seatbelt
+        // subpath rules match the real path, not the `/var` symlink.
+        let base = std::env::temp_dir();
+        let base = std::fs::canonicalize(&base).unwrap_or(base);
+        base.join(format!("kwe-{label}-{}", std::process::id()))
     }
 
     pub fn web_renderer_command(
@@ -441,7 +470,8 @@ pub mod macos {
             };
         }
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let profile = profile(root, profile_dir, home.as_deref(), network_allowed);
+        let bundle = bundle_root(Path::new(&browser));
+        let profile = profile(root, profile_dir, home.as_deref(), bundle.as_deref(), network_allowed);
         let mut arguments = vec!["-p".to_string(), profile, browser];
         arguments.extend(browser_arguments);
         WebSandboxCommand {
@@ -459,18 +489,23 @@ pub mod macos {
         fn profile_denies_home_and_network_but_allows_content_and_profile() {
             let text = profile(
                 Path::new("/Users/me/WE/steamapps/workshop/content/431960/1"),
-                Path::new("/var/folders/x/T/kwe-web-profile-1"),
+                Path::new("/private/var/folders/x/T/kwe-web-profile-1"),
                 Some(Path::new("/Users/me")),
+                Some(Path::new("/Users/me/Applications/Chromium.app")),
                 false,
             );
+            assert!(text.contains("(subpath \"/Users/me/Applications/Chromium.app\")"));
+            assert!(text.contains("(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\") (subpath \"/private/var/folders/x/T/kwe-web-profile-1\") (subpath \"/private/var/folders\")"));
+            assert_eq!(
+                bundle_root(Path::new("/Users/me/Applications/Chromium.app/Contents/MacOS/Chromium")),
+                Some(PathBuf::from("/Users/me/Applications/Chromium.app"))
+            );
+            assert_eq!(bundle_root(Path::new("/opt/homebrew/bin/chromium")), None);
             assert!(text.starts_with("(version 1)\n(allow default)\n"));
             assert!(text.contains("(deny file-write*)"));
             assert!(text.contains("(deny file-read* (subpath \"/Users/me\"))"));
-            assert!(text.contains(
-                "(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\")"
-            ));
             assert!(text.ends_with("(deny network*)\n"));
-            let open = profile(Path::new("/a"), Path::new("/b"), None, true);
+            let open = profile(Path::new("/a"), Path::new("/b"), None, None, true);
             assert!(!open.contains("network"));
             assert!(!open.contains("file-read* (subpath \"/Users"));
         }

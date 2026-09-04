@@ -166,9 +166,17 @@ QStringList IssueReporter::renderingDiagnosticLines(const QByteArray &statusJson
 
 QString IssueReporter::newestLastGoodFrame() {
     QString stateHome = qEnvironmentVariable("XDG_STATE_HOME");
+#if defined(Q_OS_MACOS)
+    // Matches kwe_platform::state_dir(): ~/Library/Application Support/kwe/state.
+    if (stateHome.isEmpty())
+        stateHome = QDir::homePath() + QStringLiteral("/Library/Application Support/kwe");
+    QDir dir(stateHome + (qEnvironmentVariableIsEmpty("XDG_STATE_HOME")
+                              ? QStringLiteral("/state") : QStringLiteral("/kwe")));
+#else
     if (stateHome.isEmpty())
         stateHome = QDir::homePath() + QStringLiteral("/.local/state");
     QDir dir(stateHome + QStringLiteral("/kwe"));
+#endif
     const auto entries =
         dir.entryInfoList({QStringLiteral("last-good-*.ppm")}, QDir::Files | QDir::NoDotAndDotDot);
     QString newestPath;

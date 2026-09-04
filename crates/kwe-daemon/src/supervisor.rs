@@ -2825,7 +2825,7 @@ mod tests {
         let home = Path::new("/run/kwe/home-7");
         let expected_base = vec![
             ("HOME".to_string(), home.to_string_lossy().into_owned()),
-            ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
+            ("PATH".to_string(), WORKER_PATH.to_string()),
         ];
         for kind in [RendererKind::Test, RendererKind::Video, RendererKind::Scene] {
             assert_eq!(

@@ -1033,6 +1033,34 @@ fn spawn_browser(
     Ok((child, client_read, client_write, page_marker))
 }
 
+/// Whether a CDP target URL names the wallpaper page. Chromium reports
+/// `file://` URLs percent-encoded (`Application Support` -> `Application%20Support`),
+/// so the raw marker is also compared against the percent-decoded URL.
+fn url_matches_marker(url: &str, page_marker: &str) -> bool {
+    url.contains(page_marker) || percent_decode(url).contains(page_marker)
+}
+
+/// Minimal `%XX` decoder (bytes, lossy UTF-8); never fails.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    let hex_value = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            out.push(high << 4 | low);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// getTargets until the fixture page target appears (headless=new starts on
 /// a pre-navigation target that later becomes the fixture page; measured in
 /// M2a). Bounded by the startup deadline.
@@ -1059,7 +1087,7 @@ fn find_page_target(
         if let Some(target) = pages.iter().find(|info| {
             info["url"]
                 .as_str()
-                .is_some_and(|url| url.contains(page_marker))
+                .is_some_and(|url| url_matches_marker(url, page_marker))
         }) {
             return Ok(target["targetId"]
                 .as_str()
@@ -2118,5 +2146,23 @@ mod tests {
         assert!(scale_and_convert(&empty, spec).is_empty());
         // The exact-size check in the publish path rejects the empty slice.
         assert_ne!(scale_and_convert(&empty, spec).len(), spec.pixel_bytes());
+    }
+}
+
+#[cfg(test)]
+mod page_marker_tests {
+    use super::*;
+
+    #[test]
+    fn percent_encoded_space_in_the_reported_url_still_matches() {
+        let marker = "/Users/me/Library/Application Support/Steam/steamapps/workshop/content/431960/1/index.html";
+        let reported = "file:///Users/me/Library/Application%20Support/Steam/steamapps/workshop/content/431960/1/index.html";
+        assert!(url_matches_marker(reported, marker));
+        assert!(url_matches_marker("file:///wallpaper/index.html", "/wallpaper/index.html"));
+        assert!(!url_matches_marker("about:blank", marker));
+        assert_eq!(percent_decode("a%2Fb%zz%"), "a/b%zz%");
+        // A '%' followed by multibyte text must not panic or corrupt.
+        assert_eq!(percent_decode("x%éy%2"), "x%éy%2");
+        assert_eq!(percent_decode("%C3%A9"), "é");
     }
 }

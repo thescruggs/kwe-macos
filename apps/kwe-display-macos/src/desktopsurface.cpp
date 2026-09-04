@@ -11,9 +11,19 @@ const QString KwePlugin = QStringLiteral("org.kde.kwe.wallpaper");
 }
 
 QString matchOutput(const QRect &screenGeometry, int screenCount, const QList<OutputRecord> &outputs) {
-  for (const OutputRecord &output : outputs)
-    if (output.hasGeometry && output.geometry == screenGeometry)
-      return output.name;
+  QString exact;
+  int exactCount = 0;
+  for (const OutputRecord &output : outputs) {
+    if (output.hasGeometry && output.geometry == screenGeometry) {
+      exact = output.name;
+      ++exactCount;
+    }
+  }
+  // Mirrored displays report identical geometry; never guess between them.
+  if (exactCount == 1)
+    return exact;
+  if (exactCount > 1)
+    return QString();
   QString sameSize;
   int sameSizeCount = 0;
   for (const OutputRecord &output : outputs) {
@@ -69,9 +79,12 @@ bool DesktopSurface::applyOutputs(const QList<OutputRecord> &outputs, bool avail
   const QRect geometry = m_screen.isNull() ? QRect() : m_screen->geometry();
   m_outputName = available ? matchOutput(geometry, screenCount, outputs) : QString();
   bool cover = false;
-  for (const OutputRecord &output : outputs)
-    if (!m_outputName.isEmpty() && output.name == m_outputName)
+  for (const OutputRecord &output : outputs) {
+    if (!m_outputName.isEmpty() && output.name == m_outputName) {
       cover = output.wallpaperPlugin == KwePlugin;
+      break;
+    }
+  }
   if (cover == m_covering)
     return false;
   m_covering = cover;
@@ -135,4 +148,9 @@ qulonglong DesktopSurface::frameSequence() const {
     return 0;
   QQuickItem *frame = root->findChild<QQuickItem *>(QStringLiteral("frameSurface"));
   return frame == nullptr ? 0 : frame->property("sequence").toULongLong();
+}
+
+void DesktopSurface::reassertDesktopLevel() {
+  if (m_desktopLevel && m_covering && isVisible())
+    platform::makeDesktopWindow(this);
 }

@@ -146,7 +146,7 @@ inverse. Spikes (§7) precede MP-2.
   - Core Audio process-tap worker; permission UX (microphone/audio TCC);
     BlackHole fallback; `smoke-audio.sh` equivalent.
   - Accept: audio-reactive scene responds to system audio.
-- **MP-7 Manager** — pending (gate G4)
+- **MP-7 Manager** — code complete 2026-09-04 (Kirigami compatibility module instead of a QML rewrite; launchd activation; agent-as-bridge; Linux offscreen smoke green); `.app` bundle pending (MP-8)
   - QML skin per G4; launchd activation; reports path; previews;
   - `.app` bundle with embedded QML modules.
   - Accept: gallery, apply, reset, playlist, issue report work end to end.

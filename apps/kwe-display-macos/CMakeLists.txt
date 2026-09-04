@@ -16,6 +16,10 @@ if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)
     target_sources(kwe-display-macos PRIVATE src/platform_mac.mm)
+    # ARC: the activity token and event-monitor objects live in globals and
+    # must be retained (MRC would drop the autoreleased token at the next
+    # pool drain and silently re-enable App Nap).
+    set_source_files_properties(src/platform_mac.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(kwe-display-macos PRIVATE
         "-framework AppKit"
         "-framework CoreGraphics"

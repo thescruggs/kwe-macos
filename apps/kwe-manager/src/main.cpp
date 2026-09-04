@@ -23,7 +23,13 @@
 
 int main(int argc, char *argv[]) {
     if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE")) {
+#if defined(Q_OS_MACOS)
+        // No org.kde.desktop style without Plasma; Fusion honours the
+        // custom delegates the gallery uses.
+        QQuickStyle::setStyle(QStringLiteral("Fusion"));
+#else
         QQuickStyle::setStyle(QStringLiteral("org.kde.desktop"));
+#endif
     }
     QGuiApplication application(argc, argv);
     application.setApplicationName(QStringLiteral("KDE Wallpaper Engine"));
@@ -120,9 +126,21 @@ int main(int argc, char *argv[]) {
     // When the daemon socket is absent, start the user service before the
     // catalog begins. Defaults to the systemd user unit; the smoke suite
     // injects a stub command instead of touching the user's real unit.
+#if defined(Q_OS_MACOS)
+    // macOS: the daemon is a launchd user agent (packaging/macos). Kick the
+    // loaded agent; if it is not loaded yet, bootstrap it from the user's
+    // LaunchAgents directory.
+    QString activationProgram = QStringLiteral("/bin/sh");
+    QStringList activationArguments{
+        QStringLiteral("-c"),
+        QStringLiteral("launchctl kickstart -k \"gui/$(id -u)/org.kde.kwe.daemon\" 2>/dev/null "
+                       "|| launchctl bootstrap \"gui/$(id -u)\" "
+                       "\"$HOME/Library/LaunchAgents/org.kde.kwe.daemon.plist\"")};
+#else
     QString activationProgram = QStringLiteral("systemctl");
     QStringList activationArguments{QStringLiteral("--user"), QStringLiteral("start"),
                                     QStringLiteral("kwe-daemon")};
+#endif
     const QString activationCommand = parser.value(daemonActivationOption);
     if (!activationCommand.isEmpty()) {
         activationProgram = activationCommand;

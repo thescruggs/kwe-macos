@@ -32,15 +32,20 @@ Binaries land in `target/release/`: `kwe-daemon`, `kwe`, the renderers, and
 workers. The daemon expects its workers beside itself, so run everything
 from that directory or install them together.
 
-## Display agent (Qt)
+## Manager and display agent (Qt)
 
 ```sh
 cmake -S . -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
 cmake --build build/agent --parallel
 scripts/macos/smoke-display-agent.sh build/agent     # offscreen end-to-end smoke
-build/agent/apps/kwe-display-macos/kwe-display-macos # covers assigned screens
+build/agent/apps/kwe-display-macos/kwe-display-macos & # covers assigned screens
+build/agent/apps/kwe-manager/kwe-manager               # gallery / apply / restore
 ```
+
+On macOS the manager builds against the bundled `org.kde.kirigami`
+compatibility module (no KF6 needed); pass
+`-DKWE_MANAGER_KIRIGAMI_SHIM=OFF` to use a real Kirigami if you have one.
 
 `kwe-display-macos --windowed --cover-all` shows the active renderer's
 frames in ordinary windows on every screen (debugging). Without flags it

@@ -33,6 +33,11 @@ qt_add_qml_module(kwe-manager
     URI org.kde.kwe
     VERSION 1.0
     NO_IMPORT_SCAN
+    # Type resolution for the ahead-of-time QML compiler: the build tree's
+    # modules (the org.kde.kirigami compatibility module when the shim is
+    # on) take precedence over anything installed system-wide.
+    IMPORT_PATH
+        "${CMAKE_BINARY_DIR}/qml"
     # These five clients carry QML_ELEMENT + QML_UNCREATABLE: the instances
     # are built in C++ and exposed as context properties, while the
     # registered type is what makes their Q_ENUM State values reachable as
@@ -71,7 +76,7 @@ target_include_directories(kwe-manager PRIVATE src)
 target_compile_definitions(kwe-manager PRIVATE KWE_APP_VERSION="${PROJECT_VERSION}")
 
 target_link_libraries(kwe-manager PRIVATE
-    KF6Kirigami
+    ${KWE_KIRIGAMI_TARGET}
     Qt6::Core
     Qt6::Gui
     Qt6::Network

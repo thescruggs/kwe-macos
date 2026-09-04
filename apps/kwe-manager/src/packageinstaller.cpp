@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "packageinstaller.h"
 
+#include <QCoreApplication>
+#include <QStandardPaths>
+
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
@@ -19,6 +22,33 @@ PackageInstaller::PackageInstaller(QString packagePath, QString systemPackagePat
                                    QObject *parent)
     : QObject(parent), m_packagePath(std::move(packagePath)),
       m_systemPackagePath(std::move(systemPackagePath)) {
+#if defined(Q_OS_MACOS)
+  // macOS fork (MP-7): there is no Plasma package. The "display bridge" is
+  // the desktop display agent; report it installed when its binary is
+  // beside the manager (bundle or build tree) or on PATH. Safe mode is
+  // handled by quitting the agent, not by disabling a package.
+  const QString appDir = QCoreApplication::applicationDirPath();
+  const QStringList candidates{
+      appDir + QStringLiteral("/kwe-display-macos"),
+      appDir + QStringLiteral("/../kwe-display-macos/kwe-display-macos"),
+      QStandardPaths::findExecutable(QStringLiteral("kwe-display-macos")),
+  };
+  QString found;
+  for (const QString &candidate : candidates) {
+    if (!candidate.isEmpty() && QFileInfo(candidate).isExecutable()) {
+      found = QFileInfo(candidate).canonicalFilePath();
+      break;
+    }
+  }
+  m_packagePath = found;
+  if (found.isEmpty())
+    setState(Unavailable,
+             tr("The desktop display agent (kwe-display-macos) was not found beside the "
+                "manager or on PATH; wallpapers will apply but nothing will show."));
+  else
+    setState(Installed, tr("The desktop display agent is available at %1.").arg(found));
+  return;
+#endif
   if (QFileInfo::exists(m_packagePath + DisabledSuffix))
     setState(SafeMode, tr("The Plasma package is disabled in safe mode."));
   else if (QFileInfo::exists(m_packagePath))
@@ -32,8 +62,13 @@ PackageInstaller::PackageInstaller(QString packagePath, QString systemPackagePat
 }
 
 bool PackageInstaller::userPackagePresent() const {
+#if defined(Q_OS_MACOS)
+  // No user-local package to disable on macOS; safe mode stays unavailable.
+  return false;
+#else
   return QFileInfo::exists(m_packagePath) ||
          QFileInfo::exists(m_packagePath + DisabledSuffix);
+#endif
 }
 
 bool PackageInstaller::validatePackage(const QString &sourcePath,

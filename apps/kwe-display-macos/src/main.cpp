@@ -138,11 +138,21 @@ int main(int argc, char *argv[]) {
   QObject::connect(&watcher, &OutputsWatcher::availabilityChanged, &application,
                    [&] { reapply(); });
 
+  QTimer reassertTimer;
   if (desktopLevel) {
     platform::startPointerMonitor([&](QPointF global) {
       for (DesktopSurface *surface : std::as_const(surfaces))
         surface->forwardGlobalPointer(global);
     });
+    // Finder re-orders its own desktop window (same level) after wake,
+    // relaunch, and Space changes; keep ours at the back of that level.
+    reassertTimer.setInterval(5000);
+    reassertTimer.setTimerType(Qt::VeryCoarseTimer);
+    QObject::connect(&reassertTimer, &QTimer::timeout, &application, [&] {
+      for (DesktopSurface *surface : std::as_const(surfaces))
+        surface->reassertDesktopLevel();
+    });
+    reassertTimer.start();
   }
 
   bool validExit = false;
