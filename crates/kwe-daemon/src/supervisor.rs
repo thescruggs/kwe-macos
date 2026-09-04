@@ -2216,6 +2216,15 @@ pub(crate) fn cleanup_renderer_home(home: &Path) {
     }
 }
 
+/// The workers' PATH. Linux: system paths only. macOS: Homebrew's bin
+/// directories first — `ffmpeg` (audio capture) and other helpers live
+/// there and nowhere on the system default path.
+const WORKER_PATH: &str = if cfg!(target_os = "macos") {
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin"
+} else {
+    "/usr/bin:/usr/sbin:/bin"
+};
+
 fn env_allowlist_with_runtime(
     kind: RendererKind,
     home: &Path,
@@ -2223,7 +2232,7 @@ fn env_allowlist_with_runtime(
 ) -> Vec<(String, String)> {
     let mut entries = vec![
         ("HOME".to_string(), home.to_string_lossy().into_owned()),
-        ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
+        ("PATH".to_string(), WORKER_PATH.to_string()),
     ];
     if kind == RendererKind::Web
         && let Some(runtime) = runtime_dir
@@ -2249,6 +2258,13 @@ fn macos_env_passthrough(entries: &mut Vec<(String, String)>) {
         "VK_ICD_FILENAMES",
         "VK_DRIVER_FILES",
         "TMPDIR",
+        // Web renderer (MP-5b): browser binary override and the
+        // sandbox-exec kill switch.
+        "KWE_CHROMIUM",
+        "KWE_WEB_SANDBOX",
+        // Audio worker (MP-6): AVFoundation device and ffmpeg override.
+        "KWE_AUDIO_DEVICE",
+        "KWE_FFMPEG",
     ] {
         if let Some(value) = std::env::var_os(name) {
             entries.push((name.to_string(), value.to_string_lossy().into_owned()));

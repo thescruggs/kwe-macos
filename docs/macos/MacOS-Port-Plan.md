@@ -109,7 +109,7 @@ inverse. Spikes (§7) precede MP-2.
   - `cargo check --workspace` matrix on macOS; record per-crate failures in
     `docs/macos/PORTING_STATUS.md`.
   - Accept: CI green on the portable crate subset; status doc complete.
-- **MP-1 Content acquisition gate** — in progress (gate G2 decided: bring-your-own-folder; SteamCMD doc pending)
+- **MP-1 Content acquisition gate** — done 2026-09-04 (`docs/macos/CONTENT.md`: bring-your-own-folder contract, SteamCMD flow documented, macOS Steam root probed); scan on a Mac unverified
   - macOS Steam roots; `STEAM_ROOT` override honored;
   - documented SteamCMD flow for Workshop items and the `assets/` depot;
   - `kwe scan` lists items on a Mac.
@@ -134,7 +134,7 @@ inverse. Spikes (§7) precede MP-2.
     hang, survive hotplug and sleep/wake.
   - Accept: pattern visible behind icons on two screens; last-good frame
     retained across a renderer kill.
-- **MP-5 Renderers** — pending
+- **MP-5 Renderers** — 5a video: no code change needed (libmpv via Homebrew); 5b web: done 2026-09-04 (sandbox-exec + Chromium sandbox, page-URL marker); 5c scene: portability enumeration done, MoltenVK runtime unverified
   - 5a video: libmpv software render, `smoke-video.sh` passes;
   - 5b web: Chrome headless + CDP pipe, `sandbox-exec` profile,
     `smoke-web.sh` + `smoke-web-compromise.sh` pass or document deviations;
@@ -142,7 +142,7 @@ inverse. Spikes (§7) precede MP-2.
     `kwe-vulkan` preflight reports Metal device; scene corpus sweep run,
     diffs vs Linux goldens triaged (visual parity, not byte identity).
   - Accept: one wallpaper of each family applied live on a Mac.
-- **MP-6 Audio** — pending (gate G7)
+- **MP-6 Audio** — interim done 2026-09-04 (ffmpeg/avfoundation + BlackHole loopback); Core Audio process tap remains the target (gate G7)
   - Core Audio process-tap worker; permission UX (microphone/audio TCC);
     BlackHole fallback; `smoke-audio.sh` equivalent.
   - Accept: audio-reactive scene responds to system audio.

@@ -654,7 +654,8 @@ impl BrowserSession {
     /// progress immediately.
     fn start(content: &Path, spec: FrameSpec, allow_network: bool) -> Result<Self> {
         let deadline = Instant::now() + STARTUP_DEADLINE;
-        let (mut child, read_fd, write_fd) = spawn_browser(content, spec, allow_network)?;
+        let (mut child, read_fd, write_fd, page_marker) =
+            spawn_browser(content, spec, allow_network)?;
         let stderr = StderrRing::new(STDERR_RING_LIMIT);
         let mut client = Client::new(read_fd, write_fd)?;
         // Stderr must drain or a chatty browser could fill the pipe buffer;
@@ -669,8 +670,9 @@ impl BrowserSession {
         // that names a browser that died at exec (B4: the unit's TasksMax
         // cut it off) never reached the daemon.
         let mut stderr = stderr;
-        let target_id = find_page_target(&mut client, deadline, &mut stderr, &mut child)
-            .with_context(|| {
+        let target_id =
+            find_page_target(&mut client, deadline, &mut stderr, &mut child, &page_marker)
+                .with_context(|| {
                 stderr.drain_from(child.stderr.as_mut());
                 format!(
                     "browser bootstrap failed; chromium stderr tail: {}",
@@ -948,8 +950,11 @@ fn spawn_browser(
     content: &Path,
     spec: FrameSpec,
     allow_network: bool,
-) -> Result<(Child, RawFd, RawFd)> {
+) -> Result<(Child, RawFd, RawFd, String)> {
     let web_command = web_renderer_command(content, allow_network, spec.width, spec.height);
+    // What the page's CDP target URL must contain: `/wallpaper/index.html`
+    // inside the Linux namespace, the real content path on macOS.
+    let page_marker = kwe_core::page_url_marker(&web_command);
     let (client_read, browser_write) = socket_pair()?;
     let (browser_read, client_write) = socket_pair()?;
     let mut process = Command::new(&web_command.program);
@@ -1025,7 +1030,7 @@ fn spawn_browser(
             libc::close(browser_write);
         }
     }
-    Ok((child, client_read, client_write))
+    Ok((child, client_read, client_write, page_marker))
 }
 
 /// getTargets until the fixture page target appears (headless=new starts on
@@ -1036,6 +1041,7 @@ fn find_page_target(
     deadline: Instant,
     stderr: &mut StderrRing,
     child: &mut Child,
+    page_marker: &str,
 ) -> Result<String> {
     loop {
         // Keep the diagnostics ring current on every round: a browser that
@@ -1053,7 +1059,7 @@ fn find_page_target(
         if let Some(target) = pages.iter().find(|info| {
             info["url"]
                 .as_str()
-                .is_some_and(|url| url.contains("/wallpaper/index.html"))
+                .is_some_and(|url| url.contains(page_marker))
         }) {
             return Ok(target["targetId"]
                 .as_str()
@@ -1656,7 +1662,7 @@ fn wait_for_probe_frame(client: &mut Client, session_id: &str) -> Result<u32> {
 /// 15 s overall deadline.
 fn probe_browser_version(content: &Path) -> Result<Value> {
     let spec = FrameSpec::new(160, 90)?;
-    let (mut child, read_fd, write_fd) = spawn_browser(content, spec, false)?;
+    let (mut child, read_fd, write_fd, page_marker) = spawn_browser(content, spec, false)?;
     let mut client = Client::new(read_fd, write_fd)?;
     // Same bootstrap diagnostics as the supervised lane (B4c): the probe's
     // failure message carries the browser's last stderr lines.
@@ -1697,6 +1703,7 @@ fn probe_browser_version(content: &Path) -> Result<Value> {
             Instant::now() + STARTUP_DEADLINE,
             &mut stderr,
             &mut child,
+            &page_marker,
         )
         .with_context(|| {
             stderr.drain_from(child.stderr.as_mut());

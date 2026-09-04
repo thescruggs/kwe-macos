@@ -76,5 +76,6 @@ pub use shader_compile_spec::{ENTRY_POINT, OPTIMIZATION_LEVEL, TARGET_ENV, TARGE
 pub use vfs::{AssetCategory, ResolvedAsset, ResolvedPath, Vfs, VfsCaps, VfsError, VfsSource};
 pub use webpreflight::{WebPreflight, preflight_web};
 pub use websandbox::{
-    WebSandboxCommand, chromium_command, sandbox_root, web_preview_command, web_renderer_command,
+    WebSandboxCommand, chromium_command, page_url_marker, sandbox_root, web_preview_command,
+    web_renderer_command,
 };

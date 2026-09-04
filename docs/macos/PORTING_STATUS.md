@@ -26,12 +26,23 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | kwe-cdp | ok | socketpair via kwe-platform |
 | kwe-cli | ok | reports dir via kwe-platform |
 | kwe-daemon | ok | pre_exec containment, rlimit type, peer creds, socket/state dirs via kwe-platform; macOS apply backend `macos_desktop.rs` (CoreGraphics displays + Plasma-script emulation, persisted); macOS worker env passthrough (DYLD_FALLBACK_LIBRARY_PATH, VK_ICD_FILENAMES, VK_DRIVER_FILES, TMPDIR) |
-| kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok | worker-side parent guard added; web renderer still spawns `bwrap` (MP-5b) |
+| kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok | worker-side parent guard; web renderer on macOS runs the browser under `sandbox-exec` (generated SBPL: no writes outside its profile dir, no home reads except the content root, no network unless granted) + Chromium's own sandbox; browser from `KWE_CHROMIUM` or /Applications; `KWE_WEB_SANDBOX=off` for diagnosis |
 | kwe-scene-renderer, kwe-shader-compiler, kwe-vulkan | ok (type-check only) | C build scripts need Xcode CLT on the Mac; VK_KHR_portability_enumeration + VK_KHR_portability_subset enabled when advertised (MoltenVK) |
-| kwe-audio-worker | ok | still PipeWire-only at runtime (MP-6) |
+| kwe-audio-worker | ok | macOS capture = `ffmpeg -f avfoundation` on a loopback device (`KWE_AUDIO_DEVICE`, default "BlackHole 2ch"; `brew install ffmpeg blackhole-2ch`, route output via a Multi-Output Device); Core Audio process tap still planned |
 | kwe-mpv | ok | build.rs adds Homebrew link search |
 
 ## Review log
+
+- 2026-09-04 MP-3 review (independent, sonnet): no show-stoppers. Fixed:
+  desktop-state persistence now uses the crate's `atomic_write` (unique
+  temp, 0600, fsync; `wallpaper.restore` runs without the apply lock so
+  two switches can race), state load opens with `O_NOFOLLOW` and bounds
+  the open descriptor, and the smoke-fallback comment now says a stubbed
+  macOS run must override `--kscreen-doctor-binary` too. Noted, not
+  changed: CoreGraphics display order is re-read per call inside one
+  transaction (verification catches a mid-transaction reorder as a
+  rollback, not a silent wrong-display switch); no macOS stock image
+  (restore is a plugin reset with no image).
 
 - 2026-09-04 MP-2 review (independent, sonnet): no show-stoppers. Fixed:
   audio worker's `pw-record` child had silently gained `PR_SET_NO_NEW_PRIVS`

@@ -5,6 +5,20 @@ use std::path::{Path, PathBuf};
 pub struct WebSandboxCommand {
     pub program: String,
     pub arguments: Vec<String>,
+    /// The page URL the browser was asked to open; the renderer matches
+    /// CDP targets against it (`file:///wallpaper/index.html` inside the
+    /// Linux namespace, the real content path on macOS).
+    pub page_url: String,
+}
+
+/// Marker the renderer looks for in a CDP target URL to recognise the
+/// wallpaper page: the sandbox-side page URL minus the scheme.
+pub fn page_url_marker(command: &WebSandboxCommand) -> String {
+    command
+        .page_url
+        .strip_prefix("file://")
+        .unwrap_or(&command.page_url)
+        .to_string()
 }
 
 pub fn chromium_command(root: &Path, network_allowed: bool) -> WebSandboxCommand {
@@ -36,6 +50,7 @@ pub fn chromium_command(root: &Path, network_allowed: bool) -> WebSandboxCommand
     WebSandboxCommand {
         program: "bwrap".into(),
         arguments,
+        page_url: LINUX_PAGE_URL.into(),
     }
 }
 
@@ -107,6 +122,20 @@ pub fn web_renderer_command(
     width: u32,
     height: u32,
 ) -> WebSandboxCommand {
+    if cfg!(target_os = "macos") {
+        return macos::web_renderer_command(root, network_allowed, width, height);
+    }
+    linux_web_renderer_command(root, network_allowed, width, height)
+}
+
+const LINUX_PAGE_URL: &str = "file:///wallpaper/index.html";
+
+fn linux_web_renderer_command(
+    root: &Path,
+    network_allowed: bool,
+    width: u32,
+    height: u32,
+) -> WebSandboxCommand {
     let mut arguments = sandbox_prefix(root, network_allowed);
     arguments.extend([
         "chromium".into(),
@@ -139,6 +168,7 @@ pub fn web_renderer_command(
     WebSandboxCommand {
         program: "bwrap".into(),
         arguments,
+        page_url: LINUX_PAGE_URL.into(),
     }
 }
 
@@ -203,6 +233,9 @@ pub fn display_binds(
 /// `--no-sandbox`) could not exec chromium at all; this command is what
 /// the manager actually launches.
 pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxCommand {
+    if cfg!(target_os = "macos") {
+        return macos::web_preview_command(root, network_allowed);
+    }
     let mut arguments = sandbox_prefix(root, network_allowed);
     let display = std::env::var("DISPLAY").ok();
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
@@ -236,6 +269,7 @@ pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxComm
     WebSandboxCommand {
         program: "bwrap".into(),
         arguments,
+        page_url: LINUX_PAGE_URL.into(),
     }
 }
 
@@ -248,9 +282,220 @@ pub fn sandbox_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// macOS web sandbox (docs/macos/MacOS-Port-Plan.md, MP-5b, gate G6).
+/// There is no bubblewrap; the browser runs under `sandbox-exec` with a
+/// generated SBPL profile plus Chromium's own macOS sandbox (so no
+/// `--no-sandbox`). The profile is last-match-wins SBPL: allow by default,
+/// then deny every write outside the throwaway profile dir and the
+/// temp/dev trees, deny reading the user's home except the content root,
+/// and deny the network unless the content permission set grants it.
+/// `KWE_WEB_SANDBOX=off` runs the browser bare (diagnosis only).
+///
+/// The browser binary: `KWE_CHROMIUM` (a path), else the first existing of
+/// Chromium.app / Google Chrome.app / Brave / Microsoft Edge under
+/// /Applications or ~/Applications.
+pub mod macos {
+    use std::path::{Path, PathBuf};
+
+    use super::WebSandboxCommand;
+
+    pub const DEFAULT_BROWSER_CANDIDATES: &[&str] = &[
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ];
+
+    /// Resolves the browser binary. `None` when nothing is installed; the
+    /// renderer then fails closed with an actionable diagnostic.
+    pub fn browser_binary() -> Option<PathBuf> {
+        if let Some(explicit) = std::env::var_os("KWE_CHROMIUM") {
+            let path = PathBuf::from(explicit);
+            return path.is_file().then_some(path);
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for candidate in DEFAULT_BROWSER_CANDIDATES {
+            let system = PathBuf::from(candidate);
+            if system.is_file() {
+                return Some(system);
+            }
+            if let Some(home) = &home {
+                let user = home.join(candidate.trim_start_matches('/'));
+                if user.is_file() {
+                    return Some(user);
+                }
+            }
+        }
+        None
+    }
+
+    /// Escapes a path for an SBPL string literal.
+    fn sbpl_string(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// The SBPL profile for one renderer launch. Pure.
+    pub fn profile(
+        root: &Path,
+        profile_dir: &Path,
+        home: Option<&Path>,
+        network_allowed: bool,
+    ) -> String {
+        let mut rules = String::from("(version 1)\n(allow default)\n");
+        // Writes: only the throwaway browser profile, temp trees, and /dev.
+        rules.push_str("(deny file-write*)\n");
+        rules.push_str(&format!(
+            "(allow file-write* (subpath {}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (subpath \"/dev\"))\n",
+            sbpl_string(profile_dir)
+        ));
+        // Reads: the user's home is off limits except the content root.
+        if let Some(home) = home {
+            rules.push_str(&format!("(deny file-read* (subpath {}))\n", sbpl_string(home)));
+        }
+        rules.push_str(&format!(
+            "(allow file-read* (subpath {}) (subpath {}))\n",
+            sbpl_string(root),
+            sbpl_string(profile_dir)
+        ));
+        if !network_allowed {
+            rules.push_str("(deny network*)\n");
+        }
+        rules
+    }
+
+    fn temp_profile_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("kwe-{label}-{}", std::process::id()))
+    }
+
+    pub fn web_renderer_command(
+        root: &Path,
+        network_allowed: bool,
+        width: u32,
+        height: u32,
+    ) -> WebSandboxCommand {
+        let browser = browser_binary()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "chromium-not-found (set KWE_CHROMIUM)".into());
+        let profile_dir = temp_profile_dir("web-profile");
+        let page_url = format!("file://{}/index.html", root.display());
+        let browser_arguments = vec![
+            "--headless=new".into(),
+            "--disable-dev-shm-usage".into(),
+            "--disable-gpu".into(),
+            "--no-first-run".into(),
+            "--no-default-browser-check".into(),
+            "--disable-extensions".into(),
+            "--allow-file-access-from-files".into(),
+            "--enable-unsafe-swiftshader".into(),
+            "--remote-debugging-pipe".into(),
+            format!("--window-size={width},{height}"),
+            format!("--user-data-dir={}", profile_dir.display()),
+            page_url.clone(),
+        ];
+        wrap(browser, browser_arguments, root, &profile_dir, network_allowed, page_url)
+    }
+
+    pub fn web_preview_command(root: &Path, network_allowed: bool) -> WebSandboxCommand {
+        let browser = browser_binary()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "chromium-not-found (set KWE_CHROMIUM)".into());
+        let profile_dir = temp_profile_dir("preview-profile");
+        let page_url = format!("file://{}/index.html", root.display());
+        let browser_arguments = vec![
+            "--disable-dev-shm-usage".into(),
+            "--no-first-run".into(),
+            "--no-default-browser-check".into(),
+            "--disable-extensions".into(),
+            "--allow-file-access-from-files".into(),
+            "--enable-unsafe-swiftshader".into(),
+            format!("--user-data-dir={}", profile_dir.display()),
+            page_url.clone(),
+        ];
+        wrap(browser, browser_arguments, root, &profile_dir, network_allowed, page_url)
+    }
+
+    fn wrap(
+        browser: String,
+        browser_arguments: Vec<String>,
+        root: &Path,
+        profile_dir: &Path,
+        network_allowed: bool,
+        page_url: String,
+    ) -> WebSandboxCommand {
+        if std::env::var("KWE_WEB_SANDBOX").as_deref() == Ok("off") {
+            return WebSandboxCommand {
+                program: browser,
+                arguments: browser_arguments,
+                page_url,
+            };
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let profile = profile(root, profile_dir, home.as_deref(), network_allowed);
+        let mut arguments = vec!["-p".to_string(), profile, browser];
+        arguments.extend(browser_arguments);
+        WebSandboxCommand {
+            program: "/usr/bin/sandbox-exec".into(),
+            arguments,
+            page_url,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn profile_denies_home_and_network_but_allows_content_and_profile() {
+            let text = profile(
+                Path::new("/Users/me/WE/steamapps/workshop/content/431960/1"),
+                Path::new("/var/folders/x/T/kwe-web-profile-1"),
+                Some(Path::new("/Users/me")),
+                false,
+            );
+            assert!(text.starts_with("(version 1)\n(allow default)\n"));
+            assert!(text.contains("(deny file-write*)"));
+            assert!(text.contains("(deny file-read* (subpath \"/Users/me\"))"));
+            assert!(text.contains(
+                "(allow file-read* (subpath \"/Users/me/WE/steamapps/workshop/content/431960/1\")"
+            ));
+            assert!(text.ends_with("(deny network*)\n"));
+            let open = profile(Path::new("/a"), Path::new("/b"), None, true);
+            assert!(!open.contains("network"));
+            assert!(!open.contains("file-read* (subpath \"/Users"));
+        }
+
+        #[test]
+        fn sbpl_strings_escape_quotes_and_backslashes() {
+            assert_eq!(sbpl_string(Path::new("/a \"b\"/c\\d")), "\"/a \\\"b\\\"/c\\\\d\"");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn page_url_marker_strips_the_scheme() {
+        let command = WebSandboxCommand {
+            program: "x".into(),
+            arguments: Vec::new(),
+            page_url: "file:///wallpaper/index.html".into(),
+        };
+        assert_eq!(page_url_marker(&command), "/wallpaper/index.html");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn defaults_to_network_isolation_and_read_only_content() {
         let command = chromium_command(Path::new("/tmp/wallpaper"), false);
@@ -270,6 +515,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn web_renderer_command_carries_the_pinned_flags() {
         let command = web_renderer_command(Path::new("/tmp/wallpaper"), false, 160, 90);
@@ -314,6 +560,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn web_renderer_command_formats_window_size_and_toggles_network() {
         let command = web_renderer_command(Path::new("/tmp/wallpaper"), false, 960, 540);
@@ -324,6 +571,7 @@ mod tests {
         assert!(open.arguments.iter().all(|arg| arg != "--unshare-net"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn web_preview_command_is_windowed_with_the_m2b_isolation() {
         let command = web_preview_command(Path::new("/tmp/wallpaper"), false);
@@ -379,6 +627,7 @@ mod tests {
         assert!(open.arguments.iter().all(|arg| arg != "--unshare-net"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn x11_local_displays_parse_and_remote_displays_do_not() {
         assert_eq!(x11_display_number(":0"), Some(0));
@@ -391,6 +640,7 @@ mod tests {
         assert_eq!(x11_display_number(""), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn display_binds_binds_the_x11_socket_dir_for_a_local_display() {
         assert_eq!(
@@ -401,6 +651,7 @@ mod tests {
         assert!(display_binds(Some("workstation:10.0"), None, None).is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn display_binds_binds_only_the_wayland_socket_file() {
         assert_eq!(
@@ -420,6 +671,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn display_binds_binds_both_displays_and_nothing_without_them() {
         assert_eq!(
@@ -441,6 +693,7 @@ mod tests {
         assert!(display_binds(None, Some("wayland-0"), None).is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn web_preview_command_binds_a_present_wayland_socket_and_skips_a_missing_one() {
         // The production function reads the process environment (set_var is

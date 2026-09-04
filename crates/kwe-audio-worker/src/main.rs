@@ -50,6 +50,7 @@ use kwe_core::analyze_stereo;
 use kwe_input_protocol::AudioFrame;
 use serde_json::{Value, json};
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const EXIT_RESOLUTION_FAILED: i32 = 74;
 const EXIT_CAPTURE_FAILED: i32 = 75;
 
@@ -212,6 +213,7 @@ impl DiagLog {
 /// return the capture target (a node name usable as pw-record `--target`).
 /// Returns `None` when no sink could be resolved; parse/read failures are
 /// errors. `Some(node)` from `--capture-node` bypasses this entirely.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn resolve_capture_target() -> Result<Option<String>> {
     let mut child = Command::new("pw-dump")
         .stdin(Stdio::null())
@@ -426,20 +428,66 @@ struct Capture {
     non_finite_dropped: u64,
 }
 
+/// The capture child for this platform, producing interleaved stereo f32
+/// PCM at `rate` on stdout. Linux: `pw-record --raw` on the PipeWire sink
+/// monitor. macOS (docs/macos/MacOS-Port-Plan.md, MP-6): there is no
+/// PipeWire; `ffmpeg -f avfoundation` reads an AVFoundation audio DEVICE,
+/// which for system audio means a loopback device such as BlackHole
+/// (`brew install blackhole-2ch`, then route output through a Multi-Output
+/// Device). The device name comes from `--capture-node`, else
+/// `KWE_AUDIO_DEVICE`, else "BlackHole 2ch". `KWE_FFMPEG` overrides the
+/// binary. A Core Audio process tap (no third-party driver) is the
+/// planned replacement once it can be tested on hardware.
+fn capture_command(arguments: &Arguments, target: &str) -> Command {
+    if cfg!(target_os = "macos") {
+        let binary = std::env::var_os("KWE_FFMPEG").unwrap_or_else(|| "ffmpeg".into());
+        let mut command = Command::new(binary);
+        command
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-nostdin")
+            .arg("-f")
+            .arg("avfoundation")
+            .arg("-i")
+            .arg(format!(":{target}"))
+            .arg("-f")
+            .arg("f32le")
+            .arg("-ar")
+            .arg(arguments.rate.to_string())
+            .arg("-ac")
+            .arg("2")
+            .arg("-");
+        return command;
+    }
+    let mut command = Command::new("pw-record");
+    command
+        .arg("--raw")
+        .arg("--format")
+        .arg("f32")
+        .arg("--rate")
+        .arg(arguments.rate.to_string())
+        .arg("--channels")
+        .arg("2")
+        .arg("--target")
+        .arg(target)
+        .arg("-");
+    command
+}
+
+/// macOS: the AVFoundation device to capture (see `capture_command`).
+#[cfg(target_os = "macos")]
+fn default_capture_device() -> String {
+    std::env::var("KWE_AUDIO_DEVICE")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "BlackHole 2ch".to_string())
+}
+
 impl Capture {
     fn start(arguments: &Arguments, target: &str) -> Result<Self> {
-        let mut command = Command::new("pw-record");
+        let mut command = capture_command(arguments, target);
         command
-            .arg("--raw")
-            .arg("--format")
-            .arg("f32")
-            .arg("--rate")
-            .arg(arguments.rate.to_string())
-            .arg("--channels")
-            .arg("2")
-            .arg("--target")
-            .arg(target)
-            .arg("-")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -925,6 +973,12 @@ fn main() -> Result<()> {
         exit(EXIT_CAPTURE_FAILED);
     }
     install_term_handler();
+    #[cfg(target_os = "macos")]
+    let target = arguments
+        .capture_node
+        .clone()
+        .unwrap_or_else(default_capture_device);
+    #[cfg(not(target_os = "macos"))]
     let target = match &arguments.capture_node {
         Some(node) => node.clone(),
         None => match resolve_capture_target() {

@@ -85,8 +85,10 @@ pub struct MacDesktopProbe {
 
 impl MacDesktopProbe {
     /// The production probe, or `None` when this build is not macOS or an
-    /// external switch command was configured (integration smokes keep
-    /// driving the stubbed Plasma boundary even on a Mac).
+    /// external switch command was configured. Note for macOS smokes: the
+    /// qdbus fallback also shells out to `--kscreen-doctor-binary` for
+    /// enumeration, so a stubbed run on a Mac must override BOTH
+    /// `--plasma-switch-command` and `--kscreen-doctor-binary`.
     #[allow(unused_variables)]
     pub fn from_config(state_dir: &Path, switch_command: Option<&Path>) -> Option<Self> {
         #[cfg(target_os = "macos")]
@@ -278,20 +280,43 @@ fn unescape_js(value: String) -> String {
 }
 
 fn load_state(path: &Path) -> BTreeMap<String, DesktopRecord> {
-    let Ok(metadata) = fs::metadata(path) else {
-        return BTreeMap::new();
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Same posture as AssignmentStore::load: open without following
+    // symlinks, then judge the OPEN descriptor (no stat/read race).
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(_) => {
+            eprintln!(
+                "event=macos_desktop.state_ignored path={} reason=unopenable",
+                path.display()
+            );
+            return BTreeMap::new();
+        }
     };
-    if !metadata.is_file() || metadata.len() > MAX_STATE_BYTES {
+    let bounded = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_STATE_BYTES => true,
+        _ => false,
+    };
+    if !bounded {
         eprintln!(
             "event=macos_desktop.state_ignored path={} reason=not-a-bounded-file",
             path.display()
         );
         return BTreeMap::new();
     }
-    match fs::read(path)
+    let mut bytes = Vec::new();
+    let read = file
+        .take(MAX_STATE_BYTES)
+        .read_to_end(&mut bytes)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<PersistedState>(&bytes).ok())
-    {
+        .and_then(|_| serde_json::from_slice::<PersistedState>(&bytes).ok());
+    match read {
         Some(state) if state.version == 1 => state.desktops,
         _ => {
             eprintln!(
@@ -303,18 +328,16 @@ fn load_state(path: &Path) -> BTreeMap<String, DesktopRecord> {
     }
 }
 
-fn save_state(path: &Path, desktops: &BTreeMap<String, DesktopRecord>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+/// Persists through the crate's `atomic_write` (unique temp name, 0600,
+/// O_NOFOLLOW, fsync, rename, parent fsync): `wallpaper.restore` does not
+/// take the apply lock, so two switches can race here.
+fn save_state(path: &Path, desktops: &BTreeMap<String, DesktopRecord>) -> anyhow::Result<()> {
     let state = PersistedState {
         version: 1,
         desktops: desktops.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&state)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes)?;
-    fs::rename(&temporary, path)
+    crate::persist::atomic_write(path, &bytes)
 }
 
 #[cfg(target_os = "macos")]
