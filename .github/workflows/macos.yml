@@ -23,6 +23,32 @@ jobs:
         # the hosted runner is unverified); they are built above and run
         # on developer machines until MP-5c settles the CI story.
         run: cargo test --workspace --exclude kwe-scene-renderer
+      - name: Vulkan preflight (MoltenVK on the hosted runner; informational)
+        env:
+          VK_ICD_FILENAMES: /opt/homebrew/opt/molten-vk/share/vulkan/icd.d/MoltenVK_icd.json
+          DYLD_FALLBACK_LIBRARY_PATH: /opt/homebrew/lib
+        run: target/debug/kwe-vulkan || true
+  qt-macos:
+    # The display agent + manager (Kirigami compatibility module) built
+    # against Homebrew Qt, and the daemon + test renderer + agent smoke run
+    # offscreen: real macOS execution of the frame path.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Homebrew dependencies
+        run: brew install pkg-config cmake ninja qt@6 jq
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure and build Qt apps
+        run: |
+          cmake -S . -B build/agent -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6)" -DBUILD_TESTING=OFF
+          cmake --build build/agent --parallel
+      - name: Agent smoke (daemon + test renderer + agent, offscreen)
+        run: scripts/macos/smoke-display-agent.sh build/agent
+      - name: Manager loads
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: build/agent/apps/kwe-manager/kwe-manager --help
   rust-linux-seam-guard:
     # The macOS seams must stay behavior-neutral on Linux.
     runs-on: ubuntu-24.04
