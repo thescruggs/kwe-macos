@@ -2947,7 +2947,11 @@ mod tests {
             Some(WorkerObservation::Failure(FailureKind::ResourceLimit, detail)) => {
                 assert!(detail.contains("resident_set_exceeded"), "{detail}");
             }
-            other => panic!("expected a ResourceLimit observation, got {other:?}"),
+            Some(WorkerObservation::Failure(kind, detail)) => {
+                panic!("expected ResourceLimit, got {kind:?}: {detail}")
+            }
+            Some(WorkerObservation::Progress(_)) => panic!("expected ResourceLimit, got progress"),
+            None => panic!("expected ResourceLimit, observed nothing within 6 s"),
         }
         fs::remove_dir_all(root).unwrap();
     }
