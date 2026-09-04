@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- KDE Wallpaper Engine (macOS fork): user LaunchAgent for the desktop
+     display agent. Installed by packaging/macos/install-dev.sh. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.kde.kwe.display</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@KWE_AGENT@</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@BREW_PREFIX@/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DYLD_FALLBACK_LIBRARY_PATH</key>
+    <string>@BREW_PREFIX@/lib</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>@KWE_LOG_DIR@/kwe-display.log</string>
+  <key>StandardErrorPath</key>
+  <string>@KWE_LOG_DIR@/kwe-display.log</string>
+</dict>
+</plist>

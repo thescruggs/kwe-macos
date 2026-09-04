@@ -150,7 +150,7 @@ inverse. Spikes (§7) precede MP-2.
   - QML skin per G4; launchd activation; reports path; previews;
   - `.app` bundle with embedded QML modules.
   - Accept: gallery, apply, reset, playlist, issue report work end to end.
-- **MP-8 Packaging** — pending
+- **MP-8 Packaging** — partial 2026-09-04: LaunchAgents for daemon + display agent, `install-dev.sh`/`uninstall-dev.sh`, README.macos.md; `.app` bundles, signing/notarization, Homebrew tap still pending
   - `.app` bundles for manager + agent, LaunchAgent, codesign + notarize,
     Homebrew tap formula/cask, uninstall script restoring desktop images;
   - arm64 first; universal binary after MP-9.

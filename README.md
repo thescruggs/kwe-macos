@@ -1,3 +1,5 @@
+> **macOS fork:** this repository is the macOS port. Start with [README.macos.md](README.macos.md); the text below is the upstream Linux/Plasma README kept for reference.
+
 # KDE Wallpaper Engine
 
 KDE Wallpaper Engine is an experimental KDE Plasma 6 application for browsing,
