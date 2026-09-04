@@ -26,15 +26,18 @@ pub type RlimitResource = libc::__rlimit_resource_t;
 pub type RlimitResource = libc::c_int;
 
 /// Address-space limit resource. Enforced on Linux. On macOS `RLIMIT_AS`
-/// exists but the kernel does not enforce it; callers that need a memory
-/// bound on Darwin must pair the limit with a resident-set watchdog.
+/// exists in the headers but `setrlimit` REFUSES it with `EINVAL` (measured
+/// on macOS 14) and the kernel would not enforce it anyway; callers must
+/// skip it there (`address_space_limit_enforced`) and pair containment
+/// with a resident-set watchdog.
 pub const RLIMIT_AS: RlimitResource = libc::RLIMIT_AS as RlimitResource;
 pub const RLIMIT_FSIZE: RlimitResource = libc::RLIMIT_FSIZE as RlimitResource;
 pub const RLIMIT_NOFILE: RlimitResource = libc::RLIMIT_NOFILE as RlimitResource;
 pub const RLIMIT_NPROC: RlimitResource = libc::RLIMIT_NPROC as RlimitResource;
 pub const RLIMIT_CORE: RlimitResource = libc::RLIMIT_CORE as RlimitResource;
 
-/// Whether the kernel enforces `RLIMIT_AS` on this platform.
+/// Whether `RLIMIT_AS` can be set and is enforced on this platform
+/// (Linux yes; Darwin refuses the call).
 pub const fn address_space_limit_enforced() -> bool {
     cfg!(target_os = "linux")
 }
@@ -486,7 +489,16 @@ mod tests {
                 "child_pre_exec",
                 Box::new(move || unsafe { child_pre_exec(parent, libc::SIGKILL) }),
             ),
-            ("RLIMIT_AS", Box::new(move || set_limit(RLIMIT_AS, 4096 * mib))),
+            (
+                "RLIMIT_AS",
+                Box::new(move || {
+                    if address_space_limit_enforced() {
+                        set_limit(RLIMIT_AS, 4096 * mib)
+                    } else {
+                        Ok(())
+                    }
+                }),
+            ),
             ("RLIMIT_FSIZE", Box::new(move || set_limit(RLIMIT_FSIZE, 160 * mib))),
             ("RLIMIT_NOFILE", Box::new(|| set_limit(RLIMIT_NOFILE, 256))),
             ("RLIMIT_NPROC", Box::new(|| set_limit(RLIMIT_NPROC, 1024))),

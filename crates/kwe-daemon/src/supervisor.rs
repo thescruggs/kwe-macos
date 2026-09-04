@@ -2422,7 +2422,12 @@ pub(crate) fn build_identity(config: &SupervisorConfig) -> String {
 
 pub(crate) fn apply_resource_limits(limits: RendererResourceLimits) -> io::Result<()> {
     let mib = 1024_u64 * 1024;
-    set_resource_limit("RLIMIT_AS", kwe_platform::RLIMIT_AS, limits.address_space_mib * mib)?;
+    // Darwin refuses RLIMIT_AS outright (setrlimit -> EINVAL, measured on
+    // the macos-14 runner) and would not enforce it anyway; the resident-set
+    // watchdog (plan MP-9) is the macOS substitute. Linux enforces it.
+    if kwe_platform::address_space_limit_enforced() {
+        set_resource_limit("RLIMIT_AS", kwe_platform::RLIMIT_AS, limits.address_space_mib * mib)?;
+    }
     set_resource_limit("RLIMIT_FSIZE", kwe_platform::RLIMIT_FSIZE, limits.file_size_mib * mib)?;
     set_resource_limit("RLIMIT_NOFILE", kwe_platform::RLIMIT_NOFILE, limits.open_files)?;
     set_resource_limit("RLIMIT_NPROC", kwe_platform::RLIMIT_NPROC, limits.processes)?;

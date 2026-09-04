@@ -535,7 +535,11 @@ fn resolve_beside_self() -> Option<PathBuf> {
 /// deliberately NOT set here — see the module doc's containment section.
 fn apply_helper_resource_limits() -> std::io::Result<()> {
     const MIB: u64 = 1024 * 1024;
-    set_resource_limit(kwe_platform::RLIMIT_AS, 512 * MIB)?;
+    // Darwin refuses RLIMIT_AS (EINVAL) and never enforces it; see
+    // kwe_platform::address_space_limit_enforced.
+    if kwe_platform::address_space_limit_enforced() {
+        set_resource_limit(kwe_platform::RLIMIT_AS, 512 * MIB)?;
+    }
     set_resource_limit(kwe_platform::RLIMIT_FSIZE, 16 * MIB)?;
     set_resource_limit(kwe_platform::RLIMIT_NOFILE, 32)?;
     Ok(())

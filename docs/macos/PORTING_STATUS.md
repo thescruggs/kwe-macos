@@ -118,10 +118,12 @@ The first real macOS execution. Fixed from its logs so far:
 `WId` cast in the AppKit shim; scan tests comparing `/var` vs
 `/private/var` temp paths; `/bin/false` and systemd-specific assertions in
 daemon tests. Whole Rust workspace **builds** on macOS with Homebrew
-shaderc/mpv/MoltenVK. Open at the time of writing: every worker spawn on
-the runner fails in the pre-exec containment with `EINVAL`
-(renderers quarantined, agent smoke sees no frame); the launch error now
-names the failing `setrlimit` resource so the next run pins it down.
+shaderc/mpv/MoltenVK. Then pinned by a per-step diagnostic test: Darwin refuses
+`setrlimit(RLIMIT_AS)` with `EINVAL`, which failed every worker spawn
+(renderers quarantined, agent smoke saw no frame). The daemon and the
+shader helper now skip `RLIMIT_AS` on macOS (never enforced there; the
+resident-set watchdog in MP-9 is the substitute) and keep the other four
+limits.
 
 ## Runtime status on a Mac
 
@@ -141,7 +143,7 @@ build/agent/apps/kwe-display-macos/kwe-display-macos --cover-all
 
 - No `PR_SET_PDEATHSIG`: workers arm a kqueue guard on their parent pid.
 - No `PR_SET_NO_NEW_PRIVS`.
-- `RLIMIT_AS` is set but unenforced by XNU; RSS watchdog pending (MP-9).
+- `RLIMIT_AS` is refused by XNU (`EINVAL`) and skipped; RSS watchdog pending (MP-9).
 - `pipe`/`socketpair` + `fcntl(FD_CLOEXEC)` instead of atomic `*_CLOEXEC`.
 - Paths: socket `~/Library/Application Support/kwe/daemon-v1.sock`,
   state `~/Library/Application Support/kwe/state`, reports
