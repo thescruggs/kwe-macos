@@ -1402,14 +1402,18 @@ impl WebWorker {
         let browser =
             match BrowserSession::start(&self.content, self.spec, self.arguments.allow_network) {
                 Ok(session) => session,
-                Err(first) => {
-                    // One bounded retry: a browser's first-ever launch on a
-                    // machine can fail its own first-run setup (measured on
-                    // macOS: Keystone/backup-exclusion XPC on a fresh
-                    // account) and the daemon never retries a refusal.
+                // One bounded retry, and only for a browser that never
+                // reached its page (died or produced no target): a
+                // browser's first-ever launch on a machine can fail its own
+                // first-run setup (measured on macOS: backup-exclusion XPC
+                // on a fresh account) and the daemon never retries a
+                // refusal. Attach/screencast failures on a live browser
+                // (a busy page) are the content's fault and are not retried.
+                Err(first) if format!("{first:#}").contains("browser bootstrap failed") => {
                     eprintln!("event=renderer.web.bootstrap_retry detail={first:#}");
                     BrowserSession::start(&self.content, self.spec, self.arguments.allow_network)?
                 }
+                Err(error) => return Err(error),
             };
         self.browser = Some(browser);
         self.capture_loop()
