@@ -51,9 +51,13 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
 1. Desktop window sits under Finder icons and survives wake/Space change
    (agent re-asserts level every 5 s).
 2. Mouse-moved global monitor works without an Accessibility prompt.
-3. `sandbox-exec` profile lets Chromium bootstrap; if web wallpapers fail,
-   bisect with `KWE_WEB_SANDBOX=off` (open question: whether Seatbelt's
-   `network*` deny also blocks Chromium's own new local IPC sockets).
+3. `sandbox-exec` profile lets Chromium bootstrap. **CI answered half of
+   this (run 33837711208):** unsandboxed, Google Chrome headless renders a
+   web wallpaper end to end on the macOS runner (frames advancing over the
+   CDP pipe); with the first profile Chrome died binding its own Unix
+   sockets under `$TMPDIR` (`(deny network*)` covers Unix domain sockets).
+   The profile now re-allows `(local unix-socket) (remote unix-socket)`;
+   `scripts/macos/smoke-web-macos.sh` reports both lanes on every CI run.
 4. MoltenVK: `kwe-vulkan` lists the Apple GPU; scene corpus behaviour.
 5. ffmpeg/BlackHole capture feeds audio-reactive scenes.
 6. Homebrew Qt: `cmake -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)` configures

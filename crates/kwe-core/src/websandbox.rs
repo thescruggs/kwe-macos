@@ -389,12 +389,14 @@ pub mod macos {
             allowed_reads.push(format!("(subpath {})", sbpl_string(bundle)));
         }
         rules.push_str(&format!("(allow file-read* {})\n", allowed_reads.join(" ")));
-        // Network: TCP/UDP off unless the content grant allows it. Whether
-        // Seatbelt's `network*` also covers the browser's own newly created
-        // local IPC sockets is a hardware-verify item (docs/macos/
-        // PORTING_STATUS.md); KWE_WEB_SANDBOX=off bisects it.
+        // Network: IP networking off unless the content grant allows it.
+        // Seatbelt's `network*` also covers Unix domain sockets, and the
+        // browser binds its own IPC/crash-handler sockets under $TMPDIR
+        // (measured on macOS 14: "Failed to bind() /var/folders/..." and a
+        // backend_reject), so local sockets are re-allowed after the deny.
         if !network_allowed {
             rules.push_str("(deny network*)\n");
+            rules.push_str("(allow network* (local unix-socket) (remote unix-socket))\n");
         }
         rules
     }
@@ -504,7 +506,7 @@ pub mod macos {
             assert!(text.starts_with("(version 1)\n(allow default)\n"));
             assert!(text.contains("(deny file-write*)"));
             assert!(text.contains("(deny file-read* (subpath \"/Users/me\"))"));
-            assert!(text.ends_with("(deny network*)\n"));
+            assert!(text.contains("(deny network*)\n(allow network* (local unix-socket) (remote unix-socket))\n"));
             let open = profile(Path::new("/a"), Path::new("/b"), None, None, true);
             assert!(!open.contains("network"));
             assert!(!open.contains("file-read* (subpath \"/Users"));
