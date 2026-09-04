@@ -26,7 +26,7 @@ every macOS-facing commit. Plan: `MacOS-Port-Plan.md`.
 | kwe-cdp | ok | socketpair via kwe-platform |
 | kwe-cli | ok | reports dir via kwe-platform |
 | kwe-daemon | ok | pre_exec containment, rlimit type, peer creds, socket/state dirs via kwe-platform; macOS apply backend `macos_desktop.rs` (CoreGraphics displays + Plasma-script emulation, persisted); macOS worker env passthrough (DYLD_FALLBACK_LIBRARY_PATH, VK_ICD_FILENAMES, VK_DRIVER_FILES, TMPDIR) |
-| kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok | worker-side parent guard; web renderer on macOS runs the browser under `sandbox-exec` (generated SBPL: no writes outside its profile dir, no home reads except the content root, no network unless granted) + Chromium's own sandbox; browser from `KWE_CHROMIUM` or /Applications; `KWE_WEB_SANDBOX=off` for diagnosis |
+| kwe-test-renderer, kwe-video-renderer, kwe-web-renderer | ok; **web verified on the macOS runner** | worker-side parent guard; web renderer on macOS runs the browser under `sandbox-exec` with `--no-sandbox` (generated SBPL: no writes outside its profile dir/temp, no reads under /Users except content root, worker home, browser bundle; IP networking denied unless granted, Unix sockets allowed); browser from `KWE_CHROMIUM` or /Applications; `KWE_WEB_SANDBOX=off|net-only|no-home` for diagnosis |
 | kwe-scene-renderer, kwe-shader-compiler, kwe-vulkan | ok (type-check only) | C build scripts need Xcode CLT on the Mac; VK_KHR_portability_enumeration + VK_KHR_portability_subset enabled when advertised (MoltenVK) |
 | kwe-audio-worker | ok | macOS capture = `ffmpeg -f avfoundation` on a loopback device (`KWE_AUDIO_DEVICE`, default "BlackHole 2ch"; `brew install ffmpeg blackhole-2ch`, route output via a Multi-Output Device); Core Audio process tap still planned |
 | kwe-mpv | ok | build.rs adds Homebrew link search |
@@ -51,13 +51,22 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
 1. Desktop window sits under Finder icons and survives wake/Space change
    (agent re-asserts level every 5 s).
 2. Mouse-moved global monitor works without an Accessibility prompt.
-3. `sandbox-exec` profile lets Chromium bootstrap. **CI answered half of
-   this (run 33837711208):** unsandboxed, Google Chrome headless renders a
-   web wallpaper end to end on the macOS runner (frames advancing over the
-   CDP pipe); with the first profile Chrome died binding its own Unix
-   sockets under `$TMPDIR` (`(deny network*)` covers Unix domain sockets).
-   The profile now re-allows `(local unix-socket) (remote unix-socket)`;
-   `scripts/macos/smoke-web-macos.sh` reports both lanes on every CI run.
+3. `sandbox-exec` profile lets Chromium bootstrap — **verified on the
+   macOS runner (run 33839294271): the production profile renders a web
+   wallpaper end to end** (Google Chrome headless, `--no-sandbox` under
+   the outer Seatbelt profile exactly as `--no-sandbox` under bwrap on
+   Linux; frames advancing over the CDP pipe). Findings on the way: SBPL
+   `network*` covers Unix domain sockets (now re-allowed; IP stays
+   denied); Chromium's nested sandbox cannot initialise inside an outer
+   profile; the read-deny targets `/Users` (the worker's HOME is a
+   daemon-created per-launch directory, re-allowed) with parent-directory
+   metadata allowed for path resolution; the browser's cwd is the content
+   root. Two earlier runs saw an intermittent first-start failure ("Failed
+   to get the path for 1001") under the same rules; the smoke now runs the
+   production lane three times and dumps Seatbelt denials on failure so
+   the flake rate and the denied path are measured on every CI run. Note
+   a bootstrap refusal (exit 73) is not retried by the daemon (B4
+   semantics); Apply again if it happens.
 4. MoltenVK: `kwe-vulkan` lists the Apple GPU; scene corpus behaviour.
 5. ffmpeg/BlackHole capture feeds audio-reactive scenes.
 6. Homebrew Qt: `cmake -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)` configures

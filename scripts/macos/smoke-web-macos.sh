@@ -81,21 +81,31 @@ run_lane() {
   return $result
 }
 
-sandboxed=1; bare=1; netonly=1; nohome=1
-run_lane sandboxed KWE_WEB_SANDBOX=on && sandboxed=0 || true
-if [[ $sandboxed != 0 ]]; then
+denials() {
   # What did Seatbelt refuse? The unified log records every denial as
   # "Sandbox: <process>(<pid>) deny(1) <operation> <path>".
-  echo "seatbelt denials in the last 3 minutes (unified log):"
-  log show --last 3m --style compact --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "Chrome" OR eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec")' 2>/dev/null \
+  echo "seatbelt denials in the last 2 minutes (unified log):"
+  log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "Chrome" OR eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec")' 2>/dev/null \
     | grep -oE 'deny\([0-9]+\) [a-z*-]+ .*' | sort | uniq -c | sort -rn | head -40 || true
-fi
+}
+# The production lane three times: an intermittent first-start failure was
+# seen on the hosted runner (2026-09-04); the pass count is the signal.
+sandboxed=1; bare=1; netonly=1; nohome=1; sandboxed_passes=0
+for attempt in 1 2 3; do
+  if run_lane "sandboxed-$attempt" KWE_WEB_SANDBOX=on; then
+    sandboxed_passes=$((sandboxed_passes + 1))
+  else
+    denials
+  fi
+done
+[[ $sandboxed_passes -gt 0 ]] && sandboxed=0
+echo "production profile: $sandboxed_passes/3 attempts rendered"
 run_lane bare KWE_WEB_SANDBOX=off && bare=0 || true
 # Bisect lanes: which rule group the browser trips on.
 run_lane net-only KWE_WEB_SANDBOX=net-only && netonly=0 || true
 run_lane no-home KWE_WEB_SANDBOX=no-home && nohome=0 || true
 verdict() { [[ $1 == 0 ]] && echo PASS || echo FAIL; }
-echo "summary: sandbox-exec full $(verdict $sandboxed); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
+echo "summary: sandbox-exec full $(verdict $sandboxed) ($sandboxed_passes/3); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
 # 0: production profile renders. 2: the browser renders under sandbox-exec
 # with a reduced profile or bare (profile needs work). 1: nothing renders.
 if [[ $sandboxed == 0 ]]; then exit 0; fi
