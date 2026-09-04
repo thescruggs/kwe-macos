@@ -385,6 +385,13 @@ mod coregraphics {
             display_count: *mut u32,
         ) -> CGError;
         fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    }
+
+    // Declared in CoreGraphics headers but exported by ColorSync (the CI
+    // link on macos-14 fails without it: "_CGDisplayCreateUUIDFromDisplayID
+    // undefined for architecture arm64").
+    #[link(name = "ColorSync", kind = "framework")]
+    unsafe extern "C" {
         fn CGDisplayCreateUUIDFromDisplayID(display: CGDirectDisplayID) -> CFTypeRef;
     }
 
