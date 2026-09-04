@@ -41,7 +41,14 @@ const APP_UPDATE_BUDGET: Duration = Duration::from_secs(60 * 60);
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const CURL_BUDGET_SECONDS: u32 = 30;
 const MAX_HTTP_BYTES: usize = 4 * 1024 * 1024;
-const WEB_API: &str = "https://api.steampowered.com";
+const DEFAULT_WEB_API: &str = "https://api.steampowered.com";
+const PAGINATION_BUDGET: Duration = Duration::from_secs(10 * 60);
+
+/// The Steam Web API base; `KWE_STEAM_WEB_API` overrides it (tests point
+/// it at an unreachable address to exercise the offline path).
+fn web_api() -> String {
+    std::env::var("KWE_STEAM_WEB_API").unwrap_or_else(|_| DEFAULT_WEB_API.to_string())
+}
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
@@ -131,8 +138,9 @@ pub fn parse_item_id(text: &str) -> Option<String> {
     valid.then_some(candidate)
 }
 
-/// Steam account names: letters, digits, `_`, `.`, `-`, 1..=64 chars —
-/// the only thing that ever reaches a SteamCMD command line besides ids.
+/// Steam account names: letters, digits, `_`, `.`, `-`, 1..=64 chars.
+/// (The other values that reach SteamCMD's argv are ids, gated by
+/// `parse_item_id`, and the sync root, gated by `validate_root`.)
 pub fn validate_steam_user(user: &str) -> Result<()> {
     let ok = !user.is_empty()
         && user.len() <= 64
@@ -141,6 +149,17 @@ pub fn validate_steam_user(user: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
     if !ok {
         bail!("--user must be 1..=64 letters, digits, '_', '.', or '-' (the Steam account name, not the profile name)");
+    }
+    Ok(())
+}
+
+/// SteamCMD treats any argv token starting with `+` as a command, so a
+/// root path that starts with `+` could be read as one; refuse it (and
+/// control characters) before it reaches the command line.
+pub fn validate_root(root: &Path) -> Result<()> {
+    let text = root.to_string_lossy();
+    if text.is_empty() || text.starts_with('+') || text.chars().any(char::is_control) {
+        bail!("--root must be a plain absolute path that does not start with '+' ({text:?})");
     }
     Ok(())
 }
@@ -212,7 +231,16 @@ pub fn manifest_subscriptions(root: &Path) -> Result<Option<BTreeSet<String>>> {
 // Steam Web API (key-less unless noted) through curl, bounded
 // ---------------------------------------------------------------------------
 
-fn http_post_form(url: &str, fields: &[(String, String)]) -> Result<String> {
+/// One bounded form POST through curl. `secret` is a field whose value
+/// must not appear in the process table: it is written to curl's stdin
+/// and referenced as `name@-`. The body is read through a capped reader
+/// (curl's `--max-filesize` does not bound chunked replies).
+fn http_post_form(
+    url: &str,
+    fields: &[(String, String)],
+    secret: Option<(&str, &str)>,
+) -> Result<String> {
+    use std::io::Write;
     let mut command = Command::new("curl");
     command
         .arg("-sS")
@@ -224,27 +252,46 @@ fn http_post_form(url: &str, fields: &[(String, String)]) -> Result<String> {
     for (name, value) in fields {
         command.arg("--data-urlencode").arg(format!("{name}={value}"));
     }
+    if let Some((name, _)) = secret {
+        command.arg("--data-urlencode").arg(format!("{name}@-"));
+    }
     command
         .arg(url)
-        .stdin(Stdio::null())
+        .stdin(if secret.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .with_context(|| format!("run curl for {url} (is curl installed?)"))?;
-    let body = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "{url}: {} {}",
-            output.status,
-            error.trim().chars().take(200).collect::<String>()
-        );
+    if let (Some((_, value)), Some(mut stdin)) = (secret, child.stdin.take()) {
+        let _ = stdin.write_all(value.as_bytes());
+        drop(stdin);
     }
+    let stdout = child.stdout.take().context("curl stdout")?;
+    let stderr = child.stderr.take().context("curl stderr")?;
+    let body_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.take(MAX_HTTP_BYTES as u64 + 1).read_to_end(&mut buffer);
+        buffer
+    });
+    let error_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr.take(16 * 1024).read_to_end(&mut buffer);
+        buffer
+    });
+    let status = child.wait().context("wait for curl")?;
+    let body = body_reader.join().unwrap_or_default();
+    let errors = error_reader.join().unwrap_or_default();
     if body.len() > MAX_HTTP_BYTES {
         bail!("{url}: reply larger than {MAX_HTTP_BYTES} bytes");
     }
-    Ok(body)
+    if !status.success() {
+        bail!(
+            "{url}: {status} {}",
+            String::from_utf8_lossy(&errors).trim().chars().take(200).collect::<String>()
+        );
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Parses `GetCollectionDetails` into the collection's child item ids.
@@ -326,11 +373,12 @@ fn fetch_collection(collection: &str) -> Result<Vec<String>> {
     let id = parse_item_id(collection)
         .ok_or_else(|| anyhow!("--collection {collection:?} is not a Workshop id or URL"))?;
     let body = http_post_form(
-        &format!("{WEB_API}/ISteamRemoteStorage/GetCollectionDetails/v1/?format=json"),
+        &format!("{}/ISteamRemoteStorage/GetCollectionDetails/v1/?format=json", web_api()),
         &[
             ("collectioncount".into(), "1".into()),
             ("publishedfileids[0]".into(), id),
         ],
+        None,
     )?;
     parse_collection_children(&body)
 }
@@ -341,8 +389,9 @@ fn fetch_details(ids: &[String]) -> Result<(Vec<(String, String)>, Vec<String>)>
         fields.push((format!("publishedfileids[{index}]"), id.clone()));
     }
     let body = http_post_form(
-        &format!("{WEB_API}/ISteamRemoteStorage/GetPublishedFileDetails/v1/?format=json"),
+        &format!("{}/ISteamRemoteStorage/GetPublishedFileDetails/v1/?format=json", web_api()),
         &fields,
+        None,
     )?;
     parse_published_details(&body)
 }
@@ -351,15 +400,22 @@ fn fetch_subscriptions(api_key: &str, steamid: &str) -> Result<Vec<String>> {
     validate_steamid(steamid)?;
     let mut ids = Vec::new();
     let mut page = 1_u32;
+    let deadline = Instant::now() + PAGINATION_BUDGET;
     loop {
+        if Instant::now() >= deadline {
+            bail!("subscription listing exceeded its {}s budget", PAGINATION_BUDGET.as_secs());
+        }
         let body = http_post_form(
-            &format!("{WEB_API}/ISteamRemoteStorage/EnumerateUserSubscribedFiles/v1/?format=json"),
+            &format!(
+                "{}/ISteamRemoteStorage/EnumerateUserSubscribedFiles/v1/?format=json",
+                web_api()
+            ),
             &[
-                ("key".into(), api_key.to_string()),
                 ("steamid".into(), steamid.to_string()),
                 ("appid".into(), WALLPAPER_ENGINE_APP_ID.into()),
                 ("page".into(), page.to_string()),
             ],
+            Some(("key", api_key)),
         )
         .map_err(|error| {
             anyhow!(
@@ -373,7 +429,8 @@ fn fetch_subscriptions(api_key: &str, steamid: &str) -> Result<Vec<String>> {
             break;
         }
         ids.extend(batch);
-        if ids.len() as u64 >= total || page >= 200 {
+        // A missing `total` (0) keeps paging until an empty page.
+        if (total > 0 && ids.len() as u64 >= total) || page >= 200 {
             break;
         }
         page += 1;
@@ -438,6 +495,12 @@ pub struct SteamcmdOutcome {
     pub app_error: Option<String>,
 }
 
+/// Whether captured SteamCMD output hit the capture cap (trailing items
+/// then look unreported; the report says so instead of "neither").
+fn output_truncated(output: &str) -> bool {
+    output.len() >= MAX_OUTPUT_BYTES
+}
+
 /// Parses SteamCMD's console output. Lines seen in the wild:
 /// `Success. Downloaded item 123 to "/path" (456 bytes)`,
 /// `ERROR! Download item 123 failed (Failure).`,
@@ -446,8 +509,18 @@ pub struct SteamcmdOutcome {
 /// `Error! App '431960' state is 0x202 after update job.`
 pub fn parse_steamcmd_output(output: &str) -> SteamcmdOutcome {
     let mut outcome = SteamcmdOutcome::default();
+    // A `FAILED (...)` line counts as a LOGIN failure only while the login
+    // step is in progress (after "Logging in user", before its "OK").
+    let mut logging_in = false;
     for raw in output.lines() {
         let line = raw.trim();
+        if line.starts_with("Logging in user") {
+            logging_in = !line.ends_with("OK");
+            continue;
+        }
+        if logging_in && (line == "OK" || line.starts_with("Logged in OK") || line.starts_with("Waiting for")) {
+            logging_in = false;
+        }
         if let Some(rest) = line.strip_prefix("Success. Downloaded item ") {
             let mut parts = rest.splitn(2, " to ");
             let id = parts.next().unwrap_or("").trim().to_string();
@@ -475,8 +548,12 @@ pub fn parse_steamcmd_output(output: &str) -> SteamcmdOutcome {
             if parse_item_id(&id).is_some() {
                 outcome.failed.push((id, if reason.is_empty() { "failure".into() } else { reason }));
             }
-        } else if line.starts_with("FAILED (") || line.contains("Login Failure") || line.starts_with("FAILED login") {
+        } else if (logging_in && line.starts_with("FAILED"))
+            || line.contains("Login Failure")
+            || line.starts_with("FAILED login")
+        {
             outcome.login_failure = Some(line.chars().take(160).collect());
+            logging_in = false;
         } else if line.contains("fully installed") {
             outcome.app_installed = true;
         } else if line.starts_with("Error! App") || line.starts_with("ERROR! App") {
@@ -539,6 +616,7 @@ fn run_steamcmd(steamcmd: &Path, args: &[String], budget: Duration) -> Result<St
 
 pub fn run(options: &SyncOptions) -> Result<SyncReport> {
     validate_steam_user(&options.steam_user)?;
+    validate_root(&options.root)?;
     let mut report = SyncReport::default();
     let mut wanted: BTreeSet<String> = BTreeSet::new();
 
@@ -558,19 +636,31 @@ pub fn run(options: &SyncOptions) -> Result<SyncReport> {
             }
         }
     }
+    // A failing secondary source is reported and skipped, never allowed
+    // to discard the ids other sources already contributed.
     if let (Some(key), Some(steamid)) = (&options.api_key, &options.steamid) {
-        let ids = fetch_subscriptions(key, steamid)?;
-        report
-            .sources
-            .push(format!("web api subscriptions for {steamid}: {} items", ids.len()));
-        wanted.extend(ids);
+        match fetch_subscriptions(key, steamid) {
+            Ok(ids) => {
+                report
+                    .sources
+                    .push(format!("web api subscriptions for {steamid}: {} items", ids.len()));
+                wanted.extend(ids);
+            }
+            Err(error) => report.sources.push(format!("web api subscriptions FAILED: {error:#}")),
+        }
     }
     for collection in &options.collections {
-        let ids = fetch_collection(collection)?;
-        report
-            .sources
-            .push(format!("collection {collection}: {} items", ids.len()));
-        wanted.extend(ids);
+        match fetch_collection(collection) {
+            Ok(ids) => {
+                report
+                    .sources
+                    .push(format!("collection {collection}: {} items", ids.len()));
+                wanted.extend(ids);
+            }
+            Err(error) => report
+                .sources
+                .push(format!("collection {collection} FAILED: {error:#}")),
+        }
     }
     for item in &options.items {
         let id = parse_item_id(item)
@@ -630,16 +720,24 @@ pub fn run(options: &SyncOptions) -> Result<SyncReport> {
                 },
             ));
         }
+        if options.assets {
+            report.assets = Some(Ok(format!(
+                "dry run: would install the app's Windows build under {}",
+                root.join("steamapps/common/wallpaper_engine").display()
+            )));
+        }
         return Ok(report);
     }
 
-    for chunk in ids.chunks(IDS_PER_STEAMCMD_RUN) {
+    let chunks: Vec<&[String]> = ids.chunks(IDS_PER_STEAMCMD_RUN).collect();
+    for (index, chunk) in chunks.iter().enumerate() {
         let args = steamcmd_download_args(&root, &options.steam_user, chunk);
         let output = run_steamcmd(&options.steamcmd, &args, STEAMCMD_RUN_BUDGET)?;
         let outcome = parse_steamcmd_output(&output);
+        let truncated = output_truncated(&output);
         if let Some(failure) = outcome.login_failure {
             report.login_failure = Some(failure);
-            for id in chunk {
+            for id in chunk.iter() {
                 report.items.push((
                     id.clone(),
                     ItemOutcome::Failed {
@@ -647,9 +745,21 @@ pub fn run(options: &SyncOptions) -> Result<SyncReport> {
                     },
                 ));
             }
+            // Every later batch is reported too: the summary must show
+            // the full scope of what was not attempted.
+            for later in &chunks[index + 1..] {
+                for id in later.iter() {
+                    report.items.push((
+                        id.clone(),
+                        ItemOutcome::Failed {
+                            reason: "not attempted: earlier steamcmd login failure".into(),
+                        },
+                    ));
+                }
+            }
             break;
         }
-        for id in chunk {
+        for id in chunk.iter() {
             if let Some((_, path)) = outcome.downloaded.iter().find(|(done, _)| done == id) {
                 report.items.push((id.clone(), ItemOutcome::Downloaded { path: path.clone() }));
             } else if let Some((_, reason)) = outcome.failed.iter().find(|(failed, _)| failed == id) {
@@ -658,7 +768,11 @@ pub fn run(options: &SyncOptions) -> Result<SyncReport> {
                 report.items.push((
                     id.clone(),
                     ItemOutcome::Failed {
-                        reason: "steamcmd reported neither success nor failure".into(),
+                        reason: if truncated {
+                            "steamcmd output exceeded the capture cap; outcome unknown".into()
+                        } else {
+                            "steamcmd reported neither success nor failure".into()
+                        },
                     },
                 ));
             }
@@ -805,6 +919,9 @@ mod tests {
         assert!(outcome.login_failure.is_none());
         let login = parse_steamcmd_output("Logging in user 'me' to Steam Public...\nFAILED (Cached credentials not found)\n");
         assert_eq!(login.login_failure.as_deref(), Some("FAILED (Cached credentials not found)"));
+        // A FAILED line after a successful login is not a login failure.
+        let later = parse_steamcmd_output("Logging in user 'me' to Steam Public...OK\nFAILED (Timeout)\n");
+        assert!(later.login_failure.is_none());
     }
 
     #[test]
@@ -860,7 +977,13 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let root = dir.join("sync-root");
+        // Deterministic: point the Web API at an unreachable address so
+        // validation fails and the download path always runs.
+        // SAFETY: test-only process-global env; no other test reads it
+        // concurrently in a way that matters.
+        unsafe { std::env::set_var("KWE_STEAM_WEB_API", "http://127.0.0.1:1") };
+        // The macOS default root contains a space; keep that shape.
+        let root = dir.join("sync root");
         let options = SyncOptions {
             steam_user: "me".into(),
             steamcmd: stub,
@@ -886,12 +1009,8 @@ mod tests {
         assert_eq!(dry_ids, vec!["100", "200", "300"]);
         assert!(dry.sources[0].contains("2 subscribed items"));
 
-        let report = run(&SyncOptions {
-            // curl to an unreachable host keeps the test offline-safe.
-            ..options
-        });
-        // Whether validation ran or not, the stub outcome per id is fixed.
-        let report = report.unwrap();
+        let report = run(&options).unwrap();
+        assert!(report.sources.iter().any(|s| s.contains("item validation skipped")));
         let outcome = |id: &str| {
             report
                 .items
@@ -899,14 +1018,13 @@ mod tests {
                 .find(|(item, _)| item == id)
                 .map(|(_, outcome)| outcome.clone())
         };
-        if matches!(outcome("100"), Some(ItemOutcome::Downloaded { .. })) {
-            assert!(root.join("steamapps/workshop/content/431960/100").is_dir());
-            assert!(matches!(outcome("200"), Some(ItemOutcome::Failed { .. })));
-        } else {
-            // Steam answered the validation call and knows none of the
-            // synthetic ids: all skipped, nothing downloaded.
-            assert!(report.items.iter().all(|(_, o)| matches!(o, ItemOutcome::Skipped { .. })));
-        }
+        assert!(matches!(outcome("100"), Some(ItemOutcome::Downloaded { .. })));
+        assert!(matches!(outcome("300"), Some(ItemOutcome::Downloaded { .. })));
+        assert!(matches!(outcome("200"), Some(ItemOutcome::Failed { .. })));
+        assert!(root.join("steamapps/workshop/content/431960/100").is_dir());
+        assert_eq!(report.downloaded(), 2);
+        assert_eq!(report.failed(), 1);
+        assert!(validate_root(Path::new("+login x")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

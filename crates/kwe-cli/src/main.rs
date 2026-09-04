@@ -392,9 +392,16 @@ fn main() -> Result<()> {
                 // the Workshop manifest.
                 let roots = default_steam_roots();
                 let (libraries, _) = kwe_core::discover_libraries(&roots);
+                // The sync root's own manifest (written by SteamCMD as it
+                // downloads) is never a subscription source: it would keep
+                // every item ever synced wanted forever.
+                let sync_root = std::fs::canonicalize(&root).unwrap_or(root.clone());
                 libraries
                     .into_iter()
                     .map(|library| library.path)
+                    .filter(|candidate| {
+                        std::fs::canonicalize(candidate).unwrap_or(candidate.clone()) != sync_root
+                    })
                     .filter(|candidate| {
                         workshop_sync::manifest_candidates(candidate)
                             .iter()
@@ -430,7 +437,11 @@ fn main() -> Result<()> {
             } else {
                 workshop_sync::print_human(&report, &root);
             }
-            if report.login_failure.is_some() || (report.failed() > 0 && report.downloaded() == 0) {
+            let assets_failed = matches!(report.assets, Some(Err(_)));
+            if report.login_failure.is_some()
+                || assets_failed
+                || (report.failed() > 0 && report.downloaded() == 0)
+            {
                 std::process::exit(2);
             }
         }

@@ -62,11 +62,12 @@ subscriptions):
   lists every subscribed item (`WorkshopItemDetails`); it exists in the
   Steam library that holds Wallpaper Engine on your Linux box (the
   library folder, not necessarily `~/.local/share/Steam`). Copy that file
-  to the Mac into
-  `~/Library/Application Support/kwe/steam/steamapps/workshop/`, and
-  pass `--manifest-root ~/Library/Application Support/kwe/steam` (or leave
-  the flag off: every discovered Steam root, including that one, is read).
-  Re-copy it after subscribing to new items.
+  to the Mac into a folder of its own — NOT the sync root, whose manifest
+  SteamCMD rewrites — e.g.
+  `~/Library/Application Support/kwe/subscriptions/steamapps/workshop/`,
+  and pass `--manifest-root ~/Library/Application Support/kwe/subscriptions`.
+  (With no source flags the tool reads every discovered Steam library
+  except the sync root.) Re-copy it after subscribing to new items.
 - **A public Workshop collection** you curate on any device:
   `--collection <id or URL>` (repeatable). No credentials involved.
 - **Explicit items:** `--item <id or URL>` (repeatable).
