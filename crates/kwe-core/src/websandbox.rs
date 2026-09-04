@@ -355,10 +355,35 @@ pub mod macos {
             .map(Path::to_path_buf)
     }
 
-    /// The SBPL profile for one renderer launch. Pure. Seatbelt matches
-    /// RESOLVED paths, so temp dirs are allowed both as given and under
-    /// `/private/var/folders` (where `$TMPDIR` really lives), and a browser
-    /// bundle under the (otherwise denied) home is re-allowed explicitly.
+    /// Which rule groups the profile carries. `Full` is production;
+    /// `NetworkOnly` and `NoHomeDeny` exist so `KWE_WEB_SANDBOX=net-only` /
+    /// `no-home` can bisect a browser that fails to boot under the full
+    /// profile (scripts/macos/smoke-web-macos.sh runs every variant on CI).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProfileVariant {
+        Full,
+        NetworkOnly,
+        NoHomeDeny,
+    }
+
+    impl ProfileVariant {
+        fn from_env() -> Option<Self> {
+            match std::env::var("KWE_WEB_SANDBOX").as_deref() {
+                Ok("off") => None,
+                Ok("net-only") => Some(Self::NetworkOnly),
+                Ok("no-home") => Some(Self::NoHomeDeny),
+                _ => Some(Self::Full),
+            }
+        }
+    }
+
+    /// The production SBPL profile for one renderer launch (`Full`). Pure.
+    /// Seatbelt matches RESOLVED paths, so temp dirs are allowed both as
+    /// given and under `/private/var/folders` (where `$TMPDIR` really
+    /// lives), and a browser bundle under the (otherwise denied) home is
+    /// re-allowed explicitly. Used by the tests; production goes through
+    /// `profile_variant` with the env-selected variant.
+    #[allow(dead_code)]
     pub fn profile(
         root: &Path,
         profile_dir: &Path,
@@ -366,7 +391,25 @@ pub mod macos {
         browser_bundle: Option<&Path>,
         network_allowed: bool,
     ) -> String {
+        profile_variant(root, profile_dir, home, browser_bundle, network_allowed, ProfileVariant::Full)
+    }
+
+    pub fn profile_variant(
+        root: &Path,
+        profile_dir: &Path,
+        home: Option<&Path>,
+        browser_bundle: Option<&Path>,
+        network_allowed: bool,
+        variant: ProfileVariant,
+    ) -> String {
         let mut rules = String::from("(version 1)\n(allow default)\n");
+        if variant == ProfileVariant::NetworkOnly {
+            if !network_allowed {
+                rules.push_str("(deny network*)\n");
+                rules.push_str("(allow network* (local unix-socket) (remote unix-socket))\n");
+            }
+            return rules;
+        }
         // Writes: only the throwaway browser profile, temp trees, and /dev.
         rules.push_str("(deny file-write*)\n");
         rules.push_str(&format!(
@@ -376,7 +419,9 @@ pub mod macos {
         // Reads: the user's home is off limits except the content root, the
         // browser's own bundle (when it lives under ~/Applications), and
         // the profile/temp trees.
-        if let Some(home) = home {
+        if let Some(home) = home
+            && variant != ProfileVariant::NoHomeDeny
+        {
             rules.push_str(&format!("(deny file-read* (subpath {}))\n", sbpl_string(home)));
         }
         let mut allowed_reads = vec![
@@ -464,16 +509,23 @@ pub mod macos {
         network_allowed: bool,
         page_url: String,
     ) -> WebSandboxCommand {
-        if std::env::var("KWE_WEB_SANDBOX").as_deref() == Ok("off") {
+        let Some(variant) = ProfileVariant::from_env() else {
             return WebSandboxCommand {
                 program: browser,
                 arguments: browser_arguments,
                 page_url,
             };
-        }
+        };
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let bundle = bundle_root(Path::new(&browser));
-        let profile = profile(root, profile_dir, home.as_deref(), bundle.as_deref(), network_allowed);
+        let profile = profile_variant(
+            root,
+            profile_dir,
+            home.as_deref(),
+            bundle.as_deref(),
+            network_allowed,
+            variant,
+        );
         let mut arguments = vec!["-p".to_string(), profile, browser];
         arguments.extend(browser_arguments);
         WebSandboxCommand {

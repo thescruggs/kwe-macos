@@ -78,10 +78,14 @@ run_lane() {
   return $result
 }
 
-sandboxed=1; bare=1
+sandboxed=1; bare=1; netonly=1; nohome=1
 run_lane sandboxed KWE_WEB_SANDBOX=on && sandboxed=0 || true
 run_lane bare KWE_WEB_SANDBOX=off && bare=0 || true
-echo "summary: sandbox-exec lane $([[ $sandboxed == 0 ]] && echo PASS || echo FAIL); unsandboxed lane $([[ $bare == 0 ]] && echo PASS || echo FAIL)"
+# Bisect lanes: which rule group the browser trips on.
+run_lane net-only KWE_WEB_SANDBOX=net-only && netonly=0 || true
+run_lane no-home KWE_WEB_SANDBOX=no-home && nohome=0 || true
+verdict() { [[ $1 == 0 ]] && echo PASS || echo FAIL; }
+echo "summary: sandbox-exec full $(verdict $sandboxed); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
 if [[ $sandboxed == 0 ]]; then exit 0; fi
 if [[ $bare == 0 ]]; then exit 2; fi
 exit 1
