@@ -450,6 +450,67 @@ mod tests {
         }
     }
 
+    /// Runs each containment step the daemon applies between fork and exec
+    /// in its own child, so a platform that refuses one names it. (macOS
+    /// CI, 2026-09-04: every worker spawn failed with std's EINVAL
+    /// placeholder, which hides which pre_exec step returned an error.)
+    #[test]
+    fn each_containment_step_succeeds_in_a_child() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        fn set_limit(resource: RlimitResource, value: u64) -> io::Result<()> {
+            let limit = libc::rlimit {
+                rlim_cur: value as libc::rlim_t,
+                rlim_max: value as libc::rlim_t,
+            };
+            if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        let parent = std::process::id() as libc::pid_t;
+        let mib = 1024_u64 * 1024;
+        type Step = Box<dyn Fn() -> io::Result<()> + Send + Sync>;
+        let steps: Vec<(&str, Step)> = vec![
+            (
+                "setpgid",
+                Box::new(|| {
+                    if unsafe { libc::setpgid(0, 0) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                }),
+            ),
+            (
+                "child_pre_exec",
+                Box::new(move || unsafe { child_pre_exec(parent, libc::SIGKILL) }),
+            ),
+            ("RLIMIT_AS", Box::new(move || set_limit(RLIMIT_AS, 4096 * mib))),
+            ("RLIMIT_FSIZE", Box::new(move || set_limit(RLIMIT_FSIZE, 160 * mib))),
+            ("RLIMIT_NOFILE", Box::new(|| set_limit(RLIMIT_NOFILE, 256))),
+            ("RLIMIT_NPROC", Box::new(|| set_limit(RLIMIT_NPROC, 1024))),
+            ("RLIMIT_CORE", Box::new(|| set_limit(RLIMIT_CORE, 0))),
+        ];
+        let mut failures = Vec::new();
+        for (name, step) in steps {
+            let mut command = Command::new("true");
+            // SAFETY: the step calls only async-signal-safe libc functions.
+            unsafe {
+                command.pre_exec(move || step());
+            }
+            match command.status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => failures.push(format!("{name}: child exited {status}")),
+                Err(error) => failures.push(format!(
+                    "{name}: spawn error {error} (raw {:?})",
+                    error.raw_os_error()
+                )),
+            }
+        }
+        assert!(failures.is_empty(), "containment steps refused: {failures:?}");
+    }
+
     #[test]
     fn steam_roots_are_platform_specific() {
         let roots = default_steam_roots(std::path::Path::new("/home/u"));
