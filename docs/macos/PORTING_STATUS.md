@@ -51,22 +51,22 @@ render blank without a Freedesktop icon theme (text labels carry meaning).
 1. Desktop window sits under Finder icons and survives wake/Space change
    (agent re-asserts level every 5 s).
 2. Mouse-moved global monitor works without an Accessibility prompt.
-3. `sandbox-exec` profile lets Chromium bootstrap — **verified on the
-   macOS runner (run 33839294271): the production profile renders a web
-   wallpaper end to end** (Google Chrome headless, `--no-sandbox` under
-   the outer Seatbelt profile exactly as `--no-sandbox` under bwrap on
-   Linux; frames advancing over the CDP pipe). Findings on the way: SBPL
-   `network*` covers Unix domain sockets (now re-allowed; IP stays
-   denied); Chromium's nested sandbox cannot initialise inside an outer
-   profile; the read-deny targets `/Users` (the worker's HOME is a
-   daemon-created per-launch directory, re-allowed) with parent-directory
-   metadata allowed for path resolution; the browser's cwd is the content
-   root. Two earlier runs saw an intermittent first-start failure ("Failed
-   to get the path for 1001") under the same rules; the smoke now runs the
-   production lane three times and dumps Seatbelt denials on failure so
-   the flake rate and the denied path are measured on every CI run. Note
-   a bootstrap refusal (exit 73) is not retried by the daemon (B4
-   semantics); Apply again if it happens.
+3. ~~`sandbox-exec` profile lets Chromium bootstrap~~ — **resolved and
+   verified on the macOS runner (run 33839908376: production profile 3/3,
+   plus the bare, net-only and no-home lanes).** Google Chrome headless
+   runs with `--no-sandbox` under the outer Seatbelt profile exactly as
+   `--no-sandbox` under bwrap on Linux; frames advance over the CDP pipe.
+   Findings on the way, each measured from the unified log's denials: SBPL
+   `network*` covers Unix domain sockets (re-allowed; IP stays denied);
+   Chromium's nested sandbox cannot initialise inside an outer profile;
+   the read-deny targets `/Users` (the worker's HOME is a daemon-created
+   per-launch directory, re-allowed); CoreFoundation start-up needs
+   `~/.CFUserTextEncoding` and metadata of `~/Library` and
+   `~/Library/Application Support`; the browser's cwd is the content
+   root. `scripts/macos/smoke-web-macos.sh` keeps running the production
+   lane three times per CI run and dumps denials on any failure. A
+   bootstrap refusal (exit 73) is not retried by the daemon (B4
+   semantics); Apply again if one ever happens.
 4. MoltenVK: `kwe-vulkan` lists the Apple GPU; scene corpus behaviour.
 5. ffmpeg/BlackHole capture feeds audio-reactive scenes.
 6. Homebrew Qt: `cmake -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)` configures

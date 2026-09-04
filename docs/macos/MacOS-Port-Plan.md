@@ -134,7 +134,7 @@ inverse. Spikes (§7) precede MP-2.
     hang, survive hotplug and sleep/wake.
   - Accept: pattern visible behind icons on two screens; last-good frame
     retained across a renderer kill.
-- **MP-5 Renderers** — 5a video: no code change needed (libmpv via Homebrew); 5b web: done and **verified on the macOS CI runner** 2026-09-04 (sandbox-exec + `--no-sandbox`, Unix sockets allowed, /Users read-deny; intermittent first-start failure under measurement); 5c scene: portability enumeration done, MoltenVK runtime unverified
+- **MP-5 Renderers** — 5a video: no code change needed (libmpv via Homebrew); 5b web: done and **verified on the macOS CI runner** 2026-09-04 (production Seatbelt profile 3/3: sandbox-exec + `--no-sandbox`, Unix sockets allowed, /Users read-deny with the measured CoreFoundation exceptions); 5c scene: portability enumeration done, MoltenVK runtime unverified
   - 5a video: libmpv software render, `smoke-video.sh` passes;
   - 5b web: Chrome headless + CDP pipe, `sandbox-exec` profile,
     `smoke-web.sh` + `smoke-web-compromise.sh` pass or document deviations;

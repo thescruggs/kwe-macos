@@ -53,8 +53,8 @@ jobs:
           cmake --build build/agent --parallel
       - name: Agent smoke (daemon + test renderer + agent, offscreen)
         run: scripts/macos/smoke-display-agent.sh build/agent
-      - name: Web wallpaper smoke (Chrome headless under sandbox-exec; informational exit 2 = only unsandboxed passes)
-        run: scripts/macos/smoke-web-macos.sh || [ $? -eq 2 ]
+      - name: Web wallpaper smoke (Chrome headless under the production sandbox-exec profile, 3 attempts + bisect lanes)
+        run: scripts/macos/smoke-web-macos.sh
       - name: Manager loads
         env:
           QT_QPA_PLATFORM: offscreen
