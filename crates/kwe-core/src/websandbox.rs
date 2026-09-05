@@ -605,6 +605,12 @@ pub mod macos {
                 .map(|name| format!("(global-name \"{name}\")"))
                 .collect();
             rules.push_str(&format!("(allow mach-lookup {})\n", names.join(" ")));
+            // The browser's own per-process rendezvous port (browser <->
+            // helper handshake): `<bundle id>.MachPortRendezvousServer.<pid>`
+            // (measured: 181 denials, helpers never attach without it).
+            rules.push_str(
+                "(allow mach-lookup (global-name-regex #\"\\.MachPortRendezvousServer\\.[0-9]+$\"))\n",
+            );
             // Device access: power assertions and the boot-disk identity
             // client the browser opens at start (measured); nothing else.
             rules.push_str("(deny iokit-open)\n");
