@@ -302,7 +302,9 @@ pub fn sandbox_root(path: &Path) -> Option<PathBuf> {
 /// There is no bubblewrap; the browser runs under `sandbox-exec` with a
 /// generated SBPL profile and, as under bwrap on Linux, `--no-sandbox`
 /// (Chromium's nested sandbox cannot initialise inside an outer Seatbelt
-/// profile). The profile is last-match-wins SBPL: allow by default,
+/// profile). Default = `ProfileVariant::Strict`; `KWE_WEB_SANDBOX=lenient`
+/// drops the Mach/IOKit/exec allow-lists, `net-only`/`no-home` bisect,
+/// `off` runs bare. The profile is last-match-wins SBPL: allow by default,
 /// then deny every write outside the throwaway profile dir and the
 /// temp/dev trees, deny reading the user's home except the content root,
 /// and deny the network unless the content permission set grants it.
@@ -378,13 +380,16 @@ pub mod macos {
     /// profile (scripts/macos/smoke-web-macos.sh runs every variant on CI).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ProfileVariant {
+        /// File and network rules only (`KWE_WEB_SANDBOX=lenient`): the
+        /// fallback when the default's Mach/IOKit/exec allow-lists miss
+        /// something a different browser build needs.
         Full,
         NetworkOnly,
         NoHomeDeny,
-        /// `Full` plus the hardening backlog: Mach service allow-list,
-        /// no IOKit, process-exec only inside the browser bundle.
-        /// Opt-in (`KWE_WEB_SANDBOX=strict`) and measured on CI until it
-        /// renders reliably; then it becomes `Full`.
+        /// The default since 2026-09-05: `Full` plus a Mach service
+        /// allow-list (no pasteboard), IOKit limited to two user clients,
+        /// process-exec only inside the browser bundle. Measured 4/4 on
+        /// hosted macOS runners with Google Chrome.
         Strict,
     }
 
@@ -394,8 +399,8 @@ pub mod macos {
                 Ok("off") => None,
                 Ok("net-only") => Some(Self::NetworkOnly),
                 Ok("no-home") => Some(Self::NoHomeDeny),
-                Ok("strict") => Some(Self::Strict),
-                _ => Some(Self::Full),
+                Ok("lenient") => Some(Self::Full),
+                _ => Some(Self::Strict),
             }
         }
     }
@@ -466,7 +471,8 @@ pub mod macos {
         "com.apple.dock.server",
     ];
 
-    /// The production SBPL profile for one renderer launch (`Full`). Pure.
+    /// The file/network SBPL profile for one renderer launch (`Full`,
+    /// the `lenient` fallback; the default adds the `Strict` rules). Pure.
     /// Seatbelt matches RESOLVED paths, so temp dirs are allowed both as
     /// given and under `/private/var/folders` (where `$TMPDIR` really
     /// lives), and a browser bundle under the (otherwise denied) home is
@@ -729,8 +735,8 @@ pub mod macos {
             page_url,
             working_dir: Some(root.to_path_buf()),
             sandbox: match variant {
-                ProfileVariant::Full => "seatbelt",
-                ProfileVariant::Strict => "seatbelt:strict",
+                ProfileVariant::Strict => "seatbelt",
+                ProfileVariant::Full => "seatbelt:lenient",
                 ProfileVariant::NetworkOnly => "seatbelt:net-only",
                 ProfileVariant::NoHomeDeny => "seatbelt:no-home",
             },

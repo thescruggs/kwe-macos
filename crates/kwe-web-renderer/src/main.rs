@@ -956,7 +956,7 @@ fn spawn_browser(
     // inside the Linux namespace, the real content path on macOS.
     let page_marker = kwe_core::page_url_marker(&web_command);
     match web_command.sandbox {
-        "bwrap" | "seatbelt" | "seatbelt:strict" => {}
+        "bwrap" | "seatbelt" => {}
         weakened => eprintln!(
             "event=renderer.web.sandbox_weakened mode={weakened} detail=KWE_WEB_SANDBOX is set; the OS sandbox around the browser is reduced or off"
         ),

@@ -184,8 +184,9 @@ inverse. Spikes (§7) precede MP-2.
 - **G5 Floor.** Recommendation: macOS 14+, Apple Silicon first.
 - **G6 Web sandbox.** `sandbox-exec` profile vs Chromium sandbox only.
   Decided by measurement 2026-09-04: `sandbox-exec` profile + `--no-sandbox`
-  (a `strict` variant with a Mach allow-list, IOKit and exec scoping
-  renders as of 2026-09-05 and is measured 3×/run toward becoming default)
+  plus, default since 2026-09-05, a Mach service allow-list (no
+  pasteboard), IOKit limited to two clients, exec only inside the browser
+  bundle; `KWE_WEB_SANDBOX=lenient` is the file+network-only fallback
   (Chromium's nested sandbox cannot initialise inside an outer Seatbelt
   profile), mirroring bwrap + `--no-sandbox` on Linux; profile denies
   reads under /Users except content root/worker home/browser bundle,

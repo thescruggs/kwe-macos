@@ -111,9 +111,12 @@ upstream has it (Linux-neutral fork rule) — worth an upstream fix.
   browser's own per-process `MachPortRendezvousServer.<pid>` name. What
   it still denies beyond the production profile: the pasteboard, every
   other Mach service, every other IOKit client, exec outside the browser
-  bundle + /usr/lib. Measured 3× per CI run from here; it becomes the
-  default once it matches the production lane's pass rate over several
-  runs. The production lane showed one first-attempt flake on a fresh VM
+  bundle + /usr/lib. **Default since 2026-09-05** after 4/4 attempts on
+  two fresh runner VMs; the previous file+network-only profile is
+  `KWE_WEB_SANDBOX=lenient`. If web wallpapers refuse on your Mac (a
+  different browser build may need one more Mach service): try
+  `lenient`, then `off`, and read `log show --last 2m --predicate
+  'eventMessage CONTAINS "deny("'` — the smoke prints the same. The production lane showed one first-attempt flake on a fresh VM
   this evening (crashpad handler noise, then CDP pipe closed); the
   in-renderer retry did not rescue it — still under observation.
 - 2026-09-05 packaging: `packaging/macos/make-bundles.sh` builds

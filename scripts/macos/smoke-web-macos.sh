@@ -104,23 +104,19 @@ for attempt in 1 2 3; do
   fi
 done
 [[ $sandboxed_passes -gt 0 ]] && sandboxed=0
-echo "production profile: $sandboxed_passes/3 attempts rendered"
+echo "production (strict) profile: $sandboxed_passes/3 attempts rendered"
 run_lane bare KWE_WEB_SANDBOX=off && bare=0 || true
-# Hardening candidate (Mach allow-list, no IOKit, exec only in the bundle):
-# informational until it renders reliably; denials name what it lacks.
-strict=1; strict_passes=0
-for attempt in 1 2 3; do
-  if run_lane "strict-$attempt" KWE_WEB_SANDBOX=strict; then strict_passes=$((strict_passes + 1)); else denials; fi
-done
-[[ $strict_passes -gt 0 ]] && strict=0
-echo "strict profile: $strict_passes/3 attempts rendered"
+# The lenient fallback (file + network rules only): the first thing to try
+# when a different browser build fails under the default.
+lenient=1
+run_lane lenient KWE_WEB_SANDBOX=lenient && lenient=0 || denials
 # Bisect lanes: which rule group the browser trips on.
 run_lane net-only KWE_WEB_SANDBOX=net-only && netonly=0 || true
 run_lane no-home KWE_WEB_SANDBOX=no-home && nohome=0 || true
 verdict() { [[ $1 == 0 ]] && echo PASS || echo FAIL; }
-echo "summary: sandbox-exec full $(verdict $sandboxed) ($sandboxed_passes/3); strict candidate $(verdict $strict) ($strict_passes/3); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
+echo "summary: default (strict) profile $(verdict $sandboxed) ($sandboxed_passes/3); lenient profile $(verdict $lenient); unsandboxed $(verdict $bare); net-only profile $(verdict $netonly); no-home-deny profile $(verdict $nohome)"
 # 0: production profile renders. 2: the browser renders under sandbox-exec
 # with a reduced profile or bare (profile needs work). 1: nothing renders.
 if [[ $sandboxed == 0 ]]; then exit 0; fi
-if [[ $bare == 0 || $netonly == 0 || $nohome == 0 ]]; then exit 2; fi
+if [[ $lenient == 0 || $bare == 0 || $netonly == 0 || $nohome == 0 ]]; then exit 2; fi
 exit 1
