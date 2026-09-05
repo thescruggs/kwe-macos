@@ -418,6 +418,10 @@ pub mod macos {
         "com.apple.system.opendirectoryd.membership",
         "com.apple.CoreServices.coreservicesd",
         "com.apple.lsd.mapdb",
+        // Chrome's browser process cannot start without LaunchServices
+        // (measured: denied lookup -> exit before CDP). Kept; the strict
+        // variant's remaining value is pasteboard, IOKit, and exec scope.
+        "com.apple.coreservices.launchservicesd",
         "com.apple.fonts",
         "com.apple.FontObjectsServer",
         "com.apple.FontServer",
@@ -590,8 +594,8 @@ pub mod macos {
             rules.push_str("(allow network* (local unix-socket) (remote unix-socket))\n");
         }
         if variant == ProfileVariant::Strict {
-            // Mach services: only the allow-list. LaunchServices (unconfined
-            // app launch) and the pasteboard are deliberately absent.
+            // Mach services: only the allow-list. The pasteboard is
+            // deliberately absent; LaunchServices had to stay (see list).
             rules.push_str("(deny mach-lookup)\n");
             let names: Vec<String> = STRICT_MACH_SERVICES
                 .iter()
@@ -769,7 +773,6 @@ pub mod macos {
             assert!(strict.contains("(deny mach-lookup)\n(allow mach-lookup (global-name \"com.apple.system.logger\")"));
             assert!(strict.contains("(deny iokit-open)"));
             assert!(strict.contains("(deny process-exec*)\n(allow process-exec* (subpath \"/usr/lib\") (subpath \"/Applications/Google Chrome.app\"))"));
-            assert!(!strict.contains("launchservicesd"));
             assert!(!strict.contains("pasteboard"));
         }
 

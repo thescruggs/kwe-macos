@@ -87,8 +87,11 @@ denials() {
   # What did Seatbelt refuse? The unified log records every denial as
   # "Sandbox: <process>(<pid>) deny(1) <operation> <path>".
   echo "seatbelt denials in the last 2 minutes (unified log):"
-  log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "Chrome" OR eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec")' 2>/dev/null \
-    | grep -oE 'deny\([0-9]+\) [a-z*-]+ .*' | sort | uniq -c | sort -rn | head -40 || true
+  # Ephemeral-port binds and IP egress are denied in every lane by design
+  # and would flood the listing; everything else is shown, grouped.
+  log show --last 90s --style compact --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "Chrome" OR eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec")' 2>/dev/null \
+    | grep -oE 'deny\([0-9]+\) [a-z*-]+ .*' | grep -vE 'network-bind local:\*:[0-9]+|network-outbound remote:' \
+    | sort | uniq -c | sort -rn | head -60 || true
 }
 # The production lane three times: an intermittent first-start failure was
 # seen on the hosted runner (2026-09-04); the pass count is the signal.
