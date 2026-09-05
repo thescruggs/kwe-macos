@@ -39,8 +39,9 @@ jobs:
   qt-macos:
     # The display agent + manager (Kirigami compatibility module) built
     # against Homebrew Qt, and the daemon + test renderer + agent smoke run
-    # offscreen: real macOS execution of the frame path.
-    runs-on: macos-14
+    # offscreen: real macOS execution of the frame path. macos-latest =
+    # the newest hosted image, closest to the maintainer's Mac.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Homebrew dependencies
