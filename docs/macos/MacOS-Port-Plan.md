@@ -154,7 +154,7 @@ inverse. Spikes (§7) precede MP-2.
   - QML skin per G4; launchd activation; reports path; previews;
   - `.app` bundle with embedded QML modules.
   - Accept: gallery, apply, reset, playlist, issue report work end to end.
-- **MP-8 Packaging** — partial 2026-09-04: LaunchAgents for daemon + display agent, `install-dev.sh`/`uninstall-dev.sh`, README.macos.md; `.app` bundles, signing/notarization, Homebrew tap still pending
+- **MP-8 Packaging** — partial: LaunchAgents for daemon + display agent, `install-dev.sh`/`uninstall-dev.sh`, README.macos.md, `make-bundles.sh` (.app bundles via macdeployqt, ad-hoc signed, unverified); Developer ID signing/notarization and a Homebrew tap still pending
   - `.app` bundles for manager + agent, LaunchAgent, codesign + notarize,
     Homebrew tap formula/cask, uninstall script restoring desktop images;
   - arm64 first; universal binary after MP-9.
@@ -184,6 +184,8 @@ inverse. Spikes (§7) precede MP-2.
 - **G5 Floor.** Recommendation: macOS 14+, Apple Silicon first.
 - **G6 Web sandbox.** `sandbox-exec` profile vs Chromium sandbox only.
   Decided by measurement 2026-09-04: `sandbox-exec` profile + `--no-sandbox`
+  (a `strict` variant with a Mach allow-list, IOKit and exec scoping
+  renders as of 2026-09-05 and is measured 3×/run toward becoming default)
   (Chromium's nested sandbox cannot initialise inside an outer Seatbelt
   profile), mirroring bwrap + `--no-sandbox` on Linux; profile denies
   reads under /Users except content root/worker home/browser bundle,

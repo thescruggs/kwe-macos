@@ -103,13 +103,22 @@ upstream has it (Linux-neutral fork rule) — worth an upstream fix.
   min(address_space_mib, 2 GiB) once a second, verified by a nested-child
   hog test on the macOS runner. Noted: a re-parented escapee is not
   counted; the Linux unit's aggregate cgroup limit has no macOS twin yet.
-- 2026-09-04 strict Seatbelt variant (`KWE_WEB_SANDBOX=strict`,
-  d0ade39): Mach allow-list without LaunchServices/pasteboard, `(deny
-  iokit-open)`, process-exec only inside the browser bundle and /usr/lib.
-  Opt-in; the smoke reports it as an informational lane with denial
-  capture. NOT yet measured on macOS (CI blocked by billing right after
-  the push) — expect the allow-list to need additions from the
-  `deny(1) mach-lookup <service>` lines.
+- 2026-09-04/05 strict Seatbelt variant (`KWE_WEB_SANDBOX=strict`):
+  **renders on the macOS runner** (run 33937715547) after five measured
+  additions — LaunchServices (Chrome cannot start without it), Dock
+  registration, `opendirectoryd.api`, exec of `/usr/bin/profiles`, the
+  two IOKit user clients (power assertions, boot-disk identity), and the
+  browser's own per-process `MachPortRendezvousServer.<pid>` name. What
+  it still denies beyond the production profile: the pasteboard, every
+  other Mach service, every other IOKit client, exec outside the browser
+  bundle + /usr/lib. Measured 3× per CI run from here; it becomes the
+  default once it matches the production lane's pass rate over several
+  runs. The production lane showed one first-attempt flake on a fresh VM
+  this evening (crashpad handler noise, then CDP pipe closed); the
+  in-renderer retry did not rescue it — still under observation.
+- 2026-09-05 packaging: `packaging/macos/make-bundles.sh` builds
+  `dist/kwe-macos/{bin, KWE Manager.app, KWE Display.app}` with
+  macdeployqt, ad-hoc signed (unverified until run on the Mac).
 - 2026-09-04 web-sandbox security review (independent, sonnet): no
   show-stoppers. Landed: temp grants narrowed from `/private/var/folders`
   to the resolved `$TMPDIR`; the renderer logs the sandbox mode at spawn
