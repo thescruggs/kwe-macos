@@ -462,6 +462,8 @@ pub mod macos {
         "com.apple.backupd.sandbox.xpc",
         "com.apple.language.assetd",
         "com.apple.runningboard",
+        // NSApplication start-up registers with the Dock even headless.
+        "com.apple.dock.server",
     ];
 
     /// The production SBPL profile for one renderer launch (`Full`). Pure.
@@ -603,8 +605,12 @@ pub mod macos {
                 .map(|name| format!("(global-name \"{name}\")"))
                 .collect();
             rules.push_str(&format!("(allow mach-lookup {})\n", names.join(" ")));
-            // No device access for a headless, software-rendered browser.
+            // Device access: power assertions and the boot-disk identity
+            // client the browser opens at start (measured); nothing else.
             rules.push_str("(deny iokit-open)\n");
+            rules.push_str(
+                "(allow iokit-open (iokit-user-client-class \"RootDomainUserClient\") (iokit-user-client-class \"AppleNVMeEANUC\"))\n",
+            );
             // exec only inside the browser's own bundle (helpers, crashpad)
             // — and the system loader/shell stubs Chromium's helpers use.
             rules.push_str("(deny process-exec*)\n");
