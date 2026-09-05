@@ -4,8 +4,12 @@
 CDT); gates §6 taken on the plan's recommendations and recorded in
 `PORTING_STATUS.md`. Fork created 2026-09-04 at
 `github.com/thescruggs/kwe-macos` (private), upstream = the Linux checkout.
-MP-0..MP-7 code-complete, MP-8 partial; whole workspace builds on the
-macos-14 CI runner and the offscreen display-agent smoke passes there. Each milestone gets an independent review; show
+MP-0..MP-7 code-complete, MP-1b (`kwe workshop-sync`) done, MP-8/MP-9
+partial; on hosted macOS runners the workspace builds, tests pass, the
+offscreen display-agent smoke and a web wallpaper under the production
+Seatbelt profile render. Repository public since 2026-09-04 evening.
+Maintainer directive 2026-09-04: KDE/Linux checkout stays untouched;
+quota-conscious continuation; first physical-desktop test 2026-09-05. Each milestone gets an independent review; show
 stoppers are fixed, everything else documented here and continued.
 
 **Baseline:** upstream trunk `fix/qt611-gallery-delegates` at `1cbc08f`

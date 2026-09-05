@@ -175,15 +175,11 @@ whether the mouse-moved global monitor needs a TCC prompt.
 
 ## macOS CI: green (GitHub macos-14 runner, last run 33841871578 on commit 253d1d2, 2026-09-04)
 
-**CI is currently blocked by GitHub billing, not by code:** from run
-33842187967 on, jobs fail at "Set up job" with "The job was not started
-because recent account payments have failed or your spending limit needs
-to be increased". macOS runners consume included minutes at 10×; this
-session ran ~30 workflow runs. Raise the Actions spending limit (Settings
-→ Billing) or make the repository public (public repositories get free
-hosted minutes) and re-run the latest workflow. Commits after 253d1d2
-(the opt-in `strict` Seatbelt variant, d0ade39) are Linux-tested and
-Darwin cross-checked only; they do not change the default profile.
+CI was blocked by the account's Actions spending limit between runs
+33842187967 and the repository going public on 2026-09-04 evening (public
+repositories get free hosted minutes); the Qt job now runs on
+`macos-latest`. Commits in the gap (`strict` Seatbelt variant,
+`kwe workshop-sync`) are re-verified by the runs after that.
 
 `rust-macos` (whole workspace builds; every portable crate's tests pass
 with Homebrew shaderc/mpv/MoltenVK, including the macOS-only resident-set
@@ -207,6 +203,22 @@ shaderc/mpv/MoltenVK. Then pinned by a per-step diagnostic test: Darwin refuses
 shader helper now skip `RLIMIT_AS` on macOS (never enforced there; the
 resident-set watchdog in MP-9 is the substitute) and keep the other four
 limits.
+
+## Start here when resuming on the Mac (2026-09-05)
+
+1. `git pull`, then `packaging/macos/install-dev.sh` (Xcode CLT + Homebrew
+   already present; the script installs nothing system-wide besides the
+   two LaunchAgents). Then `scripts/macos/desktop-test.sh 20` — the first
+   real-desktop check (hardware-verify items 1 and 2).
+2. Workshop content: copy the Linux library's manifest once —
+   `scp <linux-host>:/media/crushinator/steamapps/workshop/appworkshop_431960.acf \
+   ~/Library/Application\ Support/kwe/subscriptions/steamapps/workshop/` —
+   then `steamcmd +login <account> +quit` once, then
+   `target/release/kwe workshop-sync --user <account> --manifest-root ~/Library/Application\ Support/kwe/subscriptions --assets`.
+3. `build/agent/apps/kwe-manager/kwe-manager`: Apply a video wallpaper
+   first (no MoltenVK or browser involved), then a web one, then a scene.
+4. Whatever fails: `kwe reports` / `~/Library/Logs/kwe/*.log`; the
+   hardware-verify list below is the checklist.
 
 ## Runtime status on a Mac
 
