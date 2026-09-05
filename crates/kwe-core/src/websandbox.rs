@@ -416,6 +416,7 @@ pub mod macos {
         "com.apple.trustd.agent",
         "com.apple.system.opendirectoryd.libinfo",
         "com.apple.system.opendirectoryd.membership",
+        "com.apple.system.opendirectoryd.api",
         "com.apple.CoreServices.coreservicesd",
         "com.apple.lsd.mapdb",
         // Chrome's browser process cannot start without LaunchServices
@@ -607,7 +608,11 @@ pub mod macos {
             // exec only inside the browser's own bundle (helpers, crashpad)
             // — and the system loader/shell stubs Chromium's helpers use.
             rules.push_str("(deny process-exec*)\n");
-            let mut exec_allows = vec!["(subpath \"/usr/lib\")".to_string()];
+            // /usr/bin/profiles: Chrome's managed-device policy probe.
+            let mut exec_allows = vec![
+                "(subpath \"/usr/lib\")".to_string(),
+                "(literal \"/usr/bin/profiles\")".to_string(),
+            ];
             if let Some(bundle) = browser_bundle {
                 exec_allows.push(format!("(subpath {})", sbpl_string(bundle)));
             }
@@ -772,7 +777,7 @@ pub mod macos {
             assert!(strict.contains("(deny file-write*)"));
             assert!(strict.contains("(deny mach-lookup)\n(allow mach-lookup (global-name \"com.apple.system.logger\")"));
             assert!(strict.contains("(deny iokit-open)"));
-            assert!(strict.contains("(deny process-exec*)\n(allow process-exec* (subpath \"/usr/lib\") (subpath \"/Applications/Google Chrome.app\"))"));
+            assert!(strict.contains("(deny process-exec*)\n(allow process-exec* (subpath \"/usr/lib\") (literal \"/usr/bin/profiles\") (subpath \"/Applications/Google Chrome.app\"))"));
             assert!(!strict.contains("pasteboard"));
         }
 
