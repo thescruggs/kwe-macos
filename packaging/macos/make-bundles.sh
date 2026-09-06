@@ -10,6 +10,9 @@ set -eu
 here="$(cd "$(dirname "$0")" && pwd -P)"
 root="$(cd "$here/../.." && pwd -P)"
 case "$(uname -s)" in Darwin) ;; *) echo "macOS only" >&2; exit 2;; esac
+# rustup installs Cargo into ~/.cargo/bin; a fresh terminal may not have it yet.
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+command -v cargo >/dev/null 2>&1 || { echo "cargo not found: run 'rustup-init -y' then 'source ~/.cargo/env'" >&2; exit 1; }
 qt_prefix="$(brew --prefix qt@6 2>/dev/null || brew --prefix qt)"
 macdeployqt="$qt_prefix/bin/macdeployqt"
 [ -x "$macdeployqt" ] || { echo "macdeployqt not found under $qt_prefix/bin" >&2; exit 1; }
